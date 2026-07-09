@@ -169,6 +169,32 @@ def _remap_text(value: str, source_root: Path, target_root: Path) -> str:
     return value.replace(source, target)
 
 
+def _restore_worktree_build_wrappers(canonical_root: Path, worktree: Path) -> None:
+    """Copy gitignored/untracked build-wrapper bootstrap files the worktree lacks.
+
+    `git worktree add --detach HEAD` only checks out tracked files, so build
+    wrappers whose bootstrap artifacts are gitignored (e.g. Maven Wrapper's
+    ``.mvn/wrapper/maven-wrapper.jar`` or Gradle's
+    ``gradle/wrapper/gradle-wrapper.jar``) are missing in the worktree and break
+    offline builds. Restore them from the canonical working tree so the worktree
+    is buildable. Idempotent: only copies files that are absent in the worktree.
+    """
+    for wrapper_rel in (".mvn/wrapper", "gradle/wrapper"):
+        src_dir = canonical_root / wrapper_rel
+        if not src_dir.is_dir():
+            continue
+        dst_dir = worktree / wrapper_rel
+        for src_file in src_dir.rglob("*"):
+            if not src_file.is_file():
+                continue
+            rel = src_file.relative_to(src_dir)
+            dst_file = dst_dir / rel
+            if dst_file.exists():
+                continue
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
+
+
 def _prepare_worktree(sample: Sample, run_dir: Path) -> Sample:
     canonical_root = sample.project_root.resolve()
     safe_proc = _run(["git", "config", "--global", "--add", "safe.directory", "*"], canonical_root)
@@ -186,6 +212,8 @@ def _prepare_worktree(sample: Sample, run_dir: Path) -> Sample:
     filemode_proc = _git(worktree, ["config", "core.filemode", "false"])
     if filemode_proc.returncode != 0:
         raise RuntimeError(filemode_proc.stderr or filemode_proc.stdout or "failed to configure worktree filemode")
+
+    _restore_worktree_build_wrappers(canonical_root, worktree)
 
     return replace(
         sample,
