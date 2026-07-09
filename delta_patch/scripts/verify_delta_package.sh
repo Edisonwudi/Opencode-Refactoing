@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PAYLOAD="$PATCH_DIR/payload/opencode-refactor"
+
+required=(
+  "$PATCH_DIR/Dockerfile.delta"
+  "$PATCH_DIR/README.md"
+  "$PATCH_DIR/VERSION"
+  "$PAYLOAD/.opencode/agents/java-refactor-agent.md"
+  "$PAYLOAD/.opencode/agents/java-refactor-agent-idea.md"
+  "$PAYLOAD/.opencode/plugins/smell.ts"
+  "$PAYLOAD/runtime/python/bridge/smell_bridge.py"
+  "$PAYLOAD/runtime/python/smell_core/java/smell_guards.py"
+  "$PAYLOAD/scripts/run_smell_dataset.py"
+  "$PAYLOAD/scripts/self_check_smell_verify.mjs"
+  "$PAYLOAD/docker/java-refactor-delivery/entrypoint.sh"
+)
+
+for path in "${required[@]}"; do
+  if [[ ! -e "$path" ]]; then
+    echo "Missing required path: $path" >&2
+    exit 66
+  fi
+done
+
+if find "$PATCH_DIR" -name '.DS_Store' -o -name '__pycache__' -o -name 'node_modules' | grep -q .; then
+  echo "Unexpected generated/local-only file found in patch package." >&2
+  find "$PATCH_DIR" -name '.DS_Store' -o -name '__pycache__' -o -name 'node_modules'
+  exit 65
+fi
+
+cd "$PAYLOAD"
+pycache_root="$(mktemp -d)"
+trap 'rm -rf "$pycache_root"' EXIT
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+expected = "1.17.13"
+checks = [
+    (Path("package.json"), ["dependencies", "@opencode-ai/plugin"]),
+    (Path(".opencode/package.json"), ["dependencies", "@opencode-ai/plugin"]),
+    (Path("package-lock.json"), ["packages", "", "dependencies", "@opencode-ai/plugin"]),
+    (Path(".opencode/package-lock.json"), ["packages", "", "dependencies", "@opencode-ai/plugin"]),
+]
+for path, keys in checks:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    value = data
+    for key in keys:
+        value = value[key]
+    if value != expected:
+        raise SystemExit(f"{path} has @opencode-ai/plugin={value!r}, expected {expected!r}")
+PY
+PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile runtime/python/bridge/smell_bridge.py scripts/run_smell_dataset.py
+if [[ -x node_modules/.bin/tsc || -x ../node_modules/.bin/tsc || -x /opt/opencode-refactor/node_modules/typescript/bin/tsc ]]; then
+  npm run check
+  npm run check:self
+else
+  echo "Skipping TypeScript typecheck because node_modules is not included in the delta package."
+fi
+if PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 - <<'PY' >/dev/null 2>&1
+import tree_sitter  # noqa: F401
+import yaml  # noqa: F401
+PY
+then
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 runtime/python/bridge/smell_bridge.py verify --help >/dev/null
+else
+  echo "Skipping bridge runtime help check because Python runtime dependencies are not installed here."
+fi
+
+echo "Delta package verification passed: $PATCH_DIR"

@@ -1,0 +1,67 @@
+# IDEA refactor path examples.
+# Smell: data_clumps
+# Loaded on demand by idea-refactor-cli; do not load unrelated smell files.
+# Entry ids:
+# - parameter-object-for-occurrence-graph
+
+data_clumps:
+  - id: parameter-object-for-occurrence-graph
+    when: "the reported parameter bundle appears as a same-group occurrence graph; introduce one parameter object on a single safe anchor signature family, migrate that family with IDEA, then migrate residual ordinary helpers to the existing holder with idea_edit old/new patches"
+    before: |
+      /* TableMetaTSDB.java */
+      34    public boolean apply(EntryPosition position, String schema, String ddl, String extra);
+
+      /* DatabaseTableMeta.java */
+      144   public boolean apply(EntryPosition position, String schema, String ddl, String extra) { ... }
+
+      /* MemoryTableMeta.java */
+      69    public boolean apply(EntryPosition position, String schema, String ddl, String extra) { ... }
+
+      /* TableMetaCache.java */
+      245   public boolean apply(EntryPosition position, String schema, String ddl, String extra) {
+      247       return tableMetaTSDB.apply(position, schema, ddl, extra);
+      252   }
+
+      /* LogEventConvert.java */
+      289   tableMetaCache.apply(position, event.getDbName(), queryString, null);
+
+      /* DatabaseTableMeta.java, after the first native migration can still contain a residual helper */
+      149   return applyHistoryToDB(ddlApplyRequest.getPosition(),
+      150           ddlApplyRequest.getSchema(), ddlApplyRequest.getDdl(), ddlApplyRequest.getExtra());
+      252   private boolean applyHistoryToDB(EntryPosition position, String schema, String ddl, String extra) { ... }
+    actions:
+      - op: introduce:parameter-object
+        apply_args: '{"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false}'
+        cli_steps:
+          - idea_refactor_locate(file="parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/TableMetaTSDB.java", line=34, column=20)
+          - idea_refactor_prepare(operation="introduce:parameter-object", expectedOperation="introduce:parameter-object")
+          - idea_refactor_apply(arguments={"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false})
+      - op: idea_edit
+        argument_contract: "Read parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/DatabaseTableMeta.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/DatabaseTableMeta.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/DatabaseTableMeta.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/DatabaseTableMeta.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      /* DatabaseTableMeta.java */
+      142   public boolean apply(DdlApplyRequest ddlApplyRequest) {
+      146       if (memoryTableMeta.apply(ddlApplyRequest)) {
+      149           return applyHistoryToDB(ddlApplyRequest);
+      150       }
+      151   }
+      250   private boolean applyHistoryToDB(DdlApplyRequest ddlApplyRequest) {
+      253       metaDO.setBinlogFile(ddlApplyRequest.getPosition().getJournalName());
+      257       metaDO.setUseSchema(ddlApplyRequest.getSchema());
+      258       List<DdlResult> ddlResults = DruidDdlParser.parse(ddlApplyRequest.getDdl(), ddlApplyRequest.getSchema());
+      264       metaDO.setSqlText(ddlApplyRequest.getDdl());
+      265       metaDO.setExtra(ddlApplyRequest.getExtra());
+      277   }
+    source: { project: canal-1.1.8, class: TableMetaTSDB -> DatabaseTableMeta -> MemoryTableMeta plus DatabaseTableMeta private helper cleanup, verified: "2026-05-12", mode: "OpenCode IDEA tools + native + idea_edit" }
+    notes:
+      - "Use group_occurrences as the worklist for residual cleanup, not as a request to run native introduce:parameter-object on every occurrence. Run native introduce:parameter-object once for the safest anchor signature family that can create the holder and migrate its call sites."
+      - "After native migration, inspect smell_verify remaining_occurrences. If residual ordinary helpers unpack or still carry the old bundle, update the helper and its local callers to use the existing holder with idea_edit old/new patches."
+      - "Do not run a second introduce:parameter-object for the same reported group and holder name; that usually creates incompatible partial migrations. If another occurrence cannot be migrated to the existing holder with local rewrites, record a concrete blocker."
+      - "Do not replace the initial signature family by hand when old arguments must become `new DdlApplyRequest(...)`; a manual old/new patch cannot synthesize that wrapper at arbitrary call sites."
+      - "The path is complete only when the reported group falls below the data_clumps occurrence threshold; a single migrated signature family is just a prefix when remaining occurrences still report the same group."

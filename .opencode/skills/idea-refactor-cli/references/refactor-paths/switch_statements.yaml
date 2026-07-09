@@ -1,0 +1,353 @@
+# IDEA refactor path examples.
+# Smell: switch_statements
+# Loaded on demand by idea-refactor-cli; do not load unrelated smell files.
+# Entry ids:
+# - replace-key-switch-with-table-driven-dispatch
+# - replace-packet-type-switch-with-handler-strategy
+# - replace-type-code-switch-with-reader-registry
+# - replace-parser-char-switch-with-classifier-table
+# - replace-state-switch-with-inner-type-polymorphism
+
+switch_statements:
+  - id: replace-key-switch-with-table-driven-dispatch
+    when: "the switch is a central key-to-result dispatcher, and the branching should stay centralized but be collapsed into a lookup table instead of staying as many terminal cases"
+    before: |
+      198    @Override
+      199    public String lookup(final String key) {
+      200        if (key == null) {
+      201            return null;
+      202        }
+      203        switch (key) {
+      204        case KEY_VERSION:
+      205            return "Java version " + getSystemProperty("java.version");
+      206        case KEY_RUNTIME:
+      207            return getRuntime();
+      208        case KEY_VM:
+      209            return getVirtualMachine();
+      210        case KEY_OS:
+      211            return getOperatingSystem();
+      212        case KEY_HARDWARE:
+      213            return getHardware();
+      214        case KEY_LOCALE:
+      215            return getLocale();
+      216        default:
+      217            throw new IllegalArgumentException(key);
+      218        }
+      219    }
+    actions:
+      - op: idea_edit
+        argument_contract: "Read src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/org/apache/commons/text/lookup/JavaPlatformStringLookup.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      87     private final Map<String, Supplier<String>> lookups = createLookups();
+      88
+      89     private Map<String, Supplier<String>> createLookups() {
+      90         final Map<String, Supplier<String>> map = new HashMap<>();
+      91         map.put(KEY_VERSION, () -> "Java version " + getSystemProperty("java.version"));
+      92         map.put(KEY_RUNTIME, this::getRuntime);
+      93         map.put(KEY_VM, this::getVirtualMachine);
+      94         map.put(KEY_OS, this::getOperatingSystem);
+      95         map.put(KEY_HARDWARE, this::getHardware);
+      96         map.put(KEY_LOCALE, this::getLocale);
+      97         return Collections.unmodifiableMap(map);
+      98     }
+      199    public String lookup(final String key) {
+      200        if (key == null) {
+      201            return null;
+      202        }
+      203        final Supplier<String> supplier = lookups.get(key);
+      204        if (supplier == null) {
+      205            throw new IllegalArgumentException(key);
+      206        }
+      207        return supplier.get();
+      208    }
+    source: { project: commons-text, class: JavaPlatformStringLookup, verified: "2026-05-13", mode: "OpenCode IDEA tools" }
+    notes:
+      - "Keep the table construction Java-8 compatible from the first idea_edit patch: insert createLookups(), insert the lookups field initialized from it, then replace lookup(String)."
+      - "The final source shape was verified by running mvn -q -DskipTests compile after the Java-8-compatible createLookups field/method repair; this prompt example presents only the successful route."
+  - id: replace-packet-type-switch-with-handler-strategy
+    when: "the switch is a central dispatcher, but each branch owns a distinct workflow with validation and side effects, so dispatch stays centralized while the branch behavior moves into dedicated handler strategies"
+    before: |
+      17    public static Message deserializer(byte[] data, boolean lazyParseEntry) {
+      18        try {
+      19            if (data == null) {
+      20                return null;
+      21            } else {
+      22                CanalPacket.Packet p = CanalPacket.Packet.parseFrom(data);
+      23                switch (p.getType()) {
+      24                    case MESSAGES: {
+      25                        if (!p.getCompression().equals(Compression.NONE)
+      26                            && !p.getCompression().equals(Compression.COMPRESSIONCOMPATIBLEPROTO2)) {
+      27                            throw new CanalClientException("compression is not supported in this connector");
+      28                        }
+      29                        CanalPacket.Messages messages = CanalPacket.Messages.parseFrom(p.getBody());
+      30                        Message result = new Message(messages.getBatchId());
+      31                        // ... lazyParseEntry branch omitted ...
+      32                        return result;
+      33                    }
+      34                    case ACK: {
+      35                        Ack ack = Ack.parseFrom(p.getBody());
+      36                        throw new CanalClientException("something goes wrong with reason: " + ack.getErrorMessage());
+      37                    }
+      38                    default: {
+      39                        throw new CanalClientException("unexpected packet type: " + p.getType());
+      40                    }
+      41                }
+      42            }
+      43        } catch (Exception e) {
+      44            throw new CanalClientException("deserializer failed by " + e.getMessage(), e);
+      45        }
+      46    }
+    actions:
+      - op: idea_edit
+        argument_contract: "Use idea_edit with file=client/src/main/java/com/alibaba/otter/canal/client/PacketHandler.java, oldString=\"\", newString=<complete new Java source>, replaceAll=false. This creates the new file; do not insert a full compilation unit into an existing Java file."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/PacketHandler.java", oldString="", newString=<complete new Java source>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Use idea_edit with file=client/src/main/java/com/alibaba/otter/canal/client/MessagesPacketHandler.java, oldString=\"\", newString=<complete new Java source>, replaceAll=false. This creates the new file; do not insert a full compilation unit into an existing Java file."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/MessagesPacketHandler.java", oldString="", newString=<complete new Java source>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Use idea_edit with file=client/src/main/java/com/alibaba/otter/canal/client/AckPacketHandler.java, oldString=\"\", newString=<complete new Java source>, replaceAll=false. This creates the new file; do not insert a full compilation unit into an existing Java file."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/AckPacketHandler.java", oldString="", newString=<complete new Java source>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="client/src/main/java/com/alibaba/otter/canal/client/CanalMessageDeserializer.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      12     private static final Map<CanalPacket.PacketType, PacketHandler> HANDLERS = createHandlers();
+      13
+      14     private static Map<CanalPacket.PacketType, PacketHandler> createHandlers() {
+      15         EnumMap<CanalPacket.PacketType, PacketHandler> handlers =
+      16                 new EnumMap<>(CanalPacket.PacketType.class);
+      17         handlers.put(CanalPacket.PacketType.MESSAGES, new MessagesPacketHandler());
+      18         handlers.put(CanalPacket.PacketType.ACK, new AckPacketHandler());
+      19         return Collections.unmodifiableMap(handlers);
+      20     }
+      27     public static Message deserializer(byte[] data, boolean lazyParseEntry) {
+      28         try {
+      29             if (data == null) {
+      30                 return null;
+      31             }
+      32             CanalPacket.Packet packet = CanalPacket.Packet.parseFrom(data);
+      33             PacketHandler handler = HANDLERS.get(packet.getType());
+      34             if (handler == null) {
+      35                 throw new CanalClientException("unexpected packet type: " + packet.getType());
+      36             }
+      37             return handler.handle(packet, lazyParseEntry);
+      38         } catch (Exception e) {
+      39             throw new CanalClientException("deserializer failed by " + e.getMessage(), e);
+      40         }
+      41     }
+      // New files created:
+      //   PacketHandler.java
+      //   MessagesPacketHandler.java
+      //   AckPacketHandler.java
+    source: { project: canal-1.1.8, class: "CanalMessageDeserializer + PacketHandler family", verified: "2026-05-13", mode: "OpenCode IDEA tools" }
+    notes:
+      - "Verified by running mvn -q -pl client -am -DskipTests compile after the final idea_edit method-body patch."
+      - "New handler types must be created as separate Java files with oldString=\"\" because the same package exists in multiple modules; do not insert complete compilation units into CanalMessageDeserializer.java."
+  - id: replace-type-code-switch-with-reader-registry
+    when: "the switch maps stable wire or file-format type codes to small reader functions, so the external type codes must stay unchanged while dispatch moves into an explicit reader registry"
+    before: |
+      41     Object readValue(int type, BinaryInput input) throws IOException {
+      42         switch (type) {
+      43             case TYPE_NULL:
+      44                 return null;
+      45             case TYPE_STRING:
+      46                 return readString(input);
+      47             case TYPE_INT:
+      48                 return readInt(input);
+      49             case TYPE_DECIMAL:
+      50                 return readDecimal(input);
+      51             default:
+      52                 throw new IOException("Unsupported value type: " + type);
+      53         }
+      54     }
+    actions:
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/wire/BinaryValueReader.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/wire/BinaryValueReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/wire/BinaryValueReader.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/wire/BinaryValueReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/wire/BinaryValueReader.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/wire/BinaryValueReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      14     private final Map<Integer, ValueReader> valueReaders = createValueReaders();
+      16     private Map<Integer, ValueReader> createValueReaders() {
+      17         Map<Integer, ValueReader> readers = new HashMap<>();
+      18         readers.put(TYPE_NULL, input -> null);
+      19         readers.put(TYPE_STRING, this::readString);
+      20         readers.put(TYPE_INT, this::readInt);
+      21         readers.put(TYPE_DECIMAL, this::readDecimal);
+      22         return Collections.unmodifiableMap(readers);
+      23     }
+      41     Object readValue(int type, BinaryInput input) throws IOException {
+      42         ValueReader reader = valueReaders.get(type);
+      43         if (reader == null) {
+      44             throw new IOException("Unsupported value type: " + type);
+      45         }
+      46         return reader.read(input);
+      47     }
+    source: { project: synthetic-refactor-paths, class: BinaryValueReader, verified: synthetic }
+    notes:
+      - "Use this path for stable wire/protocol type code switches; do not rename, renumber, or reinterpret the encoded type constants."
+      - "Keep the unknown-type/default exception behavior byte-for-byte equivalent before replacing the switch."
+      - "If reader lambdas need checked exceptions, use the existing project functional interface or add a narrow private reader interface before applying this path."
+  - id: replace-parser-char-switch-with-classifier-table
+    when: "the switch classifies parser characters or token delimiters, so the branch table should become an explicit character classifier while preserving escape, EOF, and fall-through semantics"
+    before: |
+      70     Token readToken(CharStream stream) {
+      71         char ch = stream.peek();
+      72         switch (ch) {
+      73             case '"':
+      74                 return readQuoted(stream);
+      75             case ',':
+      76             case ';':
+      77                 stream.skip();
+      78                 return Token.separator(ch);
+      79             case '\n':
+      80             case '\r':
+      81                 return readLineBreak(stream);
+      82             default:
+      83                 return readBareWord(stream);
+      84         }
+      85     }
+    actions:
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/parser/TokenReader.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/parser/TokenReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/parser/TokenReader.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/parser/TokenReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/com/example/parser/TokenReader.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/com/example/parser/TokenReader.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      10     private static final byte[] CHAR_CLASSES = createCharClasses();
+      12     private static byte[] createCharClasses() {
+      13         byte[] classes = new byte[128];
+      14         classes['"'] = CLASS_QUOTE;
+      15         classes[','] = CLASS_SEPARATOR;
+      16         classes[';'] = CLASS_SEPARATOR;
+      17         classes['\n'] = CLASS_LINE_BREAK;
+      18         classes['\r'] = CLASS_LINE_BREAK;
+      19         return classes;
+      20     }
+      70     Token readToken(CharStream stream) {
+      71         char ch = stream.peek();
+      72         byte charClass = ch < CHAR_CLASSES.length ? CHAR_CLASSES[ch] : CLASS_WORD;
+      73         if (charClass == CLASS_QUOTE) {
+      74             return readQuoted(stream);
+      75         }
+      76         if (charClass == CLASS_SEPARATOR) {
+      77             stream.skip();
+      78             return Token.separator(ch);
+      79         }
+      80         if (charClass == CLASS_LINE_BREAK) {
+      81             return readLineBreak(stream);
+      82         }
+      83         return readBareWord(stream);
+      84     }
+    source: { project: synthetic-refactor-paths, class: TokenReader, verified: synthetic }
+    notes:
+      - "Use this path for parser/tokenizer character classification; preserve fall-through groups by assigning the same class value to every equivalent character."
+      - "Do not use this path when branch bodies mutate parser state in incompatible order; first prove escape, EOF, default, and line-ending behavior are unchanged."
+      - "For Unicode-heavy parsers, prefer a helper method over a fixed ASCII array unless the original switch was already ASCII-only."
+  - id: replace-state-switch-with-inner-type-polymorphism
+    when: "the switch is selecting behavior that already belongs on an inner state type, so the method should delegate to the state object instead of repeating the per-state branches"
+    before: |
+      8     private enum State {
+      9         RUNNING {
+      10            @Override
+      11            long nanoTime(Timer timer) {
+      12                return System.nanoTime() - timer.startTimeNanos;
+      13            }
+      14        },
+      15        STOPPED {
+      16            @Override
+      17            long nanoTime(Timer timer) {
+      18                return timer.stopTimeNanos - timer.startTimeNanos;
+      19            }
+      20        },
+      21        UNSTARTED {
+      22            @Override
+      23            long nanoTime(Timer timer) {
+      24                return 0L;
+      25            }
+      26        };
+      28        abstract long nanoTime(Timer timer);
+      29    }
+      31    long getNanoTime() {
+      32        switch (runningState) {
+      33            case STOPPED:
+      34                return stopTimeNanos - startTimeNanos;
+      35            case UNSTARTED:
+      36                return 0L;
+      37            case RUNNING:
+      38                return System.nanoTime() - startTimeNanos;
+      39            default:
+      40                throw new IllegalStateException("Illegal running state has occurred.");
+      41        }
+      42    }
+    actions:
+      - op: idea_edit
+        argument_contract: "Read src/demo/Timer.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/demo/Timer.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+    after: |
+      8     private enum State {
+      9         RUNNING {
+      10            @Override
+      11            long nanoTime(Timer timer) {
+      12                return System.nanoTime() - timer.startTimeNanos;
+      13            }
+      14        },
+      15        STOPPED {
+      16            @Override
+      17            long nanoTime(Timer timer) {
+      18                return timer.stopTimeNanos - timer.startTimeNanos;
+      19            }
+      20        },
+      21        UNSTARTED {
+      22            @Override
+      23            long nanoTime(Timer timer) {
+      24                return 0L;
+      25            }
+      26        };
+      28        abstract long nanoTime(Timer timer);
+      29    }
+      31    long getNanoTime() {
+      32        return runningState.nanoTime(this);
+      33    }
+    source: { project: minimal-live-smoke, class: "Timer.State + getNanoTime", verified: "2026-05-17", mode: "real OpenCode IDEA tools + javac" }
+    notes:
+      - "This route is intentionally narrow: use it when the state type already has the per-state behavior hook. Then replace only the redundant switch method instead of replacing the whole class."
+      - "Verified in a real IDEA smoke on 2026-05-17; the equivalent method-body patch compiled cleanly with javac."
+      - "If the state type does not yet contain the hook, do not use a placeholder full-class replace; add a separate verified route only when the exact AST steps are known."

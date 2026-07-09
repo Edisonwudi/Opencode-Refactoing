@@ -1,0 +1,171 @@
+# IDEA refactor path examples.
+# Smell: long_method
+# Loaded on demand by idea-refactor-cli; do not load unrelated smell files.
+# Entry ids:
+# - extract-loop-body-from-long-method
+# - extract-flat-computation-from-long-method
+# - extract-method-object-for-multi-output-block
+
+long_method:
+  - id: extract-loop-body-from-long-method
+    when: "the long method is dominated by one bulky loop body or control block, and that block can be extracted while the caller keeps orchestration"
+    before: |
+      844    public void printUsage(final PrintWriter pw, final int width, final String app, final Options options) {
+      845        final StringBuilder buff = new StringBuilder(getSyntaxPrefix()).append(app).append(Char.SP);
+      846        final Collection<OptionGroup> processedGroups = new ArrayList<>();
+      847        final List<Option> optList = new ArrayList<>(options.getOptions());
+      848        if (getOptionComparator() != null) {
+      849            Collections.sort(optList, getOptionComparator());
+      850        }
+      851        // iterate over the options
+      852        for (final Iterator<Option> it = optList.iterator(); it.hasNext();) {
+      853            // ... 25-line loop body with if/else logic ...
+      876            if (it.hasNext()) {
+      877                buff.append(Char.SP);
+      878            }
+      879        }
+      880
+      881        printWrapped(pw, width, buff.toString().indexOf(' ') + 1, buff.toString());
+      882    }
+    actions:
+      - op: extract:method
+        apply_args: '{"newName":"appendOptionsToUsage","visibility":"private"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=854, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=844, column=18, selection={"startLine":854,"startColumn":9,"endLine":878,"endColumn":10})
+          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
+          - idea_refactor_apply(arguments={"newName":"appendOptionsToUsage","visibility":"private"})
+    after: |
+      844    public void printUsage(final PrintWriter pw, final int width, final String app, final Options options) {
+      845        final StringBuilder buff = new StringBuilder(getSyntaxPrefix()).append(app).append(Char.SP);
+      846        final Collection<OptionGroup> processedGroups = new ArrayList<>();
+      847        final List<Option> optList = new ArrayList<>(options.getOptions());
+      848        if (getOptionComparator() != null) {
+      849            Collections.sort(optList, getOptionComparator());
+      850        }
+      851        // iterate over the options
+      852        appendOptionsToUsage(options, buff, processedGroups, optList);
+      853
+      854        printWrapped(pw, width, buff.toString().indexOf(' ') + 1, buff.toString());
+      855    }
+      856
+      857    private void appendOptionsToUsage(Options options, StringBuilder buff, Collection<OptionGroup> processedGroups, List<Option> optList) {
+      858        for (final Iterator<Option> it = optList.iterator(); it.hasNext();) {
+      859            // ... same loop body, moved here ...
+      882        }
+      883    }
+    source: { project: commons-cli-1.9.0, class: HelpFormatter, verified: "2026-05-09" }
+  - id: extract-flat-computation-from-long-method
+    when: "the long method contains one contiguous, mostly straight-line calculation slice with a single derived result, so a plain helper extraction is clean"
+    before: |
+      255    public static String random(int count, int start, int end, final boolean letters,
+      256            final boolean numbers, final char[] chars, final Random random) {
+      257        if (count == 0) { return StringUtils.EMPTY; }
+      258        // ... ~70 lines of guards, ASCII optimizations ...
+      327        final StringBuilder builder = new StringBuilder(count);
+      328        final int gap = end - start;
+      329        final int gapBits = Integer.SIZE - Integer.numberOfLeadingZeros(gap);
+      330        // The size of the cache we use is an heuristic:
+      331        // ... 8-line comment about cache size calculation ...
+      339        final long desiredCacheSize = ((long) count * gapBits + CACHE_PADDING_BITS) / BITS_TO_BYTES_DIVISOR + BASE_CACHE_SIZE_PADDING;
+      340        final int cacheSize = (int) Math.min(desiredCacheSize, Integer.MAX_VALUE / BITS_TO_BYTES_DIVISOR + BASE_CACHE_SIZE_PADDING);
+      341        final CachedRandomBits arb = new CachedRandomBits(cacheSize, random);
+      342
+      343        while (count-- != 0) {
+      344            // ... ~55-line sampling loop ...
+      397    }
+    actions:
+      - op: extract:method
+        apply_args: '{"newName":"computeGapBits","visibility":"private","makeStatic":true}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=329, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=255, column=25, selection={"startLine":329,"startColumn":9,"endLine":341,"endColumn":58})
+          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
+          - idea_refactor_apply(arguments={"newName":"computeGapBits","visibility":"private","makeStatic":true})
+    after: |
+      255    public static String random(int count, int start, int end, final boolean letters,
+      256            final boolean numbers, final char[] chars, final Random random) {
+      257        // ... guards and ASCII optimizations unchanged ...
+      327        final StringBuilder builder = new StringBuilder(count);
+      329        final int gapBits = computeGapBits(start, end);
+      330        //    making the cache extremely large
+      331        final long desiredCacheSize = ((long) count * gapBits + CACHE_PADDING_BITS) / BITS_TO_BYTES_DIVISOR + BASE_CACHE_SIZE_PADDING;
+      332        final int cacheSize = (int) Math.min(desiredCacheSize, Integer.MAX_VALUE / BITS_TO_BYTES_DIVISOR + BASE_CACHE_SIZE_PADDING);
+      333        final CachedRandomBits arb = new CachedRandomBits(cacheSize, random);
+      334
+      335        while (count-- != 0) { /* ... unchanged ... */ }
+      ...
+      381    private static int computeGapBits(int start, int end) {
+      382        final int gap = end - start;
+      383        // The size of the cache we use is an heuristic: ...
+      395        return Integer.SIZE - Integer.numberOfLeadingZeros(gap);
+      396    }
+    source: { project: commons-lang-3.20.0, class: RandomStringUtils, verified: "2026-05-10" }
+  - id: extract-method-object-for-multi-output-block
+    when: "the candidate slice is cohesive but writes several locals that are still needed later, so plain extract:method stalls and the path must switch to method object"
+    before: |
+      1510                            // handle cyclic substitution
+      1511                            checkCyclicSubstitution(varName, priorVariables);
+      1512                            priorVariables.add(varName);
+      1513
+      1514                            // resolve the variable
+      1515                            String varValue = resolveVariable(varName, builder, startPos, endPos);
+      1516                            if (varValue == null) {
+      1517                                varValue = varDefaultValue;
+      1518                            }
+      1519                            if (varValue != null) {
+      1520                                final int varLen = varValue.length();
+      1521                                builder.replace(startPos, endPos, varValue);
+      1522                                altered = true;
+      1523                                int change = 0;
+      1524                                if (!substitutionInValuesDisabled) {
+      1525                                    change = substitute(builder, startPos, varLen, priorVariables).lengthChange;
+      1526                                }
+      1527                                change = change + varLen - (endPos - startPos);
+      1528                                pos += change;
+      1529                                bufEnd += change;
+      1530                                lengthChange += change;
+      1531                            } else if (undefinedVariableException) {
+      1532                                throw new IllegalArgumentException(...);
+      1533                            }
+      1534
+      1535                            priorVariables.remove(priorVariables.size() - 1);
+      1536                            break;
+      // extract:method prepare reports multiple outputs: altered, lengthChange, bufEnd, pos
+    actions:
+      - op: extract:method
+        apply_args: '{"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
+          - idea_refactor_locate(file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, selection={"startLine":1515,"startColumn":29,"endLine":1538,"endColumn":80})
+          - idea_refactor_prepare(operation="extract:method", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, expectedOperation="extract:method")
+          - idea_refactor_apply(arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
+          - idea_refactor_apply(arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, decisions={"extract.multipleOutputVariables":"use_extract_method_object"})
+    after: |
+      1514                            // resolve the variable
+      1515                            ResolveAndReplaceVariableMethodObject resolveAndReplaceVariableMethodObject = new ResolveAndReplaceVariableMethodObject(builder, priorVariables, substitutionInVariablesEnabled, substitutionInValuesDisabled, undefinedVariableException, altered, lengthChange, bufEnd, pos, startPos, endPos, varName, varDefaultValue).invoke();
+      1516                            altered = resolveAndReplaceVariableMethodObject.isAltered();
+      1517                            lengthChange = resolveAndReplaceVariableMethodObject.getLengthChange();
+      1518                            bufEnd = resolveAndReplaceVariableMethodObject.getBufEnd();
+      1519                            pos = resolveAndReplaceVariableMethodObject.getPos();
+      1520                            break;
+      ...
+      1564    private class ResolveAndReplaceVariableMethodObject {
+      1565        private TextStringBuilder builder;
+      1566        private List<String> priorVariables;
+      1567        private boolean substitutionInValuesDisabled;
+      1568        private boolean undefinedVariableException;
+      1569        private boolean altered;
+      1570        private int lengthChange;
+      1571        private int bufEnd;
+      1572        private int pos;
+      1573        // ... constructor + invoke() encapsulate the extracted logic ...
+      1611        public ResolveAndReplaceVariableMethodObject invoke() {
+      1612            String varValue = resolveVariable(varName, builder, startPos, endPos);
+      1613            // ... same replacement logic, now inside the method object ...
+      1634            priorVariables.remove(priorVariables.size() - 1);
+      1635            return this;
+      1636        }
+      1637    }
+    source: { project: commons-text, class: StringSubstitutor, verified: "2026-05-11", mode: "OpenCode IDEA tools" }
+    notes: "Verified on an attached IDEA service against a clean temporary commons-text project. prepare for extract:method returned needs_decision with extract.multipleOutputVariables because the selected block updates altered, lengthChange, bufEnd, and pos. The first apply round stayed at needs_decision; the second apply round with idea_refactor_apply(decisions={\"extract.multipleOutputVariables\":\"use_extract_method_object\"}) completed by generating an inner method object named ResolveAndReplaceVariableMethodObject. The temporary project still compiled with mvn -q -DskipTests compile. IntelliJ also shortened a few same-file Javadoc @value references during the rewrite, but the refactoring result remained compilable."

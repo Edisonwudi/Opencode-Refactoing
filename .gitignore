@@ -1,0 +1,60 @@
+# ---------- macOS / OS ----------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ---------- Node ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- OpenCode plugin runtime (auto-generated) ----------
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- TypeScript / build artifacts ----------
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ---------- IDE / editor ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- Env / secrets ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Logs ----------
+*.log
+logs/
+
+# ---------- Project runtime artifacts ----------
+runs/
+.smell-artifacts/
+.trial-worktrees/
+.idea-trial-worktrees/

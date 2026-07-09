@@ -1,0 +1,40 @@
+# IDEA refactor path examples.
+# Smell: dead_code
+# Loaded on demand by idea-refactor-cli; do not load unrelated smell files.
+# Entry ids:
+# - safe-delete-unused-private-method
+
+dead_code:
+  - id: safe-delete-unused-private-method
+    when: "the reported target is a private method with no project method invocations or method references"
+    before: |
+      /* CacheIndex.java */
+      10    final class CacheIndex {
+      11      int size() {
+      12        return 0;
+      13      }
+      14
+      15      private int unusedLegacyScore(String key) {
+      16        int score = key.length();
+      17        return score * 31;
+      18      }
+      19    }
+    actions:
+      - op: delete:method
+        apply_args: '{"safe":true}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/CacheIndex.java", line=15, column=19)
+          - idea_refactor_prepare(operation="delete:method", arguments={"safe":true}, expectedOperation="delete:method")
+          - idea_refactor_apply(arguments={"safe":true})
+    after: |
+      /* CacheIndex.java */
+      10    final class CacheIndex {
+      11      int size() {
+      12        return 0;
+      13      }
+      14    }
+    source: { project: synthetic-refactor-paths, class: CacheIndex, verified: "synthetic" }
+    notes:
+      - "Use only for the reported unused private method; do not perform broad cleanup."
+      - "If Safe Delete reports real references, framework hooks, or override constraints, stop and report the blocker."
+      - "Do not replace the method body with a stub; the method declaration must leave the target class."

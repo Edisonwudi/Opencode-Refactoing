@@ -1,0 +1,185 @@
+defaults:
+  max_retries: 2
+  step_limit: 150
+  shell_timeout: 600
+  no_progress_timeout: 480
+  model_retry_attempts: 2
+  run_build: true
+  run_tests: true
+  output_root: runs
+languages:
+  java:
+    detect_extensions:
+    - .java
+    build:
+      command: mvn -q -Drat.skip=true -DskipTests compile
+    test:
+      command: mvn -q -Drat.skip=true test
+    smells:
+      long_method:
+        instruction: Refactor the target method into smaller cohesive helpers or guard
+          clauses while preserving behavior.
+        constraints:
+        - Keep the changes narrow and focused on the target method.
+        - Preserve public behavior and existing interfaces.
+        verification:
+        - Confirm the target method is shorter and easier to read.
+        guards:
+        - type: long_method
+          max_lines: 60
+        retry_hint_template: Address the reported long-method issue before submitting
+          again.
+      long_parameter_list:
+        instruction: Reduce the parameter burden of the target API while preserving
+          behavior.
+        constraints:
+        - Prefer introducing a cohesive parameter object or helper abstraction.
+        verification:
+        - Ensure callers still behave the same after the refactor.
+        guards:
+        - type: long_parameter_list
+          max_params: 5
+        retry_hint_template: Reduce the effective parameter count of the target method
+          before retrying.
+      nested_complexity:
+        instruction: Reduce branching and nesting in the target logic while preserving
+          behavior.
+        constraints:
+        - Prefer guard clauses, decomposition, and clearer control flow.
+        verification:
+        - Ensure the method remains behaviorally equivalent.
+        guards:
+        - type: nested_complexity
+          max_complexity: 20
+        retry_hint_template: Flatten the control flow further before retrying.
+      switch_statements:
+        instruction: Refactor switch-heavy branching into clearer control flow while
+          preserving behavior.
+        constraints:
+        - Prefer dispatch helpers, lookup tables, or focused helper functions when
+          they improve readability.
+        verification:
+        - Ensure branch behavior remains equivalent after the refactor.
+        guards:
+        - type: switch_statements
+          max_branches: 8
+          max_density: 10.0
+        retry_hint_template: Reduce the switch-heavy branching further before retrying.
+      code_clone_type1:
+        instruction: Remove the duplicated logic across the clone locations while
+          preserving behavior.
+        constraints:
+        - Use extraction or a shared helper only when it keeps the code clearer.
+        verification:
+        - Ensure the duplicate implementation is no longer present in both target
+          locations.
+        guards:
+        - type: code_clone_type1
+          min_tokens: 80
+        retry_hint_template: The two target blocks still look like a type-1 clone.
+          Remove or centralize the duplication.
+      feature_envy:
+        instruction: Move the target method to the class it is most enamored with,
+          or extract the foreign-data-heavy logic into a method on the appropriate
+          receiver class.
+        constraints:
+        - Keep the changes narrow and focused on the target method.
+        - Preserve public behavior and existing interfaces.
+        - Ensure the moved or extracted method has a clear single responsibility.
+        verification:
+        - Confirm the foreign member accesses have been eliminated or significantly
+          reduced.
+        - Ensure existing callers still work correctly.
+        guards:
+        - type: feature_envy
+        retry_hint_template: Reduce foreign data accesses in the target method by
+          moving or extracting logic to the appropriate receiver.
+      data_clumps:
+        instruction: Identify the recurring group of parameters that always appear
+          together across multiple methods and extract them into a cohesive data class
+          or helper abstraction while preserving behavior.
+        constraints:
+        - Keep the changes narrow and focused on the target clump sites.
+        - Prefer introducing a parameter object or data class for the clumped parameters.
+        - Preserve existing caller behavior and public interfaces.
+        verification:
+        - Confirm the clumped parameter group is no longer repeated across the affected
+          methods.
+        - Ensure existing callers still work correctly.
+        guards:
+        - type: data_clumps
+        retry_hint_template: Extract the repeated parameter group into a cohesive
+          object before retrying.
+      god_class:
+        instruction: Split the target class by moving cohesive responsibilities into
+          focused collaborators while preserving behavior.
+        constraints:
+        - Keep the change focused on the reported class and one coherent responsibility
+          cluster.
+        - Prefer IDEA-backed class and member refactorings over broad text rewrites.
+        - Prefer native extract-class for clear field/state clusters, and migrate the
+          fields together with the methods that maintain them.
+        - Use move-method only when the behavior already belongs on a real existing
+          owner or collaborator.
+        - Use insert-type plus member-level migration only when native extract-class
+          is unavailable or cannot migrate the needed members.
+        - Delete private wrappers left after extraction; wrapper-only helper extraction
+          is not complete while the original class remains above the god_class guard
+          threshold.
+        - Preserve public behavior, callers, and existing serialization or framework
+          contracts.
+        verification:
+        - Confirm the target class no longer exceeds the god_class detector thresholds.
+        - Ensure moved or delegated behavior still has tests and build passing.
+        guards:
+        - type: god_class
+        retry_hint_template: Move or delegate a cohesive responsibility cluster out
+          of the target class before retrying.
+      dead_code:
+        instruction: Remove the reported unused private Java member while preserving
+          behavior.
+        constraints:
+        - Keep the change focused on the reported private method or member.
+        - Prefer IDEA Safe Delete operations such as delete:method so references are
+          checked before removal.
+        - Do not delete public APIs, framework entrypoints, annotated methods, lifecycle
+          hooks, serialization hooks, or reflection/config-driven members.
+        - If Safe Delete reports real references, stop and report the blocker instead
+          of forcing deletion.
+        verification:
+        - Confirm the unused private member is no longer reported by the dead_code
+          detector.
+        - Ensure the project still compiles and configured tests pass.
+        guards:
+        - type: dead_code
+        retry_hint_template: Remove the reported unused private member or explain the
+          concrete reference that prevents safe deletion.
+      mysterious_name:
+        instruction: Rename the unclear Java identifier at the target location to
+          a descriptive name while preserving behavior.
+        constraints:
+        - Prefer IntelliJ rename refactoring so references are updated consistently.
+        - Keep the rename focused on the suspicious parameter, local variable, method,
+          or class name.
+        verification:
+        - Confirm the unclear identifier from the smell evidence no longer appears
+          at the target declaration or body.
+        - Ensure existing callers still compile and tests pass.
+        guards:
+        - type: mysterious_name
+        retry_hint_template: Rename the unclear identifier reported by the smell evidence
+          before retrying.
+      refused_bequest:
+        instruction: Refactor the refused bequest hierarchy by removing useless overrides,
+          pulling shared behavior up, pushing specialized behavior down, or replacing
+          inheritance with delegation when appropriate.
+        constraints:
+        - Keep the hierarchy change narrow and focused on the reported class.
+        - Preserve public behavior and existing subtype contracts.
+        verification:
+        - Confirm suspicious no-op or rejecting overrides have been reduced or removed.
+        - Ensure the project still compiles and tests pass.
+        guards:
+        - type: refused_bequest
+        retry_hint_template: Reduce the suspicious hierarchy override pattern before
+          retrying.

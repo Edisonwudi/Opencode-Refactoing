@@ -1,0 +1,280 @@
+# IDEA refactor path examples.
+# Smell: god_class
+# Loaded on demand by idea-refactor-cli; do not load unrelated smell files.
+# Entry ids:
+# - extract-class-state-and-behavior
+# - move-method-cluster-to-owner
+# - insert-type-state-cluster-member-migration
+
+god_class:
+  - id: extract-class-state-and-behavior
+    when: "primary route when the reported class has a cohesive field/state cluster such as cache, font, text, image, or geometry state, and the cluster's maintaining behavior can move with that state"
+    before: |
+      /* PanelController.java */
+      3     class PanelController {
+      4       private int left = 0;
+      5       private int top = 0;
+      6       private int width = 10;
+      7       private int height = 10;
+      8       private int scroll = 0;
+      9       private int focusIndex = 0;
+      10      private int selectedIndex = -1;
+      11      private boolean dirty = false;
+      12      private final ThemeMetrics metrics = new ThemeMetrics();
+      13      private final AuditLog audit = new AuditLog();
+      14
+      15      void layout(ScreenModel model) { resize(model); scrollTo(model, 0); focus(model, selectedIndex); }
+      16      private void resize(ScreenModel model) { width = metrics.width(model); height = metrics.height(model); dirty = true; }
+      17      private void scrollTo(ScreenModel model, int value) { scroll = Math.max(0, value); top = metrics.top(model) - scroll; dirty = true; }
+      18      private void focus(ScreenModel model, int index) { focusIndex = Math.max(0, index); selectedIndex = focusIndex; dirty = true; }
+      19      private void clear(ScreenModel model) { focusIndex = 0; selectedIndex = -1; scroll = 0; dirty = true; }
+      20      void render(ScreenModel model) { if (dirty) { audit.record(model.name()); } metrics.paint(model, left, top, width, height); }
+      21      String status(ScreenModel model) { return model.name() + ":" + left + ":" + top + ":" + width + ":" + height; }
+      22    }
+    actions:
+      - op: extract:class
+        apply_args: '{"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/PanelController.java", line=3, column=7)
+          - idea_refactor_prepare(operation="extract:class", arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]}, expectedOperation="extract:class")
+          - idea_refactor_apply(arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]})
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+        notes:
+          - "Private wrappers left after extraction must be removed with `idea_edit`; skip only if native extraction already removed the wrapper declaration."
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+    after: |
+      /* PanelController.java */
+      3     class PanelController {
+      4       private final PanelState panelState = new PanelState();
+      5
+      6       void layout(ScreenModel model) { panelState.layout(model); }
+      7       void render(ScreenModel model) { panelState.render(model); }
+      8       String status(ScreenModel model) { return panelState.status(model); }
+      9     }
+
+      /* PanelState.java */
+      3     final class PanelState {
+      4       private int left;
+      5       private int top;
+      6       private int width;
+      7       private int height;
+      8       private int scroll;
+      9       private int focusIndex;
+      10      private int selectedIndex;
+      11      private boolean dirty;
+      12      void resize(ScreenModel model) { /* state behavior moved here */ }
+      13      void scrollTo(ScreenModel model, int value) { /* state behavior moved here */ }
+      14      void focus(ScreenModel model, int index) { /* state behavior moved here */ }
+      15      void clear(ScreenModel model) { /* state behavior moved here */ }
+      16      void layout(ScreenModel model) { /* narrow orchestration over moved state */ }
+      17      void render(ScreenModel model) { /* moved state rendering */ }
+      18      String status(ScreenModel model) { /* moved state reporting */ }
+      19    }
+    source: { project: synthetic-refactor-paths, class: PanelController state cluster -> PanelState, verified: "native extract:class capability checked in IDEA CLI 2026-06-08" }
+    notes:
+      - "Use native `extract:class` first when IDEA exposes it on the reported class and can migrate the selected fields plus maintaining methods."
+      - "The selected `memberNames` must include the cohesive field cluster and the methods that maintain it; method-only extraction is not enough for field-heavy god classes."
+      - "Private wrappers left after extraction must be removed with idea_edit old/new patches; keeping a full forwarding family preserves NOM and should still fail the guard."
+      - "Public or framework entrypoints may remain only as narrow entrypoints. A wrapper for every moved method is not a valid final state."
+  - id: move-method-cluster-to-owner
+    when: "secondary route when several methods in the reported class mostly manipulate one existing collaborator, so those methods can leave the god class and become behavior on that real owner"
+    before: |
+      /* God.java */
+      3     class God {
+      4       private final Worker worker = new Worker();
+      5       private final Audit audit = new Audit();
+      6
+      7       int process0(Input input) { return worker.score(input) + worker.limit(input); }
+      8       int process1(Input input) { return worker.score(input) + worker.limit(input); }
+      9       int process2(Input input) { return worker.score(input) + worker.limit(input); }
+      10      int process3(Input input) { return worker.score(input) + worker.limit(input); }
+      11      int process4(Input input) { return worker.score(input) + worker.limit(input); }
+      12      int process5(Input input) { return worker.score(input) + worker.limit(input); }
+      13      int process6(Input input) { return worker.score(input) + worker.limit(input); }
+      14      int process7(Input input) { return worker.score(input) + worker.limit(input); }
+      15      int audit0(Input input) { return audit.value(input) + audit.limit(input); }
+      16      int audit1(Input input) { return audit.value(input) + audit.limit(input); }
+      17      int audit2(Input input) { return audit.value(input) + audit.limit(input); }
+      18      int audit3(Input input) { return audit.value(input) + audit.limit(input); }
+      19    }
+    actions:
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+      - op: move:method
+        apply_args: '{"targetVariableName":"worker"}'
+        cli_steps:
+          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
+          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
+          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+    after: |
+      /* God.java */
+      3     class God {
+      4       private final Worker worker = new Worker();
+      5       private final Audit audit = new Audit();
+      6
+      7       int audit0(Input input) { return audit.value(input) + audit.limit(input); }
+      8       int audit1(Input input) { return audit.value(input) + audit.limit(input); }
+      9       int audit2(Input input) { return audit.value(input) + audit.limit(input); }
+      10      int audit3(Input input) { return audit.value(input) + audit.limit(input); }
+      11    }
+
+      /* Worker.java */
+      24    class Worker {
+      25      int process0(Input input) { return score(input) + limit(input); }
+      26      int process1(Input input) { return score(input) + limit(input); }
+      27      int process2(Input input) { return score(input) + limit(input); }
+      28      int process3(Input input) { return score(input) + limit(input); }
+      29      int process4(Input input) { return score(input) + limit(input); }
+      30      int process5(Input input) { return score(input) + limit(input); }
+      31      int process6(Input input) { return score(input) + limit(input); }
+      32      int process7(Input input) { return score(input) + limit(input); }
+      33    }
+    source: { project: synthetic-refactor-paths, class: God process cluster -> Worker, verified: "real IDEA CLI smoke 2026-06-08" }
+    notes:
+      - "Use this only when a real owner/collaborator already exists and the moved methods primarily manipulate that owner."
+      - "Do not force this route onto a field cluster with no real owner; use the extract-class-state-and-behavior route instead."
+      - "The repeated line 7 locators are intentional: after each move, the next process method becomes the first method in God and must be re-located before prepare."
+  - id: insert-type-state-cluster-member-migration
+    when: "auxiliary route for a field/state cluster only when native extract:class is unavailable or cannot migrate the needed fields and maintaining methods"
+    before: |
+      /* LegacyPanelController.java */
+      3     class LegacyPanelController {
+      4       private int left = 0;
+      5       private int top = 0;
+      6       private int width = 10;
+      7       private int height = 10;
+      8       void layout(ScreenModel model) { resize(model); }
+      9       private void resize(ScreenModel model) { width = model.width(); height = model.height(); }
+      10      String status(ScreenModel model) { return model.name() + ":" + left + ":" + top + ":" + width + ":" + height; }
+      11    }
+    actions:
+      - op: idea_edit
+        argument_contract: "Use idea_edit with file=src/main/java/demo/PanelGeometry.java, oldString=\"\", newString=<complete new Java source>, replaceAll=false. This creates the new file; do not insert a full compilation unit into an existing Java file."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelGeometry.java", oldString="", newString=<complete new Java source>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/PanelGeometry.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/PanelGeometry.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose a unique surrounding oldString at the insertion point, and call idea_edit with newString equal to that old block plus the inserted Java source; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString=<replacement source block>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Read src/main/java/demo/LegacyPanelController.java, choose the exact unique oldString for the declaration/block being removed, and call idea_edit with newString=\"\"; replaceAll=false."
+        cli_steps:
+          - idea_edit(file="src/main/java/demo/LegacyPanelController.java", oldString=<unique exact old source block>, newString="", replaceAll=false)
+    after: |
+      /* LegacyPanelController.java */
+      3     class LegacyPanelController {
+      4       private final PanelGeometry panelGeometry = new PanelGeometry();
+      5       void layout(ScreenModel model) { panelGeometry.layout(model); }
+      6       String status(ScreenModel model) { return panelGeometry.status(model); }
+      7     }
+
+      /* PanelGeometry.java */
+      3     final class PanelGeometry {
+      4       private int left;
+      5       private int top;
+      6       private int width;
+      7       private int height;
+      8       void layout(ScreenModel model) { /* state behavior moved here */ }
+      9       void resize(ScreenModel model) { /* state behavior moved here */ }
+      10      String status(ScreenModel model) { /* state reporting moved here */ }
+      11    }
+    source: { project: synthetic-refactor-paths, class: LegacyPanelController state cluster -> PanelGeometry, verified: "synthetic auxiliary route" }
+    notes:
+      - "Use this only when native `extract:class` is unavailable or cannot migrate the needed members; it is not the main narrative for god_class."
+      - "The component patch is only for the newly inserted component, never for a large reported god class."
+      - "After creating the component, shrink the reported class with member-level idea_edit old/new patches until the original field cluster and private maintenance methods are gone."
+      - "Do not stop at wrapper-only delegation; the guard must no longer report the original class."
