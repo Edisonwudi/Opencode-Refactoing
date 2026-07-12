@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,6 +49,43 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
         "status": "active",
     },
 }
+
+# --- Batch runner retry loop -------------------------------------------------
+# MAX_RUNNER_CONTINUE_ATTEMPTS mirrors the plugin's MAX_IDLE_CONTINUE_ATTEMPTS
+# (see .opencode/plugins/smell.ts). The two must be kept in sync: the plugin
+# handles interactive-TUI continuation on session.idle, the runner handles
+# batch continuation because `opencode run` is a single-shot process that does
+# not emit session.idle.
+MAX_RUNNER_CONTINUE_ATTEMPTS = 2
+
+# REPAIRABLE_FAILURE_CATEGORIES mirrors the plugin's REPAIRABLE_CATEGORIES.
+# Python cannot import the TypeScript constant, so this is a hand-maintained
+# mirror. The single source of truth for the category strings is
+# runtime/python/bridge/smell_bridge.py::_classify_failure_pack; verify.json's
+# failure_pack.failure_category carries them. Dependency / offline / auth /
+# provider / timeout / unknown failures are intentionally NOT retried.
+REPAIRABLE_FAILURE_CATEGORIES = frozenset(
+    {
+        "SMELL_GUARD_FAILED",
+        "BUILD_COMPILE_ERROR",
+        "TEST_BEHAVIOR_REGRESSION",
+        "TEST_REFLECTION_ENTRY_STALE",
+        "SAMPLE_TEST_FAILED",
+    }
+)
+
+# Artifact filenames produced per attempt. Used by _promote_final_artifacts to
+# copy the last attempt's outputs to the canonical (suffix-less) names.
+_PER_ATTEMPT_ARTIFACT_NAMES = (
+    "run.log",
+    "run.events.jsonl",
+    "task.txt",
+    "command.json",
+    "verify.json",
+    "diff.patch",
+    "diff.stat",
+)
+
 
 
 @dataclass(frozen=True)
@@ -360,7 +398,12 @@ def _write_opencode_config(sample_dir: Path, args: argparse.Namespace) -> tuple[
 
 
 def _prepare_opencode_home(sample_dir: Path) -> dict[str, str]:
-    home = Path(tempfile.mkdtemp(prefix=f"opencode-home-{_sanitize(sample_dir.name)}-"))
+    # Use a FIXED home directory under sample_dir (not a random mkdtemp) so that
+    # all retry attempts on the same sample share the same opencode.db. This is
+    # required for `opencode run -s <session_id>` to find the session created by
+    # the first attempt.
+    home = sample_dir / "opencode-home"
+    home.mkdir(parents=True, exist_ok=True)
     config = home / ".config" / "opencode"
     config.mkdir(parents=True, exist_ok=True)
     for name in ("package.json", "package-lock.json", ".gitignore"):
@@ -391,7 +434,154 @@ def _prepare_opencode_home(sample_dir: Path) -> dict[str, str]:
     }
 
 
-def _task_prompt(sample: Sample, args: argparse.Namespace, verification_mode: str, agent: str) -> str:
+def _failure_category_from_verify_payload(payload: dict[str, Any]) -> str:
+    """Read failure_pack.failure_category from a verify payload.
+
+    The single source of truth is smell_bridge.py::_classify_failure_pack; the
+    category string is carried in verify.json's failure_pack.failure_category.
+    Returns "" when the payload has no classifiable failure_pack.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    pack = payload.get("failure_pack")
+    if not isinstance(pack, dict):
+        return ""
+    return str(pack.get("failure_category") or "").strip()
+
+
+def _compute_status(opencode_returncode: int, verify_returncode: int, verify_payload: dict[str, Any]) -> str:
+    """Compute the sample status from the opencode/verify return codes and payload.
+
+    Mirrors the original _run_sample status logic. Extracted as a pure function
+    so the retry loop and self-tests can call it without running subprocesses.
+    """
+    verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
+    status = verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
+    if opencode_returncode != 0 and verify_returncode != 0:
+        status = "OPENCODE_FAILED"
+    return status
+
+
+def _build_failure_context(verify_payload: dict[str, Any], attempt_number: int) -> str:
+    """Build the failure_pack context to feed back to the agent on a retry.
+
+    Returns "" when there is no usable failure_pack (the retry will still run
+    but without prior-failure context). Sensitive content is not specifically
+    redacted here because this context is sent to the model via opencode run as
+    part of the task text, not surfaced as a visible TUI auto-continue message.
+    """
+    if not isinstance(verify_payload, dict):
+        return ""
+    pack = verify_payload.get("failure_pack")
+    if not isinstance(pack, dict):
+        return ""
+    category = str(pack.get("failure_category") or "").strip()
+    verify_status = str(pack.get("verify_status") or "").strip()
+    lines = [f"Previous attempt {attempt_number} did not pass smell_verify."]
+    if verify_status:
+        lines.append(f"Last verify status: {verify_status}.")
+    if category:
+        lines.append(f"Failure category: {category}.")
+    highlights = pack.get("highlights")
+    if isinstance(highlights, list):
+        clean_h = [str(h).strip() for h in highlights if str(h).strip()]
+        if clean_h:
+            lines.append("Failure highlights:")
+            for h in clean_h[:3]:
+                snippet = h if len(h) <= 240 else h[:240] + "..."
+                lines.append(f"- {snippet}")
+    recommendations = pack.get("recommendations")
+    if isinstance(recommendations, list):
+        clean_r = [str(r).strip() for r in recommendations if str(r).strip()]
+        if clean_r:
+            lines.append("Recommendations:")
+            for r in clean_r[:3]:
+                lines.append(f"- {r}")
+    lines.append("Make one narrow corrective edit based on the latest failure_pack, then call smell_verify again. Do not repeat the previous edit without new evidence. Do not modify or weaken tests.")
+    return "\n".join(lines)
+
+
+def _build_continuation_nudge(verify_payload: dict[str, Any], attempt_number: int) -> str:
+    """Short nudge for a same-session continuation (run -s).
+
+    Unlike _build_failure_context, this does NOT repeat highlights/recommendations
+    because the agent already has the full conversation history from previous
+    attempts on the same session. It only points at the latest failure category
+    so the agent knows which failure_pack to re-read.
+    """
+    category = _failure_category_from_verify_payload(verify_payload)
+    verify_status = ""
+    pack = verify_payload.get("failure_pack") if isinstance(verify_payload, dict) else None
+    if isinstance(pack, dict):
+        verify_status = str(pack.get("verify_status") or "").strip()
+    parts = [f"Attempt {attempt_number} did not pass smell_verify."]
+    if verify_status:
+        parts.append(f"Last status: {verify_status}.")
+    if category:
+        parts.append(f"Failure category: {category}.")
+    parts.append("Read the latest failure_pack, make one narrow corrective edit, then call smell_verify again. Do not repeat the previous edit without new evidence. Do not modify or weaken tests.")
+    return "\n".join(parts)
+
+
+def _attempt_artifact_path(sample_dir: Path, name: str, attempt_suffix: str) -> Path:
+    """Return the per-attempt artifact path. attempt_suffix is '' for attempt 0."""
+    return sample_dir / f"{name}{attempt_suffix}"
+
+
+def _promote_final_artifacts(sample_dir: Path, total_attempts: int) -> None:
+    """Make the final attempt's artifacts available at canonical (suffix-less) names.
+
+    The first attempt (suffix '') already writes canonical names, so nothing to
+    do when total_attempts == 1. For multi-attempt samples:
+      1. Rename the first attempt's suffix-less files to '.0' so attempt-0
+         history is preserved (otherwise step 2 would overwrite it).
+      2. Copy the final attempt's suffixed files to the canonical names so
+         existing consumers that read sample_dir/verify.json etc. keep working.
+    After this, '.0'/'.1'/... hold each attempt and the suffix-less names hold
+    the final attempt's output.
+    """
+    if total_attempts <= 1:
+        return
+    final_suffix = f".{total_attempts - 1}"
+    for name in _PER_ATTEMPT_ARTIFACT_NAMES:
+        # Step 1: preserve attempt 0's suffix-less output as '.0'.
+        canonical = sample_dir / name
+        attempt0 = _attempt_artifact_path(sample_dir, name, ".0")
+        if canonical.exists() and canonical.is_file():
+            try:
+                shutil.move(str(canonical), str(attempt0))
+            except OSError:
+                pass
+        # Step 2: copy the final attempt's output to the canonical name.
+        src = _attempt_artifact_path(sample_dir, name, final_suffix)
+        if src.exists() and src.is_file():
+            try:
+                shutil.copyfile(str(src), str(canonical))
+            except OSError:
+                pass
+
+
+def _should_retry(status: str, verify_payload: dict[str, Any], attempt_idx: int) -> bool:
+    """Decide whether to retry after a failed attempt.
+
+    Pure function: returns True only when the failure is repairable AND the
+    attempt budget has not been exhausted. PASS never retries.
+    """
+    if status == "PASS":
+        return False
+    if attempt_idx >= MAX_RUNNER_CONTINUE_ATTEMPTS:
+        return False
+    category = _failure_category_from_verify_payload(verify_payload)
+    return category in REPAIRABLE_FAILURE_CATEGORIES
+
+
+def _task_prompt(
+    sample: Sample,
+    args: argparse.Namespace,
+    verification_mode: str,
+    agent: str,
+    failure_context: str = "",
+) -> str:
     idea_enabled = agent == "java-refactor-agent-idea"
     lines = [
         f"Project root: {sample.project_root}",
@@ -410,21 +600,31 @@ def _task_prompt(sample: Sample, args: argparse.Namespace, verification_mode: st
     if idea_enabled and args.idea_refactor_cli:
         lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
     lines.append("")
+    if failure_context:
+        lines.append(failure_context)
+        lines.append("")
     lines.append("Repair this one Java smell from the dataset row. Preserve behavior. Call smell_verify as the final acceptance gate.")
     return "\n".join(lines)
 
 
-def _copy_verify_artifacts(sample_dir: Path, verify_payload: dict[str, Any]) -> None:
+def _copy_verify_artifacts(sample_dir: Path, verify_payload: dict[str, Any], attempt_suffix: str = "") -> None:
     artifacts = verify_payload.get("artifacts") if isinstance(verify_payload, dict) else None
     if not isinstance(artifacts, dict):
         return
     for key, filename in (("diff", "diff.patch"), ("diff_stat", "diff.stat")):
         source = artifacts.get(key)
         if source and Path(str(source)).is_file():
-            shutil.copyfile(str(source), sample_dir / filename)
+            dst = _attempt_artifact_path(sample_dir, filename, attempt_suffix)
+            shutil.copyfile(str(source), str(dst))
 
 
-def _run_verify(sample: Sample, sample_dir: Path, args: argparse.Namespace, verification_mode: str) -> tuple[int, dict[str, Any]]:
+def _run_verify(
+    sample: Sample,
+    sample_dir: Path,
+    args: argparse.Namespace,
+    verification_mode: str,
+    attempt_suffix: str = "",
+) -> tuple[int, dict[str, Any]]:
     cmd = [
         sys.executable,
         str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"),
@@ -440,7 +640,7 @@ def _run_verify(sample: Sample, sample_dir: Path, args: argparse.Namespace, veri
         "--verification-mode",
         verification_mode,
         "--artifact-root",
-        str(sample_dir / "artifacts"),
+        str(sample_dir / f"artifacts{attempt_suffix}"),
     ]
     canonical = sample.canonical_project_root
     if canonical and canonical != sample.project_root:
@@ -465,22 +665,77 @@ def _run_verify(sample: Sample, sample_dir: Path, args: argparse.Namespace, veri
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         payload = {"success": False, "status": "VERIFY_OUTPUT_PARSE_FAILED", "stdout": proc.stdout, "stderr": proc.stderr}
-    (sample_dir / "verify.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-    _copy_verify_artifacts(sample_dir, payload)
+    verify_path = _attempt_artifact_path(sample_dir, "verify.json", attempt_suffix)
+    verify_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    _copy_verify_artifacts(sample_dir, payload, attempt_suffix)
     return proc.returncode, payload
 
 
-def _run_opencode(sample: Sample, sample_dir: Path, args: argparse.Namespace, agent: str, verification_mode: str) -> int:
+def _parse_session_id_from_json_events(events_text: str) -> str:
+    """Extract the session id from a --format json stdout event stream.
+
+    opencode run --format json emits one JSON object per line on stdout. Each
+    event carries the session id at the TOP LEVEL as ``sessionID`` (not nested
+    under properties). We scan every line and return the first non-empty
+    sessionID found, so this works even if the session.created event is not the
+    first one emitted.
+    """
+    for raw in (events_text or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        sid = ev.get("sessionID") or ev.get("session_id") or ""
+        if isinstance(sid, str) and sid.strip():
+            return sid.strip()
+        # Fallback: nested form (SSE-style properties.sessionID or properties.info.id).
+        props = ev.get("properties")
+        if isinstance(props, dict):
+            sid2 = props.get("sessionID") or ""
+            if not sid2 and isinstance(props.get("info"), dict):
+                sid2 = props["info"].get("id") or ""
+            if isinstance(sid2, str) and sid2.strip():
+                return sid2.strip()
+    return ""
+
+
+def _run_opencode(
+    sample: Sample,
+    sample_dir: Path,
+    args: argparse.Namespace,
+    agent: str,
+    verification_mode: str,
+    attempt_suffix: str = "",
+    failure_context: str = "",
+    session_id: str = "",
+) -> tuple[int, str]:
+    """Run one opencode attempt. Returns (returncode, session_id).
+
+    When session_id is empty a fresh session is created. When non-empty the
+    attempt continues on the SAME session via ``opencode run -s <id>``, so the
+    agent keeps its full conversation history across retries.
+    """
     _bootstrap_opencode(sample.project_root, sample_dir)
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
-    task = _task_prompt(sample, args, verification_mode, agent)
-    (sample_dir / "task.txt").write_text(task + "\n", encoding="utf-8")
+    task = _task_prompt(sample, args, verification_mode, agent, failure_context=failure_context)
+    task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
+    task_path.write_text(task + "\n", encoding="utf-8")
 
     env = os.environ.copy()
     env.update(_prepare_opencode_home(sample_dir))
     env.update(runtime_env)
     if config_path:
         env["OPENCODE_CONFIG"] = str(config_path)
+    # Batch continuation is owned by this runner's retry loop. Retries use
+    # ``opencode run -s <session_id>`` to continue on the same session, so the
+    # agent retains its full conversation history. The plugin's session.idle
+    # auto-continue stays off because the runner is the sole owner of batch
+    # retries.
+    env["SMELL_BATCH_RUN"] = "1"
+    env["SMELL_IDLE_CONTINUE_MODE"] = "off"
     env["SMELL_PROJECT_ROOT"] = str(sample.project_root)
     if sample.canonical_project_root:
         env["SMELL_CANONICAL_PROJECT_ROOT"] = str(sample.canonical_project_root)
@@ -500,43 +755,92 @@ def _run_opencode(sample: Sample, sample_dir: Path, args: argparse.Namespace, ag
     else:
         env.pop("SMELL_REQUIRE_BUILD_TEST", None)
 
-    cmd = [args.opencode_bin, "run", task, "--agent", agent, "--model", args.model, "--dangerously-skip-permissions", "--print-logs"]
+    # --format json: raw JSON events on stdout (for session-id parsing).
+    # --print-logs: human-readable logs on stderr (written to run.log).
+    cmd = [
+        args.opencode_bin, "run", task,
+        "--agent", agent,
+        "--model", args.model,
+        "--dangerously-skip-permissions",
+        "--format", "json",
+        "--print-logs",
+    ]
+    if session_id:
+        cmd.extend(["--session", session_id])
     command_payload = {
         "cmd": cmd,
         "cwd": str(sample.project_root),
         "agent": agent,
         "auth": {**auth_meta, "api_key_source": "configured" if auth_meta.get("api_key_configured") else ""},
         "verification_mode": verification_mode,
+        "attempt_suffix": attempt_suffix,
+        "is_retry": bool(attempt_suffix),
+        "is_continuation": bool(session_id),
+        "session_id": session_id,
     }
-    (sample_dir / "command.json").write_text(json.dumps(command_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    command_path = _attempt_artifact_path(sample_dir, "command.json", attempt_suffix)
+    command_path.write_text(json.dumps(command_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    log_path = sample_dir / "run.log"
-    with log_path.open("w", encoding="utf-8") as log:
+    log_path = _attempt_artifact_path(sample_dir, "run.log", attempt_suffix)
+    events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", attempt_suffix)
+    with log_path.open("w", encoding="utf-8") as log, events_path.open("w", encoding="utf-8") as events_file:
         proc = subprocess.Popen(
             cmd,
             cwd=str(sample.project_root),
             env=env,
             text=True,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            stderr=log,
             start_new_session=True,
         )
+        # Read stdout (JSON events) incrementally, write to events file, and
+        # detect session id. Also update idle-activity based on stdout growth.
+        detected_sid = ""
+
+        def _drain_stdout():
+            nonlocal detected_sid
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                events_file.write(line)
+                events_file.flush()
+                if not detected_sid:
+                    sid = _parse_session_id_from_json_events(line)
+                    if sid:
+                        detected_sid = sid
+
+        reader = threading.Thread(target=_drain_stdout, daemon=True)
+        reader.start()
         deadline = time.monotonic() + args.timeout
-        last_marker = (-1, -1)
+        last_log_marker = (-1, -1)
         last_activity = time.monotonic()
+        timeout_code = 0
         while proc.poll() is None:
             if time.monotonic() > deadline:
                 os.killpg(proc.pid, signal.SIGTERM)
-                return 124
+                proc.wait(timeout=10)
+                timeout_code = 124
+                break
             marker = _file_marker(log_path)
-            if marker != last_marker:
-                last_marker = marker
+            events_marker = _file_marker(events_path)
+            if marker != last_log_marker or events_marker != last_log_marker:
+                last_log_marker = max(marker, events_marker)
                 last_activity = time.monotonic()
             if args.opencode_log_idle_timeout and time.monotonic() - last_activity > args.opencode_log_idle_timeout:
                 os.killpg(proc.pid, signal.SIGTERM)
-                return 125
+                proc.wait(timeout=10)
+                timeout_code = 125
+                break
             time.sleep(1)
-        return int(proc.returncode or 0)
+        reader.join(timeout=5)
+        rc = timeout_code if timeout_code else int(proc.returncode or 0)
+        if not detected_sid:
+            # Fallback: re-parse the full events file (thread may have set it
+            # after the poll loop checked).
+            try:
+                detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+        return rc, detected_sid
 
 
 def _file_marker(path: Path) -> tuple[int, int]:
@@ -579,18 +883,79 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     agent = args.agent or ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
     verification_mode = _effective_verification_mode(sample, args)
 
+    # The worktree is prepared once and reused across retries: a retry must see
+    # the previous attempt's edits (continuation semantics), not a fresh tree.
     execution_sample = _prepare_worktree(sample, run_dir) if args.worktree else replace(sample, canonical_project_root=sample.project_root)
     (sample_dir / "sample.json").write_text(
         json.dumps({**sample.raw, "execution_project_root": str(execution_sample.project_root)}, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
 
-    opencode_returncode = _run_opencode(execution_sample, sample_dir, args, agent, verification_mode)
-    verify_returncode, verify_payload = _run_verify(execution_sample, sample_dir, args, verification_mode)
-    verify_status = str(verify_payload.get("status") or "")
-    status = verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
-    if opencode_returncode != 0 and verify_returncode != 0:
-        status = "OPENCODE_FAILED"
+    # Retry loop: attempt 0 creates a fresh session, retries continue on the
+    # SAME session via ``opencode run -s <id>`` so the agent keeps its full
+    # conversation history. The loop stops on PASS, on a non-repairable failure
+    # category, or when the attempt budget is exhausted.
+    attempts: list[dict[str, Any]] = []
+    final_status = "FAILED"
+    current_session_id = ""
+    for attempt_idx in range(MAX_RUNNER_CONTINUE_ATTEMPTS + 1):
+        attempt_suffix = "" if attempt_idx == 0 else f".{attempt_idx}"
+        failure_context = ""
+        if attempt_idx > 0 and attempts:
+            # On a same-session continuation the agent already has the full
+            # conversation history, so a short nudge suffices (no need to repeat
+            # all highlights/recommendations the agent can already see).
+            failure_context = _build_continuation_nudge(attempts[-1]["verify_payload"], attempt_idx)
+
+        opencode_returncode, attempt_session_id = _run_opencode(
+            execution_sample,
+            sample_dir,
+            args,
+            agent,
+            verification_mode,
+            attempt_suffix=attempt_suffix,
+            failure_context=failure_context,
+            session_id=current_session_id,
+        )
+        if not current_session_id and attempt_session_id:
+            current_session_id = attempt_session_id
+        verify_returncode, verify_payload = _run_verify(
+            execution_sample,
+            sample_dir,
+            args,
+            verification_mode,
+            attempt_suffix=attempt_suffix,
+        )
+        status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
+        attempts.append(
+            {
+                "attempt": attempt_idx,
+                "opencode_returncode": opencode_returncode,
+                "verify_returncode": verify_returncode,
+                "verify_payload": verify_payload,
+                "status": status,
+                "failure_category": _failure_category_from_verify_payload(verify_payload),
+                "session_id": attempt_session_id or current_session_id,
+                "is_continuation": bool(current_session_id and attempt_idx > 0),
+            }
+        )
+        final_status = status
+        print(
+            f"    attempt {attempt_idx + 1}/{MAX_RUNNER_CONTINUE_ATTEMPTS + 1}: "
+            f"{status} (category={attempts[-1]['failure_category'] or 'n/a'}"
+            f"{f', session={current_session_id[:16]}' if current_session_id else ''})",
+            flush=True,
+        )
+        if not _should_retry(status, verify_payload, attempt_idx):
+            break
+
+    total_attempts = len(attempts)
+    _promote_final_artifacts(sample_dir, total_attempts)
+    last = attempts[-1]
+    note = f"attempts={total_attempts}" if total_attempts > 1 else ""
+    if total_attempts > 1 and last["failure_category"]:
+        note += f" final_category={last['failure_category']}" if note else f"final_category={last['failure_category']}"
+
     row = {
         "sample_id": sample.sample_id,
         "smell": sample.smell,
@@ -600,14 +965,15 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "location": execution_sample.location,
         "verification_mode": verification_mode,
         "agent": agent,
-        "status": status,
-        "opencode_returncode": opencode_returncode,
-        "verify_returncode": verify_returncode,
+        "status": final_status,
+        "opencode_returncode": last["opencode_returncode"],
+        "verify_returncode": last["verify_returncode"],
         "duration_seconds": f"{time.time() - started:.1f}",
         "sample_dir": str(sample_dir),
-        "note": "",
+        "note": note,
     }
-    (sample_dir / "result.json").write_text(json.dumps(row, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    result_summary = {**row, "attempts": attempts}
+    (sample_dir / "result.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return row
 
 
@@ -672,7 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             row = _run_sample(sample, run_dir, args)
         except Exception as exc:  # keep batch artifacts for the failed row
-            failures += 1
+            # Do not increment failures here: the status-based check below
+            # counts RUNNER_FAILED once. Previously this double-counted.
             row = {
                 "sample_id": sample.sample_id,
                 "smell": sample.smell,

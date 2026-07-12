@@ -102,29 +102,452 @@ function commonArgs(input: {
   return args
 }
 
+const MAX_STDOUT_STDERR_LEN = 4000
+
+// --- session.idle limited auto-continuation (off by default) ---------------
+//
+// This is an interactive-mode fallback. It never activates in `opencode run`
+// single-shot mode or in batch runner environments. smell_verify.execute only
+// updates in-process state and metadata; the actual client.session.promptAsync
+// call happens in the plugin `event` hook after a `session.idle` for the same
+// session. The whole mechanism defaults to "off" and requires both
+// SMELL_IDLE_CONTINUE_MODE=interactive and smell_verify({ autoContinue: true }).
+
+const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
+const MAX_IDLE_CONTINUE_ATTEMPTS = 2 // hard limit, cannot be raised by model args
+const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
+const ALLOWED_AGENTS = new Set(["java-refactor-agent", "java-refactor-agent-idea"])
+// Conservative allowlist of repairable failure categories. These are the
+// category strings the Python bridge actually emits from
+// `_classify_failure_pack`. BUILD_FAILED is intentionally NOT listed: only an
+// explicit BUILD_COMPILE_ERROR classification from failure_pack is treated as
+// repairable compile trouble. Test regressions come back as
+// TEST_BEHAVIOR_REGRESSION or TEST_REFLECTION_ENTRY_STALE, so those (not the
+// never-emitted literal "TEST_FAILED") are what we allow.
+// Dependency / offline / auth / provider / config / tool / infrastructure /
+// timeout / unknown failures are never continued.
+const REPAIRABLE_CATEGORIES = new Set([
+  "SMELL_GUARD_FAILED",
+  "BUILD_COMPILE_ERROR",
+  "TEST_BEHAVIOR_REGRESSION",
+  "TEST_REFLECTION_ENTRY_STALE",
+  "SAMPLE_TEST_FAILED",
+])
+
+// OpenCode subcommands that run non-interactively or headlessly and therefore
+// must never receive an auto-continuation. The bare `opencode` invocation
+// (TUI, no subcommand) is interactive and is NOT in this set.
+const NONINTERACTIVE_SUBCOMMANDS = new Set(["run", "serve", "web", "attach"])
+
+type IdleContinueMode = "off" | "shadow" | "interactive"
+
+type FailureClassification = {
+  ok: boolean
+  category: string
+  verifyStatus: string
+  highlights: string[]
+  artifactPaths: string[]
+}
+
+type ContinuationState = {
+  taskKey: string
+  generation: number
+  dispatchedGeneration: number
+  attempt: number
+  pending: boolean
+  dispatching: boolean
+  agent: string
+  directory: string
+  failureCategory: string
+  verifyStatus: string
+  failureHighlights: string[]
+  artifactPaths: string[]
+  updatedAt: number
+}
+
+function idleContinueMode(env: NodeJS.ProcessEnv = process.env): IdleContinueMode {
+  const raw = typeof env?.SMELL_IDLE_CONTINUE_MODE === "string" ? env.SMELL_IDLE_CONTINUE_MODE.trim() : ""
+  if (raw === "shadow") return "shadow"
+  if (raw === "interactive") return "interactive"
+  return "off" // default; unrecognized values are treated as off
+}
+
+function isBatchEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!env) return false
+  if (env.SMELL_BATCH_RUN === "1") return true
+  const projectRoot = typeof env.SMELL_PROJECT_ROOT === "string" ? env.SMELL_PROJECT_ROOT.trim() : ""
+  return Boolean(projectRoot)
+}
+
+// Identify non-interactive OpenCode invocations (`opencode run`, `serve`,
+// `web`, `attach`) from argv. The bare `opencode` command (TUI, no
+// subcommand) is interactive and must return false so the README's
+// `SMELL_IDLE_CONTINUE_MODE=interactive opencode` actually enables continuation.
+// Conservative: only when we can positively identify the opencode executable do
+// we trust the subcommand; otherwise (unrecognizable argv) we treat it as run.
+function isOpendcodeRunMode(argv: readonly string[] = process.argv): boolean {
+  if (!Array.isArray(argv) || argv.length === 0) return true
+  let opencodeIndex = -1
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = String(argv[i] || "")
+    if (!token) continue
+    const base = path.basename(token)
+    if (base === "opencode" || base === "opencode.exe") {
+      opencodeIndex = i
+      break
+    }
+  }
+  if (opencodeIndex < 0) {
+    // No recognizable opencode executable in argv. Conservative: treat as run.
+    return true
+  }
+  const next = argv[opencodeIndex + 1]
+  if (typeof next !== "string") {
+    // Bare `opencode` with no subcommand -> interactive TUI. Do NOT treat as run.
+    return false
+  }
+  return NONINTERACTIVE_SUBCOMMANDS.has(next)
+}
+
+// The bridge emits failure_pack.artifact_paths as an object (name -> path), not
+// a string array. Accept both shapes defensively.
+function artifactPathsFrom(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => (typeof item === "string" ? item : "")).filter((item) => item.length > 0)
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.values(value as Record<string, unknown>)
+    return entries
+      .map((item) => (typeof item === "string" ? item : ""))
+      .filter((item) => item.length > 0)
+  }
+  return []
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => (typeof item === "string" ? item : ""))
+    .filter((item) => item.length > 0)
+}
+
+// Redact secrets and credential-like values from text before it can appear in a
+// visible synthetic message. Match by structure (key/header scheme + value),
+// not by guessing credential length, so short or quoted values are covered too.
+//
+// Covered forms:
+//   api_key="value"   api_key='value'   api_key=value   api-key: value
+//   TOKEN="value"     ACCESS_TOKEN='value'   secret=value
+//   Authorization: Basic <anything-to-end-of-line>
+//   Authorization: Bearer <anything-to-end-of-line>
+//   bearer <token>   token <token>   {env:NAME} stays, but NAME=value leaks
+//
+// Conservative: when a key/header is recognized, the WHOLE value is redacted,
+// including quoted values and scheme-prefixed credentials.
+
+const REDACT_VALUE_CHARS = String.raw`[^'"\\]`
+
+// KEY = value, KEY: value, KEY="value", KEY='value' for known credential key
+// names. Captures the key prefix up to and including the separator so we can
+// keep the key name and redact the value only.
+const REDACT_KEY_RE = new RegExp(
+  String.raw`\b(authorization|api[_-]?key|apikey|secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|passwd|passwd64|private[_-]?key|client[_-]?secret)` +
+    String.raw`\b(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|` +
+    REDACT_VALUE_CHARS +
+    String.raw`+)`,
+  "gi",
+)
+
+// Authorization: <scheme> <credentials>  — redact the credentials after the scheme.
+// Handles "Authorization: Basic abc...", "Authorization: Bearer xyz ...".
+const REDACT_AUTH_SCHEME_RE = new RegExp(
+  String.raw`\b(authorization)\b(\s*:\s*)([A-Za-z][A-Za-z0-9._-]*)(\s+)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
+  "gi",
+)
+
+// Standalone scheme tokens that carry a trailing credential: "Bearer xxx".
+const REDACT_SCHEME_TOKEN_RE = new RegExp(
+  String.raw`\b(bearer|token|basic)\b(\s+)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
+  "gi",
+)
+
+// UPPERCASE_ENV_NAME=<value> assignments leaked into logs. Covers quoted and
+// unquoted values; "NAME" is preserved, the value is redacted.
+const REDACT_ENV_ASSIGN_RE = new RegExp(
+  String.raw`\b([A-Z][A-Z0-9_]*)(\s*=\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
+  "g",
+)
+
+function redactValue(value: string): string {
+  // For quoted values, redact the inner content but keep quote boundaries so
+  // log formatting stays readable.
+  if (value.length >= 2 && (value[0] === '"' || value[0] === "'")) {
+    return `${value[0]}[REDACTED]${value[0]}`
+  }
+  return "[REDACTED]"
+}
+
+function redactSecrets(input: string): string {
+  if (typeof input !== "string" || input.length === 0) return ""
+  let out = input
+  out = out.replace(REDACT_KEY_RE, (_m, key: string, sep: string, value: string) => `${key}${sep}${redactValue(value)}`)
+  out = out.replace(REDACT_AUTH_SCHEME_RE, (_m, key: string, sep: string, scheme: string, _ws: string, _cred: string) => `${key}${sep}${scheme} [REDACTED]`)
+  out = out.replace(REDACT_SCHEME_TOKEN_RE, (_m, scheme: string, ws: string, _value: string) => `${scheme}${ws}[REDACTED]`)
+  out = out.replace(REDACT_ENV_ASSIGN_RE, (_m, name: string, sep: string, _value: string) => `${name}${sep}[REDACTED]`)
+  return out
+}
+
+function classifyFailureForContinue(failurePack: unknown): FailureClassification {
+  const empty: FailureClassification = {
+    ok: false,
+    category: "",
+    verifyStatus: "",
+    highlights: [],
+    artifactPaths: [],
+  }
+  if (!failurePack || typeof failurePack !== "object" || Array.isArray(failurePack)) {
+    return empty
+  }
+  const pack = failurePack as Record<string, unknown>
+  const category = typeof pack.failure_category === "string" ? pack.failure_category.trim() : ""
+  const verifyStatus = typeof pack.verify_status === "string" ? pack.verify_status.trim() : ""
+  const highlights = asStringArray(pack.highlights)
+  const artifactPaths = artifactPathsFrom(pack.artifact_paths)
+  return {
+    ok: REPAIRABLE_CATEGORIES.has(category),
+    category,
+    verifyStatus,
+    highlights,
+    artifactPaths,
+  }
+}
+
+function makeTaskKey(projectRoot: string, smell: string, location: string): string {
+  return [String(projectRoot || ""), String(smell || ""), String(location || "")].join("|")
+}
+
+function buildContinuationMessage(state: ContinuationState): string {
+  const attempt = Math.max(1, Math.min(state.attempt + 1, MAX_IDLE_CONTINUE_ATTEMPTS))
+  const lines: string[] = []
+  lines.push(`${SMELL_IDLE_CONTINUE_PREFIX} ${attempt}/${MAX_IDLE_CONTINUE_ATTEMPTS}]`)
+  lines.push("")
+  lines.push("The previous smell_verify result was not accepted.")
+  lines.push(`Status: ${state.verifyStatus || "FAILED"}.`)
+  lines.push(`Failure category: ${state.failureCategory || "UNKNOWN"}.`)
+  lines.push("")
+  const highlights = state.failureHighlights.slice(0, 3)
+  if (highlights.length) {
+    lines.push("Failure highlights:")
+    for (const h of highlights) {
+      const redacted = redactSecrets(h)
+      const trimmed = redacted.length > 200 ? `${redacted.slice(0, 200)}...` : redacted
+      lines.push(`- ${trimmed}`)
+    }
+    lines.push("")
+  }
+  const paths = state.artifactPaths.slice(0, 3)
+  if (paths.length) {
+    lines.push("Artifact paths:")
+    for (const p of paths) lines.push(`- ${redactSecrets(p)}`)
+    lines.push("")
+  }
+  lines.push("Read the latest failure_pack and make one narrow corrective edit.")
+  lines.push("Then call smell_verify again. Do not repeat the previous edit without")
+  lines.push("new evidence. Do not modify or weaken tests.")
+  let message = lines.join("\n")
+  // Hard cap near 2 KB to keep the synthetic message small.
+  const MAX_MSG = 2048
+  if (message.length > MAX_MSG) {
+    message = `${message.slice(0, MAX_MSG - 32)}\n...[truncated]`
+  }
+  return message
+}
+
+type StdioCarrier = {
+  exitCode?: unknown
+  stdout?: unknown
+  stderr?: unknown
+}
+
+function safeStringOutput(value: unknown): string {
+  if (typeof value === "string") return value
+  if (value === null || value === undefined) return ""
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value)
+  }
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    try {
+      return String(value)
+    } catch {
+      return ""
+    }
+  }
+}
+
+function truncateText(value: unknown, limit: number = MAX_STDOUT_STDERR_LEN): string {
+  const text = typeof value === "string" ? value : safeStringOutput(value)
+  if (text.length <= limit) return text
+  return `${text.slice(0, limit)}\n...[truncated ${text.length - limit} chars]`
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    try {
+      return JSON.stringify(
+        {
+          success: false,
+          status: "OUTPUT_SERIALIZE_FAILED",
+          error: "Tool output could not be serialized.",
+        },
+        null,
+        2,
+      )
+    } catch {
+      return '{"success":false,"status":"OUTPUT_SERIALIZE_FAILED"}'
+    }
+  }
+}
+
+function toJsonSafe(value: unknown): unknown {
+  if (value === null || value === undefined) return null
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value
+  if (typeof value === "bigint") return String(value)
+  if (Array.isArray(value)) return value.map(toJsonSafe)
+  if (typeof value === "object") {
+    try {
+      JSON.stringify(value)
+      return value
+    } catch {
+      return safeStringOutput(value)
+    }
+  }
+  return safeStringOutput(value)
+}
+
+function normalizeStdioFields(result: StdioCarrier): {
+  exitCode: number
+  stdout: string
+  stderr: string
+} {
+  const rawExit = result.exitCode
+  let exitCode = 1
+  if (typeof rawExit === "number" && Number.isFinite(rawExit)) {
+    exitCode = Math.trunc(rawExit)
+  } else if (typeof rawExit === "string" && rawExit.trim() !== "" && Number.isFinite(Number(rawExit))) {
+    exitCode = Math.trunc(Number(rawExit))
+  }
+  return {
+    exitCode,
+    stdout: typeof result.stdout === "string" ? result.stdout : safeStringOutput(result.stdout),
+    stderr: typeof result.stderr === "string" ? result.stderr : safeStringOutput(result.stderr),
+  }
+}
+
+function normalizeMetadata(
+  result: StdioCarrier,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const fields = normalizeStdioFields(result)
+  const metadata: Record<string, unknown> = {
+    exitCode: fields.exitCode,
+    stderr: truncateText(fields.stderr),
+    stdout_truncated: fields.stdout.length > MAX_STDOUT_STDERR_LEN,
+    ...extra,
+  }
+  for (const key of Object.keys(metadata)) {
+    metadata[key] = toJsonSafe(metadata[key])
+  }
+  return metadata
+}
+
+function buildBridgeOutputPayload(result: BridgeResult): string {
+  const fields = normalizeStdioFields(result)
+  const stderrSummary = truncateText(fields.stderr)
+  const stdoutSummary = truncateText(fields.stdout)
+  if (result.json === null || result.json === undefined) {
+    return safeJsonStringify({
+      success: false,
+      status: fields.exitCode === 0 ? "BRIDGE_OUTPUT_NOT_JSON" : "BRIDGE_FAILED",
+      error: stderrSummary || "Python bridge did not return a JSON payload.",
+      bridge: {
+        exitCode: fields.exitCode,
+        stderr: stderrSummary,
+        stdout_summary: stdoutSummary,
+      },
+    })
+  }
+  const jsonPayload =
+    result.json && typeof result.json === "object"
+      ? (result.json as Record<string, unknown>)
+      : { value: result.json }
+  const hasStatus = typeof jsonPayload.status === "string" && jsonPayload.status.trim() !== ""
+  const hasSuccess = typeof jsonPayload.success === "boolean"
+  return safeJsonStringify({
+    ...jsonPayload,
+    success: hasSuccess ? (jsonPayload.success as boolean) : fields.exitCode === 0,
+    status: hasStatus
+      ? (jsonPayload.status as string)
+      : fields.exitCode === 0
+        ? "BRIDGE_OK_NO_STATUS"
+        : "BRIDGE_FAILED",
+    bridge: {
+      exitCode: fields.exitCode,
+      stderr: stderrSummary,
+    },
+  })
+}
+
+function normalizeToolResult(
+  title: string,
+  result: BridgeResult,
+  extraMetadata: Record<string, unknown> = {},
+): { title: string; output: string; metadata: Record<string, unknown> } {
+  return {
+    title: typeof title === "string" && title ? title : "Smell tool result",
+    output: buildBridgeOutputPayload(result),
+    metadata: normalizeMetadata(result, extraMetadata),
+  }
+}
+
 async function runBridge(worktree: string, args: string[]): Promise<BridgeResult> {
   return await new Promise((resolve) => {
-    const child = spawn("python3", [bridgeFile, ...args], {
-      cwd: worktree,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    })
     let stdout = ""
     let stderr = ""
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk)
-    })
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk)
-    })
-    child.on("close", (code) => {
+    let settled = false
+    const finalize = (exitCode: number) => {
+      if (settled) return
+      settled = true
       let json: unknown = null
       try {
         json = JSON.parse(stdout)
       } catch {
         json = null
       }
-      resolve({ exitCode: code ?? 1, stdout, stderr, json })
+      resolve({ exitCode, stdout, stderr, json })
+    }
+    const child = spawn("python3", [bridgeFile, ...args], {
+      cwd: worktree,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk)
+    })
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on("error", (error) => {
+      if (!stderr) {
+        stderr = error instanceof Error ? error.message : String(error)
+      }
+      finalize(1)
+    })
+    child.on("close", (code) => {
+      finalize(code ?? 1)
     })
   })
 }
@@ -170,18 +593,6 @@ async function runIdeaCli(worktree: string, cli: string, args: string[]): Promis
       resolve({ exitCode: code ?? 1, stdout, stderr, json, argv: args })
     })
   })
-}
-
-function renderResult(title: string, result: BridgeResult) {
-  const output = result.json === null ? result.stdout : JSON.stringify(result.json, null, 2)
-  return {
-    title,
-    output,
-    metadata: {
-      exitCode: result.exitCode,
-      stderr: result.stderr,
-    },
-  }
 }
 
 function resolveIdeaInput(input: { projectRoot?: string; ideaProjectRoot?: string; ideaRefactorCli?: string } = {}) {
@@ -368,33 +779,332 @@ function renderIdeaResult(
   result: IdeaCliResult,
   expectedOperation?: string,
   extraWrapper: Record<string, unknown> = {},
-) {
+): { title: string; output: string; metadata: Record<string, unknown> } {
+  const fields = normalizeStdioFields(result)
   const operationAvailable = operationMatches(result.json, expectedOperation)
+  const rawPayload =
+    result.json && typeof result.json === "object"
+      ? (result.json as Record<string, unknown>)
+      : result.json === null || result.json === undefined
+        ? null
+        : { value: result.json }
+  const payloadStatus = rawPayload && typeof rawPayload.status === "string" ? rawPayload.status : ""
+  const success =
+    fields.exitCode === 0 &&
+    payloadStatus !== "failed" &&
+    payloadStatus !== "error" &&
+    Boolean(rawPayload)
+  const status =
+    payloadStatus ||
+    (success ? "IDEA_OK" : fields.exitCode === 0 ? "IDEA_EMPTY_PAYLOAD" : "IDEA_FAILED")
   return {
-    title,
-    output: JSON.stringify(
-      {
-        payload: result.json,
-        wrapper: {
-          exit_code: result.exitCode,
-          stderr: result.stderr,
-          argv_preview: result.argv,
-          expected_operation: expectedOperation || "",
-          operation_available: operationAvailable,
-          ...extraWrapper,
-        },
-      },
-      null,
-      2,
-    ),
-    metadata: {
-      exitCode: result.exitCode,
-      stderr: result.stderr,
-    },
+    title: typeof title === "string" && title ? title : "IDEA refactor result",
+    output: safeJsonStringify({
+      success,
+      status,
+      payload: rawPayload,
+      wrapper: toJsonSafe({
+        exit_code: fields.exitCode,
+        stderr: truncateText(fields.stderr),
+        argv_preview: Array.isArray(result.argv) ? result.argv.map(String) : [],
+        expected_operation: expectedOperation || "",
+        operation_available: operationAvailable,
+        ...extraWrapper,
+      }),
+    }),
+    metadata: normalizeMetadata(result),
   }
 }
 
-export const SmellPlugin: Plugin = async ({ worktree }) => {
+// Create an isolated idle-continuation runtime. Pure-function-driven so the
+// self-check can inject a fake client/env/argv without touching real state.
+// Production code calls this with the real client/process.env/process.argv.
+function createIdleContinueRuntime(options: {
+  client?: { session: { promptAsync: (opts: unknown) => Promise<unknown> } }
+  env?: NodeJS.ProcessEnv
+  argv?: readonly string[]
+  log?: (msg: string, details?: unknown) => void
+}) {
+  const env = options.env || process.env
+  const argv = options.argv || process.argv
+  const log = options.log || (() => {})
+  const states = new Map<string, ContinuationState>()
+  let disposed = false
+  let lastDispatchError = ""
+
+  function cleanupStale(now: number = Date.now()) {
+    for (const [id, state] of states) {
+      if (now - state.updatedAt > IDLE_CONTINUE_STATE_TTL_MS) states.delete(id)
+    }
+  }
+
+  function clearSession(sessionID: string) {
+    if (sessionID) states.delete(sessionID)
+  }
+
+  function clearAll() {
+    states.clear()
+  }
+
+  function dispose() {
+    disposed = true
+    clearAll()
+  }
+
+  function peek(sessionID: string): ContinuationState | undefined {
+    return states.get(sessionID)
+  }
+
+  // Called from smell_verify.execute after a bridge result is normalized.
+  // Returns the auto_continuation metadata to attach to the tool result.
+  function recordFromBridgeOutput(input: {
+    sessionID: string
+    agent: string
+    directory: string
+    taskKey: string
+    output: string
+    autoContinue: boolean
+  }): {
+    mode: IdleContinueMode
+    enabled: boolean
+    autoContinue: boolean
+    attempt: number
+    maxAttempts: number
+    generation: number
+    status: string
+    category: string
+    dispatched: boolean
+  } {
+    cleanupStale()
+    const mode = idleContinueMode(env)
+    const enabled = mode !== "off"
+    let status = ""
+    let category = ""
+    let passed = false
+    let jsonParsed = false
+    let failurePack: unknown = null
+    try {
+      const parsed = JSON.parse(input.output) as Record<string, unknown>
+      jsonParsed = true
+      status = typeof parsed.status === "string" ? parsed.status : ""
+      if (typeof parsed.success === "boolean") passed = parsed.success
+      category = typeof parsed.failure_category === "string" ? parsed.failure_category : ""
+      failurePack = parsed.failure_pack
+    } catch {
+      // Non-JSON bridge output: never continue.
+    }
+
+    const existing = states.get(input.sessionID)
+    // The continuation attempt budget is per-session and is only reset by a
+    // genuine new user message (handleChatMessage). It must NOT be reset by a
+    // taskKey/location change, otherwise the model can bypass the 2-round cap by
+    // shifting the reported location between calls.
+    const attempt = existing ? existing.attempt : 0
+
+    const base = {
+      mode,
+      enabled,
+      autoContinue: Boolean(input.autoContinue),
+      attempt,
+      maxAttempts: MAX_IDLE_CONTINUE_ATTEMPTS,
+      generation: existing ? existing.generation : 0,
+      status,
+      category: category || (existing ? existing.failureCategory : ""),
+      dispatched: existing ? existing.dispatchedGeneration === existing.generation : false,
+    }
+
+    // PASS: clear state, no continuation.
+    if (passed || status === "PASS") {
+      states.delete(input.sessionID)
+      return { ...base, dispatched: false }
+    }
+
+    // Any new verify result that cannot arm continuation must revoke a stale
+    // pending from a previous generation, otherwise a later session.idle would
+    // resume against an outdated failure_pack. This covers: non-JSON output,
+    // autoContinue=false, non-interactive mode, and non-repairable categories.
+    const revokePending = () => {
+      if (existing && existing.pending) {
+        existing.pending = false
+        existing.dispatching = false
+        existing.updatedAt = Date.now()
+      }
+    }
+
+    if (!jsonParsed) {
+      revokePending()
+      return { ...base, dispatched: false }
+    }
+
+    if (!enabled || !input.autoContinue) {
+      revokePending()
+      return base
+    }
+
+    const classification = classifyFailureForContinue(failurePack)
+    if (!classification.ok) {
+      log("smell-idle-continue skip non-repairable", {
+        sessionID: input.sessionID,
+        category: classification.category,
+        status: classification.verifyStatus,
+      })
+      revokePending()
+      return { ...base, category: classification.category || category, dispatched: false }
+    }
+
+    // A new repairable failure arms continuation for this generation. taskKey is
+    // recorded for diagnostics only; it does NOT reset the attempt budget.
+    const nextGeneration = existing ? existing.generation + 1 : 1
+    const nextState: ContinuationState = {
+      taskKey: input.taskKey,
+      generation: nextGeneration,
+      // A brand-new generation has not been dispatched yet; preserve any in-fly
+      // dispatch flag only when it belongs to this generation (it never does
+      // here), otherwise clear it.
+      dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
+      attempt,
+      pending: true,
+      dispatching: false,
+      agent: input.agent,
+      directory: input.directory,
+      failureCategory: classification.category,
+      verifyStatus: classification.verifyStatus || status,
+      failureHighlights: classification.highlights,
+      artifactPaths: classification.artifactPaths,
+      updatedAt: Date.now(),
+    }
+    states.set(input.sessionID, nextState)
+    log("smell-idle-continue armed", {
+      sessionID: input.sessionID,
+      generation: nextState.generation,
+      taskKey: nextState.taskKey,
+      category: nextState.failureCategory,
+      attempt: nextState.attempt,
+    })
+    return {
+      ...base,
+      attempt: nextState.attempt,
+      generation: nextState.generation,
+      category: nextState.failureCategory,
+      dispatched: nextState.dispatchedGeneration === nextState.generation,
+    }
+  }
+
+  // Called from the plugin `event` hook on session.idle. Returns true if a
+  // promptAsync dispatch was actually performed.
+  function handleIdle(sessionID: string): boolean {
+    cleanupStale()
+    if (disposed) return false
+    const mode = idleContinueMode(env)
+    if (mode === "off") return false
+    if (isBatchEnvironment(env) || isOpendcodeRunMode(argv)) {
+      if (mode === "shadow") {
+        log("smell-idle-continue skip batch/run mode (shadow)", { sessionID })
+      }
+      return false
+    }
+    const state = states.get(sessionID)
+    if (!state) return false
+    if (mode === "shadow") {
+      const wouldDispatch =
+        !state.dispatching &&
+        state.pending &&
+        state.attempt < MAX_IDLE_CONTINUE_ATTEMPTS &&
+        state.dispatchedGeneration !== state.generation &&
+        ALLOWED_AGENTS.has(state.agent) &&
+        Boolean(options.client)
+      log("smell-idle-continue shadow decision", {
+        sessionID,
+        wouldDispatch,
+        attempt: state.attempt,
+        generation: state.generation,
+        category: state.failureCategory,
+      })
+      return false // shadow never calls promptAsync
+    }
+    if (!options.client) return false
+    if (!ALLOWED_AGENTS.has(state.agent)) return false
+    if (!state.pending) return false
+    if (state.dispatching) return false
+    if (state.attempt >= MAX_IDLE_CONTINUE_ATTEMPTS) return false
+    if (state.dispatchedGeneration === state.generation) return false
+
+    // Atomically mark dispatching for this generation before the async call.
+    state.dispatching = true
+    state.dispatchedGeneration = state.generation
+    state.updatedAt = Date.now()
+
+    const message = buildContinuationMessage(state)
+    const dispatch = options.client!.session.promptAsync({
+      path: { id: sessionID },
+      query: { directory: state.directory },
+      body: {
+        agent: state.agent,
+        parts: [{ type: "text", text: message }],
+      },
+    })
+    Promise.resolve(dispatch)
+      .then((res) => {
+        const err = (res as { error?: unknown })?.error
+        if (err) throw err
+        state.attempt += 1
+        state.pending = false
+        state.dispatching = false
+        state.updatedAt = Date.now()
+        lastDispatchError = ""
+        log("smell-idle-continue dispatched", {
+          sessionID,
+          attempt: state.attempt,
+          generation: state.generation,
+        })
+      })
+      .catch((error) => {
+        state.dispatching = false
+        state.updatedAt = Date.now()
+        lastDispatchError = error instanceof Error ? error.message : String(error)
+        log("smell-idle-continue dispatch failed", {
+          sessionID,
+          error: lastDispatchError,
+        })
+        // Do not auto-retry; stop for this generation.
+      })
+    return true
+  }
+
+  // Returns true when a real user message was detected (state cleared).
+  function handleChatMessage(sessionID: string, parts: ReadonlyArray<{ type?: string; text?: unknown }>): boolean {
+    if (!sessionID) return false
+    const text = (Array.isArray(parts) ? parts : [])
+      .map((p) => (p && p.type === "text" && typeof p.text === "string" ? p.text : ""))
+      .join("\n")
+      .trim()
+    if (!text) return false
+    if (text.startsWith(SMELL_IDLE_CONTINUE_PREFIX)) {
+      // Our own injected continuation message: do not reset.
+      return false
+    }
+    clearSession(sessionID)
+    return true
+  }
+
+  return {
+    recordFromBridgeOutput,
+    handleIdle,
+    handleChatMessage,
+    handleSessionDeleted: clearSession,
+    clearSession,
+    clearAll,
+    cleanupStale,
+    dispose,
+    peek,
+    isDisposed: () => disposed,
+    getLastDispatchError: () => lastDispatchError,
+    size: () => states.size,
+  }
+}
+
+export const SmellPlugin: Plugin = async ({ worktree, client }) => {
+  const idleRuntime = createIdleContinueRuntime({ client })
   const commonShape = {
     projectRoot: tool.schema.string().describe("Absolute path to the source project root."),
     language: tool.schema
@@ -429,12 +1139,47 @@ export const SmellPlugin: Plugin = async ({ worktree }) => {
           .optional()
           .describe("Verification mode. Defaults to local smell guard only; strict modes also run configured build/test."),
         noSnapshot: tool.schema.boolean().optional().describe("Do not include git status and source diff snapshot."),
+        autoContinue: tool.schema
+          .boolean()
+          .optional()
+          .describe("Allow the plugin to auto-inject one continuation message after a repairable idle failure (default false)."),
       },
-      async execute(args) {
+      async execute(args, context) {
         const resolved = withBatchDefaults(args)
         const bridgeArgs = ["verify", ...commonArgs(resolved)]
         if (args.noSnapshot) bridgeArgs.push("--no-snapshot")
-        return renderResult(name, await runBridge(worktree, bridgeArgs))
+        const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
+        // Update the in-process idle-continuation state machine from the bridge
+        // output. This never throws into the tool result; it only attaches
+        // metadata and arms continuation for a later session.idle dispatch.
+        let autoContinuation: Record<string, unknown> | undefined
+        try {
+          const cont = idleRuntime.recordFromBridgeOutput({
+            sessionID: context?.sessionID || "",
+            agent: context?.agent || "",
+            directory: context?.directory || "",
+            taskKey: makeTaskKey(resolved.projectRoot || "", resolved.smell || "", resolved.location || ""),
+            output: normalized.output,
+            autoContinue: Boolean(args.autoContinue),
+          })
+          autoContinuation = {
+            mode: cont.mode,
+            enabled: cont.enabled,
+            autoContinue: cont.autoContinue,
+            attempt: cont.attempt,
+            maxAttempts: cont.maxAttempts,
+            generation: cont.generation,
+            status: cont.status,
+            category: cont.category,
+            dispatched: cont.dispatched,
+          }
+        } catch {
+          // State-machine bookkeeping must never break the verify tool result.
+        }
+        if (autoContinuation) {
+          normalized.metadata.auto_continuation = toJsonSafe(autoContinuation)
+        }
+        return normalized
       },
     })
 
@@ -619,5 +1364,69 @@ export const SmellPlugin: Plugin = async ({ worktree }) => {
         throw new Error("Java source rewrites should use IDEA-Refactoring CLI or OpenCode edit tools, not shell text rewriting.")
       }
     },
+
+    event: async ({ event }) => {
+      if (!event || typeof event.type !== "string") return
+      if (event.type === "session.idle") {
+        const sessionID = (event as { properties?: { sessionID?: string } }).properties?.sessionID
+        if (typeof sessionID === "string" && sessionID) {
+          idleRuntime.handleIdle(sessionID)
+        }
+        return
+      }
+      if (event.type === "session.deleted") {
+        const sessionID = (event as { properties?: { info?: { id?: string } } }).properties?.info?.id
+        if (typeof sessionID === "string" && sessionID) {
+          idleRuntime.handleSessionDeleted(sessionID)
+        }
+        return
+      }
+    },
+
+    "chat.message": async (input, output) => {
+      const sessionID = input?.sessionID
+      if (typeof sessionID !== "string" || !sessionID) return
+      idleRuntime.handleChatMessage(sessionID, (output?.parts || []) as ReadonlyArray<{ type?: string; text?: unknown }>)
+    },
+
+    dispose: async () => {
+      idleRuntime.dispose()
+    },
   }
 }
+
+// opencode's plugin loader iterates Object.values(module) and requires every
+// export to resolve (via lk) to a function or a { server } PluginModule. A plain
+// object export like __smellSelfTest would make the loader throw "Plugin export
+// is not a function". So the self-test helpers are attached as a property of the
+// plugin function itself — the module then only exports functions (SmellPlugin +
+// default, same reference) and the harness reads SmellPlugin.__selfTest.
+;(SmellPlugin as Plugin & { __selfTest: unknown }).__selfTest = {
+  normalizeToolResult,
+  buildBridgeOutputPayload,
+  normalizeMetadata,
+  normalizeStdioFields,
+  safeStringOutput,
+  truncateText,
+  safeJsonStringify,
+  toJsonSafe,
+  renderIdeaResult,
+  MAX_STDOUT_STDERR_LEN,
+  // Idle continuation pure helpers + constants (no production control surface):
+  idleContinueMode,
+  isOpendcodeRunMode,
+  isBatchEnvironment,
+  classifyFailureForContinue,
+  makeTaskKey,
+  buildContinuationMessage,
+  redactSecrets,
+  artifactPathsFrom,
+  createIdleContinueRuntime,
+  SMELL_IDLE_CONTINUE_PREFIX,
+  MAX_IDLE_CONTINUE_ATTEMPTS,
+  IDLE_CONTINUE_STATE_TTL_MS,
+  ALLOWED_AGENTS,
+  REPAIRABLE_CATEGORIES,
+}
+
+export default SmellPlugin

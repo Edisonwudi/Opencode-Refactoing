@@ -58,3 +58,6 @@ runs/
 .smell-artifacts/
 .trial-worktrees/
 .idea-trial-worktrees/
+
+# ---------- Editor / tooling ----------
+.zcode/

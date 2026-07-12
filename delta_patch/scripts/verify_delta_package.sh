@@ -16,6 +16,7 @@ required=(
   "$PAYLOAD/runtime/python/smell_core/java/smell_guards.py"
   "$PAYLOAD/scripts/run_smell_dataset.py"
   "$PAYLOAD/scripts/self_check_smell_verify.mjs"
+  "$PAYLOAD/scripts/self_check_runner_continue.py"
   "$PAYLOAD/docker/java-refactor-delivery/entrypoint.sh"
 )
 
@@ -54,7 +55,7 @@ for path, keys in checks:
     if value != expected:
         raise SystemExit(f"{path} has @opencode-ai/plugin={value!r}, expected {expected!r}")
 PY
-PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile runtime/python/bridge/smell_bridge.py scripts/run_smell_dataset.py
+PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile runtime/python/bridge/smell_bridge.py scripts/run_smell_dataset.py scripts/self_check_runner_continue.py
 if [[ -x node_modules/.bin/tsc || -x ../node_modules/.bin/tsc || -x /opt/opencode-refactor/node_modules/typescript/bin/tsc ]]; then
   npm run check
   npm run check:self

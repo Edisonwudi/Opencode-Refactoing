@@ -284,3 +284,102 @@ scripts/patch_running_container.sh <running-container-name-or-id>
 - 默认验证为 `local` smell guard；严格 build/test 只在显式 `verificationMode` 下启用。
 - OpenCode plugin 依赖升级到 `@opencode-ai/plugin@1.17.13`。
 - 新增 `scripts/self_check_smell_verify.mjs`，用于定位 bridge、插件返回结构和 OpenCode 工具结果消费问题。
+- 新增交互模式下的 `session.idle` 有限自动续跑兜底机制（默认关闭），见第 13 节。
+- 新增批量 runner 单样本失败重试 loop（最多 2 轮，复用插件 allowlist），见第 14 节。
+
+## 13. 交互模式 session.idle 自动续跑
+
+OpenCode 插件内置一个交互模式兜底机制：当 `java-refactor-agent` 或
+`java-refactor-agent-idea` 在最新一次 `smell_verify` 返回可修复失败后提前结束并进入
+`session.idle`，插件会向同一 session 注入一条**对用户可见**的 continuation 消息，让
+agent 读取 `failure_pack` 再做一次窄修复并重新验证。它只在 agent 提前结束时触发，优先
+依赖 OpenCode 原生 agentic loop。
+
+该机制**默认关闭**。
+
+启用命令（TUI 交互模式）：
+
+```bash
+SMELL_IDLE_CONTINUE_MODE=interactive opencode
+```
+
+`SMELL_IDLE_CONTINUE_MODE` 取值：
+
+- `off`（默认）：完全不记录、不续跑。未识别的值一律按 `off` 处理。
+- `shadow`：判断是否应续跑并写结构化日志，但**不**调用 `promptAsync`。用于在不影响
+  对话的前提下验证触发条件。
+- `interactive`：满足全部条件后调用 `promptAsync` 注入续跑消息。
+
+真正调用 `promptAsync` 必须同时满足：
+
+1. `SMELL_IDLE_CONTINUE_MODE=interactive`
+2. 本次 `smell_verify` 显式传入 `autoContinue=true`（两个 agent 默认已传）
+
+强制不续跑的场景：
+
+- 批量模式：`SMELL_BATCH_RUN=1` 或存在 `SMELL_PROJECT_ROOT`
+- 单次运行模式：`opencode run`（按 `process.argv` 识别 `run` 子命令，识别不确定时保守不续跑）
+- agent 不是 `java-refactor-agent` / `java-refactor-agent-idea`
+- 失败不可修复（依赖/离线/授权/Provider/模型/配置/工具/基础设施/超时/未知失败）
+- 已达到最大续跑次数
+
+边界：
+
+- 最多自动续跑 **2 轮**，硬限制，不可通过模型参数提升。
+- 续跑消息对用户可见，包含当前轮次、上限、status、failure category 和少量 failure
+  highlights / artifact paths；总长度限制在约 2 KB；不含 API key、auth 内容或环境变量值。
+- 同一 `session.idle` 不重复注入；每次 `smell_verify` 失败最多触发一次 continuation。
+- 用户随时可用 `Esc` / `Ctrl+C` 中断。用户真正发送的新消息会清空该 session 的续跑状态；
+  插件自己注入的 `[smell-auto-continue ...]` 消息不会重置。
+- `session.deleted` 与插件 dispose 时清理状态；状态超过 30 分钟自动清理。
+- 不写磁盘状态，不新增数据库、MCP、依赖或第三个 agent。
+- `opencode run` 和批量模式**不使用**该机制；批量模式仍由 runner 负责续跑。
+
+验证：
+
+```bash
+npm run check:self   # 含 fake-client 集成自检，不访问真实模型
+```
+
+## 14. 批量 runner 单样本失败重试
+
+批量 runner（`scripts/run_smell_dataset.py`）现在对**可修复失败**的单样本自动重试,真正让批量场景"吃到 loop"。
+
+为什么是 runner 而不是插件：`opencode run` 是单次进程,Agent 结束即退出,**不发 `session.idle`**,所以插件续跑在批量下无法触发。批量续跑由 runner 统一负责。
+
+**同一 session 续跑(保留完整对话历史)**:
+
+重试使用 `opencode run -s <session_id>` 在**同一 session** 上续跑,而不是起新 session。Agent 在重试时**保留完整对话历史**——能看到上一轮的思考、工具调用、编辑过程,而不是只看到一段失败摘要。首轮用 `--format json` 创建 session 并解析 session id;重试用 `--session <id>` 续接。
+
+规则：
+
+- **最多重试 2 轮**（`MAX_RUNNER_CONTINUE_ATTEMPTS = 2`），与插件 `MAX_IDLE_CONTINUE_ATTEMPTS` 对齐。
+- **只重试可修复失败**：`SMELL_GUARD_FAILED`、`BUILD_COMPILE_ERROR`、`TEST_BEHAVIOR_REGRESSION`、`TEST_REFLECTION_ENTRY_STALE`、`SAMPLE_TEST_FAILED`（`REPAIRABLE_FAILURE_CATEGORIES`,镜像自插件 `REPAIRABLE_CATEGORIES`)。
+- **不重试**：依赖/离线、授权/Provider/模型、超时、配置、工具、基础设施、未知失败。
+- **同 session 续跑**：重试用 `run -s <id>`,agent 看到完整历史。续跑提示只含简短的 failure category 指引(不需重复全部 highlights,agent 能从对话历史里看到)。
+- **worktree 复用**：重试在同一 git worktree 上继续,保留上一轮的编辑。
+- **每轮独立超时**：每次重试获得完整的 `--timeout` 秒数(不做总预算),与 `--verify-timeout` 一致。
+- **降级安全**:如果 session id 解析失败(事件格式变化等),回退为新 session + 完整 failure_context,保证不崩。
+
+产物：
+
+- 每轮产物带后缀留存:`run.log.1`/`run.events.jsonl.1`/`verify.json.1`/`task.txt.1`/`command.json.1`/`diff.patch.1`/`diff.stat.1`(首轮无后缀)。`run.events.jsonl` 是 `--format json` 的原始事件流,含 session id 和 agent 的工具调用事件。
+- 首轮产物在 promote 时移到 `.0`,最终轮复制到无后缀路径,保证现有消费脚本兼容。
+- `results.csv` 字段不变(向后兼容);重试信息记在 `note` 列(`attempts=N`、`final_category=...`)。
+- `result.json` 增加完整 `attempts` 汇总(含每轮 `session_id`、`is_continuation`)。
+
+停止条件(任一即停):
+
+1. 当前轮 `status == PASS`
+2. 当前轮失败分类不在 allowlist(不可修复)
+3. 已达到 2 轮重试上限
+
+验证：
+
+```bash
+python3 -m py_compile scripts/run_smell_dataset.py
+python3 scripts/self_check_runner_continue.py   # 纯函数 + loop 决策 + session-id 解析,不跑模型
+```
+
+`self_check_runner_continue.py` 覆盖:PASS 不重试、可修复重试、不可修复不重试、上限耗尽停止、failure_context 拼装、常量对齐。不访问真实模型。
+
