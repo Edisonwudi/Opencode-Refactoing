@@ -955,23 +955,40 @@ function createIdleContinueRuntime(options: {
     // A new repairable failure arms continuation for this generation. taskKey is
     // recorded for diagnostics only; it does NOT reset the attempt budget.
     const nextGeneration = existing ? existing.generation + 1 : 1
-    const nextState: ContinuationState = {
-      taskKey: input.taskKey,
-      generation: nextGeneration,
-      // A brand-new generation has not been dispatched yet; preserve any in-fly
-      // dispatch flag only when it belongs to this generation (it never does
-      // here), otherwise clear it.
-      dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
-      attempt,
-      pending: true,
-      dispatching: false,
-      agent: input.agent,
-      directory: input.directory,
-      failureCategory: classification.category,
-      verifyStatus: classification.verifyStatus || status,
-      failureHighlights: classification.highlights,
-      artifactPaths: classification.artifactPaths,
-      updatedAt: Date.now(),
+    // If an in-flight dispatch exists for the previous generation, preserve the
+    // SAME state object reference (mutate in place) so the pending .then()/.catch()
+    // callbacks still update the live object rather than an orphan. Otherwise
+    // build a fresh object.
+    const hasInflightDispatch = Boolean(existing && existing.dispatching)
+    const nextState: ContinuationState = existing && hasInflightDispatch
+      ? existing!
+      : {
+          taskKey: input.taskKey,
+          generation: nextGeneration,
+          dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
+          attempt,
+          pending: true,
+          dispatching: false,
+          agent: input.agent,
+          directory: input.directory,
+          failureCategory: classification.category,
+          verifyStatus: classification.verifyStatus || status,
+          failureHighlights: classification.highlights,
+          artifactPaths: classification.artifactPaths,
+          updatedAt: Date.now(),
+        }
+    // When mutating in place, update the fields that changed.
+    if (hasInflightDispatch) {
+      nextState.taskKey = input.taskKey
+      nextState.generation = nextGeneration
+      nextState.pending = true
+      nextState.agent = input.agent
+      nextState.directory = input.directory
+      nextState.failureCategory = classification.category
+      nextState.verifyStatus = classification.verifyStatus || status
+      nextState.failureHighlights = classification.highlights
+      nextState.artifactPaths = classification.artifactPaths
+      nextState.updatedAt = Date.now()
     }
     states.set(input.sessionID, nextState)
     log("smell-idle-continue armed", {
@@ -1074,11 +1091,19 @@ function createIdleContinueRuntime(options: {
   // Returns true when a real user message was detected (state cleared).
   function handleChatMessage(sessionID: string, parts: ReadonlyArray<{ type?: string; text?: unknown }>): boolean {
     if (!sessionID) return false
-    const text = (Array.isArray(parts) ? parts : [])
+    const partList = Array.isArray(parts) ? parts : []
+    // No parts at all → not a real message.
+    if (partList.length === 0) return false
+    const text = partList
       .map((p) => (p && p.type === "text" && typeof p.text === "string" ? p.text : ""))
       .join("\n")
       .trim()
-    if (!text) return false
+    // If the message has parts but no text (e.g. pure file attachment), it is
+    // still a real user message that should reset the continuation state.
+    if (!text) {
+      clearSession(sessionID)
+      return true
+    }
     if (text.startsWith(SMELL_IDLE_CONTINUE_PREFIX)) {
       // Our own injected continuation message: do not reset.
       return false
@@ -1366,27 +1391,38 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     },
 
     event: async ({ event }) => {
-      if (!event || typeof event.type !== "string") return
-      if (event.type === "session.idle") {
-        const sessionID = (event as { properties?: { sessionID?: string } }).properties?.sessionID
-        if (typeof sessionID === "string" && sessionID) {
-          idleRuntime.handleIdle(sessionID)
+      try {
+        if (!event || typeof event.type !== "string") return
+        if (event.type === "session.idle") {
+          const sessionID = (event as { properties?: { sessionID?: string } }).properties?.sessionID
+          if (typeof sessionID === "string" && sessionID) {
+            idleRuntime.handleIdle(sessionID)
+          }
+          return
         }
-        return
-      }
-      if (event.type === "session.deleted") {
-        const sessionID = (event as { properties?: { info?: { id?: string } } }).properties?.info?.id
-        if (typeof sessionID === "string" && sessionID) {
-          idleRuntime.handleSessionDeleted(sessionID)
+        if (event.type === "session.deleted") {
+          const sessionID = (event as { properties?: { info?: { id?: string } } }).properties?.info?.id
+          if (typeof sessionID === "string" && sessionID) {
+            idleRuntime.handleSessionDeleted(sessionID)
+          }
+          return
         }
-        return
+      } catch (error) {
+        // Hooks must never throw into the event dispatcher; swallow and log.
+        // eslint-disable-next-line no-console
+        console.error("[smell] event hook error:", error instanceof Error ? error.message : String(error))
       }
     },
 
     "chat.message": async (input, output) => {
-      const sessionID = input?.sessionID
-      if (typeof sessionID !== "string" || !sessionID) return
-      idleRuntime.handleChatMessage(sessionID, (output?.parts || []) as ReadonlyArray<{ type?: string; text?: unknown }>)
+      try {
+        const sessionID = input?.sessionID
+        if (typeof sessionID !== "string" || !sessionID) return
+        idleRuntime.handleChatMessage(sessionID, (output?.parts || []) as ReadonlyArray<{ type?: string; text?: unknown }>)
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error("[smell] chat.message hook error:", error instanceof Error ? error.message : String(error))
+      }
     },
 
     dispose: async () => {

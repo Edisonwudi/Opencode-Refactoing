@@ -10,7 +10,7 @@ c1e5d39a91894c9297ab60ae1c21c3cdce3daaad57a9b40a6d7f80734e385439  ./payload/open
 ae3f388b9f3230881d518654c299dc7743f6d9ce3ba4c14e88ccdfc7f675912f  ./payload/opencode-refactor/.opencode/commands/java-refactor-run.md
 9ef9fa39b813cdf96b84085ba6168ad49da4eca742cfd3c249e50cf756b473f4  ./payload/opencode-refactor/.opencode/package-lock.json
 c005c2d68084e1c574c52ee04665b76ab75c2b4fbc1b6981e5fe0a6a9bc97c30  ./payload/opencode-refactor/.opencode/package.json
-db6ae32d7b8f0e00a73b8ba2c750ac5ec11df641bcf2098b5244520304f9fd42  ./payload/opencode-refactor/.opencode/plugins/smell.ts
+451c2d8c8a274a68ef2f2bcf6b23c6e66e0f61d9bffa8a0366a4d7cfa66c6fd1  ./payload/opencode-refactor/.opencode/plugins/smell.ts
 cc0ce97421fdf3df06576f7222e0fbb5aea1b297bf1efb0fe56d6fa5e79e0fe4  ./payload/opencode-refactor/.opencode/skills/idea-refactor-cli/SKILL.md
 679e31e0802557cd1b03e9c11e9e858ac1950c0f36c3c1f11483b4351e9ac147  ./payload/opencode-refactor/.opencode/skills/idea-refactor-cli/references/refactor-paths/code_clone_type1.yaml
 da5cf0d08832928bee5be1ee52425e9777aa964c1983a590c39727d74bb1a6a9  ./payload/opencode-refactor/.opencode/skills/idea-refactor-cli/references/refactor-paths/data_clumps.yaml
@@ -72,9 +72,9 @@ b629d894767434d5de71b0f27176e5eaf55d26d81444ab00fffb620b255feeae  ./payload/open
 b6b9e3cf8c2fb310c946b824d589f0721bb1444d960d96aa2e777eb3b6ba18df  ./payload/opencode-refactor/runtime/python/smell_core/prompts/idea_guides.py
 ea68231bf9e6836ce48f6c5327a453ee2f89d34e6f47a887052f02abb13a611f  ./payload/opencode-refactor/runtime/python/smell_core/prompts/idea_router.py
 71438f054029e1cc5400506812a2f5e300775c64c46b8b5e70b698899e98ddfd  ./payload/opencode-refactor/runtime/python/smell_core/task_builder.py
-004c1e44c2d957722ebf0638a9799a8d0bdc44762044026095778663a00c27ac  ./payload/opencode-refactor/scripts/run_smell_dataset.py
+1201e27f4d052cde4243fa260ed12a14469787666a7e5a21c030d5459721ccc6  ./payload/opencode-refactor/scripts/run_smell_dataset.py
 77f44db3ec9225401519313616a0e36a9c379755bac396786a3433911ec31d2a  ./payload/opencode-refactor/scripts/self_check_runner_continue.py
-953791faccce226c900e5b569a7ee8bc791749c134ab0e198615761da9e41d74  ./payload/opencode-refactor/scripts/self_check_smell_verify.mjs
+d550826af2fb45f0737af50732152754db4d9fe2fa40151874da563f0d9956b9  ./payload/opencode-refactor/scripts/self_check_smell_verify.mjs
 35d70a964a80f278cf33197ac307f21bdc14af2ba42737502459edf2bbbc70da  ./scripts/build_delta_image.sh
 6885af8a547675e1b1fd62da7885e1c6819f389e0ad885dbfc11e359ea9fbdb1  ./scripts/patch_running_container.sh
-18a59779833a47e7da2e18b372a025640d1f3f9e272142348de336ba5cca75be  ./scripts/verify_delta_package.sh
+1487ad4488eaf989f403f1da21a2b9c33fc689b9c79fcdd03f558dcd33502ce3  ./scripts/verify_delta_package.sh

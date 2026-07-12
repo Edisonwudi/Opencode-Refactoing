@@ -1103,6 +1103,30 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("injected_msg_no_reset_calls", calls.length, 1, "calls")
   }
 
+  // 13b. pure-attachment message (no text) DOES reset (real user input)
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = freshRuntime({ client })
+    record(rt, { autoContinue: true })
+    const cleared = rt.handleChatMessage("s1", [{ type: "file", url: "/tmp/x.java" }])
+    assertEqual("attachment_resets_cleared", cleared, true, "cleared")
+    rt.handleIdle("s1")
+    await flush()
+    assertEqual("attachment_resets_calls", calls.length, 0, "calls")
+  }
+
+  // 13c. empty parts array does NOT reset (not a real message)
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = freshRuntime({ client })
+    record(rt, { autoContinue: true })
+    const cleared = rt.handleChatMessage("s1", [])
+    assertEqual("empty_parts_no_reset", cleared, false, "cleared")
+    rt.handleIdle("s1")
+    await flush()
+    assertEqual("empty_parts_still_dispatches", calls.length, 1, "calls")
+  }
+
   // 14. batch environment does not dispatch
   for (const extra of [{ SMELL_BATCH_RUN: "1" }, { SMELL_PROJECT_ROOT: "/data/proj" }]) {
     const { client, calls } = makeFakeClient()

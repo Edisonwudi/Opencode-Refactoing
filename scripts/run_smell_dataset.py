@@ -840,6 +840,14 @@ def _run_opencode(
                 detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
             except OSError:
                 pass
+        # If still no sid and the reader thread is alive (proc was killed before
+        # EOF), drain it fully then re-parse to avoid losing the session id.
+        if not detected_sid and reader.is_alive():
+            reader.join(timeout=10)
+            try:
+                detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
         return rc, detected_sid
 
 
@@ -880,6 +888,12 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     started = time.time()
     sample_dir = run_dir / "samples" / f"sample-{_sanitize(sample.sample_id)}-{_sanitize(sample.project_name)}"
     sample_dir.mkdir(parents=True, exist_ok=True)
+    # Clean any stale opencode-home from a previous run of the same sample to
+    # avoid opencode.db session residue / corruption. The home is recreated by
+    # _prepare_opencode_home on the first _run_opencode call.
+    stale_home = sample_dir / "opencode-home"
+    if stale_home.exists():
+        shutil.rmtree(stale_home, ignore_errors=True)
     agent = args.agent or ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
     verification_mode = _effective_verification_mode(sample, args)
 
@@ -902,10 +916,16 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         attempt_suffix = "" if attempt_idx == 0 else f".{attempt_idx}"
         failure_context = ""
         if attempt_idx > 0 and attempts:
-            # On a same-session continuation the agent already has the full
-            # conversation history, so a short nudge suffices (no need to repeat
-            # all highlights/recommendations the agent can already see).
-            failure_context = _build_continuation_nudge(attempts[-1]["verify_payload"], attempt_idx)
+            # When continuing on the SAME session (run -s), the agent already
+            # has the full conversation history, so a short nudge suffices.
+            # When session_id is empty (degraded — id parsing failed or
+            # session not found), the retry starts a NEW session where the
+            # agent has no history, so we must feed the full failure_pack
+            # context (highlights + recommendations) instead.
+            if current_session_id:
+                failure_context = _build_continuation_nudge(attempts[-1]["verify_payload"], attempt_idx)
+            else:
+                failure_context = _build_failure_context(attempts[-1]["verify_payload"], attempt_idx)
 
         opencode_returncode, attempt_session_id = _run_opencode(
             execution_sample,
