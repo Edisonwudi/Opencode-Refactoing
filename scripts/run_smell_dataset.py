@@ -292,8 +292,18 @@ def _copy_tree_item(source: Path, target: Path) -> None:
 
 
 def _bootstrap_opencode(project_root: Path, sample_dir: Path) -> None:
+    """Install the runner's .opencode config into the project root.
+
+    Idempotent: if the target already has our plugin (smell.ts), skip the
+    entire bootstrap. This prevents repeated calls (e.g. from retry attempts)
+    from trying to move/overwrite an already-bootstrapped directory, which
+    fails on read-only filesystems or permission-restricted volumes.
+    """
     source = ROOT / ".opencode"
     target = project_root / ".opencode"
+    if (target / "plugins" / "smell.ts").exists():
+        # Already bootstrapped by a previous call — skip.
+        return
     if target.exists() or target.is_symlink():
         backup = sample_dir / "original-opencode"
         if backup.exists():
@@ -718,7 +728,9 @@ def _run_opencode(
     attempt continues on the SAME session via ``opencode run -s <id>``, so the
     agent keeps its full conversation history across retries.
     """
-    _bootstrap_opencode(sample.project_root, sample_dir)
+    # NOTE: _bootstrap_opencode is called once in _run_sample (before the retry
+    # loop), not here — repeated calls on each attempt caused RUNNER_FAILED
+    # when the target directory was on a read-only / permission-restricted path.
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
     task = _task_prompt(sample, args, verification_mode, agent, failure_context=failure_context)
     task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
@@ -904,6 +916,14 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         json.dumps({**sample.raw, "execution_project_root": str(execution_sample.project_root)}, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
+
+    # Bootstrap .opencode ONCE into the project root (before the retry loop).
+    # Previously this was called inside _run_opencode on every attempt; the
+    # second call would try to shutil.move the already-bootstrapped .opencode,
+    # failing with "Operation not permitted" on read-only / volume mounts.
+    # _bootstrap_opencode is now idempotent (skips if smell.ts exists), so even
+    # if called again it is safe.
+    _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
     # Retry loop: attempt 0 creates a fresh session, retries continue on the
     # SAME session via ``opencode run -s <id>`` so the agent keeps its full
