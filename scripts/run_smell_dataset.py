@@ -24,6 +24,15 @@ if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
 from smell_core.config import VERIFICATION_MODES  # noqa: E402
+from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
+from smell_core.project_revision import (  # noqa: E402
+    DEFAULT_REVISIONS_PATH,
+    ProjectRevisionError,
+    assert_commit_present,
+    load_revisions,
+    resolve_revision,
+    verify_checkout,
+)
 
 
 OPENCODE_BATCH_API_KEY_ENV = "SMELL_OPENCODE_API_KEY"
@@ -49,44 +58,6 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
         "status": "active",
     },
 }
-
-# --- Batch runner retry loop -------------------------------------------------
-# MAX_RUNNER_CONTINUE_ATTEMPTS mirrors the plugin's MAX_IDLE_CONTINUE_ATTEMPTS
-# (see .opencode/plugins/smell.ts). The two must be kept in sync: the plugin
-# handles interactive-TUI continuation on session.idle, the runner handles
-# batch continuation because `opencode run` is a single-shot process that does
-# not emit session.idle.
-MAX_RUNNER_CONTINUE_ATTEMPTS = 2
-
-# REPAIRABLE_FAILURE_CATEGORIES mirrors the plugin's REPAIRABLE_CATEGORIES.
-# Python cannot import the TypeScript constant, so this is a hand-maintained
-# mirror. The single source of truth for the category strings is
-# runtime/python/bridge/smell_bridge.py::_classify_failure_pack; verify.json's
-# failure_pack.failure_category carries them. Dependency / offline / auth /
-# provider / timeout / unknown failures are intentionally NOT retried.
-REPAIRABLE_FAILURE_CATEGORIES = frozenset(
-    {
-        "SMELL_GUARD_FAILED",
-        "BUILD_COMPILE_ERROR",
-        "TEST_BEHAVIOR_REGRESSION",
-        "TEST_REFLECTION_ENTRY_STALE",
-        "SAMPLE_TEST_FAILED",
-    }
-)
-
-# Artifact filenames produced per attempt. Used by _promote_final_artifacts to
-# copy the last attempt's outputs to the canonical (suffix-less) names.
-_PER_ATTEMPT_ARTIFACT_NAMES = (
-    "run.log",
-    "run.events.jsonl",
-    "task.txt",
-    "command.json",
-    "verify.json",
-    "diff.patch",
-    "diff.stat",
-)
-
-
 
 @dataclass(frozen=True)
 class Sample:
@@ -210,8 +181,8 @@ def _remap_text(value: str, source_root: Path, target_root: Path) -> str:
 def _restore_worktree_build_wrappers(canonical_root: Path, worktree: Path) -> None:
     """Copy gitignored/untracked build-wrapper bootstrap files the worktree lacks.
 
-    `git worktree add --detach HEAD` only checks out tracked files, so build
-    wrappers whose bootstrap artifacts are gitignored (e.g. Maven Wrapper's
+    The isolated Git checkout only contains tracked files, so build wrappers
+    whose bootstrap artifacts are gitignored (e.g. Maven Wrapper's
     ``.mvn/wrapper/maven-wrapper.jar`` or Gradle's
     ``gradle/wrapper/gradle-wrapper.jar``) are missing in the worktree and break
     offline builds. Restore them from the canonical working tree so the worktree
@@ -233,7 +204,29 @@ def _restore_worktree_build_wrappers(canonical_root: Path, worktree: Path) -> No
             shutil.copy2(src_file, dst_file)
 
 
-def _prepare_worktree(sample: Sample, run_dir: Path) -> Sample:
+def _remove_worktree_checkout(canonical_root: Path, worktree: Path) -> None:
+    """Remove either a legacy linked worktree or the current isolated clone."""
+    if (worktree / ".git").is_file():
+        _git(canonical_root, ["worktree", "remove", "--force", str(worktree)])
+    shutil.rmtree(worktree, ignore_errors=True)
+
+
+def _execution_checkout_run_dir(run_dir: Path) -> Path:
+    """Keep executable Git metadata on the container's native filesystem."""
+    return Path(tempfile.gettempdir()) / "opencode-refactor-worktrees" / run_dir.name
+
+
+def _prepare_worktree(sample: Sample, run_dir: Path, *, target_commit: str) -> Sample:
+    """Create an isolated checkout pinned to ``target_commit``.
+
+    ``target_commit`` is REQUIRED: there is no HEAD fallback. Callers (both the real
+    refactor runner and baseline-check) must resolve the authoritative project_commit
+    via :mod:`smell_core.project_revision` and pass it here.
+    """
+    if not target_commit:
+        raise RuntimeError(
+            "_prepare_worktree requires a non-empty target_commit; HEAD fallback is forbidden"
+        )
     canonical_root = sample.project_root.resolve()
     safe_proc = _run(["git", "config", "--global", "--add", "safe.directory", "*"], canonical_root)
     if safe_proc.returncode != 0:
@@ -241,12 +234,29 @@ def _prepare_worktree(sample: Sample, run_dir: Path) -> Sample:
 
     worktree = run_dir / "worktrees" / f"sample-{_sanitize(sample.sample_id)}" / canonical_root.name
     if worktree.exists():
-        _git(canonical_root, ["worktree", "remove", "--force", str(worktree)])
-        shutil.rmtree(worktree, ignore_errors=True)
+        _remove_worktree_checkout(canonical_root, worktree)
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    proc = _git(canonical_root, ["worktree", "add", "--detach", str(worktree), "HEAD"])
+    # Keep a regular .git directory in each isolated checkout. Some build
+    # plugins (notably MyBatis' mycila license plugin through JGit) treat the
+    # .git pointer file created by `git worktree` as a bare repository. A
+    # shared local clone preserves isolation without duplicating Git objects
+    # and works with both command-line Git and those plugins.
+    proc = _git(canonical_root, ["clone", "--shared", "--no-checkout", str(canonical_root), str(worktree)])
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr or proc.stdout or f"failed to create worktree at {worktree}")
+        raise RuntimeError(proc.stderr or proc.stdout or f"failed to create isolated checkout at {worktree}")
+    # Pin to the authoritative target_commit. Verified against the manifest tree by the
+    # caller via smell_core.project_revision after the worktree is materialized.
+    verify_proc = _git(canonical_root, ["cat-file", "-e", f"{target_commit}^{{commit}}"])
+    if verify_proc.returncode != 0:
+        _remove_worktree_checkout(canonical_root, worktree)
+        raise RuntimeError(
+            f"target_commit {target_commit} does not exist in {canonical_root}: "
+            f"{verify_proc.stderr or verify_proc.stdout}"
+        )
+    checkout_proc = _git(worktree, ["checkout", "--detach", target_commit])
+    if checkout_proc.returncode != 0:
+        _remove_worktree_checkout(canonical_root, worktree)
+        raise RuntimeError(checkout_proc.stderr or checkout_proc.stdout or f"failed to check out {target_commit} at {worktree}")
     filemode_proc = _git(worktree, ["config", "core.filemode", "false"])
     if filemode_proc.returncode != 0:
         raise RuntimeError(filemode_proc.stderr or filemode_proc.stdout or "failed to configure worktree filemode")
@@ -408,10 +418,8 @@ def _write_opencode_config(sample_dir: Path, args: argparse.Namespace) -> tuple[
 
 
 def _prepare_opencode_home(sample_dir: Path) -> dict[str, str]:
-    # Use a FIXED home directory under sample_dir (not a random mkdtemp) so that
-    # all retry attempts on the same sample share the same opencode.db. This is
-    # required for `opencode run -s <session_id>` to find the session created by
-    # the first attempt.
+    # Use a fixed isolated home under sample_dir so the command session and its
+    # native agent loop share one opencode.db without leaking cross-sample state.
     home = sample_dir / "opencode-home"
     home.mkdir(parents=True, exist_ok=True)
     config = home / ".config" / "opencode"
@@ -466,71 +474,24 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
     so the retry loop and self-tests can call it without running subprocesses.
     """
     verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
-    status = verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
-    if opencode_returncode != 0 and verify_returncode != 0:
-        status = "OPENCODE_FAILED"
-    return status
+    verify_success = bool(verify_payload.get("success")) if isinstance(verify_payload, dict) else False
+    if opencode_returncode != 0:
+        if opencode_returncode == 124 and verify_returncode == 0 and verify_success and verify_status == "PASS":
+            return "PASS_AFTER_OPENCODE_TIMEOUT"
+        return "OPENCODE_FAILED"
+    return verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
 
 
-def _build_failure_context(verify_payload: dict[str, Any], attempt_number: int) -> str:
-    """Build the failure_pack context to feed back to the agent on a retry.
-
-    Returns "" when there is no usable failure_pack (the retry will still run
-    but without prior-failure context). Sensitive content is not specifically
-    redacted here because this context is sent to the model via opencode run as
-    part of the task text, not surfaced as a visible TUI auto-continue message.
-    """
-    if not isinstance(verify_payload, dict):
-        return ""
-    pack = verify_payload.get("failure_pack")
-    if not isinstance(pack, dict):
-        return ""
-    category = str(pack.get("failure_category") or "").strip()
-    verify_status = str(pack.get("verify_status") or "").strip()
-    lines = [f"Previous attempt {attempt_number} did not pass smell_verify."]
-    if verify_status:
-        lines.append(f"Last verify status: {verify_status}.")
-    if category:
-        lines.append(f"Failure category: {category}.")
-    highlights = pack.get("highlights")
-    if isinstance(highlights, list):
-        clean_h = [str(h).strip() for h in highlights if str(h).strip()]
-        if clean_h:
-            lines.append("Failure highlights:")
-            for h in clean_h[:3]:
-                snippet = h if len(h) <= 240 else h[:240] + "..."
-                lines.append(f"- {snippet}")
-    recommendations = pack.get("recommendations")
-    if isinstance(recommendations, list):
-        clean_r = [str(r).strip() for r in recommendations if str(r).strip()]
-        if clean_r:
-            lines.append("Recommendations:")
-            for r in clean_r[:3]:
-                lines.append(f"- {r}")
-    lines.append("Make one narrow corrective edit based on the latest failure_pack, then call smell_verify again. Do not repeat the previous edit without new evidence. Do not modify or weaken tests.")
-    return "\n".join(lines)
+OPENCODE_SHUTDOWN_GRACE_SECONDS = 60
 
 
-def _build_continuation_nudge(verify_payload: dict[str, Any], attempt_number: int) -> str:
-    """Short nudge for a same-session continuation (run -s).
+def _opencode_timeout_seconds(sample_deadline: int) -> int:
+    """Derive the runner hard stop from the one public sample budget."""
+    return sample_deadline + OPENCODE_SHUTDOWN_GRACE_SECONDS
 
-    Unlike _build_failure_context, this does NOT repeat highlights/recommendations
-    because the agent already has the full conversation history from previous
-    attempts on the same session. It only points at the latest failure category
-    so the agent knows which failure_pack to re-read.
-    """
-    category = _failure_category_from_verify_payload(verify_payload)
-    verify_status = ""
-    pack = verify_payload.get("failure_pack") if isinstance(verify_payload, dict) else None
-    if isinstance(pack, dict):
-        verify_status = str(pack.get("verify_status") or "").strip()
-    parts = [f"Attempt {attempt_number} did not pass smell_verify."]
-    if verify_status:
-        parts.append(f"Last status: {verify_status}.")
-    if category:
-        parts.append(f"Failure category: {category}.")
-    parts.append("Read the latest failure_pack, make one narrow corrective edit, then call smell_verify again. Do not repeat the previous edit without new evidence. Do not modify or weaken tests.")
-    return "\n".join(parts)
+
+def _is_accepted_status(status: object) -> bool:
+    return status in {"PASS", "PASS_AFTER_OPENCODE_TIMEOUT"}
 
 
 def _attempt_artifact_path(sample_dir: Path, name: str, attempt_suffix: str) -> Path:
@@ -538,59 +499,11 @@ def _attempt_artifact_path(sample_dir: Path, name: str, attempt_suffix: str) -> 
     return sample_dir / f"{name}{attempt_suffix}"
 
 
-def _promote_final_artifacts(sample_dir: Path, total_attempts: int) -> None:
-    """Make the final attempt's artifacts available at canonical (suffix-less) names.
-
-    The first attempt (suffix '') already writes canonical names, so nothing to
-    do when total_attempts == 1. For multi-attempt samples:
-      1. Rename the first attempt's suffix-less files to '.0' so attempt-0
-         history is preserved (otherwise step 2 would overwrite it).
-      2. Copy the final attempt's suffixed files to the canonical names so
-         existing consumers that read sample_dir/verify.json etc. keep working.
-    After this, '.0'/'.1'/... hold each attempt and the suffix-less names hold
-    the final attempt's output.
-    """
-    if total_attempts <= 1:
-        return
-    final_suffix = f".{total_attempts - 1}"
-    for name in _PER_ATTEMPT_ARTIFACT_NAMES:
-        # Step 1: preserve attempt 0's suffix-less output as '.0'.
-        canonical = sample_dir / name
-        attempt0 = _attempt_artifact_path(sample_dir, name, ".0")
-        if canonical.exists() and canonical.is_file():
-            try:
-                shutil.move(str(canonical), str(attempt0))
-            except OSError:
-                pass
-        # Step 2: copy the final attempt's output to the canonical name.
-        src = _attempt_artifact_path(sample_dir, name, final_suffix)
-        if src.exists() and src.is_file():
-            try:
-                shutil.copyfile(str(src), str(canonical))
-            except OSError:
-                pass
-
-
-def _should_retry(status: str, verify_payload: dict[str, Any], attempt_idx: int) -> bool:
-    """Decide whether to retry after a failed attempt.
-
-    Pure function: returns True only when the failure is repairable AND the
-    attempt budget has not been exhausted. PASS never retries.
-    """
-    if status == "PASS":
-        return False
-    if attempt_idx >= MAX_RUNNER_CONTINUE_ATTEMPTS:
-        return False
-    category = _failure_category_from_verify_payload(verify_payload)
-    return category in REPAIRABLE_FAILURE_CATEGORIES
-
-
 def _task_prompt(
     sample: Sample,
     args: argparse.Namespace,
     verification_mode: str,
     agent: str,
-    failure_context: str = "",
 ) -> str:
     idea_enabled = agent == "java-refactor-agent-idea"
     lines = [
@@ -610,11 +523,21 @@ def _task_prompt(
     if idea_enabled and args.idea_refactor_cli:
         lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
     lines.append("")
-    if failure_context:
-        lines.append(failure_context)
-        lines.append("")
     lines.append("Repair this one Java smell from the dataset row. Preserve behavior. Call smell_verify as the final acceptance gate.")
     return "\n".join(lines)
+
+
+def _command_arguments(task: str, args: argparse.Namespace, verification_mode: str) -> str:
+    options = [
+        f"--verification-mode={verification_mode}",
+        f"--loop-mode={args.loop_mode}",
+        f"--loop-max={args.loop_max}",
+        f"--loop-no-progress-limit={args.loop_no_progress_limit}",
+        f"--loop-on={args.loop_on}",
+        f"--sample-deadline={args.sample_deadline}",
+        f"--loop-instruction={args.loop_instruction}",
+    ]
+    return " ".join(options) + " -- " + task
 
 
 def _copy_verify_artifacts(sample_dir: Path, verify_payload: dict[str, Any], attempt_suffix: str = "") -> None:
@@ -669,7 +592,7 @@ def _run_verify(
         env["SMELL_REQUIRE_BUILD_TEST"] = "1"
     else:
         env.pop("SMELL_REQUIRE_BUILD_TEST", None)
-    proc = _run(cmd, ROOT, env=env, timeout=args.verify_timeout)
+    proc = _run(cmd, ROOT, env=env, timeout=args.sample_deadline)
     payload: dict[str, Any]
     try:
         payload = json.loads(proc.stdout)
@@ -718,36 +641,24 @@ def _run_opencode(
     args: argparse.Namespace,
     agent: str,
     verification_mode: str,
-    attempt_suffix: str = "",
-    failure_context: str = "",
-    session_id: str = "",
 ) -> tuple[int, str]:
-    """Run one opencode attempt. Returns (returncode, session_id).
-
-    When session_id is empty a fresh session is created. When non-empty the
-    attempt continues on the SAME session via ``opencode run -s <id>``, so the
-    agent keeps its full conversation history across retries.
-    """
-    # NOTE: _bootstrap_opencode is called once in _run_sample (before the retry
-    # loop), not here — repeated calls on each attempt caused RUNNER_FAILED
-    # when the target directory was on a read-only / permission-restricted path.
+    """Run one command-owned OpenCode loop. Returns (returncode, session_id)."""
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
-    task = _task_prompt(sample, args, verification_mode, agent, failure_context=failure_context)
-    task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
-    task_path.write_text(task + "\n", encoding="utf-8")
+    task = _task_prompt(sample, args, verification_mode, agent)
+    command_arguments = _command_arguments(task, args, verification_mode)
+    task_path = _attempt_artifact_path(sample_dir, "task.txt", "")
+    task_path.write_text(command_arguments + "\n", encoding="utf-8")
 
     env = os.environ.copy()
     env.update(_prepare_opencode_home(sample_dir))
     env.update(runtime_env)
     if config_path:
         env["OPENCODE_CONFIG"] = str(config_path)
-    # Batch continuation is owned by this runner's retry loop. Retries use
-    # ``opencode run -s <session_id>`` to continue on the same session, so the
-    # agent retains its full conversation history. The plugin's session.idle
-    # auto-continue stays off because the runner is the sole owner of batch
-    # retries.
+    # The custom command owns the native in-session loop. Disable the legacy
+    # session.idle mechanism so there is exactly one controller.
     env["SMELL_BATCH_RUN"] = "1"
     env["SMELL_IDLE_CONTINUE_MODE"] = "off"
+    env["SMELL_BRIDGE_FILE"] = str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py")
     env["SMELL_PROJECT_ROOT"] = str(sample.project_root)
     if sample.canonical_project_root:
         env["SMELL_CANONICAL_PROJECT_ROOT"] = str(sample.canonical_project_root)
@@ -770,43 +681,60 @@ def _run_opencode(
     # --format json: raw JSON events on stdout (for session-id parsing).
     # --print-logs: human-readable logs on stderr (written to run.log).
     cmd = [
-        args.opencode_bin, "run", task,
+        args.opencode_bin, "run",
+        "--command", "java-refactor-run-idea" if agent == "java-refactor-agent-idea" else "java-refactor-run",
         "--agent", agent,
         "--model", args.model,
         "--dangerously-skip-permissions",
         "--format", "json",
         "--print-logs",
     ]
-    if session_id:
-        cmd.extend(["--session", session_id])
     command_payload = {
         "cmd": cmd,
+        "command_arguments_transport": "stdin",
+        "command_arguments_length": len(command_arguments),
         "cwd": str(sample.project_root),
         "agent": agent,
         "auth": {**auth_meta, "api_key_source": "configured" if auth_meta.get("api_key_configured") else ""},
         "verification_mode": verification_mode,
-        "attempt_suffix": attempt_suffix,
-        "is_retry": bool(attempt_suffix),
-        "is_continuation": bool(session_id),
-        "session_id": session_id,
+        "loop_policy": parse_command_policy(command_arguments).loop.to_dict(),
+        "time_budget": {
+            "source": "sample-deadline",
+            "sample_deadline_seconds": args.sample_deadline,
+            "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
+            "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
+            "final_verify_timeout_seconds": args.sample_deadline,
+            "idle_watchdog_enabled": False,
+        },
     }
-    command_path = _attempt_artifact_path(sample_dir, "command.json", attempt_suffix)
+    command_path = _attempt_artifact_path(sample_dir, "command.json", "")
     command_path.write_text(json.dumps(command_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    log_path = _attempt_artifact_path(sample_dir, "run.log", attempt_suffix)
-    events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", attempt_suffix)
+    log_path = _attempt_artifact_path(sample_dir, "run.log", "")
+    events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", "")
     with log_path.open("w", encoding="utf-8") as log, events_path.open("w", encoding="utf-8") as events_file:
         proc = subprocess.Popen(
             cmd,
             cwd=str(sample.project_root),
             env=env,
             text=True,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=log,
             start_new_session=True,
         )
+        # OpenCode already supports reading the message from stdin. Keep the
+        # command arguments as one exact string so yargs cannot coerce numeric
+        # evidence tokens into numbers before run.ts formats the message.
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(command_arguments)
+        except BrokenPipeError:
+            pass
+        finally:
+            proc.stdin.close()
         # Read stdout (JSON events) incrementally, write to events file, and
-        # detect session id. Also update idle-activity based on stdout growth.
+        # detect session id.
         detected_sid = ""
 
         def _drain_stdout():
@@ -822,25 +750,13 @@ def _run_opencode(
 
         reader = threading.Thread(target=_drain_stdout, daemon=True)
         reader.start()
-        deadline = time.monotonic() + args.timeout
-        last_log_marker = (-1, -1)
-        last_activity = time.monotonic()
+        deadline = time.monotonic() + _opencode_timeout_seconds(args.sample_deadline)
         timeout_code = 0
         while proc.poll() is None:
             if time.monotonic() > deadline:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=10)
                 timeout_code = 124
-                break
-            marker = _file_marker(log_path)
-            events_marker = _file_marker(events_path)
-            if marker != last_log_marker or events_marker != last_log_marker:
-                last_log_marker = max(marker, events_marker)
-                last_activity = time.monotonic()
-            if args.opencode_log_idle_timeout and time.monotonic() - last_activity > args.opencode_log_idle_timeout:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
-                timeout_code = 125
                 break
             time.sleep(1)
         reader.join(timeout=5)
@@ -861,14 +777,6 @@ def _run_opencode(
             except OSError:
                 pass
         return rc, detected_sid
-
-
-def _file_marker(path: Path) -> tuple[int, int]:
-    try:
-        stat = path.stat()
-    except OSError:
-        return (-1, -1)
-    return (stat.st_size, stat.st_mtime_ns)
 
 
 def _append_result(results_path: Path, row: dict[str, Any]) -> None:
@@ -896,6 +804,57 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Diagnostic mode: create a REAL isolated checkout pinned to project_commit, verify it
+    against the manifest, and record the revision audit — but do NOT invoke opencode/verify.
+
+    Used to prove the real refactor entry pins project_commit (no HEAD fallback) without
+    calling the model or performing a refactor.
+    """
+    started = time.time()
+    sample_dir = run_dir / "samples" / f"sample-{_sanitize(sample.sample_id)}-{_sanitize(sample.project_name)}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    canonical_root = sample.project_root.resolve()
+    row: dict[str, Any] = {
+        "sample_id": sample.sample_id,
+        "smell": sample.smell,
+        "project_name": sample.project_name,
+        "project_root": str(sample.project_root),
+    }
+    try:
+        revisions = load_revisions(args.project_revisions)
+        rev = resolve_revision(sample.project_name, revisions, args.project_revisions)
+        assert_commit_present(canonical_root, rev.project_commit)
+        prepared = _prepare_worktree(
+            sample, _execution_checkout_run_dir(run_dir), target_commit=rev.project_commit
+        )
+        audit = verify_checkout(prepared.project_root, rev)
+        row.update({
+            "status": "CHECKOUT_OK",
+            "execution_project_root": str(prepared.project_root),
+            **audit,
+        })
+        _remove_worktree_checkout(canonical_root, prepared.project_root)
+    except ProjectRevisionError as exc:
+        row.update({
+            "status": exc.status,
+            "execution_project_root": "",
+            "requested_project_commit": exc.extra.get("project_commit", "") or (rev.project_commit if "rev" in dir() else ""),
+            "actual_commit": "",
+            "expected_tree_hash": rev.expected_tree_hash if "rev" in dir() else "",
+            "actual_tree_hash": "",
+            "project_revision_alignment": exc.status,
+            "project_revisions_path": args.project_revisions,
+            "error_message": exc.message,
+        })
+    except Exception as exc:  # noqa: BLE001
+        row.update({"status": "CHECKOUT_ERROR", "execution_project_root": "",
+                    "project_revision_alignment": "CHECKOUT_ERROR", "error_message": str(exc)})
+    row["duration_seconds"] = f"{time.time() - started:.1f}"
+    (sample_dir / "checkout_audit.json").write_text(json.dumps(row, indent=2) + "\n", encoding="utf-8")
+    return row
+
+
 def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     sample_dir = run_dir / "samples" / f"sample-{_sanitize(sample.sample_id)}-{_sanitize(sample.project_name)}"
@@ -909,92 +868,88 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     agent = args.agent or ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
     verification_mode = _effective_verification_mode(sample, args)
 
-    # The worktree is prepared once and reused across retries: a retry must see
-    # the previous attempt's edits (continuation semantics), not a fresh tree.
-    execution_sample = _prepare_worktree(sample, run_dir) if args.worktree else replace(sample, canonical_project_root=sample.project_root)
+    # One isolated checkout is used for the complete command-owned native loop.
+    # The checkout is ALWAYS pinned to the authoritative project_commit from
+    # project-revisions.json (resolved via smell_core.project_revision). There is no
+    # HEAD fallback: if the manifest entry / commit / tree cannot be honored, the
+    # sample fails fast with an explicit PROJECT_* status.
+    revision_audit: dict[str, str] = {}
+    revisions_path = getattr(args, "project_revisions", DEFAULT_REVISIONS_PATH)
+    try:
+        revisions = load_revisions(revisions_path)
+        rev = resolve_revision(sample.project_name, revisions, revisions_path)
+        assert_commit_present(sample.project_root.resolve(), rev.project_commit)
+        execution_sample = (
+            _prepare_worktree(
+                sample, _execution_checkout_run_dir(run_dir), target_commit=rev.project_commit
+            )
+            if args.worktree
+            else replace(sample, canonical_project_root=sample.project_root)
+        )
+        if args.worktree:
+            revision_audit = verify_checkout(execution_sample.project_root, rev)
+    except ProjectRevisionError as exc:
+        # Fail fast: record the deviation and abort this sample without running
+        # opencode/verify or touching runtime HEAD.
+        revision_audit = {
+            "requested_project_commit": rev.project_commit if "rev" in dir() else "",
+            "actual_commit": "",
+            "expected_tree_hash": rev.expected_tree_hash if "rev" in dir() else "",
+            "actual_tree_hash": "",
+            "project_revision_alignment": exc.status,
+            "project_revisions_path": revisions_path,
+        }
+        row = {
+            "sample_id": sample.sample_id,
+            "smell": sample.smell,
+            "project_name": sample.project_name,
+            "project_root": str(sample.project_root),
+            "execution_project_root": "",
+            "location": sample.location,
+            "verification_mode": verification_mode,
+            "agent": agent,
+            "status": exc.status,
+            "opencode_returncode": -1,
+            "verify_returncode": -1,
+            "duration_seconds": f"{time.time() - started:.1f}",
+            "sample_dir": str(sample_dir),
+            "note": f"project_revision_error: {exc.status}: {exc.message}",
+        }
+        result_summary = {**row, "attempts": [], "revision_audit": revision_audit}
+        (sample_dir / "result.json").write_text(
+            json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+        )
+        return row
     (sample_dir / "sample.json").write_text(
         json.dumps({**sample.raw, "execution_project_root": str(execution_sample.project_root)}, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
 
-    # Bootstrap .opencode ONCE into the project root (before the retry loop).
-    # Previously this was called inside _run_opencode on every attempt; the
-    # second call would try to shutil.move the already-bootstrapped .opencode,
-    # failing with "Operation not permitted" on read-only / volume mounts.
-    # _bootstrap_opencode is now idempotent (skips if smell.ts exists), so even
-    # if called again it is safe.
+    # Bootstrap .opencode once before starting the command-owned loop.
     _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
-    # Retry loop: attempt 0 creates a fresh session, retries continue on the
-    # SAME session via ``opencode run -s <id>`` so the agent keeps its full
-    # conversation history. The loop stops on PASS, on a non-repairable failure
-    # category, or when the attempt budget is exhausted.
-    attempts: list[dict[str, Any]] = []
-    final_status = "FAILED"
-    current_session_id = ""
-    for attempt_idx in range(MAX_RUNNER_CONTINUE_ATTEMPTS + 1):
-        attempt_suffix = "" if attempt_idx == 0 else f".{attempt_idx}"
-        failure_context = ""
-        if attempt_idx > 0 and attempts:
-            # When continuing on the SAME session (run -s), the agent already
-            # has the full conversation history, so a short nudge suffices.
-            # When session_id is empty (degraded — id parsing failed or
-            # session not found), the retry starts a NEW session where the
-            # agent has no history, so we must feed the full failure_pack
-            # context (highlights + recommendations) instead.
-            if current_session_id:
-                failure_context = _build_continuation_nudge(attempts[-1]["verify_payload"], attempt_idx)
-            else:
-                failure_context = _build_failure_context(attempts[-1]["verify_payload"], attempt_idx)
-
-        opencode_returncode, attempt_session_id = _run_opencode(
-            execution_sample,
-            sample_dir,
-            args,
-            agent,
-            verification_mode,
-            attempt_suffix=attempt_suffix,
-            failure_context=failure_context,
-            session_id=current_session_id,
-        )
-        if not current_session_id and attempt_session_id:
-            current_session_id = attempt_session_id
-        verify_returncode, verify_payload = _run_verify(
-            execution_sample,
-            sample_dir,
-            args,
-            verification_mode,
-            attempt_suffix=attempt_suffix,
-        )
-        status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
-        attempts.append(
-            {
-                "attempt": attempt_idx,
-                "opencode_returncode": opencode_returncode,
-                "verify_returncode": verify_returncode,
-                "verify_payload": verify_payload,
-                "status": status,
-                "failure_category": _failure_category_from_verify_payload(verify_payload),
-                "session_id": attempt_session_id or current_session_id,
-                "is_continuation": bool(current_session_id and attempt_idx > 0),
-            }
-        )
-        final_status = status
-        print(
-            f"    attempt {attempt_idx + 1}/{MAX_RUNNER_CONTINUE_ATTEMPTS + 1}: "
-            f"{status} (category={attempts[-1]['failure_category'] or 'n/a'}"
-            f"{f', session={current_session_id[:16]}' if current_session_id else ''})",
-            flush=True,
-        )
-        if not _should_retry(status, verify_payload, attempt_idx):
-            break
-
-    total_attempts = len(attempts)
-    _promote_final_artifacts(sample_dir, total_attempts)
-    last = attempts[-1]
-    note = f"attempts={total_attempts}" if total_attempts > 1 else ""
-    if total_attempts > 1 and last["failure_category"]:
-        note += f" final_category={last['failure_category']}" if note else f"final_category={last['failure_category']}"
+    # The custom command and smell_verify own the native in-session loop. The
+    # batch runner launches it once, then performs one independent final audit;
+    # it does not add a second cross-process retry policy.
+    opencode_returncode, session_id = _run_opencode(
+        execution_sample, sample_dir, args, agent, verification_mode
+    )
+    verify_returncode, verify_payload = _run_verify(
+        execution_sample, sample_dir, args, verification_mode
+    )
+    final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
+    last = {
+        "attempt": 0,
+        "opencode_returncode": opencode_returncode,
+        "verify_returncode": verify_returncode,
+        "verify_payload": verify_payload,
+        "status": final_status,
+        "failure_category": _failure_category_from_verify_payload(verify_payload),
+        "session_id": session_id,
+        "is_continuation": False,
+    }
+    attempts = [last]
+    note = f"loop_policy={args.loop_mode}:{args.loop_max}"
 
     row = {
         "sample_id": sample.sample_id,
@@ -1012,7 +967,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "sample_dir": str(sample_dir),
         "note": note,
     }
-    result_summary = {**row, "attempts": attempts}
+    result_summary = {**row, "attempts": attempts, "revision_audit": revision_audit}
     (sample_dir / "result.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return row
 
@@ -1034,21 +989,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", action="append")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--timeout", type=int, default=900, help="Seconds allowed for OpenCode per sample.")
-    parser.add_argument("--verify-timeout", type=int, default=900, help="Seconds allowed for final independent verify.")
-    parser.add_argument("--opencode-log-idle-timeout", type=int, default=180, help="Stop OpenCode after this many seconds with no log growth. Use 0 to disable.")
+    parser.add_argument("--loop-mode", choices=["off", "verify-failure"], default="verify-failure")
+    parser.add_argument("--loop-max", type=int, choices=range(0, 6), default=2)
+    parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=1)
+    parser.add_argument("--loop-on", default="smell,compile,test")
+    parser.add_argument("--loop-instruction", default=LoopPolicy().instruction)
+    parser.add_argument(
+        "--sample-deadline",
+        type=int,
+        default=1800,
+        help="Single per-phase time budget in seconds for the command loop and final verify; the runner adds only a 60-second OpenCode shutdown grace.",
+    )
     parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="local")
     parser.add_argument("--agent", choices=["java-refactor-agent", "java-refactor-agent-idea"], default="")
     parser.add_argument("--idea", action="store_true", help="Use java-refactor-agent-idea and expose IDEA CLI.")
     parser.add_argument("--idea-refactor-cli", default=os.environ.get("IDEA_REFACTOR_CLI", ""))
-    parser.add_argument("--no-worktree", dest="worktree", action="store_false", help="Mutate project_path directly. Default is per-sample git worktree.")
+    parser.add_argument("--no-worktree", dest="worktree", action="store_false", help="Mutate project_path directly. Default is one isolated Git checkout per sample.")
     parser.set_defaults(worktree=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--checkout-only",
+        action="store_true",
+        help="Diagnostic: create a real isolated checkout pinned to project_commit and verify "
+        "it against the manifest, but do NOT invoke opencode/verify. Proves the real refactor "
+        "entry pins project_commit without calling the model.",
+    )
+    parser.add_argument(
+        "--project-revisions",
+        default=os.environ.get("PROJECT_REVISIONS", DEFAULT_REVISIONS_PATH),
+        help="JSON manifest mapping project_name -> {project_commit, tree_hash, ...}. "
+        "The real refactor runner pins every checkout to project_commit; HEAD is never used.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Validate the runner flags through the same parser used by the OpenCode
+    # command hook, so batch and direct command invocations cannot drift.
+    parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
     dataset = Path(args.dataset).expanduser().resolve()
     samples = _filter_samples(_load_samples(dataset), args)
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1060,7 +1039,19 @@ def main(argv: list[str] | None = None) -> int:
         "model": args.model,
         "selected_count": len(samples),
         "run_dir": str(run_dir),
+        "execution_checkout_root": str(_execution_checkout_run_dir(run_dir)),
         "verification_mode": args.verification_mode,
+        "loop_policy": parse_command_policy(
+            _command_arguments("validation task", args, args.verification_mode)
+        ).loop.to_dict(),
+        "time_budget": {
+            "source": "sample-deadline",
+            "sample_deadline_seconds": args.sample_deadline,
+            "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
+            "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
+            "final_verify_timeout_seconds": args.sample_deadline,
+            "idle_watchdog_enabled": False,
+        },
         "dry_run": args.dry_run,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1070,6 +1061,20 @@ def main(argv: list[str] | None = None) -> int:
         for sample in samples:
             print(f"{sample.sample_id}\t{sample.smell}\t{sample.project_name}\t{sample.location}")
         return 0
+
+    if args.checkout_only:
+        checkout_rows = []
+        for index, sample in enumerate(samples, start=1):
+            print(f"[checkout-only {index}/{len(samples)}] {sample.sample_id} {sample.project_name}", flush=True)
+            row = _checkout_only_sample(sample, run_dir, args)
+            checkout_rows.append(row)
+            print(f"  -> status={row.get('status')} actual_commit={(row.get('actual_commit') or '')[:12]} "
+                  f"actual_tree={(row.get('actual_tree_hash') or '')[:12]} "
+                  f"alignment={row.get('project_revision_alignment')}", flush=True)
+        (run_dir / "checkout_audit.csv").write_text(
+            json.dumps(checkout_rows, indent=2) + "\n", encoding="utf-8"
+        )
+        return 0 if all(r.get("status") == "CHECKOUT_OK" for r in checkout_rows) else 1
 
     results_path = run_dir / "results.csv"
     failures = 0
@@ -1096,7 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
                 "sample_dir": "",
                 "note": str(exc),
             }
-        if row.get("status") != "PASS":
+        if not _is_accepted_status(row.get("status")):
             failures += 1
         _append_result(results_path, row)
         print(f"  -> {row.get('status')} {row.get('sample_dir')}", flush=True)

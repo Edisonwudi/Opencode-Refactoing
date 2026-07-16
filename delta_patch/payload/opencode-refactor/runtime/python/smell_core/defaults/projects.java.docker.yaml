@@ -1,0 +1,714 @@
+projects:
+- root: /opt/projects/Mindustry-v154.3
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      ./gradlew --offline --no-daemon :annotations:classes :core:classes :tools:classes :tests:classes
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      ./gradlew --offline --no-daemon :core:test :tests:test --tests "*CoverageBoost*"
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/canal-1.1.8
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      CANAL_SMELL_MODULES="client,client-adapter/clickhouse,client-adapter/common,client-adapter/es7x,client-adapter/es8x,client-adapter/escore,client-adapter/hbase,client-adapter/kudu,client-adapter/phoenix,client-adapter/rdb,client-adapter/tablestore,common,connector/core,dbsync,deployer,driver,instance/manager,meta,parse,prometheus,protocol,server,sink"
+
+      ./mvnw -o -V -B -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -pl "$CANAL_SMELL_MODULES" -am -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      export TZ=Asia/Shanghai
+
+      CANAL_SMELL_MODULES="client,client-adapter/clickhouse,client-adapter/common,client-adapter/es7x,client-adapter/es8x,client-adapter/escore,client-adapter/hbase,client-adapter/kudu,client-adapter/phoenix,client-adapter/rdb,client-adapter/tablestore,common,connector/core,dbsync,deployer,driver,instance/manager,meta,parse,prometheus,protocol,server,sink"
+
+      ./mvnw -o -V -B -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -pl "$CANAL_SMELL_MODULES" -am clean test -DskipTests=false ''-Dtest=*CoverageBoost*,*RefusedBequest*'' -DfailIfNoTests=false
+      -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/zulu-8
+    PATH: /opt/buildenv/jdks/zulu-8/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/commons-lang-3.20.0
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -Ddoclint=all -Drat.skip=true -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository"
+      -Dpmd.skip=true -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -Ddoclint=all -Drat.skip=true -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository"
+      -Dpmd.skip=true clean test
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-21
+    PATH: /opt/buildenv/jdks/temurin-21/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/wumpz-jhotdraw-10.2.4
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      JHOTDRAW_DEAD_CODE_MODULES="jhotdraw-core,jhotdraw-gui,jhotdraw-samples/jhotdraw-samples-mini,jhotdraw-samples/jhotdraw-samples-misc,jhotdraw-utils"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -DskipTests=true -pl "$JHOTDRAW_DEAD_CODE_MODULES" -am clean compile --file pom.xml
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -pl jhotdraw-core,jhotdraw-utils -am test ''-Dtest=org.jhotdraw.draw.**.*,org.jhotdraw.utils.geom.path.BezierCoverageBoost_ESTest,org.jhotdraw.utils.geom.path.BezierPathTest''
+      -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false --file pom.xml
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/Stirling-PDF-v2.1.5
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      ./gradlew -PnoSpotless --offline --no-daemon :common:classes :stirling-pdf:classes -PnoSpotless
+
+      '
+  test:
+    script: "BUILDENV=\"/opt/buildenv\"\nexport BUILDENV\nexport HOME=\"$BUILDENV/offline-home\"\nexport GRADLE_USER_HOME=\"\
+      $BUILDENV/offline-home/.gradle\"\nexport MAVEN_USER_HOME=\"$BUILDENV/offline-home/.m2\"\nexport JAVA_HOME=\"/opt/buildenv/jdks/temurin-17\"\
+      \nexport PATH=\"$JAVA_HOME/bin:$PATH\"\n./gradlew -PnoSpotless --offline --no-daemon :common:test -PnoSpotless --no-build-cache\
+      \ \\\n  --tests \"stirling.software.common.util.FileToPdfTest\" \\\n  --tests \"stirling.software.common.util.GeneralUtilsTest\"\
+      \ \\\n  --tests \"stirling.software.common.util.GeneralUtilsAdditionalTest\" \\\n  --tests \"stirling.software.common.util.GeneralUtilsCoverageBoost_ESTest\"\
+      \ \\\n  -x :common:jacocoTestReport -x :stirling-pdf:jacocoTestReport\n./gradlew -PnoSpotless --offline --no-daemon\
+      \ :stirling-pdf:test -PnoSpotless --no-build-cache \\\n  --tests \"stirling.software.SPDF.controller.api.MergeControllerTest\"\
+      \ \\\n  --tests \"stirling.software.SPDF.service.PdfJsonConversionServiceCoverageBoost_ESTest\" \\\n  --tests \"stirling.software.SPDF.controller.api.misc.CompressControllerCoverageBoost_ESTest.optimizePdfRejectsMissingOptimizeInputs\"\
+      \ \\\n  --tests \"stirling.software.SPDF.controller.api.misc.CompressControllerCoverageBoost_ESTest.optimizePdfAppliesImageCompressionPath\"\
+      \ \\\n  --tests \"stirling.software.SPDF.controller.api.misc.CompressControllerCoverageBoost_ESTest.optimizePdfRejectsMissingLineArtService\"\
+      \ \\\n  --tests \"stirling.software.SPDF.controller.api.misc.CompressControllerCoverageBoost_ESTest.optimizePdfRejectsLineArtWhenImageMagickDisabled\"\
+      \ \\\n  -x :common:jacocoTestReport -x :stirling-pdf:jacocoTestReport\n"
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/h2database
+  language: java
+  roots:
+    dataset: .
+    idea: h2
+    build: h2
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      cd "${project_root}/h2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      ./mvnw -o -B -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      cd "${project_root}/h2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      ./mvnw -o -B -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -DskipTests=false ''-Dtest=H2CoverageBoost_ESTest,TestTokenizer_ESTest,TestToDateTokenizer_ESTest,TestMetaDataScope_ESTest,TestDateTimeTemplate_ESTest,TestGeometryScope_ESTest,TestInterval_ESTest,TestJSONTextSource_ESTest''
+      test -DfailIfNoTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/directory-kerby-2.1.1
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o -Djava.awt.headless=true -B -gs
+      "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true -DskipTests=true
+      -pl kerby-kerb/kerb-crypto -am clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o -Djava.awt.headless=true -B -gs
+      "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true -pl kerby-kerb/kerb-crypto
+      -am test -Dtest=DesKeyMakerTest -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/zulu-8
+    PATH: /opt/buildenv/jdks/zulu-8/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/jcseg-573874f
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/zulu-8"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      test -DskipTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/zulu-8
+    PATH: /opt/buildenv/jdks/zulu-8/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/guava
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o -B --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository"
+      -Dpmd.skip=true -Drat.skip=true -Dmaven.javadoc.skip=true -DskipJavadoc=true -DskipTests=true -pl guava -am clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true -f android/pom.xml -pl guava-tests
+      -am -Dtest=Murmur3Hash128Test,BigIntegerMathCoverageBoost_ESTest,DoubleMathTest,IntMathTest,LongMathTest,BacklogRefusedBequestCoverageBoost_ESTest,BacklogRoundToDoubleCoverageBoost_ESTest
+      test -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/tika
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      TIKA_DEAD_CODE_MODULES="tika-core,tika-encoding-detectors/tika-encoding-detector-mojibuster,tika-ml/tika-ml-chardetect,tika-ml/tika-ml-junkdetect,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-mail-commons,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-microsoft-module,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-miscoffice-module,tika-pipes/tika-pipes-plugins/tika-pipes-file-system,tika-pipes/tika-pipes-plugins/tika-pipes-http,tika-server/tika-server-core"
+
+      ./mvnw -o --errors --show-version --batch-mode --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository"
+      -Dpmd.skip=true -Dossindex.skip -Dcheckstyle.skip=true -Dforbiddenapis.skip=true -pl "$TIKA_DEAD_CODE_MODULES" -am -DskipTests
+      clean install
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-17"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      TIKA_DEAD_CODE_MODULES="tika-core,tika-encoding-detectors/tika-encoding-detector-mojibuster,tika-ml/tika-ml-chardetect,tika-ml/tika-ml-junkdetect,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-mail-commons,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-microsoft-module,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-miscoffice-module,tika-pipes/tika-pipes-plugins/tika-pipes-file-system,tika-pipes/tika-pipes-plugins/tika-pipes-http,tika-server/tika-server-core"
+
+      ./mvnw -o --errors --show-version --batch-mode --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository"
+      -Dpmd.skip=true -Dossindex.skip -Dcheckstyle.skip=true -Dforbiddenapis.skip=true -pl "$TIKA_DEAD_CODE_MODULES" -am test
+      ''-Dtest=*CoverageBoost*,*_ESTest,HtmlByteStripper_ESTest,JunkDetectorSmokeTest,JunkDetectorRoundTripTest,MailDateParserTest,OneNotePtr_ESTest,OpenDocumentContentParserTest,HttpFetcherTest,TikaServerConfigTest''
+      -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-17
+    PATH: /opt/buildenv/jdks/temurin-17/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/commons-compress
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true -Dtest=AttributeLayoutParser_ESTest,BZip2CompressorInputStreamCoverageBoost_ESTest,BcBands_ESTest,BlockLZ4CompressorInputStreamCoverageBoost_ESTest,BlockLZ4CompressorInputStream_ESTest,ClassBands_ESTest,SevenZFileCoverageBoost_ESTest,TarArchiveEntryCoverageBoost_ESTest,TarArchiveEntry_ESTest,ZipArchiveInputStreamCoverageBoost_ESTest
+      -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false test
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-21
+    PATH: /opt/buildenv/jdks/temurin-21/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/commons-text
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true clean test -Dtest=TextStringBuilderTest,StrBuilderTest -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-21
+    PATH: /opt/buildenv/jdks/temurin-21/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/commons-io
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o --errors --show-version --batch-mode
+      --no-transfer-progress -gs "$BUILDENV/maven-global-settings.xml" -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true
+      -Drat.skip=true clean test -Dtest=FileUtilsCoverageBoost_ESTest,IOUtilsCoverageBoost_ESTest,PathUtilsCoverageBoost_ESTest
+      -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-21
+    PATH: /opt/buildenv/jdks/temurin-21/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+- root: /opt/projects/mybatis-3
+  language: java
+  build:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      SKIP_MUTATION_FLAGS="-Dwhitespace.skip=true -Dformatter.skip=true -Dimpsort.skip=true -Drewrite.skip=true -Dlicense.skip=true"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o -V -B -Dmaven.plugin.validation=NONE -gs "$BUILDENV/maven-global-settings.xml"
+      -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true $SKIP_MUTATION_FLAGS -DskipTests=true clean compile
+
+      '
+  test:
+    script: 'BUILDENV="/opt/buildenv"
+
+      export BUILDENV
+
+      export HOME="$BUILDENV/offline-home"
+
+      export GRADLE_USER_HOME="$BUILDENV/offline-home/.gradle"
+
+      export MAVEN_USER_HOME="$BUILDENV/offline-home/.m2"
+
+      export JAVA_HOME="/opt/buildenv/jdks/temurin-21"
+
+      export PATH="$JAVA_HOME/bin:$PATH"
+
+      SKIP_MUTATION_FLAGS="-Dwhitespace.skip=true -Dformatter.skip=true -Dimpsort.skip=true -Drewrite.skip=true -Dlicense.skip=true"
+
+      rm -rf "$PWD/ibderby" "$PWD/target/derby" "$PWD/target/ibderby"
+
+      mvn -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.apply.skip=true -o -V -B -Dmaven.plugin.validation=NONE -gs "$BUILDENV/maven-global-settings.xml"
+      -Dmaven.repo.local="$MAVEN_USER_HOME/repository" -Dpmd.skip=true $SKIP_MUTATION_FLAGS test
+
+      '
+  env:
+    BUILDENV: /opt/buildenv
+    HOME: /opt/buildenv/offline-home
+    GRADLE_USER_HOME: /opt/buildenv/offline-home/.gradle
+    MAVEN_USER_HOME: /opt/buildenv/offline-home/.m2
+    TZ: Asia/Shanghai
+    JAVA_HOME: /opt/buildenv/jdks/temurin-21
+    PATH: /opt/buildenv/jdks/temurin-21/bin:/opt/idea-refactoring/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
