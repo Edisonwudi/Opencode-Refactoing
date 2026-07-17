@@ -342,6 +342,7 @@ function normalizeToolResult(result) {
     lineCount,
     status: parsed.status,
     success: parsed.success,
+    loop: parsed.loop || null,
     artifactKeys: Object.keys(parsed.artifacts || {}).sort(),
   }
 }
@@ -851,526 +852,152 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve))
 }
 
-async function runIsOpendcodeRunModeSelfCheck(hooks) {
-  const cases = [
-    // run / serve / web / attach are non-interactive and must be detected.
-    { name: "node_then_opencode_run", argv: ["node", "/usr/local/bin/opencode", "run", "task"], expected: true },
-    { name: "opencode_run", argv: ["/usr/local/bin/opencode", "run", "task"], expected: true },
-    { name: "opencode_exe_run", argv: ["opencode.exe", "run", "task"], expected: true },
-    { name: "opencode_run_only", argv: ["/usr/local/bin/opencode", "run"], expected: true },
-    { name: "opencode_serve", argv: ["opencode", "serve"], expected: true },
-    { name: "opencode_web", argv: ["opencode", "web"], expected: true },
-    { name: "opencode_attach", argv: ["opencode", "attach"], expected: true },
-    // Bare `opencode` is the interactive TUI (the README's enable command).
-    { name: "opencode_no_subcommand", argv: ["/usr/local/bin/opencode"], expected: false },
-    { name: "opencode_tui_subcommand", argv: ["/usr/local/bin/opencode", "tui"], expected: false },
-    { name: "opencode_with_env_prefix", argv: ["env", "SMELL_IDLE_CONTINUE_MODE=interactive", "opencode"], expected: false },
-    // Unrecognizable argv is conservatively treated as run.
-    { name: "empty_argv", argv: [], expected: true },
-    { name: "non_array_argv", argv: null, expected: true },
-    { name: "no_opencode_executable", argv: ["node", "script.js"], expected: true },
-    // `run` not immediately after opencode is not a run invocation.
-    { name: "run_in_wrong_position", argv: ["opencode", "tui", "run"], expected: false },
-  ]
-  const results = []
-  for (const c of cases) {
-    const actual = hooks.isOpendcodeRunMode(c.argv)
-    assertEqual(`runmode:${c.name}`, actual, c.expected, "isOpendcodeRunMode")
-    results.push({ name: c.name, expected: c.expected, actual })
-  }
-  return results
-}
-
 async function runIdleContinueSelfCheck(pluginModule) {
   const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
-  if (!hooks || typeof hooks !== "object") {
-    throw new SelfCheckError("idle_continue_hooks", "Plugin does not expose SmellPlugin.__selfTest.", {})
-  }
   for (const key of [
-    "idleContinueMode",
-    "isOpendcodeRunMode",
-    "isBatchEnvironment",
     "classifyFailureForContinue",
     "makeTaskKey",
     "buildContinuationMessage",
     "createIdleContinueRuntime",
     "SMELL_IDLE_CONTINUE_PREFIX",
+  ]) {
+    assertCond(`unified_loop_hook:${key}`, Boolean(hooks && key in hooks), `missing ${key}`)
+  }
+  for (const removed of [
+    "idleContinueMode",
+    "isOpendcodeRunMode",
+    "isBatchEnvironment",
     "MAX_IDLE_CONTINUE_ATTEMPTS",
-    "REPAIRABLE_CATEGORIES",
   ]) {
-    if (!(key in hooks)) {
-      throw new SelfCheckError("idle_continue_hooks", `Plugin __selfTest is missing ${key}.`, {
-        keys: Object.keys(hooks).sort(),
-      })
+    assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
+  }
+
+  function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED" } = {}) {
+    const payload = JSON.parse(makeFailureOutput(status, status))
+    payload.loop = {
+      decision,
+      continuation,
+      max_continuations: max,
+      instruction: decision === "continue" ? "repair from the latest evidence" : "",
     }
+    return JSON.stringify(payload)
   }
-  if (hooks.MAX_IDLE_CONTINUE_ATTEMPTS !== 2) {
-    throw new SelfCheckError("idle_continue_hooks", "MAX_IDLE_CONTINUE_ATTEMPTS is not 2.", {
-      value: hooks.MAX_IDLE_CONTINUE_ATTEMPTS,
+
+  function record(rt, options = {}) {
+    return rt.recordFromBridgeOutput({
+      sessionID: options.sessionID || "s1",
+      agent: options.agent || "any-refactor-agent",
+      directory: options.directory || IDLE_DIR,
+      taskKey: options.taskKey || IDLE_TASK,
+      output: options.output || outputWithLoop(options),
     })
   }
 
-  const runModeUnit = await runIsOpendcodeRunModeSelfCheck(hooks)
-
-  function freshRuntime({ mode = "interactive", client, argv = ["/usr/local/bin/opencode", "tui"], extraEnv = {} } = {}) {
-    const env = { SMELL_IDLE_CONTINUE_MODE: mode, ...extraEnv }
-    return hooks.createIdleContinueRuntime({ client, env, argv })
-  }
-
-  function record(rt, { status = "SMELL_GUARD_FAILED", category = "SMELL_GUARD_FAILED", autoContinue = true, output, sessionID = "s1", taskKey = IDLE_TASK, agent = IDLE_AGENT, directory = IDLE_DIR } = {}) {
-    const out = output || makeFailureOutput(status, category)
-    return rt.recordFromBridgeOutput({ sessionID, agent, directory, taskKey, output: out, autoContinue })
-  }
-
-  // 1. off mode does not dispatch
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ mode: "off", client })
-    record(rt, { autoContinue: true })
-    const dispatched = rt.handleIdle("s1")
-    await flush()
-    assertEqual("off_no_dispatch_dispatched", dispatched, false, "dispatched")
-    assertEqual("off_no_dispatch_calls", calls.length, 0, "calls")
-    assertCond("off_metadata_disabled", record(rt, { autoContinue: true }).mode === "off", "off metadata mode")
-  }
-
-  // 2. shadow mode records but does not promptAsync
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ mode: "shadow", client })
-    record(rt, { autoContinue: true })
-    const dispatched = rt.handleIdle("s1")
-    await flush()
-    assertEqual("shadow_no_dispatch_dispatched", dispatched, false, "dispatched")
-    assertEqual("shadow_no_dispatch_calls", calls.length, 0, "calls")
-    assertCond("shadow_peek_exists", Boolean(rt.peek("s1")), "shadow should retain state")
-  }
-
-  // 3. interactive + autoContinue=true dispatches
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    const dispatched = rt.handleIdle("s1")
-    await flush()
-    assertEqual("interactive_dispatch_dispatched", dispatched, true, "dispatched")
-    assertEqual("interactive_dispatch_calls", calls.length, 1, "calls")
-    const body = calls[0].body
-    assertCond("interactive_dispatch_agent", body && body.agent === IDLE_AGENT, "agent in body")
-    assertCond("interactive_dispatch_parts", Array.isArray(body.parts) && body.parts[0].type === "text", "text part")
-    assertCond("interactive_dispatch_query", calls[0].query && calls[0].query.directory === IDLE_DIR, "directory query")
-    assertCond("interactive_dispatch_path", calls[0].path && calls[0].path.id === "s1", "path id")
-  }
-
-  // 4. autoContinue=false does not dispatch
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: false })
-    const dispatched = rt.handleIdle("s1")
-    await flush()
-    assertEqual("no_autocontinue_dispatched", dispatched, false, "dispatched")
-    assertEqual("no_autocontinue_calls", calls.length, 0, "calls")
-  }
-
-  // 5 & 6. first failure idle dispatches once; repeated idle stays at 1
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("first_idle_calls", calls.length, 1, "calls")
-    rt.handleIdle("s1")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("repeated_idle_calls", calls.length, 1, "calls")
-  }
-
-  // 7 & 8. new failing verify allows round 2; round 3 hits the cap and stops
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true }) // generation 1
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("round1_calls", calls.length, 1, "calls")
-    // Agent retried but failed again -> generation 2
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("round2_calls", calls.length, 2, "calls")
-    // Third failing verify -> generation 3, but attempt cap reached
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("round3_cap_calls", calls.length, 2, "calls")
-    const peeked = rt.peek("s1")
-    assertCond("round3_attempt_cap", peeked && peeked.attempt === 2, "attempt must be 2")
-  }
-
-  // 9. PASS clears state
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("pass_before_calls", calls.length, 1, "calls")
-    record(rt, { autoContinue: true, output: makePassOutput() })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("pass_after_calls", calls.length, 1, "calls")
-    assertCond("pass_state_cleared", !rt.peek("s1"), "state should be cleared on PASS")
-  }
-
-  // 10. non-repairable failures do not dispatch
-  for (const category of [
-    "BUILD_TEST_REQUIRED",
-    "SAMPLE_TEST_SPEC_MISSING",
-    "RUNNER_VERIFY_FAILED",
-    "MODEL_NO_VERIFY",
-    "MODEL_NO_CONTEXT",
-    "CONTEXT_FAILED",
-    "OPENCODE_FAILED",
-    "BUILD_DEPENDENCY_RESOLUTION",
-    "TIMEOUT_OR_MODAL_SUSPECTED",
-    "BUILD_TEST_FAILED",
-    "UNKNOWN_VERIFY_FAILURE",
+  // All OpenCode modes and batch-like environments use exactly the same path.
+  for (const modeCase of [
+    { name: "tui", argv: ["opencode"] },
+    { name: "run", argv: ["opencode", "run"] },
+    { name: "serve", argv: ["opencode", "serve"] },
+    { name: "web", argv: ["opencode", "web"] },
+    { name: "attach", argv: ["opencode", "attach"] },
+    { name: "batch", argv: ["opencode", "run"], env: { SMELL_BATCH_RUN: "1", SMELL_PROJECT_ROOT: "/tmp/project" } },
   ]) {
     const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { status: category, category, autoContinue: true })
-    rt.handleIdle("s1")
+    const rt = hooks.createIdleContinueRuntime({ client, argv: modeCase.argv, env: modeCase.env || {} })
+    const metadata = record(rt)
+    assertEqual(`unified_${modeCase.name}_enabled`, metadata.enabled, true, "enabled")
+    assertEqual(`unified_${modeCase.name}_continuation`, metadata.continuation, 1, "continuation")
+    assertEqual(`unified_${modeCase.name}_max`, metadata.maxContinuations, 2, "maxContinuations")
+    assertEqual(`unified_${modeCase.name}_dispatch`, rt.handleIdle("s1"), true, "dispatch")
     await flush()
-    assertEqual(`non_repairable_${category}_calls`, calls.length, 0, "calls")
+    assertEqual(`unified_${modeCase.name}_calls`, calls.length, 1, "calls")
   }
-  // BUILD_FAILED is NOT repairable by itself
+
+  // The loop decision owns the only budget. Dispatch does not increment it.
   {
     const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { status: "BUILD_FAILED", category: "BUILD_FAILED", autoContinue: true })
+    const rt = hooks.createIdleContinueRuntime({ client })
+    record(rt, { continuation: 1, max: 2 })
     rt.handleIdle("s1")
     await flush()
-    assertEqual("build_failed_raw_not_repairable", calls.length, 0, "calls")
+    assertEqual("unified_budget_round1", calls.length, 1, "calls")
+    assertEqual("unified_budget_value1", rt.peek("s1").continuation, 1, "continuation")
+
+    record(rt, { continuation: 2, max: 2 })
+    rt.handleIdle("s1")
+    await flush()
+    assertEqual("unified_budget_round2", calls.length, 2, "calls")
+    assertEqual("unified_budget_value2", rt.peek("s1").continuation, 2, "continuation")
+
+    record(rt, { decision: "stop", continuation: 2, max: 2 })
+    assertEqual("unified_budget_stop_dispatch", rt.handleIdle("s1"), false, "dispatch")
+    await flush()
+    assertEqual("unified_budget_stop_calls", calls.length, 2, "calls")
   }
-  // BUILD_FAILED is repairable only when classified as BUILD_COMPILE_ERROR
+
+  // A generation dispatches once; PASS or malformed output revokes pending.
   {
     const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { status: "BUILD_FAILED", category: "BUILD_COMPILE_ERROR", autoContinue: true })
+    const rt = hooks.createIdleContinueRuntime({ client })
+    record(rt)
+    rt.handleIdle("s1")
     rt.handleIdle("s1")
     await flush()
-    assertEqual("build_compile_error_repairable", calls.length, 1, "calls")
+    assertEqual("unified_generation_once", calls.length, 1, "calls")
+
+    record(rt, { output: makePassOutput() })
+    assertEqual("unified_pass_stops", rt.handleIdle("s1"), false, "dispatch")
+    record(rt)
+    record(rt, { output: "not-json" })
+    assertEqual("unified_malformed_stops", rt.handleIdle("s1"), false, "dispatch")
   }
 
-  // 11. after a continuation without a new verify, no further dispatch
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("cont_noreverify_before", calls.length, 1, "calls")
-    // No new smell_verify call -> pending is false after dispatch
-    rt.handleIdle("s1")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("cont_noreverify_after", calls.length, 1, "calls")
-  }
+  return { modes: ["tui", "run", "serve", "web", "attach", "batch"], sharedBudget: true, passed: true }
+}
 
-  // 12. new real user message resets state
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    const cleared = rt.handleChatMessage("s1", [{ type: "text", text: "please stop and try X instead" }])
-    assertEqual("real_user_resets_cleared", cleared, true, "cleared")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("real_user_resets_calls", calls.length, 0, "calls")
+function runCommandPolicyDecisionSelfCheck(pluginModule) {
+  const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
+  assertCond("command_decision_hook", typeof hooks?.applyCommandLoopDecision === "function", "missing applyCommandLoopDecision")
+  const state = {
+    policy: {
+      task: "task",
+      verification_mode: "local",
+      loop: {
+        mode: "verify-failure",
+        max_continuations: 2,
+        no_progress_limit: 1,
+        allowed_failure_groups: ["smell"],
+        instruction: "repair narrowly",
+        sample_deadline_seconds: 1800,
+      },
+    },
+    startedAt: Date.now(),
+    continuationCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
   }
-
-  // 13. plugin-injected [smell-auto-continue ...] message does NOT reset
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    const cleared = rt.handleChatMessage("s1", [{ type: "text", text: `${hooks.SMELL_IDLE_CONTINUE_PREFIX} 1/2] keep going` }])
-    assertEqual("injected_msg_no_reset_cleared", cleared, false, "cleared")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("injected_msg_no_reset_calls", calls.length, 1, "calls")
+  const failure = {
+    success: false,
+    status: "SMELL_GUARD_FAILED",
+    failure_pack: {
+      failure_category: "SMELL_GUARD_FAILED",
+      failure_group: "smell",
+      retryable: true,
+      verify_status: "SMELL_GUARD_FAILED",
+      highlights: ["still too long"],
+    },
   }
-
-  // 13b. pure-attachment message (no text) DOES reset (real user input)
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    const cleared = rt.handleChatMessage("s1", [{ type: "file", url: "/tmp/x.java" }])
-    assertEqual("attachment_resets_cleared", cleared, true, "cleared")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("attachment_resets_calls", calls.length, 0, "calls")
-  }
-
-  // 13c. empty parts array does NOT reset (not a real message)
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    const cleared = rt.handleChatMessage("s1", [])
-    assertEqual("empty_parts_no_reset", cleared, false, "cleared")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("empty_parts_still_dispatches", calls.length, 1, "calls")
-  }
-
-  // 14. batch environment does not dispatch
-  for (const extra of [{ SMELL_BATCH_RUN: "1" }, { SMELL_PROJECT_ROOT: "/data/proj" }]) {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client, extraEnv: extra })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual(`batch_${Object.keys(extra)[0]}_calls`, calls.length, 0, "calls")
-  }
-
-  // 15. opencode run mode does not dispatch
-  for (const argv of [["node", "/x/opencode", "run", "task"], ["/usr/local/bin/opencode", "run"]]) {
-    const { client, calls } = makeFakeClient()
-    const rt = hooks.createIdleContinueRuntime({ client, env: { SMELL_IDLE_CONTINUE_MODE: "interactive" }, argv })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual(`runmode_${argv.join("_").slice(0, 20)}_calls`, calls.length, 0, "calls")
-  }
-
-  // 16. promptAsync failure -> safe stop, no retry
-  {
-    const { client, calls } = makeFailingFakeClient("boom")
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("dispatch_fail_calls", calls.length, 1, "calls")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("dispatch_fail_no_retry", calls.length, 1, "calls")
-    assertCond("dispatch_fail_error_recorded", Boolean(rt.getLastDispatchError()), "lastDispatchError should be set")
-  }
-
-  // 17. session.deleted and dispose clear state
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.handleSessionDeleted("s1")
-    assertCond("deleted_clears_state", !rt.peek("s1"), "state should be cleared on session.deleted")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("deleted_no_dispatch", calls.length, 0, "calls")
-  }
-  {
-    const { client } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    rt.dispose()
-    assertCond("dispose_sets_flag", rt.isDisposed(), "disposed flag")
-    assertCond("dispose_clears_state", !rt.peek("s1"), "state should be cleared on dispose")
-    assertEqual("dispose_no_dispatch", rt.handleIdle("s1"), false, "dispatched after dispose")
-  }
-
-  // 18. message length bounded, secrets redacted, and artifact_paths (object)
-  // are surfaced. Mirrors the real Python bridge contract.
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, {
-      autoContinue: true,
-      category: "BUILD_COMPILE_ERROR",
-      status: "BUILD_FAILED",
-      output: makeFailureOutput("BUILD_FAILED", "BUILD_COMPILE_ERROR", {
-        highlights: [
-          "cannot find symbol Foo at line 42",
-          "Authorization: Bearer sk-secret-token-1234567890abcdef",
-          "api_key=gl-abcdef0123456789 in config",
-          'config.api_key="shortsecret123" loaded',
-          "Authorization: Basic abcdefghijklmnop",
-          'TOKEN="smallsecret123"',
-          "OPENCODE_API_KEY=sk-live-0987654321 along the log",
-          "x".repeat(5000),
-        ],
-        artifact_paths: {
-          build_log: "/tmp/art/build.log",
-          test_log: "/tmp/art/test.log",
-          verify_full: "/tmp/art/verify.json",
-        },
-      }),
-    })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("bounded_msg_calls", calls.length, 1, "calls")
-    const msg = calls[0].body.parts[0].text
-    assertCond("bounded_msg_prefix", msg.startsWith(hooks.SMELL_IDLE_CONTINUE_PREFIX), "prefix present")
-    assertCond("bounded_msg_length", msg.length <= 2100, `message too long: ${msg.length}`)
-    assertCond("bounded_msg_has_status", msg.includes("Status:"), "message must include status")
-    assertCond("bounded_msg_has_category", msg.includes("Failure category:"), "message must include category")
-    // Secrets must be redacted: no bearer token value, no raw key value, no
-    // env-var assignment value.
-    assertCond("redact_no_bearer_token", !/sk-secret-token-1234567890abcdef/.test(msg), "bearer token leaked")
-    assertCond("redact_no_apikey_value", !/gl-abcdef0123456789/.test(msg), "api_key value leaked")
-    assertCond("redact_no_env_value", !/sk-live-0987654321/.test(msg), "env value leaked")
-    assertCond("redact_has_redacted_marker", /\[REDACTED\]/.test(msg), "should contain REDACTED marker")
-    // The real-code error line must survive redaction.
-    assertCond("redact_keeps_code_hint", /cannot find symbol Foo/.test(msg), "code hint should survive")
-    // Object artifact_paths must surface as paths in the message.
-    assertCond("artifact_object_surfaced", /\/tmp\/art\/build\.log/.test(msg), "object artifact path missing")
-  }
-
-  // Non-allowed agent never dispatches
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    rt.recordFromBridgeOutput({
-      sessionID: "s1",
-      agent: "some-other-agent",
-      directory: IDLE_DIR,
-      taskKey: IDLE_TASK,
-      output: makeFailureOutput("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED"),
-      autoContinue: true,
-    })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("non_allowed_agent_calls", calls.length, 0, "calls")
-  }
-
-  // REGRESSION (P1): the 2-round attempt budget is per-session and must NOT be
-  // reset by a taskKey/location change. Two failures + two idle already used
-  // the budget; a third failure with a DIFFERENT location must not dispatch.
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true }) // gen 1
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("budget_round1", calls.length, 1, "calls")
-    record(rt, { autoContinue: true }) // gen 2
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("budget_round2", calls.length, 2, "calls")
-    // Attempt to bypass by changing location -> taskKey changes.
-    record(rt, { autoContinue: true, taskKey: "/tmp/proj|feature_envy|Other.java:99" })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("budget_no_reset_on_taskkey", calls.length, 2, "calls")
-    assertCond("budget_peek_attempt", rt.peek("s1") && rt.peek("s1").attempt === 2, "attempt must remain 2")
-  }
-
-  // REGRESSION (P1): a non-repairable result after a repairable one must revoke
-  // the stale pending, so a subsequent idle does NOT resume on the old pack.
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true, category: "SMELL_GUARD_FAILED" }) // arms pending
-    assertCond("revoke_armed", rt.peek("s1") && rt.peek("s1").pending === true, "should be armed")
-    record(rt, { autoContinue: true, category: "BUILD_DEPENDENCY_RESOLUTION" }) // non-repairable
-    const peeked = rt.peek("s1")
-    assertCond("revoke_pending_false", peeked && peeked.pending === false, "pending must be revoked")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("revoke_no_dispatch", calls.length, 0, "calls")
-  }
-
-  // REGRESSION (P1): autoContinue=false after a repairable result revokes
-  // pending too.
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    record(rt, { autoContinue: false })
-    const peeked = rt.peek("s1")
-    assertCond("autofalse_revoke", peeked && peeked.pending === false, "pending must be revoked on autoContinue=false")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("autofalse_no_dispatch", calls.length, 0, "calls")
-  }
-
-  // REGRESSION (P1): non-JSON bridge output after a repairable result revokes
-  // pending.
-  {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { autoContinue: true })
-    record(rt, { autoContinue: true, output: "Traceback: not json at all" })
-    const peeked = rt.peek("s1")
-    assertCond("nonjson_revoke", peeked && peeked.pending === false, "pending must be revoked on non-JSON")
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual("nonjson_no_dispatch", calls.length, 0, "calls")
-  }
-
-  // REGRESSION (P2): the real test-regression categories the bridge emits are
-  // TEST_BEHAVIOR_REGRESSION and TEST_REFLECTION_ENTRY_STALE, not a literal
-  // "TEST_FAILED". Both must be repairable.
-  for (const category of ["TEST_BEHAVIOR_REGRESSION", "TEST_REFLECTION_ENTRY_STALE"]) {
-    const { client, calls } = makeFakeClient()
-    const rt = freshRuntime({ client })
-    record(rt, { status: "TEST_FAILED", category, autoContinue: true })
-    rt.handleIdle("s1")
-    await flush()
-    assertEqual(`real_test_category_${category}_calls`, calls.length, 1, "calls")
-  }
-
-  // REGRESSION (P2): artifact_paths object contract is accepted at the pure
-  // classifyFailureForContinue level too (not only through the message).
-  {
-    const cls = hooks.classifyFailureForContinue({
-      failure_category: "BUILD_COMPILE_ERROR",
-      verify_status: "BUILD_FAILED",
-      highlights: ["h1"],
-      artifact_paths: { a: "/x/a.log", b: "/x/b.log" },
-    })
-    assertEqual("classify_object_artifact_len", cls.artifactPaths.length, 2, "artifactPaths length")
-    assertCond("classify_object_artifact_ok", cls.ok === true, "should be repairable")
-    const clsArr = hooks.classifyFailureForContinue({
-      failure_category: "BUILD_COMPILE_ERROR",
-      artifact_paths: ["/x/a.log"],
-    })
-    assertEqual("classify_array_artifact_len", clsArr.artifactPaths.length, 1, "array fallback length")
-  }
-
-  // REGRESSION (P1): redaction pure function covers common secret patterns,
-  // including quoted values and Authorization scheme credentials, without
-  // relying on a minimum-length heuristic.
-  {
-    assertCond("redact_helper_exists", typeof hooks.redactSecrets === "function", "redactSecrets must be exported")
-    const redact = (txt) => hooks.redactSecrets(txt)
-    // Reviewer counterexample 1: quoted api_key value (short).
-    assertCond("redact_quoted_apikey_short", !/shortsecret123/.test(redact('api_key="shortsecret123"')), "quoted api_key value leaked")
-    // Reviewer counterexample 2: Authorization: Basic <short cred>.
-    assertCond("redact_auth_basic_short", !/abcdefghijklmnop/.test(redact("Authorization: Basic abcdefghijklmnop")), "Authorization Basic cred leaked")
-    // Reviewer counterexample 3: short quoted TOKEN.
-    assertCond("redact_quoted_token_short", !/smallsecret123/.test(redact('TOKEN="smallsecret123"')), "quoted TOKEN value leaked")
-    // Original coverage still holds.
-    assertCond("redact_bearer", !/secret-blob-value-1234567890/.test(redact("Authorization: Bearer secret-blob-value-1234567890")), "bearer not redacted")
-    assertCond("redact_apikey", !/gl-live-key-9988776655/.test(redact("api_key=gl-live-key-9988776655")), "api_key not redacted")
-    assertCond("redact_env_assign", !/supersecretvalue/.test(redact("MY_TOKEN=supersecretvalue here")), "env assign not redacted")
-    assertCond("redact_single_quoted", !/innersecret/.test(redact("secret='innersecret'")), "single-quoted secret leaked")
-    assertCond("redact_scheme_token", !/abc123/.test(redact("Token abc123 here")), "scheme token leaked")
-    assertCond("redact_marker_present", /\[REDACTED\]/.test(redact("api_key=v")), "should contain REDACTED marker")
-    assertCond("redact_keeps_text", /keep this/.test(redact("keep this plain text")), "non-secret text should survive")
-    assertCond("redact_keeps_code_hint", /cannot find symbol Foo/.test(redact("cannot find symbol Foo at line 42")), "code hint should survive")
-  }
-
-  return {
-    runModeUnit,
-    maxAttempts: hooks.MAX_IDLE_CONTINUE_ATTEMPTS,
-    repairableCategories: Array.from(hooks.REPAIRABLE_CATEGORIES).sort(),
-    allowedAgents: Array.from(hooks.ALLOWED_AGENTS || []).sort(),
-    passed: true,
-  }
+  const first = { output: JSON.stringify(failure), metadata: {} }
+  hooks.applyCommandLoopDecision(first, state)
+  const firstPayload = JSON.parse(first.output)
+  assertEqual("command_decision_continue", firstPayload.loop.decision, "continue", "decision")
+  assertEqual("command_decision_count", firstPayload.loop.continuation, 1, "continuation")
+  assertEqual("command_decision_instruction", firstPayload.loop.instruction, "repair narrowly", "instruction")
+  const second = { output: JSON.stringify(failure), metadata: {} }
+  hooks.applyCommandLoopDecision(second, state)
+  const secondPayload = JSON.parse(second.output)
+  assertEqual("command_decision_no_progress", secondPayload.loop.termination_reason, "NO_PROGRESS", "termination")
+  return { passed: true }
 }
 
 async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
@@ -1397,6 +1024,24 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
           smellVerifyKeys: smellVerify && typeof smellVerify === "object" ? Object.keys(smellVerify) : [],
         })
       }
+      const commandHook = plugin?.["command.execute.before"]
+      if (typeof commandHook !== "function") {
+        throw new SelfCheckError("command_policy_hook", "command.execute.before hook was not registered.", {})
+      }
+      const commandOutput = { parts: [{ type: "text", text: "placeholder" }] }
+      await commandHook(
+        {
+          command: "java-refactor-run",
+          sessionID: "command-policy-self-check",
+          arguments: `--verification-mode=local --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2`,
+        },
+        commandOutput,
+      )
+      assertCond(
+        "command_policy_prompt",
+        String(commandOutput.parts?.[0]?.text || "").includes("Controller-owned verification and loop policy"),
+        "command hook must inject canonical policy",
+      )
       const result = await smellVerify.execute({
         projectRoot: fixtureRoot,
         language: "java",
@@ -1404,12 +1049,19 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         location: "src/main/java/SelfCheckSample.java:2",
         verificationMode: "local",
         noSnapshot: true,
+      }, {
+        sessionID: "command-policy-self-check",
+        agent: "java-refactor-agent",
+        directory: fixtureRoot,
       })
       const successPath = normalizeToolResult(result)
+      assertEqual("command_policy_pass_decision", successPath.loop?.decision, "stop", "loop.decision")
+      assertEqual("command_policy_pass_reason", successPath.loop?.termination_reason, "PASS", "termination_reason")
       const normalizeUnit = await runPluginNormalizeSelfCheck(pluginModule)
       const failureIntegration = await runPluginFailureIntegrationSelfCheck(smellVerify)
       const idleContinue = await runIdleContinueSelfCheck(pluginModule)
-      return { successPath, normalizeUnit, failureIntegration, idleContinue }
+      const commandPolicyDecision = runCommandPolicyDecisionSelfCheck(pluginModule)
+      return { successPath, normalizeUnit, failureIntegration, idleContinue, commandPolicy: { passed: true }, commandPolicyDecision }
     } finally {
       for (const key of Object.keys(process.env)) {
         if (!(key in envBefore)) delete process.env[key]

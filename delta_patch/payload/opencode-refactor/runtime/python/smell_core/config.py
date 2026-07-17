@@ -62,7 +62,6 @@ class CommandConfig:
 
 @dataclass
 class DefaultsConfig:
-    max_retries: int = 2
     step_limit: int = 100
     shell_timeout: int = 600
     no_progress_timeout: int = 480
@@ -75,7 +74,6 @@ class DefaultsConfig:
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "DefaultsConfig":
         data = data or {}
         return cls(
-            max_retries=int(data.get("max_retries", 2)),
             step_limit=int(data.get("step_limit", 100)),
             shell_timeout=int(data.get("shell_timeout", 600)),
             no_progress_timeout=int(data.get("no_progress_timeout", 480)),

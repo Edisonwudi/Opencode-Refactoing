@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1",
+  "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+  "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+  "delivery_image_id_source": "external_attestation",
+  "projects": {
+    "Mindustry-v154.3": {
+      "project_name": "Mindustry-v154.3",
+      "repository_path": "/opt/projects/Mindustry-v154.3",
+      "project_commit": "7199fbc4db1d37d0e2649e9fd8f76fc027a2a59e",
+      "tree_hash": "bc07ebde420962dbc2a27d1b0fc34a99ff2172de",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "Stirling-PDF-v2.1.5": {
+      "project_name": "Stirling-PDF-v2.1.5",
+      "repository_path": "/opt/projects/Stirling-PDF-v2.1.5",
+      "project_commit": "8e15550e6df1a10ce73586119730e71994af5104",
+      "tree_hash": "67f50820ae1c62404802d5e8737d79cc43dbec20",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "canal-1.1.8": {
+      "project_name": "canal-1.1.8",
+      "repository_path": "/opt/projects/canal-1.1.8",
+      "project_commit": "5913b85309c4cd0b1696e06896aa21a47e81a415",
+      "tree_hash": "cf93ed6904399fa212270ec6d79b947bb48ee95b",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "commons-compress": {
+      "project_name": "commons-compress",
+      "repository_path": "/opt/projects/commons-compress",
+      "project_commit": "59161e9d07b62d4fb501df666c1ae047102b39bc",
+      "tree_hash": "ae77bba16801ab5587d91b22143a7f4f1f2482c3",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "commons-io": {
+      "project_name": "commons-io",
+      "repository_path": "/opt/projects/commons-io",
+      "project_commit": "5e68ddeac99c788e875ff579f9eb484b586ed8fa",
+      "tree_hash": "397c4e8d892b180c4254ca1a85580936fea6145d",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "commons-lang-3.20.0": {
+      "project_name": "commons-lang-3.20.0",
+      "repository_path": "/opt/projects/commons-lang-3.20.0",
+      "project_commit": "5f0b2e87a4391df37c1865a624f85de8df42006c",
+      "tree_hash": "b7bd1972e1f7ce8e1e633c7d82de827b96de2a07",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "commons-text": {
+      "project_name": "commons-text",
+      "repository_path": "/opt/projects/commons-text",
+      "project_commit": "35725d9e8815fa22caee8de7e92bbff0406ddffc",
+      "tree_hash": "c4df1e4c5c4e0492d5a04bd920515ab4cb4a5cb1",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "directory-kerby-2.1.1": {
+      "project_name": "directory-kerby-2.1.1",
+      "repository_path": "/opt/projects/directory-kerby-2.1.1",
+      "project_commit": "75cf12a60e7e7fada42adec9c2ef21d367b6be07",
+      "tree_hash": "78f87f063d85f44f067e310999aacbbd84125002",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "guava": {
+      "project_name": "guava",
+      "repository_path": "/opt/projects/guava",
+      "project_commit": "1933e3fc2b4fdb56a6a571f0fb4f12b0da1a4467",
+      "tree_hash": "7abb1d9d6a5dd028459da3a3249c477463fa48e7",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "h2database": {
+      "project_name": "h2database",
+      "repository_path": "/opt/projects/h2database",
+      "project_commit": "280a5da951fbb10185df57144a56419a51201c83",
+      "tree_hash": "0994b731694fa864295e439af46843796bf409a5",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "jcseg-573874f": {
+      "project_name": "jcseg-573874f",
+      "repository_path": "/opt/projects/jcseg-573874f",
+      "project_commit": "71106b8ec8e885c0e419e376f3b711a8147def89",
+      "tree_hash": "13cd1ef1cb88f7a919e341057aa3b05e604215f8",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "mybatis-3": {
+      "project_name": "mybatis-3",
+      "repository_path": "/opt/projects/mybatis-3",
+      "project_commit": "e366cb7ee72e71564dded236c3515af64c61dca4",
+      "tree_hash": "43f17482571f6c0fab402c7f33bac0b88ae21852",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "tika": {
+      "project_name": "tika",
+      "repository_path": "/opt/projects/tika",
+      "project_commit": "577932c0703fe8d13a979bb6c79406cd167741b0",
+      "tree_hash": "a7d4c277b9784860762f0a7eed48630841d14d6d",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    },
+    "wumpz-jhotdraw-10.2.4": {
+      "project_name": "wumpz-jhotdraw-10.2.4",
+      "repository_path": "/opt/projects/wumpz-jhotdraw-10.2.4",
+      "project_commit": "78e98d66727f64394539e46adff0254c18f63133",
+      "tree_hash": "0ded2a8c2c9964275e4683519cd9d9c12ba63e21",
+      "source_image_tag": "opencode-java-refactor-delivery:0.1.3-coupling-fix-experiment-r7",
+      "source_image_id": "sha256:9a1d6719358d141a15edd22bd38eab27da9280172d329881b65c35c044c80abb",
+      "delivery_image_tag": "opencode-java-refactor-delivery:0.1.3-unified-loop-refused-bequest-r8.1"
+    }
+  }
+}

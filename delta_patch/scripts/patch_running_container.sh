@@ -13,8 +13,9 @@ PATCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 docker exec "$CONTAINER" sh -lc '
   set -e
   command -v node >/dev/null
-  node --version | grep -E "^v22\."
+  test "$(node --version)" = "v18.19.1"
   command -v npm >/dev/null
+  test "$(opencode --version)" = "1.17.8"
 '
 
 docker exec "$CONTAINER" sh -lc 'mkdir -p /opt/opencode-refactor /usr/local/bin'

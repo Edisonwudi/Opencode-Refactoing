@@ -2,7 +2,8 @@ ARG OPENCODE_IMAGE=opencode-smell-opencode:0.1.0-amd64
 ARG IDEA_IMAGE=opencode-smell-idea:0.1.0-amd64
 ARG JAVA_PROJECTS_IMAGE=opencode-smell-java-projects:0.1.0-amd64
 ARG DATASET_IMAGE=opencode-java-refactor-delivery:0.1.0-amd64
-ARG NODE_VERSION=22.22.2
+ARG NODE_VERSION=18.19.1
+ARG OPENCODE_VERSION=1.17.8
 ARG NODE_DIST_BASE=https://nodejs.org/dist
 
 FROM ${OPENCODE_IMAGE} AS opencode
@@ -10,11 +11,13 @@ FROM ${IDEA_IMAGE} AS idea
 FROM ${DATASET_IMAGE} AS dataset
 FROM ${JAVA_PROJECTS_IMAGE}
 
-ARG NODE_VERSION=22.22.2
+ARG NODE_VERSION=18.19.1
+ARG OPENCODE_VERSION=1.17.8
 ARG NODE_DIST_BASE=https://nodejs.org/dist
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/opt/buildenv/offline-home \
@@ -63,16 +66,25 @@ RUN NODE_VERSION="${NODE_VERSION}" NODE_DIST_BASE="${NODE_DIST_BASE}" python3 -c
     && cd /opt/opencode-refactor \
     && chmod +x /usr/local/bin/opencode \
     && chmod +x /usr/local/bin/rg \
-    && node --version | grep -E '^v22\.' \
-    && node -e "const p=require('/opt/opencode-refactor/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.17.13') process.exit(1)" \
-    && node -e "const p=require('/opt/opencode-refactor/.opencode/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.17.13') process.exit(1)" \
+    && test "$(node --version)" = "v${NODE_VERSION}" \
+    && test "$(opencode --version)" = "${OPENCODE_VERSION}" \
+    && node -e "const p=require('/opt/opencode-refactor/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.15.10') process.exit(1)" \
+    && node -e "const p=require('/opt/opencode-refactor/.opencode/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.15.10') process.exit(1)" \
     && chmod +x /usr/local/bin/idea-refactor-open \
     && chmod +x /opt/idea-refactoring/bin/idea-refactor \
     && chmod +x /usr/local/bin/run-java-refactor-delivery \
     && chmod +x /opt/opencode-refactor/scripts/run_smell_dataset.py \
     && chmod +x /opt/opencode-refactor/scripts/self_check_smell_verify.mjs \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_java_baselines.py \
+    && chmod +x /opt/opencode-refactor/scripts/materialize_java_project_env.py \
+    && chmod +x /opt/opencode-refactor/scripts/normalize_java_sample_commands.py \
     && cp /opt/java-projects-config/projects.java.docker.yaml /opt/opencode-refactor/runtime/python/smell_core/defaults/projects.java.docker.yaml \
-    && python3 -m py_compile /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py /opt/opencode-refactor/scripts/run_smell_dataset.py \
+    && python3 /opt/opencode-refactor/scripts/materialize_java_project_env.py /opt/opencode-refactor/runtime/python/smell_core/defaults/projects.java.docker.yaml \
+    && python3 /opt/opencode-refactor/scripts/normalize_java_sample_commands.py /opt/dataset/java/delivery_schema --project-root-base /opt/projects \
+    && python3 /opt/opencode-refactor/scripts/self_check_java_baselines.py --list-only --report /tmp/baseline-preflight.json \
+    && install -d -o smell -g smell /opt/buildenv/offline-home/.gradle/init.d \
+    && install -m 0644 -o smell -g smell /opt/opencode-refactor/docker/java-refactor-delivery/gradle-cache-retention.init.gradle /opt/buildenv/offline-home/.gradle/init.d/zz-opencode-cache-retention.gradle \
+    && python3 -m py_compile /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py /opt/opencode-refactor/scripts/run_smell_dataset.py /opt/opencode-refactor/scripts/self_check_java_baselines.py /opt/opencode-refactor/scripts/java_verification_policy.py /opt/opencode-refactor/scripts/materialize_java_project_env.py /opt/opencode-refactor/scripts/normalize_java_sample_commands.py \
     && node /opt/opencode-refactor/node_modules/typescript/bin/tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node /opt/opencode-refactor/.opencode/plugins/smell.ts \
     && python3 /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py verify --help >/dev/null \
     && node /opt/opencode-refactor/scripts/self_check_smell_verify.mjs --require-dataset >/tmp/smell-verify-self-check.json \

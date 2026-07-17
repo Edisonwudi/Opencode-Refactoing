@@ -112,25 +112,48 @@ python3 scripts/run_smell_dataset.py --dataset /path/to/java.csv --dry-run
 
 手动模式下，用户输入就是最终任务输入，需要包含项目根目录、语言、异味类型、目标位置、证据和验证模式等信息。
 
-直接编辑路径：
+直接编辑路径（command 参数是显式配置验证与 loop policy 的入口）：
 
 ```bash
-opencode run "<包含 project root、smell、location、evidence 的完整任务输入>" \
-  --agent "java-refactor-agent"
+printf '%s\n' '--verification-mode=local --loop-mode=verify-failure --loop-max=2 --loop-no-progress-limit=1 --loop-on=smell,compile,test -- Project root: /abs/java-project Smell type: long_method Target location: src/main/java/Foo.java:42' \
+  | opencode run --command java-refactor-run
 ```
 
 IDEA CLI 增强路径：
 
 ```bash
-opencode run "<包含 project root、smell、location、evidence 的完整任务输入>" \
-  --agent "java-refactor-agent-idea"
+printf '%s\n' '--verification-mode=local --loop-mode=verify-failure --loop-max=2 --loop-no-progress-limit=1 --loop-on=smell,compile,test -- Project root: /abs/java-project Smell type: long_method Target location: src/main/java/Foo.java:42' \
+  | opencode run --command java-refactor-run-idea
 ```
 
-交互式 OpenCode 会话中也可以使用命令包装器。它们不会额外构造或注入异味上下文，只负责选择对应 agent，并把剩余文本透传给 agent：
+command 参数与任务正文作为一个完整字符串从 stdin 传入。批处理 runner 也使用同一入口，避免 OpenCode CLI/yargs 将证据中的纯数字 token 转成 number 后破坏消息格式化。
+
+支持的 command policy 参数如下。参数和任务正文必须用独立的 ` -- ` 分隔；参数非法时直接返回 `INVALID_LOOP_POLICY`，不会静默回退。
+
+- `--verification-mode=local|auto|sample_optimized|project_full`
+- `--loop-mode=off|verify-failure`
+- `--loop-max=0..5`
+- `--loop-no-progress-limit=1..5`
+- `--loop-on=smell,compile,test`（可取子集）
+- `--loop-instruction=...`（如使用，必须是 `--` 前最后一个 policy 参数）
+- `--sample-deadline=60..7200`
+
+`smell_verify` 的 `loop.decision` 是唯一的 continuation 决策，插件会在
+`session.idle` 时自动恢复同一个 session；TUI、`opencode run`、`serve`、
+`web`、`attach` 和批处理使用相同机制，不需要环境开关，也不需要模型传入
+`autoContinue`。自动恢复与模型主动继续共享 `--loop-max` 预算，不会叠加第二套
+重试次数。没有通过 command 启动的直接 `smell_verify` 会使用默认 policy
+（`verify-failure`、最多 2 次 continuation）。
+
+`--sample-deadline` 是唯一的时间预算入口。批处理 runner、command loop 和最终独立 verify 都从该值派生：loop 使用原值，runner 只额外保留 60 秒给 OpenCode 正常退出，最终 verify 使用同一预算。runner 不再提供独立的 `--timeout`、`--verify-timeout` 或基于日志静默的 `--opencode-log-idle-timeout`，避免外层时限提前截断 loop。
+
+如果 OpenCode 到达截止时间但最终独立 verify 仍完整通过，结果记为 `PASS_AFTER_OPENCODE_TIMEOUT`；该状态表示重构验收通过，但模型进程未在预算内正常结束。
+
+交互式 OpenCode 会话中也可以使用相同 command；参数契约不变：
 
 ```text
-/java-refactor-run --project-root /abs/java-project --smell long_method --location src/main/java/Foo.java:42 --language java
-/java-refactor-run-idea --project-root /abs/java-project --smell long_method --location src/main/java/Foo.java:42 --language java
+/java-refactor-run --verification-mode=local --loop-max=2 -- Project root: /abs/java-project; Smell type: long_method; Target location: src/main/java/Foo.java:42
+/java-refactor-run-idea --verification-mode=local --loop-max=2 -- Project root: /abs/java-project; Smell type: long_method; Target location: src/main/java/Foo.java:42
 ```
 
 ## 6. 批量运行数据集
@@ -180,7 +203,7 @@ python3 scripts/run_smell_dataset.py \
 
 ## 7. 查看批量输出
 
-runner 默认为每个样本创建 git worktree。运行完成后查看：
+runner 默认为每个样本创建独立 Git checkout。checkout 位于容器原生的临时文件系统，`runs/` 挂载目录只保存可交付结果，避免 NTFS 等宿主机文件系统破坏 Git 权限语义。运行完成后查看：
 
 ```text
 runs/<run-name>/results.csv
@@ -214,12 +237,13 @@ runs/<run-name>/samples/<sample>/opencode.runtime.json
 ```bash
 docker build \
   -f docker/java-refactor-delivery/Dockerfile \
-  --build-arg NODE_VERSION=22.22.2 \
+  --build-arg NODE_VERSION=18.19.1 \
+  --build-arg OPENCODE_VERSION=1.17.8 \
   -t opencode-java-refactor-delivery:0.1.1-amd64 \
   .
 ```
 
-镜像构建阶段会重新安装 `@opencode-ai/plugin@1.17.13`，并执行 `scripts/self_check_smell_verify.mjs`。
+镜像构建阶段会安装与参考补丁一致的 Node `18.19.1`、校验 OpenCode `1.17.8`、安装 `@opencode-ai/plugin@1.15.10`，并执行 `scripts/self_check_smell_verify.mjs`。
 
 Docker 内部自检：
 
@@ -239,6 +263,34 @@ python3 scripts/run_smell_dataset.py \
 ```
 
 该步骤只验证 dataset runner 能读取真实 CSV 并选中固定样本，不访问模型 API。
+
+交付前 baseline build/sample-test 门禁：
+
+```bash
+mkdir -p "$PWD/runs"
+docker run --rm \
+  -v "$PWD/runs:/runs" \
+  opencode-java-refactor-delivery:0.1.1-amd64 \
+  baseline-check
+```
+
+`baseline-check` 不调用模型。它逐条处理数据集样本：为当前样本创建独立 Git checkout，在同一个 checkout 中先执行该项目配置的 build，build 通过后立即执行该样本的 test command，然后才进入下一条样本。相同 test command 不跨样本去重或复用 build 结果。任一样本的 build 或 test 失败时命令返回非零，并把完整报告写到 `runs/baseline-preflight.json`。
+
+镜像构建时还会统一验证环境口径：把 CSV 的 `project_path` 映射到 `/opt/projects/<project_name>`，固定 `TZ=Asia/Shanghai`，并让编译/行为测试跳过 Checkstyle 与 Spotless 这类格式门禁。baseline 预检会拒绝仍读取源码文本的锚点测试，以及长参数样本中通过完整参数列表反射目标方法的结构耦合测试。项目测试文件必须已经进入对应项目的 Git `HEAD`，仅覆盖工作区文件不能通过隔离 checkout 校验。
+
+定点检查可使用 `--project`、`--smell` 和 `--sample-id`：
+
+```bash
+docker run --rm \
+  -v "$PWD/runs:/runs" \
+  opencode-java-refactor-delivery:0.1.1-amd64 \
+  baseline-check \
+  --project Mindustry-v154.3 \
+  --smell long_method \
+  --sample-id 1
+```
+
+镜像会在专用 Gradle User Home 中通过官方 init DSL 禁用 cache cleanup，避免离线依赖在 build 与 sample test 之间被 Gradle GC 删除。
 
 Docker 批量 dry-run：
 

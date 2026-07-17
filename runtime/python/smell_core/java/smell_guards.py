@@ -30,6 +30,7 @@ from .semantic_detector import (
     find_matching_semantic_finding,
     run_java_semantic_detector,
 )
+from .ast_ncss import run_ast_ncss
 from .syntactic_detector import (
     find_matching_clone_pair,
     find_matching_syntactic_finding,
@@ -85,6 +86,8 @@ def run_java_syntactic_guard(
             "message": f"{guard_type} guard: target file not found or not a .java file: {target.file_path}",
             "details": {"detector": "java_syntactic_detector", "file": str(target.file_path)},
         }
+    if guard_type == "long_method":
+        return _run_java_ast_ncss_guard(config, target, thresholds, evidence)
     detection = run_java_syntactic_detector(
         config.project_root,
         target_files=[target.file_path],
@@ -137,6 +140,66 @@ def run_java_syntactic_guard(
             f"{target.project_path}#{target.method or target.line}."
         ),
         "details": {"detector": "java_syntactic_detector"},
+    }
+
+
+def _run_java_ast_ncss_guard(
+    config: ResolvedRunConfig,
+    target: Any,
+    thresholds: Dict[str, object],
+    evidence: str,
+) -> Dict[str, object]:
+    threshold = int(thresholds.get("long_method_ncss", 60))
+    result = run_ast_ncss(target.file_path, config.project_root, threshold)
+    if not result.ok:
+        return {
+            "type": "long_method",
+            "success": False,
+            "message": f"long_method guard: Java AST-NCSS unavailable: {result.error}",
+            "details": {"detector": "java_ast_ncss", "metric": "PMD-compatible AST-NCSS", "error": result.error},
+        }
+    match = find_matching_syntactic_finding(
+        result.findings,
+        target_file=target.file_path,
+        project_root=config.project_root,
+        method=target.method,
+        line=target.line,
+        original_start_line=target.start_line,
+        evidence=evidence,
+    )
+    if match:
+        return {
+            "type": "long_method",
+            "success": False,
+            "message": (
+                f"long_method guard: Java AST still reports {target.project_path}#"
+                f"{target.method or target.line} with AST-NCSS {match.score:g} "
+                f"(threshold {threshold})."
+            ),
+            "details": {
+                "detector": "java_ast_ncss",
+                "metric": "PMD-compatible AST-NCSS",
+                "file": match.file,
+                "method": match.method,
+                "begin_line": match.begin_line,
+                "score": match.score,
+                "threshold": threshold,
+                "rule_id": match.rule_id,
+                "evidence": match.evidence,
+            },
+        }
+    return {
+        "type": "long_method",
+        "success": True,
+        "message": (
+            f"long_method guard: Java AST no longer reports {target.project_path}#"
+            f"{target.method or target.line} at or above AST-NCSS threshold {threshold}."
+        ),
+        "details": {
+            "detector": "java_ast_ncss",
+            "metric": "PMD-compatible AST-NCSS",
+            "threshold": threshold,
+        },
     }
 
 
@@ -517,6 +580,7 @@ def _run_god_class_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
             },
         }
     evidence = _guard_evidence(guard)
+    baseline_metrics = _parse_god_class_metrics(evidence)
     target_class = target.class_name or _class_from_evidence(evidence)
     target_class_exists = _target_class_exists(config, target.file_path, target_class) if target_class else True
     if target_class_exists is False:
@@ -551,6 +615,11 @@ def _run_god_class_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
         line=target.line,
     )
     if match:
+        current_metrics = _parse_god_class_metrics(match.evidence)
+        metric_delta = {
+            name: current_metrics[name] - baseline_metrics[name]
+            for name in sorted(set(baseline_metrics).intersection(current_metrics))
+        }
         return {
             "type": "god_class",
             "success": False,
@@ -567,6 +636,9 @@ def _run_god_class_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
                 "score": match.score,
                 "rule_id": match.rule_id,
                 "evidence": match.evidence,
+                "baseline_metrics": baseline_metrics,
+                "current_metrics": current_metrics,
+                "metric_delta": metric_delta,
             },
         }
     return {
@@ -580,6 +652,7 @@ def _run_god_class_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
             "detector": "python_semantic_detector",
             "file": str(target.project_path),
             "class_name": target_class,
+            "baseline_metrics": baseline_metrics,
         },
     }
 
@@ -757,6 +830,13 @@ def _guard_evidence(guard: Dict[str, object]) -> str:
 def _class_from_evidence(evidence: str) -> str:
     match = re.search(r"\bclass=([^;,\s]+)", str(evidence or ""))
     return match.group(1).strip() if match else ""
+
+
+def _parse_god_class_metrics(evidence: str) -> Dict[str, int]:
+    return {
+        name: int(value)
+        for name, value in re.findall(r"\b(nom|nof|wmc|loc|atfd)=(\d+)\b", str(evidence or ""))
+    }
 
 
 def _normalize_class_name(value: str) -> str:

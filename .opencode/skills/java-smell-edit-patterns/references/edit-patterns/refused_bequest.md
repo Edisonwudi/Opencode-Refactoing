@@ -10,11 +10,18 @@ contracts, delegating to real owners, splitting interfaces, or pushing behavior 
 - The reported child/parent contract mismatch should be gone.
 - Unsupported-operation throws or empty overrides called out by evidence must be deleted,
   implemented, or delegated.
+- The supplied sample test is an immutable project-behavior regression oracle. Keep it
+  unchanged and make production code satisfy both the smell guard and that behavior test.
+- Use the evidence `refactor_path` as the primary route and inspect the referenced existing
+  helper, overload, state field, sibling protocol, or capability boundary before editing.
 
 ## Common avoid
 
 - Hiding refused behavior behind a rename.
 - Removing inheritance before checking parent-typed callers and sibling implementations.
+- Editing, deleting, skipping, or weakening the sample test.
+- Replacing an empty or rejecting override with logging, comments, swallowed exceptions,
+  or a placeholder constant.
 
 ## Routes
 

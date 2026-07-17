@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
 import { existsSync, readdirSync } from "node:fs"
@@ -15,9 +16,34 @@ type IdeaCliResult = BridgeResult & {
   argv: string[]
 }
 
+type LoopPolicy = {
+  mode: "off" | "verify-failure"
+  max_continuations: number
+  no_progress_limit: number
+  allowed_failure_groups: string[]
+  instruction: string
+  sample_deadline_seconds: number
+}
+
+type CommandPolicy = {
+  task: string
+  verification_mode: "local" | "auto" | "sample_optimized" | "project_full"
+  loop: LoopPolicy
+}
+
+type CommandLoopState = {
+  policy: CommandPolicy
+  startedAt: number
+  continuationCount: number
+  noProgressCount: number
+  lastFailureFingerprint: string
+}
+
 const pluginFile = fileURLToPath(import.meta.url)
 const pluginRoot = path.resolve(path.dirname(pluginFile), "..", "..")
-const bridgeFile = path.join(pluginRoot, "runtime", "python", "bridge", "smell_bridge.py")
+const bridgeFile = path.resolve(
+  process.env.SMELL_BRIDGE_FILE || path.join(pluginRoot, "runtime", "python", "bridge", "smell_bridge.py"),
+)
 const bundledIdeaRefactorCli = path.resolve(pluginRoot, "bin", "idea-refactor")
 
 function addOptional(args: string[], flag: string, value?: string) {
@@ -102,21 +128,39 @@ function commonArgs(input: {
   return args
 }
 
+function taskField(task: string, label: string): string | undefined {
+  const prefix = `${label.toLowerCase()}:`
+  for (const rawLine of String(task || "").split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (line.toLowerCase().startsWith(prefix)) {
+      const value = line.slice(prefix.length).trim()
+      return value || undefined
+    }
+  }
+  return undefined
+}
+
+function commandTaskIdentity(task: string) {
+  return withBatchDefaults({
+    projectRoot: taskField(task, "Project root"),
+    language: taskField(task, "Language"),
+    smell: taskField(task, "Smell type"),
+    location: taskField(task, "Target location"),
+    smellEvidence: taskField(task, "Smell evidence"),
+  })
+}
+
 const MAX_STDOUT_STDERR_LEN = 4000
 
-// --- session.idle limited auto-continuation (off by default) ---------------
+// --- session.idle command-policy continuation -------------------------------
 //
-// This is an interactive-mode fallback. It never activates in `opencode run`
-// single-shot mode or in batch runner environments. smell_verify.execute only
-// updates in-process state and metadata; the actual client.session.promptAsync
-// call happens in the plugin `event` hook after a `session.idle` for the same
-// session. The whole mechanism defaults to "off" and requires both
-// SMELL_IDLE_CONTINUE_MODE=interactive and smell_verify({ autoContinue: true }).
+// smell_verify attaches the authoritative command-owned loop decision and this
+// runtime resumes the same session after session.idle when that decision is
+// `continue`. There is no interactive/batch/run-mode switch and no second retry
+// budget: command policy is the single source of truth.
 
 const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
-const MAX_IDLE_CONTINUE_ATTEMPTS = 2 // hard limit, cannot be raised by model args
 const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
-const ALLOWED_AGENTS = new Set(["java-refactor-agent", "java-refactor-agent-idea"])
 // Conservative allowlist of repairable failure categories. These are the
 // category strings the Python bridge actually emits from
 // `_classify_failure_pack`. BUILD_FAILED is intentionally NOT listed: only an
@@ -134,13 +178,6 @@ const REPAIRABLE_CATEGORIES = new Set([
   "SAMPLE_TEST_FAILED",
 ])
 
-// OpenCode subcommands that run non-interactively or headlessly and therefore
-// must never receive an auto-continuation. The bare `opencode` invocation
-// (TUI, no subcommand) is interactive and is NOT in this set.
-const NONINTERACTIVE_SUBCOMMANDS = new Set(["run", "serve", "web", "attach"])
-
-type IdleContinueMode = "off" | "shadow" | "interactive"
-
 type FailureClassification = {
   ok: boolean
   category: string
@@ -153,7 +190,9 @@ type ContinuationState = {
   taskKey: string
   generation: number
   dispatchedGeneration: number
-  attempt: number
+  continuation: number
+  maxContinuations: number
+  instruction: string
   pending: boolean
   dispatching: boolean
   agent: string
@@ -163,50 +202,6 @@ type ContinuationState = {
   failureHighlights: string[]
   artifactPaths: string[]
   updatedAt: number
-}
-
-function idleContinueMode(env: NodeJS.ProcessEnv = process.env): IdleContinueMode {
-  const raw = typeof env?.SMELL_IDLE_CONTINUE_MODE === "string" ? env.SMELL_IDLE_CONTINUE_MODE.trim() : ""
-  if (raw === "shadow") return "shadow"
-  if (raw === "interactive") return "interactive"
-  return "off" // default; unrecognized values are treated as off
-}
-
-function isBatchEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (!env) return false
-  if (env.SMELL_BATCH_RUN === "1") return true
-  const projectRoot = typeof env.SMELL_PROJECT_ROOT === "string" ? env.SMELL_PROJECT_ROOT.trim() : ""
-  return Boolean(projectRoot)
-}
-
-// Identify non-interactive OpenCode invocations (`opencode run`, `serve`,
-// `web`, `attach`) from argv. The bare `opencode` command (TUI, no
-// subcommand) is interactive and must return false so the README's
-// `SMELL_IDLE_CONTINUE_MODE=interactive opencode` actually enables continuation.
-// Conservative: only when we can positively identify the opencode executable do
-// we trust the subcommand; otherwise (unrecognizable argv) we treat it as run.
-function isOpendcodeRunMode(argv: readonly string[] = process.argv): boolean {
-  if (!Array.isArray(argv) || argv.length === 0) return true
-  let opencodeIndex = -1
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = String(argv[i] || "")
-    if (!token) continue
-    const base = path.basename(token)
-    if (base === "opencode" || base === "opencode.exe") {
-      opencodeIndex = i
-      break
-    }
-  }
-  if (opencodeIndex < 0) {
-    // No recognizable opencode executable in argv. Conservative: treat as run.
-    return true
-  }
-  const next = argv[opencodeIndex + 1]
-  if (typeof next !== "string") {
-    // Bare `opencode` with no subcommand -> interactive TUI. Do NOT treat as run.
-    return false
-  }
-  return NONINTERACTIVE_SUBCOMMANDS.has(next)
 }
 
 // The bridge emits failure_pack.artifact_paths as an object (name -> path), not
@@ -327,9 +322,8 @@ function makeTaskKey(projectRoot: string, smell: string, location: string): stri
 }
 
 function buildContinuationMessage(state: ContinuationState): string {
-  const attempt = Math.max(1, Math.min(state.attempt + 1, MAX_IDLE_CONTINUE_ATTEMPTS))
   const lines: string[] = []
-  lines.push(`${SMELL_IDLE_CONTINUE_PREFIX} ${attempt}/${MAX_IDLE_CONTINUE_ATTEMPTS}]`)
+  lines.push(`${SMELL_IDLE_CONTINUE_PREFIX} ${state.continuation}/${state.maxContinuations}]`)
   lines.push("")
   lines.push("The previous smell_verify result was not accepted.")
   lines.push(`Status: ${state.verifyStatus || "FAILED"}.`)
@@ -351,7 +345,7 @@ function buildContinuationMessage(state: ContinuationState): string {
     for (const p of paths) lines.push(`- ${redactSecrets(p)}`)
     lines.push("")
   }
-  lines.push("Read the latest failure_pack and make one narrow corrective edit.")
+  lines.push(state.instruction || "Read the latest failure_pack and make one narrow corrective edit.")
   lines.push("Then call smell_verify again. Do not repeat the previous edit without")
   lines.push("new evidence. Do not modify or weaken tests.")
   let message = lines.join("\n")
@@ -816,17 +810,13 @@ function renderIdeaResult(
   }
 }
 
-// Create an isolated idle-continuation runtime. Pure-function-driven so the
-// self-check can inject a fake client/env/argv without touching real state.
-// Production code calls this with the real client/process.env/process.argv.
+// Create an isolated idle-continuation runtime. It consumes the authoritative
+// loop decision already attached by applyCommandLoopDecision; it neither owns
+// a second budget nor varies behavior by OpenCode invocation mode.
 function createIdleContinueRuntime(options: {
   client?: { session: { promptAsync: (opts: unknown) => Promise<unknown> } }
-  env?: NodeJS.ProcessEnv
-  argv?: readonly string[]
   log?: (msg: string, details?: unknown) => void
 }) {
-  const env = options.env || process.env
-  const argv = options.argv || process.argv
   const log = options.log || (() => {})
   const states = new Map<string, ContinuationState>()
   let disposed = false
@@ -863,66 +853,53 @@ function createIdleContinueRuntime(options: {
     directory: string
     taskKey: string
     output: string
-    autoContinue: boolean
   }): {
-    mode: IdleContinueMode
     enabled: boolean
-    autoContinue: boolean
-    attempt: number
-    maxAttempts: number
+    continuation: number
+    maxContinuations: number
     generation: number
     status: string
     category: string
     dispatched: boolean
   } {
     cleanupStale()
-    const mode = idleContinueMode(env)
-    const enabled = mode !== "off"
     let status = ""
     let category = ""
-    let passed = false
     let jsonParsed = false
     let failurePack: unknown = null
+    let loop: Record<string, unknown> | null = null
     try {
       const parsed = JSON.parse(input.output) as Record<string, unknown>
       jsonParsed = true
       status = typeof parsed.status === "string" ? parsed.status : ""
-      if (typeof parsed.success === "boolean") passed = parsed.success
       category = typeof parsed.failure_category === "string" ? parsed.failure_category : ""
       failurePack = parsed.failure_pack
+      loop = parsed.loop && typeof parsed.loop === "object" && !Array.isArray(parsed.loop)
+        ? parsed.loop as Record<string, unknown>
+        : null
     } catch {
       // Non-JSON bridge output: never continue.
     }
 
     const existing = states.get(input.sessionID)
-    // The continuation attempt budget is per-session and is only reset by a
-    // genuine new user message (handleChatMessage). It must NOT be reset by a
-    // taskKey/location change, otherwise the model can bypass the 2-round cap by
-    // shifting the reported location between calls.
-    const attempt = existing ? existing.attempt : 0
+    const continuation = typeof loop?.continuation === "number" ? loop.continuation : 0
+    const maxContinuations = typeof loop?.max_continuations === "number" ? loop.max_continuations : 0
+    const decision = typeof loop?.decision === "string" ? loop.decision : "stop"
+    const instruction = typeof loop?.instruction === "string" ? loop.instruction : ""
 
     const base = {
-      mode,
-      enabled,
-      autoContinue: Boolean(input.autoContinue),
-      attempt,
-      maxAttempts: MAX_IDLE_CONTINUE_ATTEMPTS,
+      enabled: true,
+      continuation,
+      maxContinuations,
       generation: existing ? existing.generation : 0,
       status,
       category: category || (existing ? existing.failureCategory : ""),
       dispatched: existing ? existing.dispatchedGeneration === existing.generation : false,
     }
 
-    // PASS: clear state, no continuation.
-    if (passed || status === "PASS") {
-      states.delete(input.sessionID)
-      return { ...base, dispatched: false }
-    }
-
-    // Any new verify result that cannot arm continuation must revoke a stale
-    // pending from a previous generation, otherwise a later session.idle would
-    // resume against an outdated failure_pack. This covers: non-JSON output,
-    // autoContinue=false, non-interactive mode, and non-repairable categories.
+    // Any result other than the controller's authoritative `continue` revokes a
+    // stale pending generation. This includes PASS, malformed output, disabled
+    // policy, non-repairable failure, deadline, no-progress, and exhausted cap.
     const revokePending = () => {
       if (existing && existing.pending) {
         existing.pending = false
@@ -931,29 +908,14 @@ function createIdleContinueRuntime(options: {
       }
     }
 
-    if (!jsonParsed) {
+    if (!jsonParsed || decision !== "continue" || continuation <= 0 || continuation > maxContinuations) {
       revokePending()
       return { ...base, dispatched: false }
     }
 
-    if (!enabled || !input.autoContinue) {
-      revokePending()
-      return base
-    }
-
     const classification = classifyFailureForContinue(failurePack)
-    if (!classification.ok) {
-      log("smell-idle-continue skip non-repairable", {
-        sessionID: input.sessionID,
-        category: classification.category,
-        status: classification.verifyStatus,
-      })
-      revokePending()
-      return { ...base, category: classification.category || category, dispatched: false }
-    }
-
-    // A new repairable failure arms continuation for this generation. taskKey is
-    // recorded for diagnostics only; it does NOT reset the attempt budget.
+    // applyCommandLoopDecision already validated repairability and consumed one
+    // unit from the shared command-policy budget.
     const nextGeneration = existing ? existing.generation + 1 : 1
     // If an in-flight dispatch exists for the previous generation, preserve the
     // SAME state object reference (mutate in place) so the pending .then()/.catch()
@@ -966,7 +928,9 @@ function createIdleContinueRuntime(options: {
           taskKey: input.taskKey,
           generation: nextGeneration,
           dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
-          attempt,
+          continuation,
+          maxContinuations,
+          instruction,
           pending: true,
           dispatching: false,
           agent: input.agent,
@@ -981,6 +945,9 @@ function createIdleContinueRuntime(options: {
     if (hasInflightDispatch) {
       nextState.taskKey = input.taskKey
       nextState.generation = nextGeneration
+      nextState.continuation = continuation
+      nextState.maxContinuations = maxContinuations
+      nextState.instruction = instruction
       nextState.pending = true
       nextState.agent = input.agent
       nextState.directory = input.directory
@@ -996,11 +963,13 @@ function createIdleContinueRuntime(options: {
       generation: nextState.generation,
       taskKey: nextState.taskKey,
       category: nextState.failureCategory,
-      attempt: nextState.attempt,
+      continuation: nextState.continuation,
+      maxContinuations: nextState.maxContinuations,
     })
     return {
       ...base,
-      attempt: nextState.attempt,
+      continuation: nextState.continuation,
+      maxContinuations: nextState.maxContinuations,
       generation: nextState.generation,
       category: nextState.failureCategory,
       dispatched: nextState.dispatchedGeneration === nextState.generation,
@@ -1012,38 +981,12 @@ function createIdleContinueRuntime(options: {
   function handleIdle(sessionID: string): boolean {
     cleanupStale()
     if (disposed) return false
-    const mode = idleContinueMode(env)
-    if (mode === "off") return false
-    if (isBatchEnvironment(env) || isOpendcodeRunMode(argv)) {
-      if (mode === "shadow") {
-        log("smell-idle-continue skip batch/run mode (shadow)", { sessionID })
-      }
-      return false
-    }
     const state = states.get(sessionID)
     if (!state) return false
-    if (mode === "shadow") {
-      const wouldDispatch =
-        !state.dispatching &&
-        state.pending &&
-        state.attempt < MAX_IDLE_CONTINUE_ATTEMPTS &&
-        state.dispatchedGeneration !== state.generation &&
-        ALLOWED_AGENTS.has(state.agent) &&
-        Boolean(options.client)
-      log("smell-idle-continue shadow decision", {
-        sessionID,
-        wouldDispatch,
-        attempt: state.attempt,
-        generation: state.generation,
-        category: state.failureCategory,
-      })
-      return false // shadow never calls promptAsync
-    }
     if (!options.client) return false
-    if (!ALLOWED_AGENTS.has(state.agent)) return false
     if (!state.pending) return false
     if (state.dispatching) return false
-    if (state.attempt >= MAX_IDLE_CONTINUE_ATTEMPTS) return false
+    if (state.continuation <= 0 || state.continuation > state.maxContinuations) return false
     if (state.dispatchedGeneration === state.generation) return false
 
     // Atomically mark dispatching for this generation before the async call.
@@ -1064,14 +1007,14 @@ function createIdleContinueRuntime(options: {
       .then((res) => {
         const err = (res as { error?: unknown })?.error
         if (err) throw err
-        state.attempt += 1
         state.pending = false
         state.dispatching = false
         state.updatedAt = Date.now()
         lastDispatchError = ""
         log("smell-idle-continue dispatched", {
           sessionID,
-          attempt: state.attempt,
+          continuation: state.continuation,
+          maxContinuations: state.maxContinuations,
           generation: state.generation,
         })
       })
@@ -1128,8 +1071,178 @@ function createIdleContinueRuntime(options: {
   }
 }
 
+function parseCommandPolicyResult(result: BridgeResult): CommandPolicy {
+  if (result.exitCode !== 0 || !result.json || typeof result.json !== "object" || Array.isArray(result.json)) {
+    const parsed = result.json as { error?: unknown } | null
+    const detail = typeof parsed?.error === "string" ? parsed.error : (result.stderr || "command policy could not be resolved")
+    throw new Error(detail)
+  }
+  const payload = result.json as Record<string, unknown>
+  const loop = payload.loop
+  if (!loop || typeof loop !== "object" || Array.isArray(loop)) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned no loop policy")
+  }
+  return payload as unknown as CommandPolicy
+}
+
+function commandPolicyPrompt(policy: CommandPolicy): string {
+  const allowed = policy.loop.allowed_failure_groups.join(", ") || "none"
+  const lines = [
+    policy.task,
+    "",
+    "Controller-owned verification and loop policy:",
+    `- verification_mode: ${policy.verification_mode}`,
+    `- loop_mode: ${policy.loop.mode}`,
+    `- max_continuations: ${policy.loop.max_continuations}`,
+    `- no_progress_limit: ${policy.loop.no_progress_limit}`,
+    `- allowed_failure_groups: ${allowed}`,
+    `- sample_deadline_seconds: ${policy.loop.sample_deadline_seconds}`,
+    `- continuation_instruction: ${policy.loop.instruction}`,
+    "",
+    "Call smell_verify as the acceptance gate. Its loop.decision field is authoritative.",
+    "When loop.decision is continue, follow loop.instruction and call smell_verify again.",
+    "When loop.decision is stop, stop and report loop.termination_reason. Never modify or weaken tests.",
+  ]
+  if (/^Smell type:\s*feature_envy\s*$/im.test(policy.task)) {
+    lines.push(
+      "",
+      "Feature Envy checkpoint contract:",
+      "- The dataset label is authoritative even when the strict threshold detector is initially clean.",
+      "- An unchanged baseline can never pass; make a substantive production-Java refactoring.",
+      "- Acceptance requires measurable reduction of dependency on the expected envied receiver plus build/test preservation.",
+    )
+  }
+  return lines.join("\n")
+}
+
+function defaultCommandPolicy(
+  verificationMode: CommandPolicy["verification_mode"] = "local",
+): CommandPolicy {
+  return {
+    task: "Complete the current smell refactoring task.",
+    verification_mode: verificationMode,
+    loop: {
+      mode: "verify-failure",
+      max_continuations: 2,
+      no_progress_limit: 1,
+      allowed_failure_groups: ["smell", "compile", "test"],
+      instruction: "Read the latest failure_pack, make one narrow corrective edit, and call smell_verify again. Do not modify or weaken tests.",
+      sample_deadline_seconds: 1800,
+    },
+  }
+}
+
+function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
+  return {
+    policy,
+    startedAt: Date.now(),
+    continuationCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+}
+
+function failureFingerprint(payload: Record<string, unknown>): string {
+  const pack = payload.failure_pack
+  const smellGuard = payload.smell_guard && typeof payload.smell_guard === "object" && !Array.isArray(payload.smell_guard)
+    ? payload.smell_guard as Record<string, unknown>
+    : null
+  const firstResult = Array.isArray(smellGuard?.results) && smellGuard!.results.length > 0
+    && smellGuard!.results[0] && typeof smellGuard!.results[0] === "object"
+    ? smellGuard!.results[0] as Record<string, unknown>
+    : null
+  const details = firstResult?.details && typeof firstResult.details === "object" && !Array.isArray(firstResult.details)
+    ? firstResult.details as Record<string, unknown>
+    : null
+  const metricDelta = details?.metric_delta && typeof details.metric_delta === "object" && !Array.isArray(details.metric_delta)
+    ? details.metric_delta as Record<string, unknown>
+    : null
+  const source = pack && typeof pack === "object" && !Array.isArray(pack)
+    ? {
+        category: (pack as Record<string, unknown>).failure_category || "",
+        status: (pack as Record<string, unknown>).verify_status || payload.status || "",
+        highlights: (pack as Record<string, unknown>).highlights || [],
+        checkpointProgress: details ? {
+          reason: details.reason || "",
+          hasProductionDiff: details.has_production_diff === true,
+          expectedReceiverAccess: metricDelta?.expected_receiver_access || null,
+        } : null,
+      }
+    : { category: "", status: payload.status || "", highlights: [] }
+  return createHash("sha256").update(JSON.stringify(source)).digest("hex")
+}
+
+function applyCommandLoopDecision(normalized: { output: string; metadata: Record<string, unknown> }, state: CommandLoopState) {
+  let payload: Record<string, unknown>
+  try {
+    payload = JSON.parse(normalized.output) as Record<string, unknown>
+  } catch {
+    return
+  }
+  const passed = payload.success === true || payload.status === "PASS"
+  const pack = payload.failure_pack
+  const category = pack && typeof pack === "object" && !Array.isArray(pack)
+    ? String((pack as Record<string, unknown>).failure_category || "")
+    : ""
+  const group = pack && typeof pack === "object" && !Array.isArray(pack)
+    ? String((pack as Record<string, unknown>).failure_group || "")
+    : ""
+  const bridgeRetryable = pack && typeof pack === "object" && !Array.isArray(pack)
+    ? (pack as Record<string, unknown>).retryable === true
+    : false
+  const retryable = Boolean(bridgeRetryable && group && state.policy.loop.allowed_failure_groups.includes(group))
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000))
+  let decision: "continue" | "stop" = "stop"
+  let terminationReason = "PASS"
+
+  if (!passed) {
+    const fingerprint = failureFingerprint(payload)
+    if (state.lastFailureFingerprint && state.lastFailureFingerprint === fingerprint) {
+      state.noProgressCount += 1
+    } else {
+      state.noProgressCount = 0
+    }
+    state.lastFailureFingerprint = fingerprint
+
+    if (state.policy.loop.mode === "off" || state.policy.loop.max_continuations <= 0) {
+      terminationReason = "LOOP_DISABLED"
+    } else if (!retryable) {
+      terminationReason = "NON_REPAIRABLE_FAILURE"
+    } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
+      terminationReason = "SAMPLE_DEADLINE_REACHED"
+    } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
+      terminationReason = "NO_PROGRESS"
+    } else if (state.continuationCount >= state.policy.loop.max_continuations) {
+      terminationReason = "MAX_CONTINUATIONS_REACHED"
+    } else {
+      state.continuationCount += 1
+      decision = "continue"
+      terminationReason = ""
+    }
+  }
+
+  const loop = {
+    decision,
+    termination_reason: terminationReason,
+    continuation: state.continuationCount,
+    max_continuations: state.policy.loop.max_continuations,
+    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
+    no_progress_count: state.noProgressCount,
+    no_progress_limit: state.policy.loop.no_progress_limit,
+    elapsed_seconds: elapsedSeconds,
+    sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
+    failure_category: category,
+    failure_group: group,
+    instruction: decision === "continue" ? state.policy.loop.instruction : "",
+  }
+  payload.loop = loop
+  normalized.output = safeJsonStringify(payload)
+  normalized.metadata.loop = toJsonSafe(loop)
+}
+
 export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const idleRuntime = createIdleContinueRuntime({ client })
+  const commandLoopStates = new Map<string, CommandLoopState>()
   const commonShape = {
     projectRoot: tool.schema.string().describe("Absolute path to the source project root."),
     language: tool.schema
@@ -1164,35 +1277,41 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           .optional()
           .describe("Verification mode. Defaults to local smell guard only; strict modes also run configured build/test."),
         noSnapshot: tool.schema.boolean().optional().describe("Do not include git status and source diff snapshot."),
-        autoContinue: tool.schema
-          .boolean()
-          .optional()
-          .describe("Allow the plugin to auto-inject one continuation message after a repairable idle failure (default false)."),
       },
       async execute(args, context) {
         const resolved = withBatchDefaults(args)
+        const sessionID = context?.sessionID || ""
+        let commandState = commandLoopStates.get(sessionID)
+        if (!commandState && sessionID) {
+          const requestedMode = String(resolved.verificationMode || "local") as CommandPolicy["verification_mode"]
+          commandState = newCommandLoopState(defaultCommandPolicy(requestedMode))
+          commandLoopStates.set(sessionID, commandState)
+        }
+        if (commandState) {
+          resolved.verificationMode = commandState.policy.verification_mode
+        }
         const bridgeArgs = ["verify", ...commonArgs(resolved)]
         if (args.noSnapshot) bridgeArgs.push("--no-snapshot")
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
-        // Update the in-process idle-continuation state machine from the bridge
-        // output. This never throws into the tool result; it only attaches
-        // metadata and arms continuation for a later session.idle dispatch.
+        if (commandState) {
+          applyCommandLoopDecision(normalized, commandState)
+        }
+        // Consume the authoritative loop decision and arm same-session
+        // continuation. This path is identical for TUI, run, serve, web,
+        // attach, and batch environments.
         let autoContinuation: Record<string, unknown> | undefined
         try {
           const cont = idleRuntime.recordFromBridgeOutput({
-            sessionID: context?.sessionID || "",
+            sessionID,
             agent: context?.agent || "",
             directory: context?.directory || "",
             taskKey: makeTaskKey(resolved.projectRoot || "", resolved.smell || "", resolved.location || ""),
             output: normalized.output,
-            autoContinue: Boolean(args.autoContinue),
           })
           autoContinuation = {
-            mode: cont.mode,
             enabled: cont.enabled,
-            autoContinue: cont.autoContinue,
-            attempt: cont.attempt,
-            maxAttempts: cont.maxAttempts,
+            continuation: cont.continuation,
+            maxContinuations: cont.maxContinuations,
             generation: cont.generation,
             status: cont.status,
             category: cont.category,
@@ -1390,6 +1509,38 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       }
     },
 
+    "command.execute.before": async (input, output) => {
+      if (input.command !== "java-refactor-run" && input.command !== "java-refactor-run-idea") return
+      const result = await runBridge(worktree, ["resolve-command", "--arguments", input.arguments])
+      const policy = parseCommandPolicyResult(result)
+      const identity = commandTaskIdentity(policy.task)
+      if (identity.smell === "feature_envy") {
+        if (!identity.projectRoot || !identity.location) {
+          throw new Error("FEATURE_ENVY_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
+        }
+        const baselineResult = await runBridge(worktree, [
+          "capture-baseline",
+          ...commonArgs({
+            projectRoot: String(identity.projectRoot),
+            projectOverrideRoot: identity.projectOverrideRoot,
+            language: identity.language,
+            smell: "feature_envy",
+            location: String(identity.location),
+            smellEvidence: identity.smellEvidence,
+          }),
+        ])
+        const baselinePayload = baselineResult.json as Record<string, unknown> | null
+        if (baselineResult.exitCode !== 0 || !baselinePayload || baselinePayload.success !== true) {
+          throw new Error(
+            `FEATURE_ENVY_BASELINE_CAPTURE_FAILED: ${truncateText(baselineResult.stderr || baselineResult.stdout)}`,
+          )
+        }
+      }
+      commandLoopStates.set(input.sessionID, newCommandLoopState(policy))
+      idleRuntime.clearSession(input.sessionID)
+      output.parts = [{ type: "text", text: commandPolicyPrompt(policy) }] as typeof output.parts
+    },
+
     event: async ({ event }) => {
       try {
         if (!event || typeof event.type !== "string") return
@@ -1404,6 +1555,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           const sessionID = (event as { properties?: { info?: { id?: string } } }).properties?.info?.id
           if (typeof sessionID === "string" && sessionID) {
             idleRuntime.handleSessionDeleted(sessionID)
+            commandLoopStates.delete(sessionID)
           }
           return
         }
@@ -1427,6 +1579,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
 
     dispose: async () => {
       idleRuntime.dispose()
+      commandLoopStates.clear()
     },
   }
 }
@@ -1447,11 +1600,14 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   safeJsonStringify,
   toJsonSafe,
   renderIdeaResult,
+  parseCommandPolicyResult,
+  commandPolicyPrompt,
+  defaultCommandPolicy,
+  newCommandLoopState,
+  failureFingerprint,
+  applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,
   // Idle continuation pure helpers + constants (no production control surface):
-  idleContinueMode,
-  isOpendcodeRunMode,
-  isBatchEnvironment,
   classifyFailureForContinue,
   makeTaskKey,
   buildContinuationMessage,
@@ -1459,9 +1615,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   artifactPathsFrom,
   createIdleContinueRuntime,
   SMELL_IDLE_CONTINUE_PREFIX,
-  MAX_IDLE_CONTINUE_ATTEMPTS,
   IDLE_CONTINUE_STATE_TTL_MS,
-  ALLOWED_AGENTS,
   REPAIRABLE_CATEGORIES,
 }
 

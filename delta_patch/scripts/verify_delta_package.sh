@@ -13,11 +13,18 @@ required=(
   "$PAYLOAD/.opencode/agents/java-refactor-agent-idea.md"
   "$PAYLOAD/.opencode/plugins/smell.ts"
   "$PAYLOAD/runtime/python/bridge/smell_bridge.py"
+  "$PAYLOAD/runtime/python/smell_core/loop_policy.py"
   "$PAYLOAD/runtime/python/smell_core/java/smell_guards.py"
   "$PAYLOAD/scripts/run_smell_dataset.py"
   "$PAYLOAD/scripts/self_check_smell_verify.mjs"
+  "$PAYLOAD/scripts/self_check_feature_envy_guard.py"
+  "$PAYLOAD/scripts/self_check_feature_envy_checkpoint.py"
+  "$PAYLOAD/scripts/self_check_god_class_guard.py"
+  "$PAYLOAD/scripts/self_check_ast_ncss_guard.py"
+  "$PAYLOAD/scripts/self_check_java_baselines.py"
   "$PAYLOAD/scripts/self_check_runner_continue.py"
   "$PAYLOAD/docker/java-refactor-delivery/entrypoint.sh"
+  "$PAYLOAD/docker/java-refactor-delivery/gradle-cache-retention.init.gradle"
 )
 
 for path in "${required[@]}"; do
@@ -40,7 +47,7 @@ python3 - <<'PY'
 import json
 from pathlib import Path
 
-expected = "1.17.13"
+expected = "1.15.10"
 checks = [
     (Path("package.json"), ["dependencies", "@opencode-ai/plugin"]),
     (Path(".opencode/package.json"), ["dependencies", "@opencode-ai/plugin"]),
@@ -55,7 +62,7 @@ for path, keys in checks:
     if value != expected:
         raise SystemExit(f"{path} has @opencode-ai/plugin={value!r}, expected {expected!r}")
 PY
-PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile runtime/python/bridge/smell_bridge.py scripts/run_smell_dataset.py scripts/self_check_runner_continue.py
+PYTHONPYCACHEPREFIX="$pycache_root" python3 -m py_compile runtime/python/bridge/smell_bridge.py runtime/python/smell_core/loop_policy.py scripts/run_smell_dataset.py scripts/self_check_runner_continue.py scripts/self_check_java_baselines.py
 if [[ -x node_modules/.bin/tsc || -x ../node_modules/.bin/tsc || -x /opt/opencode-refactor/node_modules/typescript/bin/tsc ]]; then
   npm run check
   npm run check:self
@@ -68,6 +75,10 @@ import yaml  # noqa: F401
 PY
 then
   PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 runtime/python/bridge/smell_bridge.py verify --help >/dev/null
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 scripts/self_check_feature_envy_guard.py
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 scripts/self_check_feature_envy_checkpoint.py
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 scripts/self_check_god_class_guard.py
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$pycache_root" python3 scripts/self_check_ast_ncss_guard.py
 else
   echo "Skipping bridge runtime help check because Python runtime dependencies are not installed here."
 fi

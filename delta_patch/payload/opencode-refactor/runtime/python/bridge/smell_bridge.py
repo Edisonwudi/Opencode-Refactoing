@@ -24,7 +24,12 @@ from smell_core.config import (  # noqa: E402
     load_refactor_config,
     resolve_run_config,
 )
-from smell_core.guards import run_build_test_guard, run_smell_guards  # noqa: E402
+from smell_core.checkpoints import (  # noqa: E402
+    capture_feature_envy_baseline,
+    finalize_feature_envy_checkpoint,
+    prepare_feature_envy_checkpoint,
+)
+from smell_core.guards import GuardRunContext, run_build_test_guard, run_smell_guards  # noqa: E402
 from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
     IdeaRefactorPreflightError,
@@ -34,6 +39,7 @@ from smell_core.java.idea_refactor import (  # noqa: E402
 )
 from smell_core.java.data_clumps import detect_data_clump_occurrences as detect_java_data_clump_occurrences  # noqa: E402
 from smell_core.languages import get_language  # noqa: E402
+from smell_core.loop_policy import REPAIRABLE_CATEGORY_GROUPS, parse_command_policy  # noqa: E402
 from smell_core.planning import build_plan_context_payload, build_repair_context_payload  # noqa: E402
 from smell_core.prompts.idea_router import build_idea_prompt_route  # noqa: E402
 from smell_core.task_builder import build_task  # noqa: E402
@@ -362,6 +368,58 @@ def cmd_run_build_test_guard(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def cmd_capture_baseline(args: argparse.Namespace) -> dict[str, Any]:
+    resolved = _resolve(args)
+    if resolved.smell != "feature_envy":
+        return {"success": True, "status": "BASELINE_NOT_REQUIRED", "smell": resolved.smell}
+    if not resolved.locations:
+        raise ValueError("FEATURE_ENVY_BASELINE_CAPTURE_FAILED: no target location")
+    target = resolved.locations[0]
+    baseline = capture_feature_envy_baseline(
+        project_root=resolved.project_root,
+        target_file=target.file_path,
+        method=target.method,
+        line=target.line,
+        location=target.raw,
+        evidence=getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", ""),
+    )
+    return {
+        "success": True,
+        "status": "BASELINE_CAPTURED",
+        "checkpoint_id": baseline.get("checkpoint_id"),
+        "expected_receiver_type": baseline.get("expected_receiver_type"),
+        "metrics": baseline.get("metrics"),
+    }
+
+
+def _feature_envy_checkpoint_context(resolved) -> tuple[Optional[GuardRunContext], Optional[dict[str, Any]]]:
+    if resolved.smell != "feature_envy" or not resolved.locations:
+        return None, None
+    target = resolved.locations[0]
+    checkpoint = prepare_feature_envy_checkpoint(
+        project_root=resolved.project_root,
+        target_file=target.file_path,
+        method=target.method,
+        line=target.line,
+        location=target.raw,
+    )
+    if not checkpoint.get("required"):
+        return None, checkpoint
+    delta = dict(checkpoint.get("delta") or {})
+    changed = [resolved.project_root / item for item in checkpoint.get("changed_production_java_files") or []]
+    context = GuardRunContext(
+        changed_java_files=changed,
+        feature_envy_checkpoint_required=True,
+        feature_envy_checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
+        feature_envy_baseline_metrics=dict(checkpoint.get("baseline_metrics") or {}),
+        feature_envy_current_metrics=dict(checkpoint.get("current_metrics") or {}),
+        feature_envy_metric_delta=delta,
+        feature_envy_has_production_diff=bool(checkpoint.get("production_diff")),
+        feature_envy_metric_progress=bool(delta.get("metric_progress")),
+    )
+    return context, checkpoint
+
+
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
     if args.skip_build_test and os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1":
@@ -391,7 +449,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": artifacts,
             "failure_pack": failure_pack,
         }
-    smell_results = run_smell_guards(resolved)
+    guard_context, checkpoint = _feature_envy_checkpoint_context(resolved)
+    smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
     build_test_result = None
     if not failed_smell and args.run_build_test and resolved.verification_mode != "local":
@@ -413,6 +472,21 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "build_test_guard": build_test_result,
         "snapshot": snapshot,
     }
+    if checkpoint is not None:
+        full_payload["checkpoint"] = checkpoint
+        checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+        if checkpoint_id:
+            checkpoint["accepted"] = success
+            checkpoint["verify_status"] = full_payload["status"]
+            checkpoint["build_test_success"] = (
+                bool(build_test_result.get("success")) if build_test_result is not None else None
+            )
+            finalize_feature_envy_checkpoint(
+                resolved.project_root,
+                resolved.locations[0].raw,
+                checkpoint_id,
+                full_payload,
+            )
     artifact_dir = _verify_artifact_dir(args, resolved.project_root)
     artifacts = _write_verify_artifacts(artifact_dir, full_payload)
     failure_pack = None
@@ -428,9 +502,15 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "snapshot": _summarize_snapshot(snapshot, artifacts),
         "artifacts": artifacts,
     }
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
     if failure_pack is not None:
         payload["failure_pack"] = failure_pack
     return payload
+
+
+def cmd_resolve_command(args: argparse.Namespace) -> dict[str, Any]:
+    return parse_command_policy(args.arguments).to_dict()
 
 
 def _verify_status(
@@ -842,6 +922,7 @@ def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[
     paths = _artifact_paths_from_verify_payload(payload, artifact_paths)
     bundle = _failure_text_bundle(payload, paths)
     category, recommendations = _classify_failure_pack(payload, bundle)
+    failure_group = REPAIRABLE_CATEGORY_GROUPS.get(category, "")
     patterns = [
         "DependencyResolutionException",
         "Could not resolve dependencies",
@@ -862,6 +943,8 @@ def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[
     ]
     return {
         "failure_category": category,
+        "failure_group": failure_group,
+        "retryable": bool(failure_group),
         "verify_status": payload.get("status") if isinstance(payload, dict) else "",
         "artifact_paths": paths,
         "highlights": _highlight_patterns(bundle, patterns),
@@ -898,6 +981,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="smell_bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    resolve_command_parser = subparsers.add_parser("resolve-command")
+    resolve_command_parser.add_argument("--arguments", required=True)
+    resolve_command_parser.set_defaults(func=cmd_resolve_command)
+
+    baseline_parser = subparsers.add_parser("capture-baseline")
+    _add_common(baseline_parser)
+    baseline_parser.set_defaults(func=cmd_capture_baseline)
 
     context_parser = subparsers.add_parser("build-context")
     _add_common(context_parser)

@@ -8,7 +8,8 @@ fi
 
 BASE_IMAGE="$1"
 NEW_IMAGE="${2:-opencode-java-refactor-delivery:0.1.1-patch}"
-NODE_VERSION="${NODE_VERSION:-22.22.2}"
+NODE_VERSION="${NODE_VERSION:-18.19.1}"
+OPENCODE_VERSION="${OPENCODE_VERSION:-1.17.8}"
 NODE_DIST_BASE="${NODE_DIST_BASE:-https://nodejs.org/dist}"
 NO_CACHE="${NO_CACHE:-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +26,7 @@ docker build \
   -f Dockerfile.delta \
   --build-arg "BASE_IMAGE=$BASE_IMAGE" \
   --build-arg "NODE_VERSION=$NODE_VERSION" \
+  --build-arg "OPENCODE_VERSION=$OPENCODE_VERSION" \
   --build-arg "NODE_DIST_BASE=$NODE_DIST_BASE" \
   -t "$NEW_IMAGE" \
   .

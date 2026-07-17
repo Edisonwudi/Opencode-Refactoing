@@ -59,5 +59,9 @@ runs/
 .trial-worktrees/
 .idea-trial-worktrees/
 
+# ---------- Local materialization / synchronization ----------
+/backups/
+/runtime/python/smell_core/defaults/projects.java.local.yaml
+
 # ---------- Editor / tooling ----------
 .zcode/

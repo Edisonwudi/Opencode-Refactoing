@@ -1,5 +1,5 @@
 opencode-java-refactor-dependency-patch
-version: 0.1.1
-date: 2026-07-06
+version: 0.1.2
+date: 2026-07-13
 target_path: /opt/opencode-refactor
 primary_entrypoint: /usr/local/bin/run-java-refactor-delivery

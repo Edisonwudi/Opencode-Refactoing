@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Minimal OpenCode Java smell refactor plugin delivery package.",
   "dependencies": {
-    "@opencode-ai/plugin": "1.17.13"
+    "@opencode-ai/plugin": "1.15.10"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
@@ -14,7 +14,8 @@
   "scripts": {
     "check:bridge": "python3 -m py_compile runtime/python/bridge/smell_bridge.py",
     "check:plugin": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node .opencode/plugins/smell.ts",
+    "check:feature-envy-checkpoint": "python3 scripts/self_check_feature_envy_checkpoint.py",
     "check:self": "node scripts/self_check_smell_verify.mjs",
-    "check": "npm run check:bridge && npm run check:plugin"
+    "check": "npm run check:bridge && npm run check:plugin && npm run check:feature-envy-checkpoint"
   }
 }

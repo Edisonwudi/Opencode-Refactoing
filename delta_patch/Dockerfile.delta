@@ -1,16 +1,19 @@
 ARG BASE_IMAGE
-ARG NODE_VERSION=22.22.2
+ARG NODE_VERSION=18.19.1
+ARG OPENCODE_VERSION=1.17.8
 ARG NODE_DIST_BASE=https://nodejs.org/dist
 
 FROM ${BASE_IMAGE}
 
-ARG NODE_VERSION=22.22.2
+ARG NODE_VERSION=18.19.1
+ARG OPENCODE_VERSION=1.17.8
 ARG NODE_DIST_BASE=https://nodejs.org/dist
 
 USER root
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/opt/buildenv/offline-home \
@@ -33,6 +36,8 @@ WORKDIR /opt/opencode-refactor
 
 COPY payload/opencode-refactor/ /opt/opencode-refactor/
 COPY payload/opencode-refactor/docker/java-refactor-delivery/entrypoint.sh /usr/local/bin/run-java-refactor-delivery
+COPY project-commits/ /tmp/project-commits/
+COPY dataset/refused_bequest.csv /opt/dataset/java/delivery_schema/refused_bequest.csv
 
 RUN NODE_VERSION="${NODE_VERSION}" NODE_DIST_BASE="${NODE_DIST_BASE}" python3 -c 'import os, tarfile, urllib.request; from pathlib import Path; version = os.environ["NODE_VERSION"].lstrip("v"); tag = f"v{version}"; base = os.environ["NODE_DIST_BASE"].rstrip("/"); archive = f"node-{tag}-linux-x64.tar.xz"; target = Path(f"/opt/node-{tag}-linux-x64"); url = f"{base}/{tag}/{archive}"; archive_path = Path("/tmp") / archive; target.exists() or (urllib.request.urlretrieve(url, archive_path), (lambda handle: (handle.extractall("/opt"), handle.close()))(tarfile.open(archive_path, "r:xz")), archive_path.unlink())' \
     && ln -sf "/opt/node-v${NODE_VERSION}-linux-x64/bin/node" /usr/local/bin/node \
@@ -49,16 +54,47 @@ RUN NODE_VERSION="${NODE_VERSION}" NODE_DIST_BASE="${NODE_DIST_BASE}" python3 -c
     && cd /opt/opencode-refactor \
     && test -x /usr/local/bin/opencode \
     && test -x /usr/local/bin/rg \
-    && node --version | grep -E '^v22\.' \
-    && node -e "const p=require('/opt/opencode-refactor/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.17.13') process.exit(1)" \
-    && node -e "const p=require('/opt/opencode-refactor/.opencode/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.17.13') process.exit(1)" \
+    && test "$(node --version)" = "v${NODE_VERSION}" \
+    && test "$(opencode --version)" = "${OPENCODE_VERSION}" \
+    && node -e "const p=require('/opt/opencode-refactor/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.15.10') process.exit(1)" \
+    && node -e "const p=require('/opt/opencode-refactor/.opencode/node_modules/@opencode-ai/plugin/package.json'); if (p.version !== '1.15.10') process.exit(1)" \
+    && git -c safe.directory=/opt/projects/directory-kerby-2.1.1 -C /opt/projects/directory-kerby-2.1.1 fetch /tmp/project-commits/directory-kerby-2.1.1.bundle HEAD \
+    && git -c safe.directory=/opt/projects/directory-kerby-2.1.1 -C /opt/projects/directory-kerby-2.1.1 checkout --detach 75cf12a60e7e7fada42adec9c2ef21d367b6be07 \
+    && git -c safe.directory=/opt/projects/mybatis-3 -C /opt/projects/mybatis-3 fetch /tmp/project-commits/mybatis-3.bundle HEAD \
+    && git -c safe.directory=/opt/projects/mybatis-3 -C /opt/projects/mybatis-3 checkout --detach e366cb7ee72e71564dded236c3515af64c61dca4 \
+    && git -c safe.directory=/opt/projects/wumpz-jhotdraw-10.2.4 -C /opt/projects/wumpz-jhotdraw-10.2.4 fetch /tmp/project-commits/wumpz-jhotdraw-10.2.4.bundle HEAD \
+    && git -c safe.directory=/opt/projects/wumpz-jhotdraw-10.2.4 -C /opt/projects/wumpz-jhotdraw-10.2.4 checkout --detach 78e98d66727f64394539e46adff0254c18f63133 \
+    && git -c safe.directory=/opt/projects/canal-1.1.8 -C /opt/projects/canal-1.1.8 fetch /tmp/project-commits/canal-1.1.8.bundle HEAD \
+    && git -c safe.directory=/opt/projects/canal-1.1.8 -C /opt/projects/canal-1.1.8 checkout --detach 5913b85309c4cd0b1696e06896aa21a47e81a415 \
+    && git -c safe.directory=/opt/projects/commons-lang-3.20.0 -C /opt/projects/commons-lang-3.20.0 fetch /tmp/project-commits/commons-lang-3.20.0.bundle HEAD \
+    && git -c safe.directory=/opt/projects/commons-lang-3.20.0 -C /opt/projects/commons-lang-3.20.0 checkout --detach 5f0b2e87a4391df37c1865a624f85de8df42006c \
+    && rm -rf /tmp/project-commits \
+    && chown -R smell:smell /opt/projects/directory-kerby-2.1.1 /opt/projects/mybatis-3 /opt/projects/wumpz-jhotdraw-10.2.4 /opt/projects/canal-1.1.8 /opt/projects/commons-lang-3.20.0 \
     && if [ -f /opt/java-projects-config/projects.java.docker.yaml ]; then cp /opt/java-projects-config/projects.java.docker.yaml /opt/opencode-refactor/runtime/python/smell_core/defaults/projects.java.docker.yaml; fi \
     && chmod +x /usr/local/bin/run-java-refactor-delivery \
     && chmod +x /opt/opencode-refactor/scripts/run_smell_dataset.py \
     && chmod +x /opt/opencode-refactor/scripts/self_check_smell_verify.mjs \
-    && python3 -m py_compile /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py /opt/opencode-refactor/scripts/run_smell_dataset.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_java_baselines.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_feature_envy_guard.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_feature_envy_checkpoint.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_god_class_guard.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_refused_bequest_guard.py \
+    && chmod +x /opt/opencode-refactor/scripts/self_check_ast_ncss_guard.py \
+    && chmod +x /opt/opencode-refactor/scripts/materialize_java_project_env.py \
+    && chmod +x /opt/opencode-refactor/scripts/normalize_java_sample_commands.py \
+    && python3 /opt/opencode-refactor/scripts/materialize_java_project_env.py /opt/opencode-refactor/runtime/python/smell_core/defaults/projects.java.docker.yaml \
+    && python3 /opt/opencode-refactor/scripts/normalize_java_sample_commands.py /opt/dataset/java/delivery_schema --project-root-base /opt/projects --buildenv-root /opt/buildenv \
+    && python3 /opt/opencode-refactor/scripts/self_check_java_baselines.py --list-only --report /tmp/baseline-preflight.json \
+    && install -d -o smell -g smell /opt/buildenv/offline-home/.gradle/init.d \
+    && install -m 0644 -o smell -g smell /opt/opencode-refactor/docker/java-refactor-delivery/gradle-cache-retention.init.gradle /opt/buildenv/offline-home/.gradle/init.d/zz-opencode-cache-retention.gradle \
+    && python3 -m py_compile /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py /opt/opencode-refactor/runtime/python/smell_core/checkpoints.py /opt/opencode-refactor/runtime/python/smell_core/java/semantic_detector.py /opt/opencode-refactor/runtime/python/smell_core/java/smell_guards.py /opt/opencode-refactor/runtime/python/smell_core/java/ast_ncss.py /opt/opencode-refactor/scripts/run_smell_dataset.py /opt/opencode-refactor/scripts/self_check_java_baselines.py /opt/opencode-refactor/scripts/self_check_feature_envy_guard.py /opt/opencode-refactor/scripts/self_check_feature_envy_checkpoint.py /opt/opencode-refactor/scripts/self_check_god_class_guard.py /opt/opencode-refactor/scripts/self_check_refused_bequest_guard.py /opt/opencode-refactor/scripts/self_check_ast_ncss_guard.py /opt/opencode-refactor/scripts/java_verification_policy.py /opt/opencode-refactor/scripts/materialize_java_project_env.py /opt/opencode-refactor/scripts/normalize_java_sample_commands.py \
     && node /opt/opencode-refactor/node_modules/typescript/bin/tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node /opt/opencode-refactor/.opencode/plugins/smell.ts \
     && python3 /opt/opencode-refactor/runtime/python/bridge/smell_bridge.py verify --help >/dev/null \
+    && python3 /opt/opencode-refactor/scripts/self_check_feature_envy_guard.py \
+    && python3 /opt/opencode-refactor/scripts/self_check_feature_envy_checkpoint.py \
+    && python3 /opt/opencode-refactor/scripts/self_check_god_class_guard.py \
+    && python3 /opt/opencode-refactor/scripts/self_check_refused_bequest_guard.py \
+    && python3 /opt/opencode-refactor/scripts/self_check_ast_ncss_guard.py \
     && node /opt/opencode-refactor/scripts/self_check_smell_verify.mjs --require-dataset >/tmp/smell-verify-self-check.json \
     && find /opt/opencode-refactor -name '__pycache__' -type d -prune -exec rm -rf {} + \
     && find /opt/opencode-refactor -name '*.pyc' -delete \

@@ -20,7 +20,7 @@ import itertools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
@@ -44,11 +44,19 @@ DEFAULT_THRESHOLDS = {
     "data_clumps_param_group_size": 3,
     "data_clumps_occurrences": 3,
     "data_clumps_min_classes": 2,
-    "god_class_nom": 12,
-    "god_class_nof": 6,
-    "god_class_wmc": 40,
-    "god_class_loc": 120,
-    "god_class_atfd": 10,
+    # Keep these values and the predicate in ``_detect_god_class`` aligned
+    # with smell_datasets/scripts/collect_god_class.py.  The delivery rows were
+    # selected with that detector; using a second threshold family here makes
+    # the post-refactoring oracle measure a different smell from the baseline.
+    "god_class_min_nom": 5,
+    "god_class_min_wmc": 20,
+    "god_class_nom": 10,
+    "god_class_wmc": 30,
+    "god_class_loc": 100,
+    "god_class_atfd": 3,
+    "god_class_strong_nom": 15,
+    "god_class_strong_wmc": 50,
+    "god_class_min_signals": 2,
 }
 
 DEFAULT_EXCLUDE_PATHS = [
@@ -156,6 +164,57 @@ CONSTANT_LITERAL_TYPES = {
     "string_literal",
 }
 
+GOD_CLASS_CONTROL_NODE_TYPES = {
+    "if_statement",
+    "for_statement",
+    "enhanced_for_statement",
+    "while_statement",
+    "do_statement",
+    "switch_statement",
+    "case",
+    "catch_clause",
+}
+
+GOD_CLASS_ATFD_EXCLUDED_RECEIVERS = {
+    "this",
+    "super",
+    "get",
+    "set",
+    "is",
+    "add",
+    "remove",
+    "if",
+    "while",
+    "for",
+    "return",
+    "new",
+    "null",
+    "true",
+    "false",
+}
+
+GOD_CLASS_ATFD_EXCLUDED_TYPES = {
+    "String",
+    "Integer",
+    "Long",
+    "Boolean",
+    "Double",
+    "Float",
+    "List",
+    "Map",
+    "Set",
+    "Object",
+    "Class",
+    "Exception",
+    "Override",
+    "Public",
+    "Private",
+    "Protected",
+    "Static",
+    "Final",
+    "Void",
+}
+
 
 @dataclass(frozen=True)
 class SemanticFinding:
@@ -201,6 +260,7 @@ class ClassRecord:
     type_parameters: Dict[str, str] = field(default_factory=dict)
     fields: Dict[str, str] = field(default_factory=dict)
     methods: List["MethodRecord"] = field(default_factory=list)
+    bodyless_method_declarations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -214,6 +274,7 @@ class MethodRecord:
     end_line: int
     body: Optional[Node]
     body_text: str
+    declaration_text: str
     loc: int
     return_type: str
     parameter_descriptors: List[str]
@@ -241,6 +302,9 @@ class MemberAccessStats:
     foreign_by_origin: Dict[str, int] = field(default_factory=dict)
     local_by_origin: Dict[str, int] = field(default_factory=dict)
     ignored_by_origin: Dict[str, int] = field(default_factory=dict)
+    foreign_by_type: Dict[str, int] = field(default_factory=dict)
+    local_by_type: Dict[str, int] = field(default_factory=dict)
+    ignored_by_type: Dict[str, int] = field(default_factory=dict)
     unresolved: int = 0
 
 
@@ -278,6 +342,84 @@ def run_java_semantic_detector(
         return SemanticDetectionResult(ok=True, findings=findings)
     except Exception as exc:
         return _failed(f"Python semantic detector failed: {exc}")
+
+
+def analyze_feature_envy_target(
+    project_root: Path,
+    *,
+    target_file: Path,
+    method: Optional[str] = None,
+    line: Optional[int] = None,
+    expected_receiver_type: str = "",
+) -> Dict[str, Any]:
+    """Return threshold-independent Feature Envy metrics for one method.
+
+    Delivery rows may be trusted review candidates even when they do not cross
+    the strict detector threshold.  This profile exposes the continuous values
+    used by the detector so a verifier can compare the immutable baseline with
+    the edited source instead of treating an initial non-finding as a repair.
+    """
+    root = project_root.expanduser().resolve()
+    model = _build_project_model(root, include_tests=False)
+    target_rel = _normalize_rel_path(target_file, root)
+    target_method = _normalize_method(method)
+    candidates = [item for item in model.methods if _normalize_path(item.file) == target_rel]
+    if target_method:
+        candidates = [item for item in candidates if _normalize_method(item.method_name) == target_method]
+    elif line is not None:
+        candidates = [item for item in candidates if item.begin_line <= line <= item.end_line]
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "target_method_not_found",
+            "file": target_rel,
+            "method": str(method or ""),
+            "line": line,
+        }
+    target = min(candidates, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
+    stats = _member_access_stats(model, target, feature_envy_semantics=True)
+    dominant_type, dominant_count = _dominant_access(stats.foreign_by_type)
+    expected_simple = _erase_type(expected_receiver_type).rsplit(".", 1)[-1].strip()
+    expected_count = 0
+    expected_types: Dict[str, int] = {}
+    if expected_simple:
+        for type_name, count in stats.foreign_by_type.items():
+            if _erase_type(type_name).rsplit(".", 1)[-1] == expected_simple:
+                expected_types[type_name] = count
+                expected_count += count
+    ratio = dominant_count / stats.total if stats.total else 0.0
+    expected_ratio = expected_count / stats.total if stats.total else 0.0
+    strict_hit = (
+        target.loc >= int(DEFAULT_THRESHOLDS["feature_envy_min_loc"])
+        and dominant_count >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
+        and ratio >= float(DEFAULT_THRESHOLDS["feature_envy_foreign_ratio"])
+    )
+    return {
+        "ok": True,
+        "file": target.file,
+        "class_name": target.class_name,
+        "method": target.method_signature,
+        "method_name": target.method_name,
+        "begin_line": target.begin_line,
+        "end_line": target.end_line,
+        "method_loc": target.loc,
+        "expected_receiver_type": expected_receiver_type,
+        "expected_receiver_access": expected_count,
+        "expected_receiver_ratio": round(expected_ratio, 6),
+        "matched_expected_types": expected_types,
+        "dominant_receiver_type": dominant_type,
+        "dominant_receiver_access": dominant_count,
+        "dominant_receiver_ratio": round(ratio, 6),
+        "total_member_access": stats.total,
+        "aggregate_foreign_access": stats.foreign,
+        "local_access": stats.local,
+        "unresolved_access": stats.unresolved,
+        "foreign_type_count": len(stats.foreign_by_type),
+        "foreign_by_type": dict(sorted(stats.foreign_by_type.items())),
+        "foreign_by_origin": dict(sorted(stats.foreign_by_origin.items())),
+        "ignored_by_type": dict(sorted(stats.ignored_by_type.items())),
+        "strict_detector_hit": strict_hit,
+    }
 
 
 def find_matching_semantic_finding(
@@ -484,6 +626,10 @@ def _collect_method_records(
             if record:
                 class_record.methods.append(record)
                 methods.append(record)
+            elif child.type == "method_declaration":
+                # The dataset collector counts abstract/native declarations as
+                # methods with minimum complexity 1.
+                class_record.bodyless_method_declarations.append(_node_text(file_model.source, child))
         elif child.type in CLASS_NODE_TYPES:
             _collect_method_records(file_model, child, owners + [class_name], classes, classes_by_simple, methods)
 
@@ -529,6 +675,7 @@ def _build_method_record(
         end_line=_node_end_line(method_node),
         body=body,
         body_text=body_text,
+        declaration_text=_node_text(file_model.source, method_node),
         loc=count_meaningful_lines(body_text, "java"),
         return_type=return_type,
         parameter_descriptors=[f"{type_name}:{_stem_name(param)}" for param, type_name in zip(parameter_names, parameter_types)],
@@ -548,11 +695,12 @@ def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
     for method in model.methods:
         if method.loc < int(DEFAULT_THRESHOLDS["feature_envy_min_loc"]):
             continue
-        access_stats = _member_access_stats(model, method)
+        access_stats = _member_access_stats(model, method, feature_envy_semantics=True)
         total_access = access_stats.total
-        foreign_access = access_stats.foreign
+        aggregate_foreign_access = access_stats.foreign
         if total_access <= 0:
             continue
+        dominant_type, foreign_access = _dominant_access(access_stats.foreign_by_type)
         ratio = foreign_access / total_access
         if (
             foreign_access >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
@@ -570,7 +718,10 @@ def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
                     rule_id="symbol_solver:feature_envy",
                     evidence=(
                         f"foreign_access={foreign_access}; total_access={total_access}; "
+                        f"aggregate_foreign_access={aggregate_foreign_access}; "
                         f"local_access={access_stats.local}; ratio={ratio:.3f}; loc={method.loc}; "
+                        f"dominant_foreign_type={dominant_type or 'none'}; "
+                        f"foreign_by_type={_format_counter(access_stats.foreign_by_type)}; "
                         f"foreign_by_origin={_format_counter(access_stats.foreign_by_origin)}; "
                         f"local_by_origin={_format_counter(access_stats.local_by_origin)}"
                     ),
@@ -674,40 +825,44 @@ def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
 
 
 def _detect_god_class(model: ProjectModel) -> List[SemanticFinding]:
+    min_nom = int(DEFAULT_THRESHOLDS["god_class_min_nom"])
+    min_wmc = int(DEFAULT_THRESHOLDS["god_class_min_wmc"])
     nom_threshold = int(DEFAULT_THRESHOLDS["god_class_nom"])
-    nof_threshold = int(DEFAULT_THRESHOLDS["god_class_nof"])
     wmc_threshold = int(DEFAULT_THRESHOLDS["god_class_wmc"])
     loc_threshold = int(DEFAULT_THRESHOLDS["god_class_loc"])
     atfd_threshold = int(DEFAULT_THRESHOLDS["god_class_atfd"])
+    strong_nom_threshold = int(DEFAULT_THRESHOLDS["god_class_strong_nom"])
+    strong_wmc_threshold = int(DEFAULT_THRESHOLDS["god_class_strong_wmc"])
+    min_signals = int(DEFAULT_THRESHOLDS["god_class_min_signals"])
     findings: List[SemanticFinding] = []
     for cls in model.classes.values():
         if cls.kind != "class" or _is_test_like_rel_path(cls.file):
             continue
-        methods = [method for method in cls.methods if not method.is_constructor]
+        # Dataset NOM/WMC include constructors, so the guard must do the same.
+        methods = list(cls.methods)
         if not methods:
             continue
-        nom = len(methods)
+        nom = len(methods) + len(cls.bodyless_method_declarations)
         nof = len(cls.fields)
-        wmc = sum(max(method.loc, 1) for method in methods)
+        wmc = sum(_god_class_method_complexity(method) for method in methods) + len(cls.bodyless_method_declarations)
         loc = max(0, cls.end_line - cls.begin_line + 1)
-        atfd = sum(_member_access_stats(model, method).foreign for method in methods)
-        if atfd < atfd_threshold:
+        atfd = _god_class_atfd(methods, cls.bodyless_method_declarations)
+        if nom < min_nom or wmc < min_wmc:
             continue
-        if not (
-            nom >= nom_threshold
-            or nof >= nof_threshold
-            or wmc >= wmc_threshold
-            or loc >= loc_threshold
-        ):
+        signals = [
+            name
+            for name, matched in (
+                ("nom", nom >= nom_threshold),
+                ("wmc", wmc >= wmc_threshold),
+                ("loc", loc >= loc_threshold),
+                ("atfd", atfd >= atfd_threshold),
+                ("strong_nom_wmc", nom >= strong_nom_threshold and wmc >= strong_wmc_threshold),
+            )
+            if matched
+        ]
+        if len(signals) < min_signals:
             continue
-        size_score = max(
-            nom / max(nom_threshold, 1),
-            nof / max(nof_threshold, 1),
-            wmc / max(wmc_threshold, 1),
-            loc / max(loc_threshold, 1),
-        )
-        atfd_score = atfd / max(atfd_threshold, 1)
-        score = size_score + atfd_score
+        score = float(len(signals)) + (wmc / max(wmc_threshold, 1))
         findings.append(
             SemanticFinding(
                 smell_type="god_class",
@@ -720,13 +875,48 @@ def _detect_god_class(model: ProjectModel) -> List[SemanticFinding]:
                 rule_id="symbol_solver:god_class",
                 evidence=(
                     f"class={cls.class_name}; nom={nom}; nof={nof}; wmc={wmc}; "
-                    f"loc={loc}; atfd={atfd}; thresholds="
-                    f"nom>={nom_threshold}|nof>={nof_threshold}|wmc>={wmc_threshold}|"
-                    f"loc>={loc_threshold}|atfd>={atfd_threshold}"
+                    f"loc={loc}; atfd={atfd}; signals={','.join(signals)}; "
+                    f"policy=nom>={min_nom}&wmc>={min_wmc}&signals>={min_signals}; "
+                    f"signal_thresholds=nom>={nom_threshold}|wmc>={wmc_threshold}|"
+                    f"loc>={loc_threshold}|atfd>={atfd_threshold}|"
+                    f"strong=nom>={strong_nom_threshold}&wmc>={strong_wmc_threshold}"
                 ),
             )
         )
     return findings
+
+
+def _god_class_method_complexity(method: MethodRecord) -> int:
+    """Return the dataset detector's per-method cyclomatic proxy."""
+    if method.body is None:
+        return 1
+    controls = sum(1 for node in _iter_nodes(method.body) if node.type in GOD_CLASS_CONTROL_NODE_TYPES)
+    return max(controls, 1)
+
+
+def _god_class_atfd(
+    methods: Sequence[MethodRecord],
+    bodyless_declarations: Sequence[str] = (),
+) -> int:
+    """Return the distinct-access proxy used to create the delivery dataset.
+
+    This intentionally mirrors the reviewed dataset collector instead of the
+    feature-envy access-count metric.  The latter counts individual accesses,
+    while the God Class dataset records distinct receiver/type tokens.
+    """
+    foreign_tokens: Set[str] = set()
+    declarations = [method.declaration_text for method in methods]
+    declarations.extend(bodyless_declarations)
+    for text in declarations:
+        for match in re.finditer(r"(\w+)\s*\.\s*\w+\s*\(", text):
+            receiver = match.group(1)
+            if receiver not in GOD_CLASS_ATFD_EXCLUDED_RECEIVERS:
+                foreign_tokens.add(receiver)
+        for match in re.finditer(r"\b([A-Z][a-zA-Z0-9]*)\b", text):
+            type_name = match.group(1)
+            if type_name not in GOD_CLASS_ATFD_EXCLUDED_TYPES:
+                foreign_tokens.add(type_name)
+    return len(foreign_tokens)
 
 
 def _detect_dead_code(model: ProjectModel) -> List[SemanticFinding]:
@@ -803,7 +993,12 @@ def _count_member_accesses(model: ProjectModel, method: MethodRecord) -> Tuple[i
     return stats.total, stats.foreign
 
 
-def _member_access_stats(model: ProjectModel, method: MethodRecord) -> MemberAccessStats:
+def _member_access_stats(
+    model: ProjectModel,
+    method: MethodRecord,
+    *,
+    feature_envy_semantics: bool = False,
+) -> MemberAccessStats:
     stats = MemberAccessStats()
     if method.body is None:
         return stats
@@ -835,13 +1030,20 @@ def _member_access_stats(model: ProjectModel, method: MethodRecord) -> MemberAcc
         if receiver_info is None:
             stats.unresolved += 1
             continue
-        _record_member_access(model, method, stats, receiver_info)
+        _record_member_access(
+            model,
+            method,
+            stats,
+            receiver_info,
+            feature_envy_semantics=feature_envy_semantics,
+        )
     for _ in _implicit_owner_method_invocation_names(method.body, owner_method_returns):
         _record_member_access(
             model,
             method,
             stats,
             ReceiverInfo(method.owner_qualified_name, "owner_method"),
+            feature_envy_semantics=feature_envy_semantics,
         )
     return stats
 
@@ -851,21 +1053,31 @@ def _record_member_access(
     method: MethodRecord,
     stats: MemberAccessStats,
     receiver_info: ReceiverInfo,
+    *,
+    feature_envy_semantics: bool = False,
 ) -> None:
-    if _should_ignore_feature_envy_receiver(receiver_info):
+    receiver_type = _normalized_receiver_type(model, receiver_info.type_name)
+    if _should_ignore_feature_envy_receiver(
+        receiver_info,
+        classify_by_type=feature_envy_semantics,
+    ):
         _increment_counter(stats.ignored_by_origin, receiver_info.origin)
+        _increment_counter(stats.ignored_by_type, receiver_type)
         return
     stats.total += 1
-    if receiver_info.origin in {"local", "owner", "owner_method"}:
+    if not feature_envy_semantics and receiver_info.origin in {"local", "owner", "owner_method"}:
         stats.local += 1
         _increment_counter(stats.local_by_origin, receiver_info.origin)
+        _increment_counter(stats.local_by_type, receiver_type)
         return
     if _is_foreign_type(model, receiver_info.type_name, method.owner_qualified_name):
         stats.foreign += 1
         _increment_counter(stats.foreign_by_origin, receiver_info.origin)
+        _increment_counter(stats.foreign_by_type, receiver_type)
     else:
         stats.local += 1
         _increment_counter(stats.local_by_origin, receiver_info.origin)
+        _increment_counter(stats.local_by_type, receiver_type)
 
 
 def _increment_counter(counter: Dict[str, int], key: str) -> None:
@@ -876,6 +1088,18 @@ def _format_counter(counter: Mapping[str, int]) -> str:
     if not counter:
         return "none"
     return ",".join(f"{key}:{counter[key]}" for key in sorted(counter))
+
+
+def _dominant_access(counter: Mapping[str, int]) -> Tuple[str, int]:
+    if not counter:
+        return "", 0
+    type_name, count = min(counter.items(), key=lambda item: (-item[1], item[0]))
+    return type_name, count
+
+
+def _normalized_receiver_type(model: ProjectModel, type_name: str) -> str:
+    erased = _erase_type(type_name).strip()
+    return _resolve_model_type(model, erased) if erased else "<unknown>"
 
 
 def _owner_method_return_types(owner: Optional[ClassRecord]) -> Dict[str, str]:
@@ -973,16 +1197,48 @@ def _is_receiver_operand(node: Node) -> bool:
     )
 
 
-def _should_ignore_feature_envy_receiver(receiver: ReceiverInfo) -> bool:
+def _should_ignore_feature_envy_receiver(
+    receiver: ReceiverInfo,
+    *,
+    classify_by_type: bool = False,
+) -> bool:
     if _is_primitive(receiver.type_name):
+        return True
+    if classify_by_type and _is_value_type(receiver.type_name):
         return True
     if _is_container_type(receiver.type_name):
         return True
-    if receiver.origin == "enhanced_for_variable":
+    if not classify_by_type and receiver.origin == "enhanced_for_variable":
         return True
-    if receiver.origin == "local" and _is_local_tool_type(receiver.type_name):
+    if _is_local_tool_type(receiver.type_name) and (
+        classify_by_type or receiver.origin == "local"
+    ):
         return True
     return False
+
+
+def _is_value_type(type_name: str) -> bool:
+    base, _ = _split_array_suffix(_erase_type(type_name))
+    simple = base.rsplit(".", 1)[-1]
+    return simple in {
+        "BigDecimal",
+        "BigInteger",
+        "Boolean",
+        "Byte",
+        "Character",
+        "Class",
+        "Double",
+        "Float",
+        "Integer",
+        "Long",
+        "Number",
+        "Short",
+        "String",
+        "URI",
+        "URL",
+        "UUID",
+        "var",
+    }
 
 
 def _is_container_type(type_name: str) -> bool:
@@ -1141,6 +1397,15 @@ def _is_stub_method(method: MethodRecord) -> bool:
     if stmt.type == "return_statement":
         expr = next((child for child in stmt.children if child.is_named and child.type != "return"), None)
         return expr is None or _is_constant_literal(expr)
+    if stmt.type == "expression_statement":
+        text = _node_text_from_node(stmt)
+        return bool(
+            re.match(
+                r"^\s*(?:(?:LOG|LOGGER|log|logger)|System\.(?:out|err))\s*\.\s*"
+                r"(?:trace|debug|info|warn|warning|error|print|println)\s*\(",
+                text,
+            )
+        )
     return False
 
 

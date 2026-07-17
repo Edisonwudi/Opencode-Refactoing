@@ -1,0 +1,11 @@
+import org.gradle.api.cache.Cleanup
+
+// The delivery image ships an immutable, pre-seeded Gradle User Home for
+// offline verification. Default Gradle GC can remove artifacts that are not
+// referenced by a project dependency graph but are loaded directly by sample
+// tests. Never garbage-collect this bundled dependency store at runtime.
+beforeSettings { settings ->
+    settings.caches {
+        cleanup = Cleanup.DISABLED
+    }
+}

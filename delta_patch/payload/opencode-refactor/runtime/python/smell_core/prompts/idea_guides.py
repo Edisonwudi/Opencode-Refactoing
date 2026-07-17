@@ -141,12 +141,15 @@ class SmellGuideBuilder:
             "IDEA refactoring hints for refused_bequest:",
             "",
             "- Identify overrides that reject, ignore, or duplicate parent behavior.",
+            "- Treat the supplied sample test as an immutable project-behavior regression oracle; never edit or weaken it.",
+            "- Read the evidence refactor_path first and inspect the named helper, state, overload, sibling protocol, or capability boundary.",
             "- Do not guess `safe-delete`; this route does not expose a `safe-delete` IDEA CLI operation.",
             "- For pure super-delegation or delete-legal useless overrides, prefer `inline:method` with `keepMethodDeclaration=false`.",
             "- When the method is required by an interface or abstract parent, keep the method and use `idea_edit` to implement the narrow contract.",
             "- When real behavior is owned by a narrower subtype, use `pushDown:method` instead of leaving a rejecting hook on the parent.",
             "- Use pull-up or push-down only when the ownership boundary is genuinely wrong; do not flatten the hierarchy broadly.",
             "- Remove useless overrides only when parent behavior is actually correct for the subtype.",
+            "- Logging, comments, swallowed exceptions, and placeholder constants do not implement a refused contract.",
             "- Build and test after hierarchy edits because the caller impact often extends beyond the reported file.",
         ])
 

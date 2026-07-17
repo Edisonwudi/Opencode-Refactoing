@@ -1,5 +1,4 @@
 defaults:
-  max_retries: 2
   step_limit: 150
   shell_timeout: 600
   no_progress_timeout: 480
@@ -171,15 +170,24 @@ languages:
           before retrying.
       refused_bequest:
         instruction: Refactor the refused bequest hierarchy by removing useless overrides,
-          pulling shared behavior up, pushing specialized behavior down, or replacing
-          inheritance with delegation when appropriate.
+          implementing or delegating required behavior, splitting capabilities, pulling
+          shared behavior up, pushing specialized behavior down, or replacing inheritance
+          with delegation when appropriate.
         constraints:
         - Keep the hierarchy change narrow and focused on the reported class.
         - Preserve public behavior and existing subtype contracts.
+        - Treat the dataset test as an immutable project-behavior regression oracle; never
+          edit, delete, skip, or weaken it to make the refactoring pass.
+        - Follow the evidence refactor_path when it names an existing helper, state field,
+          overload, protocol sibling, or capability split.
+        - A log statement, comment, swallowed exception, or placeholder constant is not an
+          implementation of an inherited contract.
         verification:
         - Confirm suspicious no-op or rejecting overrides have been reduced or removed.
-        - Ensure the project still compiles and tests pass.
+        - Confirm the refused_bequest guard no longer reports the target.
+        - Ensure the unchanged project-behavior regression test still passes.
         guards:
         - type: refused_bequest
-        retry_hint_template: Reduce the suspicious hierarchy override pattern before
-          retrying.
+        retry_hint_template: The rejecting or empty inheritance pattern remains. Follow the
+          reported refactor_path and change production structure or behavior; do not edit
+          the regression test or replace the body with logging or a placeholder.

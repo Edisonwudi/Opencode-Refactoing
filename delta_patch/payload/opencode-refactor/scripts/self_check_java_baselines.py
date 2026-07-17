@@ -28,6 +28,7 @@ if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
 from smell_core.config import (  # noqa: E402
+    interpolate_command_text,
     load_project_overrides,
     load_refactor_config,
     resolve_run_config,
@@ -46,6 +47,11 @@ from run_smell_dataset import (  # noqa: E402
     _prepare_worktree,
     _remove_worktree_checkout,
 )
+
+# Dedup-execution-plan support: shared paths and constants.
+MAVEN_OFFLINE_SETTINGS = "/opt/buildenv/maven-offline-settings.xml"
+GRADLE_INIT_RETENTION = "/opt/buildenv/gradle-cache-retention.init.gradle"
+EXECUTION_PLAN_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,28 @@ def parse_args() -> argparse.Namespace:
             "PROJECT_REVISIONS", "/opt/opencode-refactor/project-revisions.json"
         ),
         help="JSON mapping project_name -> {project_commit, tree_hash, ...} used to pin checkouts.",
+    )
+    parser.add_argument(
+        "--list-execution-plans",
+        action="store_true",
+        help=(
+            "Dedup mode: materialize every sample into an authoritative execution plan (keyed by "
+            "commit/tree/build/test scripts/env/maven-settings/jdk, NOT the legacy command_hash), "
+            "deduplicate, and write execution_plan_manifest.json. Does NOT execute build/test."
+        ),
+    )
+    parser.add_argument(
+        "--deduplicate-execution-plans",
+        action="store_true",
+        help=(
+            "Dedup mode: materialize the manifest, then execute exactly one unique plan (the one "
+            "selected by --execution-id) once, first-pass, writing full build/test evidence."
+        ),
+    )
+    parser.add_argument(
+        "--execution-id",
+        default="",
+        help="With --deduplicate-execution-plans, select the single plan to execute.",
     )
     return parser.parse_args()
 
@@ -258,6 +286,180 @@ def resolve(
     return resolved
 
 
+def _sha256_file(path: str | Path) -> str:
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    h = hashlib.sha256()
+    with p.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _java_version_fingerprint(java_home: str) -> str:
+    """Stable hash of the JDK identity at JAVA_HOME (path + `java -version`)."""
+    parts: list[str] = [f"JAVA_HOME={java_home}"]
+    java_bin = Path(java_home) / "bin" / "java"
+    if java_bin.is_file():
+        try:
+            proc = subprocess.run(
+                [str(java_bin), "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            parts.append(f"java -version rc={proc.returncode}\n{proc.stdout}")
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"java -version UNAVAILABLE: {exc}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _normalize_path_relative(text: str, project_root: str, canonical_root: str) -> str:
+    """Collapse absolute project/worktree paths to a project-relative placeholder.
+
+    The materialized build/test commands embed the isolated worktree's absolute
+    path. Two samples sharing the same logical plan would otherwise hash
+    differently because their worktrees live at different temp paths. Rewrite any
+    known absolute root back to ``${PROJECT_ROOT}`` so the key is stable.
+    """
+    out = text
+    for anchor in (project_root, canonical_root):
+        if anchor:
+            out = out.replace(anchor, "${PROJECT_ROOT}")
+    return out
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """A fully-materialized, authoritative build/test execution plan.
+
+    The ``execution_id`` is a SHA256 over the stable-ordered serialization of
+    every input that can change execution semantics (commit/tree/cwd/build/test
+    scripts/env/maven-settings/jdk). It deliberately does NOT include random
+    worktree temp paths — those are normalized to ``${PROJECT_ROOT}``.
+    """
+
+    execution_id: str
+    project_name: str
+    project_commit: str
+    tree_hash: str
+    delivery_image_id: str
+    verification_mode: str
+    build_command: str
+    build_script: str
+    test_command: str
+    test_script: str
+    normalized_cwd: str
+    environment: dict[str, str]
+    environment_fingerprint: str
+    maven_settings_sha256: str
+    gradle_init_sha256: str
+    jdk_fingerprint: str
+    build_source: str
+    test_source: str
+    sample_keys: list[str]
+
+    def to_manifest_entry(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "project_name": self.project_name,
+            "project_commit": self.project_commit,
+            "tree_hash": self.tree_hash,
+            "delivery_image_id": self.delivery_image_id,
+            "verification_mode": self.verification_mode,
+            "build": {"command": self.build_command, "script": self.build_script},
+            "test": {"command": self.test_command, "script": self.test_script},
+            "normalized_cwd": self.normalized_cwd,
+            "environment_fingerprint": self.environment_fingerprint,
+            "maven_settings_sha256": self.maven_settings_sha256,
+            "gradle_init_sha256": self.gradle_init_sha256,
+            "jdk_fingerprint": self.jdk_fingerprint,
+            "build_source": self.build_source,
+            "test_source": self.test_source,
+            "sample_keys": list(self.sample_keys),
+        }
+
+
+def materialize_execution_plan(
+    sample: Sample,
+    rev,
+    resolved,
+    canonical_root: str,
+) -> ExecutionPlan:
+    """Build the authoritative, materialized execution plan for one sample.
+
+    Takes the ALREADY-resolved run config (post sample_optimized resolution, so
+    test = dataset test_command when present) and normalizes away unstable
+    absolute paths so equivalent plans hash identically.
+    """
+    project_root = str(resolved.project_root)
+    build_command = interpolate_command_text(resolved.build.command or "", resolved.project_root)
+    build_script = interpolate_command_text(resolved.build.script or "", resolved.project_root)
+    test_command = interpolate_command_text(resolved.test.command or "", resolved.project_root)
+    test_script = interpolate_command_text(resolved.test.script or "", resolved.project_root)
+    # Normalize absolute roots out of every textual field that participates in the key.
+    build_command = _normalize_path_relative(build_command, project_root, canonical_root)
+    build_script = _normalize_path_relative(build_script, project_root, canonical_root)
+    test_command = _normalize_path_relative(test_command, project_root, canonical_root)
+    test_script = _normalize_path_relative(test_script, project_root, canonical_root)
+    cwd = _normalize_path_relative(str(resolved.cwd), project_root, canonical_root)
+
+    java_home = str(resolved.env.get("JAVA_HOME") or "").strip()
+    # Stable, sorted serialization of the environment that affects execution.
+    env_for_hash = {k: str(resolved.env.get(k, "")) for k in sorted(resolved.env)}
+    environment_fingerprint = hashlib.sha256(
+        json.dumps(env_for_hash, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    maven_sha = _sha256_file(MAVEN_OFFLINE_SETTINGS)
+    gradle_sha = _sha256_file(GRADLE_INIT_RETENTION)
+    jdk_fp = _java_version_fingerprint(java_home)
+
+    blob = {
+        "schema": "execution-plan-v1",
+        "delivery_image_id": rev.source_image_id,
+        "project_name": sample.project_name,
+        "actual_commit": rev.project_commit,
+        "actual_tree_hash": rev.expected_tree_hash,
+        "normalized_cwd": cwd,
+        "verification_mode": resolved.verification_mode,
+        "build_command": build_command,
+        "build_script": build_script,
+        "test_command": test_command,
+        "test_script": test_script,
+        "environment_fingerprint": environment_fingerprint,
+        "maven_settings_sha256": maven_sha,
+        "gradle_init_sha256": gradle_sha,
+        "jdk_fingerprint": jdk_fp,
+    }
+    execution_id = hashlib.sha256(
+        json.dumps(blob, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    return ExecutionPlan(
+        execution_id=execution_id,
+        project_name=sample.project_name,
+        project_commit=rev.project_commit,
+        tree_hash=rev.expected_tree_hash,
+        delivery_image_id=rev.source_image_id,
+        verification_mode=resolved.verification_mode,
+        build_command=build_command,
+        build_script=build_script,
+        test_command=test_command,
+        test_script=test_script,
+        normalized_cwd=cwd,
+        environment=dict(env_for_hash),
+        environment_fingerprint=environment_fingerprint,
+        maven_settings_sha256=maven_sha,
+        gradle_init_sha256=gradle_sha,
+        jdk_fingerprint=jdk_fp,
+        build_source=resolved.build_source,
+        test_source=resolved.test_source,
+        sample_keys=[sample.key],
+    )
+
+
 @contextmanager
 def isolated_worktree(sample: Sample, checkout_id: str, *, target_commit: str | None = None):
     canonical_root = Path(sample.project_path).resolve()
@@ -317,10 +519,226 @@ def concise_phase(result: dict[str, Any] | None, phase: str) -> dict[str, Any] |
     }
 
 
-# Project revision pinning is delegated to the shared module
-# ``smell_core.project_revision`` so baseline-check and the real refactor runner use
-# the identical load/resolve/checkout/verify path. The helpers below are thin wrappers
-# kept only to minimize churn at the call sites.
+def build_execution_plan_manifest(
+    samples: list[Sample],
+    refactor_config: Any,
+    project_overrides: list[Any],
+    revisions_path: str,
+) -> tuple[dict[str, Any], dict[str, ExecutionPlan], list[dict[str, Any]]]:
+    """Materialize every sample into an authoritative plan and deduplicate.
+
+    Returns ``(manifest_dict, plans_by_id, materialization_errors)``. The first
+    pass ONLY materializes text/env (no build/test execution) so equivalent plans
+    collapse regardless of which sample surfaced them.
+    """
+    revisions = load_revisions(revisions_path)
+    plans_by_id: dict[str, ExecutionPlan] = {}
+    sample_to_plan: dict[str, str] = {}
+    materialization_errors: list[dict[str, Any]] = []
+    for sample in samples:
+        canonical_root = str(Path(sample.project_path).resolve())
+        try:
+            rev = resolve_revision(sample.project_name, revisions, revisions_path)
+            assert_commit_present(Path(canonical_root), rev.project_commit)
+            resolved = resolve(
+                sample,
+                refactor_config,
+                project_overrides,
+                project_override_root=canonical_root,
+            )
+            plan = materialize_execution_plan(sample, rev, resolved, canonical_root)
+        except ProjectRevisionError as exc:
+            materialization_errors.append(
+                {"sample_key": sample.key, "status": exc.status, "message": exc.message}
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            materialization_errors.append(
+                {"sample_key": sample.key, "status": "MATERIALIZE_ERROR", "message": str(exc)}
+            )
+            continue
+        sample_to_plan[sample.key] = plan.execution_id
+        existing = plans_by_id.get(plan.execution_id)
+        if existing is None:
+            plans_by_id[plan.execution_id] = plan
+        else:
+            # Same plan already seen: attach this sample key (preserve first-seen plan).
+            merged_keys = list(existing.sample_keys) + [sample.key]
+            plans_by_id[plan.execution_id] = ExecutionPlan(
+                execution_id=existing.execution_id,
+                project_name=existing.project_name,
+                project_commit=existing.project_commit,
+                tree_hash=existing.tree_hash,
+                delivery_image_id=existing.delivery_image_id,
+                verification_mode=existing.verification_mode,
+                build_command=existing.build_command,
+                build_script=existing.build_script,
+                test_command=existing.test_command,
+                test_script=existing.test_script,
+                normalized_cwd=existing.normalized_cwd,
+                environment=existing.environment,
+                environment_fingerprint=existing.environment_fingerprint,
+                maven_settings_sha256=existing.maven_settings_sha256,
+                gradle_init_sha256=existing.gradle_init_sha256,
+                jdk_fingerprint=existing.jdk_fingerprint,
+                build_source=existing.build_source,
+                test_source=existing.test_source,
+                sample_keys=merged_keys,
+            )
+    delivery_image_id = ""
+    if plans_by_id:
+        delivery_image_id = next(iter(plans_by_id.values())).delivery_image_id
+    manifest = {
+        "schema_version": EXECUTION_PLAN_SCHEMA_VERSION,
+        "delivery_image_id": delivery_image_id,
+        "sample_count": len(samples),
+        "unique_plan_count": len(plans_by_id),
+        "sample_to_plan": sample_to_plan,
+        "plans": [p.to_manifest_entry() for p in plans_by_id.values()],
+    }
+    return manifest, plans_by_id, materialization_errors
+
+
+def _plan_by_id(plans_by_id: dict[str, ExecutionPlan], execution_id: str) -> ExecutionPlan:
+    plan = plans_by_id.get(execution_id)
+    if plan is None:
+        raise SystemExit(f"execution_id {execution_id} not found in manifest")
+    return plan
+
+
+def _find_representative_sample(samples: list[Sample], plan: ExecutionPlan) -> Sample:
+    """Return the first sample in dataset order that belongs to this plan."""
+    wanted = set(plan.sample_keys)
+    for sample in samples:
+        if sample.key in wanted:
+            return sample
+    raise SystemExit(
+        f"no sample found for execution_id {plan.execution_id} "
+        f"(sample_keys={plan.sample_keys[:3]}...)"
+    )
+
+
+def execute_single_plan(
+    samples: list[Sample],
+    plan: ExecutionPlan,
+    refactor_config: Any,
+    project_overrides: list[Any],
+    revisions_path: str,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Execute exactly one unique plan once (first-pass, no retry).
+
+    Creates an isolated worktree pinned to the manifest commit, verifies the
+    tree, runs build then test via the shared guard, and writes a full-evidence
+    ``plan_result.json`` (complete build/test stdout/stderr, not just tails).
+    """
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    sample = _find_representative_sample(samples, plan)
+    canonical_root = Path(sample.project_path).resolve()
+    started = time.time()
+    result: dict[str, Any] = {
+        "execution_id": plan.execution_id,
+        "project_name": plan.project_name,
+        "sample_keys": list(plan.sample_keys),
+        "representative_sample_key": sample.key,
+        "status": "running",
+        "attempt": 1,
+        "first_pass": False,
+    }
+    revisions = load_revisions(revisions_path)
+    try:
+        rev = resolve_revision(sample.project_name, revisions, revisions_path)
+        assert_commit_present(canonical_root, rev.project_commit)
+        # Sanity: the manifest plan must match what we resolve now.
+        if rev.project_commit != plan.project_commit or rev.expected_tree_hash != plan.tree_hash:
+            raise RuntimeError(
+                "manifest/revisions drift: "
+                f"commit {rev.project_commit[:12]} vs plan {plan.project_commit[:12]}, "
+                f"tree {rev.expected_tree_hash[:12]} vs plan {plan.tree_hash[:12]}"
+            )
+        checkout_id = hashlib.sha256(
+            f"plan\0{plan.execution_id}".encode("utf-8")
+        ).hexdigest()
+        with isolated_worktree(sample, checkout_id, target_commit=rev.project_commit) as (isolated, _canonical):
+            revision_audit = verify_checkout(Path(isolated.project_path), rev)
+            resolved = copy.deepcopy(
+                resolve(
+                    isolated,
+                    refactor_config,
+                    project_overrides,
+                    project_override_root=str(canonical_root),
+                )
+            )
+            resolved.defaults.run_build = True
+            resolved.defaults.run_tests = True
+            guard_result = run_build_test_guard(resolved)
+    except ProjectRevisionError as exc:
+        result.update(
+            status="commit_error",
+            success=False,
+            build_success=False,
+            test_success=False,
+            commit_error=exc.status,
+            message=f"{exc.status}: {exc.message}",
+            revision_audit={
+                "requested_project_commit": exc.extra.get("project_commit") or rev.project_commit,
+                "actual_commit": "",
+                "expected_tree_hash": rev.expected_tree_hash,
+                "actual_tree_hash": "",
+                "project_revision_alignment": exc.status,
+            },
+        )
+        result["elapsed_seconds"] = round(time.time() - started, 3)
+        report_path.write_text(json.dumps(result, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result.update(
+            status="checkout_error",
+            success=False,
+            build_success=False,
+            test_success=False,
+            commit_error="CHECKOUT_ERROR",
+            message=str(exc),
+        )
+        result["elapsed_seconds"] = round(time.time() - started, 3)
+        report_path.write_text(json.dumps(result, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        return result
+
+    build_phase = concise_phase(guard_result, "build")
+    test_phase = concise_phase(guard_result, "test")
+    build_success = bool(
+        build_phase and build_phase.get("success") and build_phase.get("status") == "ok"
+    )
+    test_success = bool(build_success and test_phase and test_phase.get("success"))
+    first_pass = bool(build_success and test_success)
+    # Preserve COMPLETE build/test output (full stdout/stderr), not just tails.
+    details = (guard_result or {}).get("details") or {}
+    build_full = details.get("build") or {}
+    test_full = details.get("test") or {}
+    result.update(
+        status="pass" if first_pass else ("build_failed" if not build_success else "test_failed"),
+        success=first_pass,
+        first_pass=first_pass,
+        build_success=build_success,
+        test_success=test_success,
+        build=build_phase,
+        test=test_phase,
+        revision_audit=revision_audit,
+        build_output_chars=len(str(build_full.get("output") or "")),
+        test_output_chars=len(str(test_full.get("output") or "")),
+    )
+    # Write full logs next to the result file.
+    logs_dir = report_path.parent
+    if isinstance(build_full.get("output"), str) and build_full["output"]:
+        (logs_dir / "build.log").write_text(build_full["output"], encoding="utf-8", errors="replace")
+    if isinstance(test_full.get("output"), str) and test_full["output"]:
+        (logs_dir / "test.log").write_text(test_full["output"], encoding="utf-8", errors="replace")
+    result["elapsed_seconds"] = round(time.time() - started, 3)
+    report_path.write_text(json.dumps(result, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    return result
+
+
+
 
 def _legacy_status(sample: "Sample", canonical_root: Path, legacy: str) -> str:
     if not legacy:
@@ -374,6 +792,50 @@ def main() -> int:
         summary["success"] = True
         _write_report(Path(args.report), summary, started)
         return 0
+
+    if args.list_execution_plans or args.deduplicate_execution_plans:
+        refactor_config = load_refactor_config(args.config or None)
+        project_overrides = load_project_overrides(args.projects or None)
+        manifest, plans_by_id, merrors = build_execution_plan_manifest(
+            samples, refactor_config, project_overrides, args.project_revisions
+        )
+        if merrors:
+            manifest["materialization_errors"] = merrors
+            print(
+                f"execution-plan materialization_errors={len(merrors)} "
+                f"(first: {merrors[0] if merrors else ''})",
+                flush=True,
+            )
+            _write_report(Path(args.report), manifest, started)
+            return 1
+        if args.list_execution_plans:
+            _write_report(Path(args.report), manifest, started)
+            print(
+                f"execution-plan sample_count={manifest['sample_count']} "
+                f"unique_plan_count={manifest['unique_plan_count']} report={args.report}",
+                flush=True,
+            )
+            return 0
+        # --deduplicate-execution-plans: execute the single selected plan once.
+        if not args.execution_id:
+            print("deduplicate-execution-plans requires --execution-id", flush=True)
+            return 2
+        plan = _plan_by_id(plans_by_id, args.execution_id)
+        result = execute_single_plan(
+            samples,
+            plan,
+            refactor_config,
+            project_overrides,
+            args.project_revisions,
+            Path(args.report),
+        )
+        print(
+            f"plan execution_id={plan.execution_id[:12]} project={plan.project_name} "
+            f"sample_keys={len(plan.sample_keys)} status={result.get('status')} "
+            f"first_pass={result.get('first_pass')} report={args.report}",
+            flush=True,
+        )
+        return 0 if result.get("first_pass") else 1
 
     refactor_config = load_refactor_config(args.config or None)
     project_overrides = load_project_overrides(args.projects or None)

@@ -36,8 +36,7 @@ Workflow:
    changes when they fit the task; otherwise use OpenCode read/search/edit
    tools for narrow edits.
 4. Do not rewrite Java files with shell text commands.
-5. Call `smell_verify` as the acceptance gate, passing `autoContinue=true` so
-   the plugin may inject a visible continuation message if you stop early.
+5. Call `smell_verify` as the acceptance gate.
    Default verification is `verificationMode="local"`, which runs the local
    Python smell guard and records a diff/status snapshot without requiring
    project build or test commands. Use `verificationMode="auto"`,
@@ -48,16 +47,15 @@ Workflow:
    strict build/test verification fails, repair the compile/test regression or
    report a concrete environment or repository-state blocker.
 
-Continuation policy:
+Loop policy:
 
-- Prefer to keep repairing within the current agent loop. Do not report success
-  or stop while a repairable failure still has remaining attempts.
-- Repairable failures include smell guard failures and compile/test regressions.
-  Dependency, offline, auth/provider/model, timeout, and infrastructure
-  problems are not repairable; report them as concrete blockers instead.
-- The plugin caps automatic continuation at 2 rounds. When the metadata
-  `auto_continuation.attempt` reaches `maxAttempts`, stop and report the
-  remaining blocker.
+- The initial `java-refactor-run-idea` command owns verification and loop policy.
+  Do not invent or change loop limits inside the agent.
+- After `smell_verify`, obey its `loop.decision`. When it is `continue`, follow
+  `loop.instruction`, make one evidence-based correction, and verify again.
+- When `loop.decision` is `stop`, stop and report `loop.termination_reason` and
+  the remaining blocker. Dependency, auth/provider, timeout, and infrastructure
+  failures are not made repairable by prompt instructions.
 - Never modify or weaken dataset test files to pass verification.
 
 Acceptance:

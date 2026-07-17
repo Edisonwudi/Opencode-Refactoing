@@ -102,6 +102,55 @@ def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str
     return _run(["git", *args], project_root)
 
 
+def _prepare_idea_service(project_root: Path, sample_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    cli = args.idea_refactor_cli or "idea-refactor"
+    proc = _run(
+        [
+            cli,
+            "ensure-service",
+            "--project-root",
+            str(project_root),
+            "--open",
+            "--timeout",
+            "120",
+            "--poll-interval",
+            "1",
+        ],
+        project_root,
+        timeout=180,
+    )
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        payload = {
+            "status": "failed",
+            "diagnostics": [{"code": "IDEA_PRECHECK_INVALID_JSON", "summary": proc.stderr or proc.stdout}],
+        }
+    payload["returncode"] = proc.returncode
+    payload["stderr"] = proc.stderr
+    (sample_dir / "idea-preflight.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+    )
+    return payload
+
+
+def _close_idea_project(project_root: Path, sample_dir: Path, args: argparse.Namespace) -> None:
+    cli = args.idea_refactor_cli or "idea-refactor"
+    proc = _run(
+        [cli, "close-project", "--project-root", str(project_root)],
+        project_root,
+        timeout=60,
+    )
+    payload = {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+    (sample_dir / "idea-close-project.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+    )
+
+
 def _load_samples(dataset: Path) -> list[Sample]:
     with dataset.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -121,7 +170,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     location=str(row["location"]),
                     evidence=str(row.get("evidence", "")),
                     raw={str(k): str(v) for k, v in row.items()},
-                    test_location=str(row.get("test_location", "")),
+                    test_location=str(row.get("test_location") or row.get("test_file") or ""),
                     test_command=str(row.get("test_command", "")),
                     verification_mode=str(row.get("verification_mode", "")),
                 )
@@ -657,7 +706,8 @@ def _run_opencode(
     # The custom command owns the native in-session loop. Disable the legacy
     # session.idle mechanism so there is exactly one controller.
     env["SMELL_BATCH_RUN"] = "1"
-    env["SMELL_IDLE_CONTINUE_MODE"] = "off"
+    if agent == "java-refactor-agent-idea":
+        env["SMELL_IDEA_PREPARED"] = "1"
     env["SMELL_BRIDGE_FILE"] = str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py")
     env["SMELL_PROJECT_ROOT"] = str(sample.project_root)
     if sample.canonical_project_root:
@@ -925,6 +975,31 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
 
+    if agent == "java-refactor-agent-idea":
+        idea_preflight = _prepare_idea_service(execution_sample.project_root, sample_dir, args)
+        if idea_preflight.get("status") != "ok" or idea_preflight.get("returncode") != 0:
+            row = {
+                "sample_id": sample.sample_id,
+                "smell": sample.smell,
+                "project_name": sample.project_name,
+                "project_root": str(sample.project_root),
+                "execution_project_root": str(execution_sample.project_root),
+                "location": execution_sample.location,
+                "verification_mode": verification_mode,
+                "agent": agent,
+                "status": "IDEA_PRECHECK_FAILED",
+                "opencode_returncode": -1,
+                "verify_returncode": -1,
+                "duration_seconds": f"{time.time() - started:.1f}",
+                "sample_dir": str(sample_dir),
+                "note": "IDEA service did not become ready; see idea-preflight.json",
+            }
+            (sample_dir / "result.json").write_text(
+                json.dumps({**row, "attempts": [], "revision_audit": revision_audit}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return row
+
     # Bootstrap .opencode once before starting the command-owned loop.
     _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
@@ -937,6 +1012,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     verify_returncode, verify_payload = _run_verify(
         execution_sample, sample_dir, args, verification_mode
     )
+    if agent == "java-refactor-agent-idea":
+        _close_idea_project(execution_sample.project_root, sample_dir, args)
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
     last = {
         "attempt": 0,
