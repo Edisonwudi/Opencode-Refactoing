@@ -20,7 +20,7 @@ import itertools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
@@ -241,6 +241,9 @@ class MemberAccessStats:
     foreign_by_origin: Dict[str, int] = field(default_factory=dict)
     local_by_origin: Dict[str, int] = field(default_factory=dict)
     ignored_by_origin: Dict[str, int] = field(default_factory=dict)
+    foreign_by_type: Dict[str, int] = field(default_factory=dict)
+    local_by_type: Dict[str, int] = field(default_factory=dict)
+    ignored_by_type: Dict[str, int] = field(default_factory=dict)
     unresolved: int = 0
 
 
@@ -278,6 +281,84 @@ def run_java_semantic_detector(
         return SemanticDetectionResult(ok=True, findings=findings)
     except Exception as exc:
         return _failed(f"Python semantic detector failed: {exc}")
+
+
+def analyze_feature_envy_target(
+    project_root: Path,
+    *,
+    target_file: Path,
+    method: Optional[str] = None,
+    line: Optional[int] = None,
+    expected_receiver_type: str = "",
+) -> Dict[str, Any]:
+    """Return threshold-independent Feature Envy metrics for one method.
+
+    Delivery rows may be trusted review candidates even when they do not cross
+    the strict detector threshold.  This profile exposes the continuous values
+    used by the detector so a verifier can compare the immutable baseline with
+    the edited source instead of treating an initial non-finding as a repair.
+    """
+    root = project_root.expanduser().resolve()
+    model = _build_project_model(root, include_tests=False)
+    target_rel = _normalize_rel_path(target_file, root)
+    target_method = _normalize_method(method)
+    candidates = [item for item in model.methods if _normalize_path(item.file) == target_rel]
+    if target_method:
+        candidates = [item for item in candidates if _normalize_method(item.method_name) == target_method]
+    elif line is not None:
+        candidates = [item for item in candidates if item.begin_line <= line <= item.end_line]
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "target_method_not_found",
+            "file": target_rel,
+            "method": str(method or ""),
+            "line": line,
+        }
+    target = min(candidates, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
+    stats = _member_access_stats(model, target, feature_envy_semantics=True)
+    dominant_type, dominant_count = _dominant_access(stats.foreign_by_type)
+    expected_simple = _erase_type(expected_receiver_type).rsplit(".", 1)[-1].strip()
+    expected_count = 0
+    expected_types: Dict[str, int] = {}
+    if expected_simple:
+        for type_name, count in stats.foreign_by_type.items():
+            if _erase_type(type_name).rsplit(".", 1)[-1] == expected_simple:
+                expected_types[type_name] = count
+                expected_count += count
+    ratio = dominant_count / stats.total if stats.total else 0.0
+    expected_ratio = expected_count / stats.total if stats.total else 0.0
+    strict_hit = (
+        target.loc >= int(DEFAULT_THRESHOLDS["feature_envy_min_loc"])
+        and dominant_count >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
+        and ratio >= float(DEFAULT_THRESHOLDS["feature_envy_foreign_ratio"])
+    )
+    return {
+        "ok": True,
+        "file": target.file,
+        "class_name": target.class_name,
+        "method": target.method_signature,
+        "method_name": target.method_name,
+        "begin_line": target.begin_line,
+        "end_line": target.end_line,
+        "method_loc": target.loc,
+        "expected_receiver_type": expected_receiver_type,
+        "expected_receiver_access": expected_count,
+        "expected_receiver_ratio": round(expected_ratio, 6),
+        "matched_expected_types": expected_types,
+        "dominant_receiver_type": dominant_type,
+        "dominant_receiver_access": dominant_count,
+        "dominant_receiver_ratio": round(ratio, 6),
+        "total_member_access": stats.total,
+        "aggregate_foreign_access": stats.foreign,
+        "local_access": stats.local,
+        "unresolved_access": stats.unresolved,
+        "foreign_type_count": len(stats.foreign_by_type),
+        "foreign_by_type": dict(sorted(stats.foreign_by_type.items())),
+        "foreign_by_origin": dict(sorted(stats.foreign_by_origin.items())),
+        "ignored_by_type": dict(sorted(stats.ignored_by_type.items())),
+        "strict_detector_hit": strict_hit,
+    }
 
 
 def find_matching_semantic_finding(
@@ -548,11 +629,12 @@ def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
     for method in model.methods:
         if method.loc < int(DEFAULT_THRESHOLDS["feature_envy_min_loc"]):
             continue
-        access_stats = _member_access_stats(model, method)
+        access_stats = _member_access_stats(model, method, feature_envy_semantics=True)
         total_access = access_stats.total
-        foreign_access = access_stats.foreign
+        aggregate_foreign_access = access_stats.foreign
         if total_access <= 0:
             continue
+        dominant_type, foreign_access = _dominant_access(access_stats.foreign_by_type)
         ratio = foreign_access / total_access
         if (
             foreign_access >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
@@ -570,7 +652,10 @@ def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
                     rule_id="symbol_solver:feature_envy",
                     evidence=(
                         f"foreign_access={foreign_access}; total_access={total_access}; "
+                        f"aggregate_foreign_access={aggregate_foreign_access}; "
                         f"local_access={access_stats.local}; ratio={ratio:.3f}; loc={method.loc}; "
+                        f"dominant_foreign_type={dominant_type or 'none'}; "
+                        f"foreign_by_type={_format_counter(access_stats.foreign_by_type)}; "
                         f"foreign_by_origin={_format_counter(access_stats.foreign_by_origin)}; "
                         f"local_by_origin={_format_counter(access_stats.local_by_origin)}"
                     ),
@@ -803,7 +888,12 @@ def _count_member_accesses(model: ProjectModel, method: MethodRecord) -> Tuple[i
     return stats.total, stats.foreign
 
 
-def _member_access_stats(model: ProjectModel, method: MethodRecord) -> MemberAccessStats:
+def _member_access_stats(
+    model: ProjectModel,
+    method: MethodRecord,
+    *,
+    feature_envy_semantics: bool = False,
+) -> MemberAccessStats:
     stats = MemberAccessStats()
     if method.body is None:
         return stats
@@ -835,13 +925,20 @@ def _member_access_stats(model: ProjectModel, method: MethodRecord) -> MemberAcc
         if receiver_info is None:
             stats.unresolved += 1
             continue
-        _record_member_access(model, method, stats, receiver_info)
+        _record_member_access(
+            model,
+            method,
+            stats,
+            receiver_info,
+            feature_envy_semantics=feature_envy_semantics,
+        )
     for _ in _implicit_owner_method_invocation_names(method.body, owner_method_returns):
         _record_member_access(
             model,
             method,
             stats,
             ReceiverInfo(method.owner_qualified_name, "owner_method"),
+            feature_envy_semantics=feature_envy_semantics,
         )
     return stats
 
@@ -851,21 +948,31 @@ def _record_member_access(
     method: MethodRecord,
     stats: MemberAccessStats,
     receiver_info: ReceiverInfo,
+    *,
+    feature_envy_semantics: bool = False,
 ) -> None:
-    if _should_ignore_feature_envy_receiver(receiver_info):
+    receiver_type = _normalized_receiver_type(model, receiver_info.type_name)
+    if _should_ignore_feature_envy_receiver(
+        receiver_info,
+        classify_by_type=feature_envy_semantics,
+    ):
         _increment_counter(stats.ignored_by_origin, receiver_info.origin)
+        _increment_counter(stats.ignored_by_type, receiver_type)
         return
     stats.total += 1
-    if receiver_info.origin in {"local", "owner", "owner_method"}:
+    if not feature_envy_semantics and receiver_info.origin in {"local", "owner", "owner_method"}:
         stats.local += 1
         _increment_counter(stats.local_by_origin, receiver_info.origin)
+        _increment_counter(stats.local_by_type, receiver_type)
         return
     if _is_foreign_type(model, receiver_info.type_name, method.owner_qualified_name):
         stats.foreign += 1
         _increment_counter(stats.foreign_by_origin, receiver_info.origin)
+        _increment_counter(stats.foreign_by_type, receiver_type)
     else:
         stats.local += 1
         _increment_counter(stats.local_by_origin, receiver_info.origin)
+        _increment_counter(stats.local_by_type, receiver_type)
 
 
 def _increment_counter(counter: Dict[str, int], key: str) -> None:
@@ -876,6 +983,18 @@ def _format_counter(counter: Mapping[str, int]) -> str:
     if not counter:
         return "none"
     return ",".join(f"{key}:{counter[key]}" for key in sorted(counter))
+
+
+def _dominant_access(counter: Mapping[str, int]) -> Tuple[str, int]:
+    if not counter:
+        return "", 0
+    type_name, count = min(counter.items(), key=lambda item: (-item[1], item[0]))
+    return type_name, count
+
+
+def _normalized_receiver_type(model: ProjectModel, type_name: str) -> str:
+    erased = _erase_type(type_name).strip()
+    return _resolve_model_type(model, erased) if erased else "<unknown>"
 
 
 def _owner_method_return_types(owner: Optional[ClassRecord]) -> Dict[str, str]:
@@ -973,16 +1092,48 @@ def _is_receiver_operand(node: Node) -> bool:
     )
 
 
-def _should_ignore_feature_envy_receiver(receiver: ReceiverInfo) -> bool:
+def _should_ignore_feature_envy_receiver(
+    receiver: ReceiverInfo,
+    *,
+    classify_by_type: bool = False,
+) -> bool:
     if _is_primitive(receiver.type_name):
+        return True
+    if classify_by_type and _is_value_type(receiver.type_name):
         return True
     if _is_container_type(receiver.type_name):
         return True
-    if receiver.origin == "enhanced_for_variable":
+    if not classify_by_type and receiver.origin == "enhanced_for_variable":
         return True
-    if receiver.origin == "local" and _is_local_tool_type(receiver.type_name):
+    if _is_local_tool_type(receiver.type_name) and (
+        classify_by_type or receiver.origin == "local"
+    ):
         return True
     return False
+
+
+def _is_value_type(type_name: str) -> bool:
+    base, _ = _split_array_suffix(_erase_type(type_name))
+    simple = base.rsplit(".", 1)[-1]
+    return simple in {
+        "BigDecimal",
+        "BigInteger",
+        "Boolean",
+        "Byte",
+        "Character",
+        "Class",
+        "Double",
+        "Float",
+        "Integer",
+        "Long",
+        "Number",
+        "Short",
+        "String",
+        "URI",
+        "URL",
+        "UUID",
+        "var",
+    }
 
 
 def _is_container_type(type_name: str) -> bool:
