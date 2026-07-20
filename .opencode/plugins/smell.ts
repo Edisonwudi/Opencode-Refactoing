@@ -45,6 +45,32 @@ const bridgeFile = path.resolve(
   process.env.SMELL_BRIDGE_FILE || path.join(pluginRoot, "runtime", "python", "bridge", "smell_bridge.py"),
 )
 const bundledIdeaRefactorCli = path.resolve(pluginRoot, "bin", "idea-refactor")
+const checkpointSmells = new Set([
+  "long_method",
+  "nested_complexity",
+  "long_parameter_list",
+  "feature_envy",
+  "data_clumps",
+  "code_clone_type1",
+  "god_class",
+  "refused_bequest",
+  "switch_statements",
+  "mysterious_name",
+  "dead_code",
+])
+const checkpointObjectiveHints: Record<string, string> = {
+  long_method: "Reduce the AST-NCSS of the named target method itself; moving or renaming unrelated code does not count.",
+  nested_complexity: "Reduce the cognitive complexity of the named target method itself; cosmetic edits do not count.",
+  long_parameter_list: "Reduce the parameter count of the named target declaration itself; changing only callers or another overload does not count. Migrate source callers and keep tests compiling, but do not retain the original long-signature compatibility overload and never edit tests.",
+  feature_envy: "Reduce accesses from the target method to the expected envied receiver.",
+  data_clumps: "Reduce the number of occurrences of the labeled parameter or field group.",
+  code_clone_type1: "Reduce the exact-clone token count between the two labeled targets.",
+  god_class: "Reduce at least one labeled class objective (NOM, NOF, WMC, LOC, or ATFD) without worsening behavior.",
+  refused_bequest: "Reduce the labeled refusal score, suspicious overrides, or target rejection signals while preserving the inheritance contract.",
+  switch_statements: "Reduce the case count or case density in the named target method; changing an unrelated switch does not count.",
+  mysterious_name: "Remove the exact labeled suspicious identifier by giving it a meaningful name and updating its usages; unrelated renames do not count.",
+  dead_code: "Remove the exact labeled dead declaration safely; editing unrelated declarations does not count.",
+}
 
 function addOptional(args: string[], flag: string, value?: string) {
   if (value && value.trim()) {
@@ -195,6 +221,9 @@ type ContinuationState = {
   instruction: string
   pending: boolean
   dispatching: boolean
+  awaitingVerify: boolean
+  awaitingVerifyReason: "initial" | "continuation"
+  verifyReminderGeneration: number
   agent: string
   directory: string
   failureCategory: string
@@ -355,6 +384,20 @@ function buildContinuationMessage(state: ContinuationState): string {
     message = `${message.slice(0, MAX_MSG - 32)}\n...[truncated]`
   }
   return message
+}
+
+function buildVerifyRequiredMessage(state: ContinuationState): string {
+  const reason = state.awaitingVerifyReason === "continuation"
+    ? "The previous corrective continuation ended without a new smell_verify result."
+    : "No smell_verify call has completed for this refactoring task."
+  return [
+    `${SMELL_IDLE_CONTINUE_PREFIX} verify-required/${state.generation}]`,
+    "",
+    reason,
+    "Call smell_verify now on the current production-Java changes.",
+    "Treat its loop.decision as authoritative: continue only when instructed, otherwise stop.",
+    "Do not modify or weaken tests.",
+  ].join("\n")
 }
 
 type StdioCarrier = {
@@ -845,6 +888,36 @@ function createIdleContinueRuntime(options: {
     return states.get(sessionID)
   }
 
+  function armInitialVerification(input: {
+    sessionID: string
+    agent: string
+    directory: string
+    maxContinuations: number
+    instruction: string
+  }) {
+    if (!input.sessionID) return
+    states.set(input.sessionID, {
+      taskKey: "",
+      generation: 0,
+      dispatchedGeneration: -1,
+      continuation: 0,
+      maxContinuations: input.maxContinuations,
+      instruction: input.instruction,
+      pending: false,
+      dispatching: false,
+      awaitingVerify: true,
+      awaitingVerifyReason: "initial",
+      verifyReminderGeneration: -1,
+      agent: input.agent,
+      directory: input.directory,
+      failureCategory: "",
+      verifyStatus: "",
+      failureHighlights: [],
+      artifactPaths: [],
+      updatedAt: Date.now(),
+    })
+  }
+
   // Called from smell_verify.execute after a bridge result is normalized.
   // Returns the auto_continuation metadata to attach to the tool result.
   function recordFromBridgeOutput(input: {
@@ -882,6 +955,12 @@ function createIdleContinueRuntime(options: {
     }
 
     const existing = states.get(input.sessionID)
+    if (existing) {
+      // Reaching this function proves that smell_verify completed. Re-arm only
+      // after a continuation is actually dispatched.
+      existing.awaitingVerify = false
+      existing.updatedAt = Date.now()
+    }
     const continuation = typeof loop?.continuation === "number" ? loop.continuation : 0
     const maxContinuations = typeof loop?.max_continuations === "number" ? loop.max_continuations : 0
     const decision = typeof loop?.decision === "string" ? loop.decision : "stop"
@@ -901,9 +980,10 @@ function createIdleContinueRuntime(options: {
     // stale pending generation. This includes PASS, malformed output, disabled
     // policy, non-repairable failure, deadline, no-progress, and exhausted cap.
     const revokePending = () => {
-      if (existing && existing.pending) {
+      if (existing) {
         existing.pending = false
         existing.dispatching = false
+        existing.awaitingVerify = false
         existing.updatedAt = Date.now()
       }
     }
@@ -933,6 +1013,9 @@ function createIdleContinueRuntime(options: {
           instruction,
           pending: true,
           dispatching: false,
+          awaitingVerify: false,
+          awaitingVerifyReason: "continuation",
+          verifyReminderGeneration: -1,
           agent: input.agent,
           directory: input.directory,
           failureCategory: classification.category,
@@ -949,6 +1032,9 @@ function createIdleContinueRuntime(options: {
       nextState.maxContinuations = maxContinuations
       nextState.instruction = instruction
       nextState.pending = true
+      nextState.awaitingVerify = false
+      nextState.awaitingVerifyReason = "continuation"
+      nextState.verifyReminderGeneration = -1
       nextState.agent = input.agent
       nextState.directory = input.directory
       nextState.failureCategory = classification.category
@@ -984,8 +1070,46 @@ function createIdleContinueRuntime(options: {
     const state = states.get(sessionID)
     if (!state) return false
     if (!options.client) return false
-    if (!state.pending) return false
     if (state.dispatching) return false
+
+    if (!state.pending) {
+      if (!state.awaitingVerify) return false
+      if (state.verifyReminderGeneration === state.generation) return false
+
+      state.dispatching = true
+      state.verifyReminderGeneration = state.generation
+      state.updatedAt = Date.now()
+      const message = buildVerifyRequiredMessage(state)
+      const dispatch = options.client!.session.promptAsync({
+        path: { id: sessionID },
+        query: { directory: state.directory },
+        body: {
+          agent: state.agent,
+          parts: [{ type: "text", text: message }],
+        },
+      })
+      Promise.resolve(dispatch)
+        .then((res) => {
+          const err = (res as { error?: unknown })?.error
+          if (err) throw err
+          state.dispatching = false
+          state.updatedAt = Date.now()
+          lastDispatchError = ""
+          log("smell-verify-required dispatched", {
+            sessionID,
+            generation: state.generation,
+            reason: state.awaitingVerifyReason,
+          })
+        })
+        .catch((error) => {
+          state.dispatching = false
+          state.updatedAt = Date.now()
+          lastDispatchError = error instanceof Error ? error.message : String(error)
+          log("smell-verify-required dispatch failed", { sessionID, error: lastDispatchError })
+        })
+      return true
+    }
+
     if (state.continuation <= 0 || state.continuation > state.maxContinuations) return false
     if (state.dispatchedGeneration === state.generation) return false
 
@@ -993,6 +1117,7 @@ function createIdleContinueRuntime(options: {
     state.dispatching = true
     state.dispatchedGeneration = state.generation
     state.updatedAt = Date.now()
+    const dispatchedGeneration = state.generation
 
     const message = buildContinuationMessage(state)
     const dispatch = options.client!.session.promptAsync({
@@ -1007,9 +1132,16 @@ function createIdleContinueRuntime(options: {
       .then((res) => {
         const err = (res as { error?: unknown })?.error
         if (err) throw err
-        state.pending = false
-        state.dispatching = false
-        state.updatedAt = Date.now()
+        // A verify call may finish while promptAsync is resolving. Only arm
+        // the reminder if this is still the generation we dispatched.
+        if (state.generation === dispatchedGeneration) {
+          state.pending = false
+          state.dispatching = false
+          state.awaitingVerify = true
+          state.awaitingVerifyReason = "continuation"
+          state.verifyReminderGeneration = -1
+          state.updatedAt = Date.now()
+        }
         lastDispatchError = ""
         log("smell-idle-continue dispatched", {
           sessionID,
@@ -1056,6 +1188,7 @@ function createIdleContinueRuntime(options: {
   }
 
   return {
+    armInitialVerification,
     recordFromBridgeOutput,
     handleIdle,
     handleChatMessage,
@@ -1103,13 +1236,15 @@ function commandPolicyPrompt(policy: CommandPolicy): string {
     "When loop.decision is continue, follow loop.instruction and call smell_verify again.",
     "When loop.decision is stop, stop and report loop.termination_reason. Never modify or weaken tests.",
   ]
-  if (/^Smell type:\s*feature_envy\s*$/im.test(policy.task)) {
+  const smell = String(taskField(policy.task, "Smell type") || "")
+  if (checkpointSmells.has(smell)) {
     lines.push(
       "",
-      "Feature Envy checkpoint contract:",
+      "Continuous-metric checkpoint contract:",
       "- The dataset label is authoritative even when the strict threshold detector is initially clean.",
       "- An unchanged baseline can never pass; make a substantive production-Java refactoring.",
-      "- Acceptance requires measurable reduction of dependency on the expected envied receiver plus build/test preservation.",
+      "- Acceptance requires at least one adapter objective to decrease plus the ordinary smell guard and build/test preservation.",
+      `- Adapter objective: ${checkpointObjectiveHints[smell]}`,
     )
   }
   return lines.join("\n")
@@ -1165,7 +1300,7 @@ function failureFingerprint(payload: Record<string, unknown>): string {
         checkpointProgress: details ? {
           reason: details.reason || "",
           hasProductionDiff: details.has_production_diff === true,
-          expectedReceiverAccess: metricDelta?.expected_receiver_access || null,
+          objectives: metricDelta?.objectives || null,
         } : null,
       }
     : { category: "", status: payload.status || "", highlights: [] }
@@ -1510,13 +1645,17 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     },
 
     "command.execute.before": async (input, output) => {
-      if (input.command !== "java-refactor-run" && input.command !== "java-refactor-run-idea") return
+      if (
+        input.command !== "smell-refactor-run" &&
+        input.command !== "java-refactor-run" &&
+        input.command !== "java-refactor-run-idea"
+      ) return
       const result = await runBridge(worktree, ["resolve-command", "--arguments", input.arguments])
       const policy = parseCommandPolicyResult(result)
       const identity = commandTaskIdentity(policy.task)
-      if (identity.smell === "feature_envy") {
+      if (identity.smell && checkpointSmells.has(identity.smell)) {
         if (!identity.projectRoot || !identity.location) {
-          throw new Error("FEATURE_ENVY_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
+          throw new Error("CHECKPOINT_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
         }
         const baselineResult = await runBridge(worktree, [
           "capture-baseline",
@@ -1524,7 +1663,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             projectRoot: String(identity.projectRoot),
             projectOverrideRoot: identity.projectOverrideRoot,
             language: identity.language,
-            smell: "feature_envy",
+            smell: String(identity.smell),
             location: String(identity.location),
             smellEvidence: identity.smellEvidence,
           }),
@@ -1532,12 +1671,24 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const baselinePayload = baselineResult.json as Record<string, unknown> | null
         if (baselineResult.exitCode !== 0 || !baselinePayload || baselinePayload.success !== true) {
           throw new Error(
-            `FEATURE_ENVY_BASELINE_CAPTURE_FAILED: ${truncateText(baselineResult.stderr || baselineResult.stdout)}`,
+            `CHECKPOINT_BASELINE_CAPTURE_FAILED: ${truncateText(baselineResult.stderr || baselineResult.stdout)}`,
           )
         }
       }
       commandLoopStates.set(input.sessionID, newCommandLoopState(policy))
       idleRuntime.clearSession(input.sessionID)
+      idleRuntime.armInitialVerification({
+        sessionID: input.sessionID,
+        agent:
+          input.command === "java-refactor-run-idea"
+            ? "java-refactor-agent-idea"
+            : input.command === "smell-refactor-run"
+              ? "smell-refactor-agent"
+              : "java-refactor-agent",
+        directory: worktree,
+        maxContinuations: policy.loop.max_continuations,
+        instruction: policy.loop.instruction,
+      })
       output.parts = [{ type: "text", text: commandPolicyPrompt(policy) }] as typeof output.parts
     },
 
@@ -1611,6 +1762,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   classifyFailureForContinue,
   makeTaskKey,
   buildContinuationMessage,
+  buildVerifyRequiredMessage,
   redactSecrets,
   artifactPathsFrom,
   createIdleContinueRuntime,

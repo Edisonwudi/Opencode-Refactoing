@@ -151,6 +151,17 @@ def _close_idea_project(project_root: Path, sample_dir: Path, args: argparse.Nam
     )
 
 
+def _dataset_evidence(row: dict[str, str | None]) -> str:
+    """Carry stable dataset identity fields into detector evidence."""
+    evidence = str(row.get("evidence") or "").strip()
+    smell = str(row.get("smell_type") or "").strip()
+    class_name = str(row.get("class") or "").strip()
+    has_class = any(part.strip().lower().startswith("class=") for part in evidence.split(";"))
+    if smell == "god_class" and class_name and not has_class:
+        return f"{evidence};class={class_name}" if evidence else f"class={class_name}"
+    return evidence
+
+
 def _load_samples(dataset: Path) -> list[Sample]:
     with dataset.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -168,7 +179,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     project_name=str(row["project_name"]),
                     project_root=Path(row["project_path"]).expanduser().resolve(),
                     location=str(row["location"]),
-                    evidence=str(row.get("evidence", "")),
+                    evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
                     test_location=str(row.get("test_location") or row.get("test_file") or ""),
                     test_command=str(row.get("test_command", "")),
@@ -458,6 +469,13 @@ def _write_opencode_config(sample_dir: Path, args: argparse.Namespace) -> tuple[
         "model": args.model,
         "enabled_providers": [provider_id],
         "provider": {provider_id: provider_config},
+        # Batch runs are headless: a subagent (e.g. the built-in explore agent)
+        # reading outside the session directory would otherwise hit an
+        # external_directory "ask" that can never be answered, hanging the
+        # session until the sample deadline. The primary agents already grant
+        # this in their frontmatter; extend the same grant to every agent in
+        # this isolated, per-sample runtime config.
+        "permission": {"external_directory": "allow"},
     }
     path = sample_dir / "opencode.runtime.json"
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -572,7 +590,10 @@ def _task_prompt(
     if idea_enabled and args.idea_refactor_cli:
         lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
     lines.append("")
-    lines.append("Repair this one Java smell from the dataset row. Preserve behavior. Call smell_verify as the final acceptance gate.")
+    lines.append(
+        f"Repair this one {sample.language} smell from the dataset row. "
+        "Preserve behavior. Call smell_verify as the final acceptance gate."
+    )
     return "\n".join(lines)
 
 
@@ -684,19 +705,173 @@ def _parse_session_id_from_json_events(events_text: str) -> str:
     return ""
 
 
+def _verification_trace(events_text: str) -> dict[str, Any]:
+    """Summarize completed smell_verify calls from one OpenCode JSON stream."""
+    calls = 0
+    last_payload: dict[str, Any] | None = None
+    last_decision = ""
+    last_status = ""
+    last_termination_reason = ""
+    for raw in (events_text or "").splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "tool_use":
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("tool") != "smell_verify":
+            continue
+        state = part.get("state")
+        if not isinstance(state, dict) or state.get("status") != "completed":
+            continue
+        calls += 1
+        metadata = state.get("metadata")
+        if isinstance(metadata, dict):
+            meta_loop = metadata.get("loop")
+            if isinstance(meta_loop, dict):
+                last_decision = str(meta_loop.get("decision") or "")
+                last_termination_reason = str(meta_loop.get("termination_reason") or "")
+            auto = metadata.get("auto_continuation")
+            if isinstance(auto, dict):
+                last_status = str(auto.get("status") or "")
+        output = state.get("output")
+        if not isinstance(output, str):
+            continue
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            last_payload = payload
+    loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
+    if not last_decision and isinstance(loop, dict):
+        last_decision = str(loop.get("decision") or "")
+    if not last_termination_reason and isinstance(loop, dict):
+        last_termination_reason = str(loop.get("termination_reason") or "")
+    if not last_status and isinstance(last_payload, dict):
+        last_status = str(last_payload.get("status") or "")
+    failure_pack = last_payload.get("failure_pack") if isinstance(last_payload, dict) else None
+    checkpoint = last_payload.get("checkpoint") if isinstance(last_payload, dict) else None
+    delta = checkpoint.get("delta") if isinstance(checkpoint, dict) else None
+    return {
+        "smell_verify_calls": calls,
+        "last_loop_decision": last_decision,
+        "last_termination_reason": last_termination_reason,
+        "last_status": last_status,
+        "last_failure_retryable": failure_pack.get("retryable") if isinstance(failure_pack, dict) else None,
+        "last_metric_progress": delta.get("metric_progress") if isinstance(delta, dict) else None,
+        "last_output_parsed": last_payload is not None,
+    }
+
+
+def _runner_closure_action(
+    trace: dict[str, Any],
+    *,
+    reminder_used: bool,
+    continuations_dispatched: int,
+    max_continuations: int,
+) -> str:
+    """Return the next synchronous runner action for a completed OpenCode turn."""
+    if int(trace.get("smell_verify_calls") or 0) == 0:
+        return "stop" if reminder_used else "verify_required"
+    if (
+        trace.get("last_loop_decision") == "continue"
+        and continuations_dispatched < max_continuations
+    ):
+        return "continue"
+    # The plugin's in-turn continuation budget and the runner's cross-process
+    # budget protect different boundaries. If the plugin stopped only because
+    # its internal budget was exhausted while the latest retryable checkpoint
+    # still made measurable progress, resume the same session. The runner's
+    # existing max_continuations remains the outer hard cap.
+    if (
+        trace.get("last_loop_decision") == "stop"
+        and trace.get("last_termination_reason") == "MAX_CONTINUATIONS_REACHED"
+        and trace.get("last_failure_retryable") is True
+        and trace.get("last_metric_progress") is True
+        and continuations_dispatched < max_continuations
+    ):
+        return "continue_after_internal_cap"
+    return "stop"
+
+
+def _runner_continuation_prompt(action: str, continuation: int, max_continuations: int, instruction: str) -> str:
+    if action == "verify_required":
+        return "\n".join(
+            [
+                "[runner-verification-closure verify-required]",
+                "The previous turn ended without a completed smell_verify call.",
+                "Call smell_verify now on the current production-code changes.",
+                "Treat its loop.decision as authoritative and do not modify or weaken tests.",
+            ]
+        )
+    reason = (
+        "The plugin stopped only because its internal continuation budget was exhausted, "
+        "but the latest retryable checkpoint still made measurable progress."
+        if action == "continue_after_internal_cap"
+        else "The previous smell_verify result requested another corrective iteration."
+    )
+    return "\n".join(
+        [
+            f"[runner-verification-closure continue {continuation}/{max_continuations}]",
+            reason,
+            instruction,
+            "Continue the same task in this session, then call smell_verify again.",
+            "Use the latest failure pack and remaining-occurrence evidence as the repair scope.",
+            "Do not modify or weaken tests.",
+        ]
+    )
+
+
+def _opencode_run_command(args: argparse.Namespace, agent: str, session_id: str = "") -> list[str]:
+    cmd = [args.opencode_bin, "run"]
+    if session_id:
+        cmd.extend(["--session", session_id])
+    else:
+        command = {
+            "java-refactor-agent-idea": "java-refactor-run-idea",
+            "java-refactor-agent": "java-refactor-run",
+            "smell-refactor-agent": "smell-refactor-run",
+        }[agent]
+        cmd.extend(["--command", command])
+    cmd.extend([
+        "--agent", agent,
+        "--model", args.model,
+        "--dangerously-skip-permissions",
+        "--format", "json",
+        "--print-logs",
+    ])
+    return cmd
+
+
+def _select_agent(sample: Sample, args: argparse.Namespace) -> str:
+    if args.agent:
+        return args.agent
+    if sample.language == "java":
+        return "java-refactor-agent-idea" if args.idea else "java-refactor-agent"
+    return "smell-refactor-agent"
+
+
 def _run_opencode(
     sample: Sample,
     sample_dir: Path,
     args: argparse.Namespace,
     agent: str,
     verification_mode: str,
+    *,
+    session_id: str = "",
+    continuation_prompt: str = "",
+    attempt_suffix: str = "",
+    hard_timeout_seconds: int | None = None,
 ) -> tuple[int, str]:
-    """Run one command-owned OpenCode loop. Returns (returncode, session_id)."""
+    """Run one initial or same-session OpenCode turn."""
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
     task = _task_prompt(sample, args, verification_mode, agent)
     command_arguments = _command_arguments(task, args, verification_mode)
-    task_path = _attempt_artifact_path(sample_dir, "task.txt", "")
-    task_path.write_text(command_arguments + "\n", encoding="utf-8")
+    stdin_payload = continuation_prompt if session_id else command_arguments
+    task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
+    task_path.write_text(stdin_payload + "\n", encoding="utf-8")
 
     env = os.environ.copy()
     env.update(_prepare_opencode_home(sample_dir))
@@ -730,19 +905,13 @@ def _run_opencode(
 
     # --format json: raw JSON events on stdout (for session-id parsing).
     # --print-logs: human-readable logs on stderr (written to run.log).
-    cmd = [
-        args.opencode_bin, "run",
-        "--command", "java-refactor-run-idea" if agent == "java-refactor-agent-idea" else "java-refactor-run",
-        "--agent", agent,
-        "--model", args.model,
-        "--dangerously-skip-permissions",
-        "--format", "json",
-        "--print-logs",
-    ]
+    cmd = _opencode_run_command(args, agent, session_id)
     command_payload = {
         "cmd": cmd,
         "command_arguments_transport": "stdin",
-        "command_arguments_length": len(command_arguments),
+        "command_arguments_length": len(stdin_payload),
+        "session_id_requested": session_id,
+        "is_continuation": bool(session_id),
         "cwd": str(sample.project_root),
         "agent": agent,
         "auth": {**auth_meta, "api_key_source": "configured" if auth_meta.get("api_key_configured") else ""},
@@ -752,16 +921,16 @@ def _run_opencode(
             "source": "sample-deadline",
             "sample_deadline_seconds": args.sample_deadline,
             "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
-            "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
+            "opencode_hard_timeout_seconds": hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_timeout_seconds": args.sample_deadline,
             "idle_watchdog_enabled": False,
         },
     }
-    command_path = _attempt_artifact_path(sample_dir, "command.json", "")
+    command_path = _attempt_artifact_path(sample_dir, "command.json", attempt_suffix)
     command_path.write_text(json.dumps(command_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    log_path = _attempt_artifact_path(sample_dir, "run.log", "")
-    events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", "")
+    log_path = _attempt_artifact_path(sample_dir, "run.log", attempt_suffix)
+    events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", attempt_suffix)
     with log_path.open("w", encoding="utf-8") as log, events_path.open("w", encoding="utf-8") as events_file:
         proc = subprocess.Popen(
             cmd,
@@ -778,7 +947,7 @@ def _run_opencode(
         # evidence tokens into numbers before run.ts formats the message.
         assert proc.stdin is not None
         try:
-            proc.stdin.write(command_arguments)
+            proc.stdin.write(stdin_payload)
         except BrokenPipeError:
             pass
         finally:
@@ -800,7 +969,9 @@ def _run_opencode(
 
         reader = threading.Thread(target=_drain_stdout, daemon=True)
         reader.start()
-        deadline = time.monotonic() + _opencode_timeout_seconds(args.sample_deadline)
+        deadline = time.monotonic() + (
+            hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
+        )
         timeout_code = 0
         while proc.poll() is None:
             if time.monotonic() > deadline:
@@ -826,7 +997,7 @@ def _run_opencode(
                 detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
             except OSError:
                 pass
-        return rc, detected_sid
+        return rc, detected_sid or session_id
 
 
 def _append_result(results_path: Path, row: dict[str, Any]) -> None:
@@ -915,7 +1086,11 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     stale_home = sample_dir / "opencode-home"
     if stale_home.exists():
         shutil.rmtree(stale_home, ignore_errors=True)
-    agent = args.agent or ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
+    agent = _select_agent(sample, args)
+    if sample.language != "java" and agent == "java-refactor-agent-idea":
+        raise ValueError(
+            f"IDEA_UNSUPPORTED_LANGUAGE: IDEA execution is Java-only; got {sample.language}"
+        )
     verification_mode = _effective_verification_mode(sample, args)
 
     # One isolated checkout is used for the complete command-owned native loop.
@@ -1003,12 +1178,76 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     # Bootstrap .opencode once before starting the command-owned loop.
     _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
-    # The custom command and smell_verify own the native in-session loop. The
-    # batch runner launches it once, then performs one independent final audit;
-    # it does not add a second cross-process retry policy.
-    opencode_returncode, session_id = _run_opencode(
-        execution_sample, sample_dir, args, agent, verification_mode
-    )
+    # Batch `opencode run` exits as the session becomes idle, so a fire-and-forget
+    # plugin promptAsync cannot reliably create another turn. Keep the policy in
+    # one OpenCode session, but synchronously resume that session from the runner
+    # when the completed event stream proves verification closure is missing.
+    model_deadline = time.monotonic() + _opencode_timeout_seconds(args.sample_deadline)
+    controller_attempts: list[dict[str, Any]] = []
+    session_id = ""
+    continuation_prompt = ""
+    continuations_dispatched = 0
+    reminders_dispatched = 0
+    reminder_used = False
+    attempt_index = 0
+    opencode_returncode = 0
+    while True:
+        remaining = int(model_deadline - time.monotonic())
+        if remaining <= 0:
+            opencode_returncode = 124
+            break
+        attempt_suffix = "" if attempt_index == 0 else f".continue-{attempt_index}"
+        opencode_returncode, detected_session_id = _run_opencode(
+            execution_sample,
+            sample_dir,
+            args,
+            agent,
+            verification_mode,
+            session_id=session_id,
+            continuation_prompt=continuation_prompt,
+            attempt_suffix=attempt_suffix,
+            hard_timeout_seconds=remaining,
+        )
+        if detected_session_id:
+            session_id = detected_session_id
+        events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", attempt_suffix)
+        try:
+            trace = _verification_trace(events_path.read_text(encoding="utf-8"))
+        except OSError:
+            trace = _verification_trace("")
+        controller_attempts.append(
+            {
+                "attempt": attempt_index,
+                "suffix": attempt_suffix,
+                "opencode_returncode": opencode_returncode,
+                "session_id": session_id,
+                **trace,
+            }
+        )
+        if opencode_returncode != 0 or not session_id:
+            break
+        action = _runner_closure_action(
+            trace,
+            reminder_used=reminder_used,
+            continuations_dispatched=continuations_dispatched,
+            max_continuations=args.loop_max if args.loop_mode == "verify-failure" else 0,
+        )
+        if action == "stop":
+            break
+        if action == "verify_required":
+            reminders_dispatched += 1
+            reminder_used = True
+        else:
+            continuations_dispatched += 1
+            reminder_used = False
+        continuation_prompt = _runner_continuation_prompt(
+            action,
+            continuations_dispatched,
+            args.loop_max,
+            args.loop_instruction,
+        )
+        attempt_index += 1
+
     verify_returncode, verify_payload = _run_verify(
         execution_sample, sample_dir, args, verification_mode
     )
@@ -1016,17 +1255,21 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         _close_idea_project(execution_sample.project_root, sample_dir, args)
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
     last = {
-        "attempt": 0,
+        "attempt": attempt_index,
         "opencode_returncode": opencode_returncode,
         "verify_returncode": verify_returncode,
         "verify_payload": verify_payload,
         "status": final_status,
         "failure_category": _failure_category_from_verify_payload(verify_payload),
         "session_id": session_id,
-        "is_continuation": False,
+        "is_continuation": attempt_index > 0,
     }
     attempts = [last]
-    note = f"loop_policy={args.loop_mode}:{args.loop_max}"
+    note = (
+        f"loop_policy={args.loop_mode}:{args.loop_max};"
+        f"runner_continuations={continuations_dispatched};"
+        f"verify_reminders={reminders_dispatched}"
+    )
 
     row = {
         "sample_id": sample.sample_id,
@@ -1044,14 +1287,19 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "sample_dir": str(sample_dir),
         "note": note,
     }
-    result_summary = {**row, "attempts": attempts, "revision_audit": revision_audit}
+    result_summary = {
+        **row,
+        "attempts": attempts,
+        "controller_attempts": controller_attempts,
+        "revision_audit": revision_audit,
+    }
     (sample_dir / "result.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return row
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Java smell dataset rows through the minimal OpenCode Java refactor agent.")
-    parser.add_argument("--dataset", required=True, help="Path to one Java delivery_schema CSV file.")
+    parser = argparse.ArgumentParser(description="Run smell dataset rows through the mounted-source OpenCode refactor agent.")
+    parser.add_argument("--dataset", required=True, help="Path to one supported-language smell dataset CSV file.")
     parser.add_argument("--model", default="zai/glm-4.7")
     parser.add_argument("--opencode-bin", default="opencode")
     parser.add_argument("--opencode-api-key", default="")
@@ -1067,8 +1315,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--loop-mode", choices=["off", "verify-failure"], default="verify-failure")
-    parser.add_argument("--loop-max", type=int, choices=range(0, 6), default=2)
-    parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=1)
+    parser.add_argument("--loop-max", type=int, choices=range(0, 6), default=3)
+    parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=2)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--loop-instruction", default=LoopPolicy().instruction)
     parser.add_argument(
@@ -1078,8 +1326,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Single per-phase time budget in seconds for the command loop and final verify; the runner adds only a 60-second OpenCode shutdown grace.",
     )
     parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="local")
-    parser.add_argument("--agent", choices=["java-refactor-agent", "java-refactor-agent-idea"], default="")
-    parser.add_argument("--idea", action="store_true", help="Use java-refactor-agent-idea and expose IDEA CLI.")
+    parser.add_argument(
+        "--agent",
+        choices=["smell-refactor-agent", "java-refactor-agent", "java-refactor-agent-idea"],
+        default="",
+    )
+    idea_group = parser.add_mutually_exclusive_group()
+    idea_group.add_argument("--idea", action="store_true", help="Use java-refactor-agent-idea for Java samples.")
+    idea_group.add_argument("--no-idea", dest="idea", action="store_false", help="Use direct editing without IDEA (required for C, C++, and Python).")
+    parser.set_defaults(idea=False)
     parser.add_argument("--idea-refactor-cli", default=os.environ.get("IDEA_REFACTOR_CLI", ""))
     parser.add_argument("--no-worktree", dest="worktree", action="store_false", help="Mutate project_path directly. Default is one isolated Git checkout per sample.")
     parser.set_defaults(worktree=True)
@@ -1101,14 +1356,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     # Validate the runner flags through the same parser used by the OpenCode
     # command hook, so batch and direct command invocations cannot drift.
     parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
     dataset = Path(args.dataset).expanduser().resolve()
     samples = _filter_samples(_load_samples(dataset), args)
+    if (args.idea or args.agent == "java-refactor-agent-idea") and any(
+        sample.language != "java" for sample in samples
+    ):
+        languages = ", ".join(sorted({sample.language for sample in samples if sample.language != "java"}))
+        parser.error(
+            "IDEA_UNSUPPORTED_LANGUAGE: --idea/java-refactor-agent-idea is Java-only; "
+            f"selected non-Java language(s): {languages}. Use --no-idea."
+        )
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = args.run_name or f"java-refactor-{dataset.stem}-{timestamp}"
+    run_name = args.run_name or f"smell-refactor-{dataset.stem}-{timestamp}"
     run_dir = Path(args.runs_root).expanduser().resolve() / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -1170,7 +1434,11 @@ def main(argv: list[str] | None = None) -> int:
                 "execution_project_root": "",
                 "location": sample.location,
                 "verification_mode": args.verification_mode,
-                "agent": args.agent or ("java-refactor-agent-idea" if args.idea else "java-refactor-agent"),
+                "agent": args.agent or (
+                    ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
+                    if samples and all(sample.language == "java" for sample in samples)
+                    else "smell-refactor-agent"
+                ),
                 "status": "RUNNER_FAILED",
                 "opencode_returncode": "",
                 "verify_returncode": "",

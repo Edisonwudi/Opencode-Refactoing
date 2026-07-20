@@ -280,6 +280,36 @@ def extract_pair_snippets(targets: List[LocationTarget], language: str) -> Tuple
     return extract_snippet(targets[0], language), extract_snippet(targets[1], language)
 
 
+def extract_class_text(target: LocationTarget, language: str) -> Optional[str]:
+    """Return the labeled class body, or the C translation unit used as its module surrogate."""
+    if not target.file_path.is_file():
+        return None
+    source_bytes = target.file_path.read_bytes()
+    if language == "c":
+        # C datasets use `class=<module>` for file-level god-class candidates.
+        return _decode(source_bytes)
+    node_types = {
+        "python": {"class_definition"},
+        "cpp": {"class_specifier", "struct_specifier"},
+    }.get(language, set())
+    if not node_types:
+        return None
+    root = _parse_tree(target.file_path, language, source_bytes)
+    candidates = [node for node in _iter_nodes(root) if node.type in node_types]
+    class_name = str(target.class_name or "").rsplit(".", 1)[-1]
+    if class_name:
+        named = []
+        for node in candidates:
+            name_node = node.child_by_field_name("name")
+            name = _node_text(source_bytes, name_node).strip() if name_node is not None else ""
+            if name.rsplit("::", 1)[-1] == class_name:
+                named.append(node)
+        if named:
+            candidates = named
+    node = _select_best_node(candidates, target.line)
+    return _node_text(source_bytes, node) if node is not None else None
+
+
 def iter_function_signatures(project_root: Path, language: str) -> list[FunctionSignature]:
     extensions = LANGUAGE_EXTENSIONS.get(language, set())
     if not extensions:

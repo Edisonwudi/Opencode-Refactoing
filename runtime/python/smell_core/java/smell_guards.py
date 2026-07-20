@@ -670,45 +670,6 @@ def _run_feature_envy_guard(
             "details": {"detector": "python_semantic_detector", "language": config.language},
         }
     target = config.locations[0]
-    if context is not None and context.feature_envy_checkpoint_required:
-        checkpoint_details = {
-            "detector": "python_semantic_detector",
-            "checkpoint_id": context.feature_envy_checkpoint_id,
-            "baseline_metrics": context.feature_envy_baseline_metrics,
-            "current_metrics": context.feature_envy_current_metrics,
-            "metric_delta": context.feature_envy_metric_delta,
-            "has_production_diff": context.feature_envy_has_production_diff,
-        }
-        if not context.feature_envy_has_production_diff:
-            return {
-                "type": "feature_envy",
-                "success": False,
-                "message": (
-                    "feature_envy checkpoint gate: the unchanged dataset baseline is not an "
-                    "accepted repair; make a substantive production-Java refactoring first."
-                ),
-                "details": {**checkpoint_details, "reason": "EDIT_REQUIRED"},
-            }
-        if not bool(context.feature_envy_metric_delta.get("metric_available")):
-            return {
-                "type": "feature_envy",
-                "success": False,
-                "message": (
-                    "feature_envy checkpoint gate: the expected envied receiver has no measurable "
-                    "baseline accesses; the checkpoint cannot prove structural improvement."
-                ),
-                "details": {**checkpoint_details, "reason": "BASELINE_METRIC_UNAVAILABLE"},
-            }
-        if not context.feature_envy_metric_progress:
-            return {
-                "type": "feature_envy",
-                "success": False,
-                "message": (
-                    "feature_envy checkpoint gate: production source changed, but dependency on "
-                    "the expected envied receiver did not improve enough from the immutable baseline."
-                ),
-                "details": {**checkpoint_details, "reason": "NO_STRUCTURAL_PROGRESS"},
-            }
     detection = run_java_semantic_detector(config.project_root)
     if not detection.ok:
         return {
@@ -860,8 +821,6 @@ def _find_matching_god_class_finding(
         finding_class = _normalize_class_name(finding.class_name or _class_from_evidence(finding.evidence))
         if target_class and finding_class != target_class:
             continue
-        if not target_class and line and not _line_in_class_finding(line, finding):
-            continue
         candidates.append(finding)
     if not candidates:
         return None
@@ -970,8 +929,8 @@ def _requires_unsupported_throw_removal(evidence: str) -> bool:
 def _requires_empty_override_removal(evidence: str) -> bool:
     return bool(
         re.search(
-            r"\b(empty_override|unimplemented_contract|unimplemented_loader|resource_leak_contract)"
-            r"(?:\s*=\s*(?:true|1|yes))?\b",
+            r"(?:empty_override|unimplemented_contract|unimplemented_loader|resource_leak_contract)"
+            r"(?:\s*=\s*(?:true|1|yes))?",
             evidence,
             flags=re.IGNORECASE,
         )

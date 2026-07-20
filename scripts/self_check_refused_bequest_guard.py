@@ -14,6 +14,7 @@ if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
 from smell_core.java.semantic_detector import run_java_semantic_detector  # noqa: E402
+from smell_core.detector_utils import parse_parent_from_evidence  # noqa: E402
 
 
 PARENT = """\
@@ -38,6 +39,8 @@ def _findings(child_declaration: str):
 
 
 def main() -> int:
+    if parse_parent_from_evidence("quality=STRICT_PASS; parents=Parent|Ancestor; flags=empty_override") != "parent":
+        raise AssertionError("dataset parents= evidence must resolve to its primary parent")
     logging_only = """\
 class Child extends Parent {
   @Override void first() { throw new UnsupportedOperationException(); }

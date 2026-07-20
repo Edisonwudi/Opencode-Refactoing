@@ -124,14 +124,27 @@ def main() -> int:
         repaired = _bridge(project, env, "verify")
         if repaired.get("status") != "PASS" or repaired.get("success") is not True:
             raise AssertionError(f"metric-improving refactor did not pass: {repaired}")
-        delta = repaired["checkpoint"]["delta"]["expected_receiver_access"]
-        if delta.get("before") != 4 or delta.get("after") != 3 or delta.get("required_reduction") != 1:
+        delta = repaired["checkpoint"]["delta"]["objectives"]["expected_receiver_access"]
+        if delta.get("before") != 4 or delta.get("after") != 3 or delta.get("absolute_reduction") != 1:
             raise AssertionError(f"unexpected metric delta: {delta}")
 
         checkpoint_root = project / ".smell-artifacts" / "checkpoints"
         manifests = sorted(checkpoint_root.glob("*/c*-verify/manifest.json"))
         if len(manifests) != 2:
             raise AssertionError(f"expected two verify checkpoints, found {manifests}")
+        task_states = sorted(checkpoint_root.glob("*/task-state.json"))
+        if len(task_states) != 1:
+            raise AssertionError(f"expected one checkpoint state, found {task_states}")
+        state = json.loads(task_states[0].read_text(encoding="utf-8"))
+        best_partial = state.get("best_partial") or {}
+        if best_partial.get("checkpoint_id") != "c002":
+            raise AssertionError(f"metric-improving checkpoint was not retained: {state}")
+        production_patch = project / str(best_partial.get("production_patch") or "")
+        if not production_patch.is_file():
+            raise AssertionError(f"production-only patch is missing: {production_patch}")
+        patch_text = production_patch.read_text(encoding="utf-8")
+        if "Fixture.java" not in patch_text or ".smell-artifacts" in patch_text:
+            raise AssertionError(f"production-only patch has the wrong scope: {patch_text[:500]}")
         print(
             "feature-envy-checkpoint-self-check PASS "
             "baseline=4 strict_hit=true unchanged=EDIT_REQUIRED refactored=4->3 required=1"

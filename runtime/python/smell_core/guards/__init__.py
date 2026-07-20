@@ -20,6 +20,7 @@ from ..analysis import (
     count_parameters,
     estimate_complexity,
     estimate_switch_branches,
+    extract_class_text,
     extract_pair_snippets,
     extract_snippet,
     method_basename,
@@ -31,6 +32,7 @@ from ..data_clumps import (
     data_clump_occurrence_threshold,
     detect_data_clump_occurrences,
 )
+from ..checkpoint_contract import checkpoint_gate_result
 from .context import GuardRunContext
 from .registry import get_clone_guard, get_smell_guard, get_syntactic_guard
 
@@ -105,6 +107,16 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
     for guard in config.profile.guards:
         guard_type = str(guard.get("type", "")).strip()
 
+        if (
+            context is not None
+            and context.checkpoint_required
+            and context.checkpoint_smell == guard_type
+        ):
+            checkpoint_failure = checkpoint_gate_result(guard_type, context.checkpoint)
+            if checkpoint_failure is not None:
+                outcomes.append(checkpoint_failure)
+                continue
+
         # --- Language-specific smell guard (registered via registry) ---
         smell_handler = get_smell_guard(config.language)
         if smell_handler is not None:
@@ -128,6 +140,8 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
             outcomes.append(_run_data_clumps_guard(config, guard))
         elif guard_type == "dead_code":
             outcomes.append(_run_dead_code_guard(config, guard))
+        elif guard_type == "god_class" and config.language != "java":
+            outcomes.append(_run_generic_god_class_guard(config, context))
         else:
             outcomes.append(
                 {
@@ -138,6 +152,25 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
                 }
             )
     return outcomes
+
+
+def _run_generic_god_class_guard(
+    config: ResolvedRunConfig,
+    context: Optional[GuardRunContext],
+) -> Dict[str, object]:
+    text = extract_class_text(config.locations[0], config.language) if config.locations else None
+    loc = count_meaningful_lines(text or "", config.language)
+    checkpoint_ready = bool(context and context.checkpoint_required)
+    return {
+        "type": "god_class",
+        "success": text is not None and checkpoint_ready,
+        "message": (
+            f"Generic class/module metric is measurable at {loc} LOC; checkpoint reduction passed."
+            if text is not None and checkpoint_ready
+            else "God-class verification requires a measurable target and the checkpoint reduction contract."
+        ),
+        "details": {"class_loc": loc, "checkpoint_required": checkpoint_ready},
+    }
 
 
 def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:

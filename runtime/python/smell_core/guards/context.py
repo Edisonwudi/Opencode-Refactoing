@@ -11,10 +11,12 @@ class GuardRunContext:
     feature_envy_baseline_findings: List[Dict[str, Any]] = field(default_factory=list)
     feature_envy_baseline_ok: bool = True
     feature_envy_baseline_error: str = ""
-    feature_envy_checkpoint_required: bool = False
-    feature_envy_checkpoint_id: str = ""
-    feature_envy_baseline_metrics: Dict[str, Any] = field(default_factory=dict)
-    feature_envy_current_metrics: Dict[str, Any] = field(default_factory=dict)
-    feature_envy_metric_delta: Dict[str, Any] = field(default_factory=dict)
-    feature_envy_has_production_diff: bool = False
-    feature_envy_metric_progress: bool = False
+    checkpoint_required: bool = False
+    checkpoint_smell: str = ""
+    checkpoint_id: str = ""
+    baseline_metrics: Dict[str, Any] = field(default_factory=dict)
+    current_metrics: Dict[str, Any] = field(default_factory=dict)
+    metric_delta: Dict[str, Any] = field(default_factory=dict)
+    has_production_diff: bool = False
+    metric_progress: bool = False
+    checkpoint: Dict[str, Any] = field(default_factory=dict)

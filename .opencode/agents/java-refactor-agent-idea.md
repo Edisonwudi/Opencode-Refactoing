@@ -2,7 +2,6 @@
 description: Repairs one Java smell with IDEA CLI enhancement available
 mode: primary
 temperature: 0
-steps: 30
 permission:
   read: allow
   glob: allow

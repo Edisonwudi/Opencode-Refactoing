@@ -9,9 +9,13 @@ Run: python3 scripts/self_check_runner_continue.py
 from __future__ import annotations
 
 import contextlib
+import argparse
 import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +60,24 @@ check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "S
 check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
 check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS_AFTER_OPENCODE_TIMEOUT")
 check("opencode_timeout_verify_fail", R._compute_status(124, 0, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+
+print("== dataset evidence identity ==")
+god_row = {"smell_type": "god_class", "class": "Configuration", "evidence": "nom=143;wmc=162"}
+check(
+    "god_class_appends_class",
+    R._dataset_evidence(god_row),
+    "nom=143;wmc=162;class=Configuration",
+)
+check(
+    "god_class_preserves_existing_class",
+    R._dataset_evidence({**god_row, "evidence": "nom=143;class=Configuration"}),
+    "nom=143;class=Configuration",
+)
+check(
+    "other_smell_unchanged",
+    R._dataset_evidence({"smell_type": "feature_envy", "class": "Configuration", "evidence": "far=8"}),
+    "far=8",
+)
 
 print("== single time budget ==")
 check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)
@@ -114,9 +136,177 @@ check("non_json_ignored", R._parse_session_id_from_json_events('not json\n{"sess
 # Whitespace in sessionID trimmed
 check("sid_trimmed", R._parse_session_id_from_json_events('{"sessionID":"  ses_trim  "}'), "ses_trim")
 
+print("== synchronous verification closure ==")
+def verify_event(payload: dict, status: str = "completed") -> str:
+    return json.dumps({
+        "type": "tool_use",
+        "sessionID": "ses_loop",
+        "part": {
+            "tool": "smell_verify",
+            "state": {"status": status, "output": json.dumps(payload)},
+        },
+    })
+
+empty_trace = R._verification_trace('{"type":"text","part":{"text":"done"}}')
+check("trace_empty_calls", empty_trace["smell_verify_calls"], 0)
+check(
+    "initial_missing_verify_reminder",
+    R._runner_closure_action(empty_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+    "verify_required",
+)
+check(
+    "missing_verify_one_shot",
+    R._runner_closure_action(empty_trace, reminder_used=True, continuations_dispatched=0, max_continuations=2),
+    "stop",
+)
+continue_trace = R._verification_trace(verify_event({"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}}))
+check("trace_verify_calls", continue_trace["smell_verify_calls"], 1)
+check("trace_decision", continue_trace["last_loop_decision"], "continue")
+check(
+    "continue_with_budget",
+    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=1, max_continuations=2),
+    "continue",
+)
+check(
+    "continue_cap_shared",
+    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "stop",
+)
+pass_trace = R._verification_trace(verify_event({"status": "PASS", "loop": {"decision": "stop"}}))
+check(
+    "pass_stops",
+    R._runner_closure_action(pass_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+    "stop",
+)
+malformed = json.dumps({"type": "tool_use", "part": {"tool": "smell_verify", "state": {"status": "completed", "output": "truncated"}}})
+malformed_trace = R._verification_trace(malformed)
+check("malformed_still_counts_verify", malformed_trace["smell_verify_calls"], 1)
+check("malformed_has_no_decision", malformed_trace["last_loop_decision"], "")
+truncated_with_metadata = json.dumps({
+    "type": "tool_use",
+    "part": {
+        "tool": "smell_verify",
+        "state": {
+            "status": "completed",
+            "output": "{truncated",
+            "metadata": {
+                "loop": {"decision": "continue"},
+                "auto_continuation": {"status": "SMELL_GUARD_FAILED"},
+            },
+        },
+    },
+})
+metadata_trace = R._verification_trace(truncated_with_metadata)
+check("metadata_survives_truncated_output", metadata_trace["last_loop_decision"], "continue")
+check("metadata_status", metadata_trace["last_status"], "SMELL_GUARD_FAILED")
+cap_payload = {
+    "status": "SMELL_GUARD_FAILED",
+    "failure_pack": {"retryable": True},
+    "checkpoint": {"delta": {"metric_progress": True}},
+    "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
+}
+cap_trace = R._verification_trace(verify_event(cap_payload))
+check("cap_termination_reason", cap_trace["last_termination_reason"], "MAX_CONTINUATIONS_REACHED")
+check("cap_retryable", cap_trace["last_failure_retryable"], True)
+check("cap_metric_progress", cap_trace["last_metric_progress"], True)
+check(
+    "cap_progress_resumes_same_session",
+    R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+    "continue_after_internal_cap",
+)
+check(
+    "cap_progress_obeys_outer_budget",
+    R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "stop",
+)
+for name, mutation in (
+    ("cap_without_progress_stops", {"checkpoint": {"delta": {"metric_progress": False}}}),
+    ("cap_non_retryable_stops", {"failure_pack": {"retryable": False}}),
+    ("non_cap_stop_stops", {"loop": {"decision": "stop", "termination_reason": "NO_PROGRESS"}}),
+):
+    payload = {**cap_payload, **mutation}
+    trace = R._verification_trace(verify_event(payload))
+    check(
+        name,
+        R._runner_closure_action(trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+        "stop",
+    )
+check_true("verify_prompt_marker", "verify-required" in R._runner_continuation_prompt("verify_required", 0, 2, "repair"))
+check_true("continue_prompt_marker", "continue 1/2" in R._runner_continuation_prompt("continue", 1, 2, "repair"))
+check_true(
+    "cap_prompt_explains_budget_boundary",
+    "internal continuation budget was exhausted"
+    in R._runner_continuation_prompt("continue_after_internal_cap", 1, 2, "repair"),
+)
+
+command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
+initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
+continued_cmd = R._opencode_run_command(command_args, "java-refactor-agent", "ses_loop")
+check_true("initial_uses_command", "--command" in initial_cmd and "--session" not in initial_cmd)
+check_true("continuation_uses_session", "--session" in continued_cmd and "ses_loop" in continued_cmd)
+check("continuation_no_command", "--command" in continued_cmd, False)
+
+print("== fake CLI same-session integration ==")
+with tempfile.TemporaryDirectory() as tmp:
+    fake = Path(tmp) / "fake-opencode"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+prompt = sys.stdin.read()
+continued = "--session" in sys.argv
+decision = "stop" if continued else "continue"
+status = "PASS" if continued else "SMELL_GUARD_FAILED"
+payload = {"status": status, "loop": {"decision": decision}}
+event = {
+    "type": "tool_use",
+    "sessionID": "ses_fake",
+    "part": {
+        "tool": "smell_verify",
+        "state": {
+            "status": "completed",
+            "output": json.dumps(payload),
+            "metadata": {"loop": payload["loop"], "auto_continuation": {"status": status}},
+        },
+    },
+}
+print(json.dumps(event))
+""",
+        encoding="utf-8",
+    )
+    os.chmod(fake, 0o755)
+    fake_args = argparse.Namespace(opencode_bin=str(fake), model="minimax/MiniMax-M2.7")
+    first = subprocess.run(
+        R._opencode_run_command(fake_args, "java-refactor-agent"),
+        input="initial command",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    first_sid = R._parse_session_id_from_json_events(first.stdout)
+    first_trace = R._verification_trace(first.stdout)
+    first_action = R._runner_closure_action(
+        first_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2
+    )
+    check("fake_initial_rc", first.returncode, 0)
+    check("fake_initial_sid", first_sid, "ses_fake")
+    check("fake_initial_action", first_action, "continue")
+    second = subprocess.run(
+        R._opencode_run_command(fake_args, "java-refactor-agent", first_sid),
+        input=R._runner_continuation_prompt("continue", 1, 2, "repair"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    second_trace = R._verification_trace(second.stdout)
+    second_action = R._runner_closure_action(
+        second_trace, reminder_used=False, continuations_dispatched=1, max_continuations=2
+    )
+    check("fake_continuation_rc", second.returncode, 0)
+    check("fake_continuation_status", second_trace["last_status"], "PASS")
+    check("fake_continuation_action", second_action, "stop")
+
 print("== _task_prompt ==")
 # Build a minimal fake sample/args to call _task_prompt
-import argparse
 from run_smell_dataset import Sample
 sample = Sample(
     sample_id="1", language="java", smell="long_method", project_name="p",
@@ -132,10 +322,10 @@ args = argparse.Namespace(
     sample_deadline=1800,
 )
 prompt_plain = R._task_prompt(sample, args, "local", "java-refactor-agent")
-check_true("prompt_has_base", "Repair this one Java smell" in prompt_plain)
+check_true("prompt_has_base", "Repair this one java smell" in prompt_plain)
 roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "local"))
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
-check_true("command_roundtrip_task", "Repair this one Java smell" in roundtrip.task)
+check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
 
 print()
 if failures:

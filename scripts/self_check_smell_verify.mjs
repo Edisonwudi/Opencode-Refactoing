@@ -218,6 +218,16 @@ async function makeFixtureProject() {
     ].join("\n"),
     "utf8",
   )
+  for (const args of [
+    ["init", "-q"],
+    ["add", "src/main/java/SelfCheckSample.java"],
+    ["-c", "user.name=smell-self-check", "-c", "user.email=self-check@example.invalid", "commit", "-qm", "baseline"],
+  ]) {
+    const result = await run("git", args, { cwd: fixtureRoot })
+    if (result.exitCode !== 0) {
+      throw new SelfCheckError("fixture_git", "Unable to create immutable checkpoint fixture baseline.", result)
+    }
+  }
   return fixtureRoot
 }
 
@@ -858,6 +868,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
     "classifyFailureForContinue",
     "makeTaskKey",
     "buildContinuationMessage",
+    "buildVerifyRequiredMessage",
     "createIdleContinueRuntime",
     "SMELL_IDLE_CONTINUE_PREFIX",
   ]) {
@@ -952,7 +963,56 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("unified_malformed_stops", rt.handleIdle("s1"), false, "dispatch")
   }
 
-  return { modes: ["tui", "run", "serve", "web", "attach", "batch"], sharedBudget: true, passed: true }
+  // A task that idles before its first verify receives exactly one reminder.
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = hooks.createIdleContinueRuntime({ client })
+    rt.armInitialVerification({
+      sessionID: "initial",
+      agent: "java-refactor-agent",
+      directory: IDLE_DIR,
+      maxContinuations: 2,
+      instruction: "repair narrowly",
+    })
+    assertEqual("verify_required_initial_dispatch", rt.handleIdle("initial"), true, "dispatch")
+    await flush()
+    assertEqual("verify_required_initial_calls", calls.length, 1, "calls")
+    assertCond(
+      "verify_required_initial_text",
+      calls[0].body.parts[0].text.includes("No smell_verify call has completed"),
+      "initial reminder text missing",
+    )
+    assertEqual("verify_required_initial_once", rt.handleIdle("initial"), false, "dispatch")
+  }
+
+  // A dispatched corrective continuation must close with another verify. The
+  // reminder is one-shot and a real verify result clears it.
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = hooks.createIdleContinueRuntime({ client })
+    record(rt, { sessionID: "after-continuation" })
+    assertEqual("verify_required_continuation_dispatch", rt.handleIdle("after-continuation"), true, "dispatch")
+    await flush()
+    assertEqual("verify_required_continuation_prompt", calls.length, 1, "calls")
+    assertEqual("verify_required_after_continuation", rt.handleIdle("after-continuation"), true, "dispatch")
+    await flush()
+    assertEqual("verify_required_after_continuation_calls", calls.length, 2, "calls")
+    assertCond(
+      "verify_required_after_continuation_text",
+      calls[1].body.parts[0].text.includes("corrective continuation ended without a new smell_verify"),
+      "continuation reminder text missing",
+    )
+    assertEqual("verify_required_after_continuation_once", rt.handleIdle("after-continuation"), false, "dispatch")
+    record(rt, { sessionID: "after-continuation", output: makePassOutput() })
+    assertEqual("verify_required_cleared_by_verify", rt.handleIdle("after-continuation"), false, "dispatch")
+  }
+
+  return {
+    modes: ["tui", "run", "serve", "web", "attach", "batch"],
+    sharedBudget: true,
+    verifyClosure: true,
+    passed: true,
+  }
 }
 
 function runCommandPolicyDecisionSelfCheck(pluginModule) {
@@ -1042,26 +1102,60 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         String(commandOutput.parts?.[0]?.text || "").includes("Controller-owned verification and loop policy"),
         "command hook must inject canonical policy",
       )
-      const result = await smellVerify.execute({
+      const verifyArgs = {
         projectRoot: fixtureRoot,
         language: "java",
         smell: "long_method",
         location: "src/main/java/SelfCheckSample.java:2",
         verificationMode: "local",
         noSnapshot: true,
-      }, {
+      }
+      const verifyContext = {
         sessionID: "command-policy-self-check",
         agent: "java-refactor-agent",
         directory: fixtureRoot,
-      })
-      const successPath = normalizeToolResult(result)
+      }
+      const unchangedResult = await smellVerify.execute(verifyArgs, verifyContext)
+      const unchangedPayload = parseJson("checkpoint_unchanged_tool_result", unchangedResult.output)
+      assertEqual("checkpoint_unchanged_status", unchangedPayload.status, "SMELL_GUARD_FAILED", "status")
+      assertEqual("checkpoint_unchanged_loop", unchangedPayload.loop?.decision, "continue", "loop.decision")
+      assertEqual(
+        "checkpoint_unchanged_reason",
+        unchangedPayload.smell_guard?.results?.[0]?.details?.reason,
+        "EDIT_REQUIRED",
+        "checkpoint reason",
+      )
+      await writeFile(
+        path.join(fixtureRoot, "src", "main", "java", "SelfCheckSample.java"),
+        [
+          "public class SelfCheckSample {",
+          "  public void add(int left, int right) {}",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8",
+      )
+      const repairedResult = await smellVerify.execute(verifyArgs, verifyContext)
+      const successPath = normalizeToolResult(repairedResult)
       assertEqual("command_policy_pass_decision", successPath.loop?.decision, "stop", "loop.decision")
       assertEqual("command_policy_pass_reason", successPath.loop?.termination_reason, "PASS", "termination_reason")
       const normalizeUnit = await runPluginNormalizeSelfCheck(pluginModule)
       const failureIntegration = await runPluginFailureIntegrationSelfCheck(smellVerify)
       const idleContinue = await runIdleContinueSelfCheck(pluginModule)
       const commandPolicyDecision = runCommandPolicyDecisionSelfCheck(pluginModule)
-      return { successPath, normalizeUnit, failureIntegration, idleContinue, commandPolicy: { passed: true }, commandPolicyDecision }
+      return {
+        successPath,
+        unchangedCheckpoint: {
+          status: unchangedPayload.status,
+          reason: unchangedPayload.smell_guard?.results?.[0]?.details?.reason,
+          loop: unchangedPayload.loop,
+        },
+        normalizeUnit,
+        failureIntegration,
+        idleContinue,
+        commandPolicy: { passed: true },
+        commandPolicyDecision,
+      }
     } finally {
       for (const key of Object.keys(process.env)) {
         if (!(key in envBefore)) delete process.env[key]
@@ -1093,6 +1187,7 @@ async function main() {
       },
       bridge,
       smellVerifyTool: pluginSelfCheck.successPath,
+      unchangedCheckpoint: pluginSelfCheck.unchangedCheckpoint,
       smellVerifyFailurePaths: {
         normalizeUnit: pluginSelfCheck.normalizeUnit,
         integration: pluginSelfCheck.failureIntegration,

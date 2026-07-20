@@ -25,10 +25,13 @@ from smell_core.config import (  # noqa: E402
     resolve_run_config,
 )
 from smell_core.checkpoints import (  # noqa: E402
-    capture_feature_envy_baseline,
-    finalize_feature_envy_checkpoint,
-    prepare_feature_envy_checkpoint,
+    capture_checkpoint_baseline,
+    checkpoint_location,
+    finalize_checkpoint,
+    prepare_checkpoint,
 )
+from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
+from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
 from smell_core.guards import GuardRunContext, run_build_test_guard, run_smell_guards  # noqa: E402
 from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
@@ -370,52 +373,41 @@ def cmd_run_build_test_guard(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_capture_baseline(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
-    if resolved.smell != "feature_envy":
+    if resolved.smell not in CHECKPOINT_SMELLS:
         return {"success": True, "status": "BASELINE_NOT_REQUIRED", "smell": resolved.smell}
-    if not resolved.locations:
-        raise ValueError("FEATURE_ENVY_BASELINE_CAPTURE_FAILED: no target location")
-    target = resolved.locations[0]
-    baseline = capture_feature_envy_baseline(
-        project_root=resolved.project_root,
-        target_file=target.file_path,
-        method=target.method,
-        line=target.line,
-        location=target.raw,
-        evidence=getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", ""),
+    baseline = capture_checkpoint_baseline(
+        resolved,
+        getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", ""),
     )
     return {
         "success": True,
         "status": "BASELINE_CAPTURED",
+        "smell": resolved.smell,
         "checkpoint_id": baseline.get("checkpoint_id"),
-        "expected_receiver_type": baseline.get("expected_receiver_type"),
+        "adapter": baseline.get("adapter"),
         "metrics": baseline.get("metrics"),
     }
 
 
-def _feature_envy_checkpoint_context(resolved) -> tuple[Optional[GuardRunContext], Optional[dict[str, Any]]]:
-    if resolved.smell != "feature_envy" or not resolved.locations:
+def _checkpoint_context(resolved, evidence: str) -> tuple[Optional[GuardRunContext], Optional[dict[str, Any]]]:
+    if resolved.smell not in CHECKPOINT_SMELLS or not resolved.locations:
         return None, None
-    target = resolved.locations[0]
-    checkpoint = prepare_feature_envy_checkpoint(
-        project_root=resolved.project_root,
-        target_file=target.file_path,
-        method=target.method,
-        line=target.line,
-        location=target.raw,
-    )
+    checkpoint = prepare_checkpoint(resolved, evidence)
     if not checkpoint.get("required"):
         return None, checkpoint
     delta = dict(checkpoint.get("delta") or {})
     changed = [resolved.project_root / item for item in checkpoint.get("changed_production_java_files") or []]
     context = GuardRunContext(
         changed_java_files=changed,
-        feature_envy_checkpoint_required=True,
-        feature_envy_checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
-        feature_envy_baseline_metrics=dict(checkpoint.get("baseline_metrics") or {}),
-        feature_envy_current_metrics=dict(checkpoint.get("current_metrics") or {}),
-        feature_envy_metric_delta=delta,
-        feature_envy_has_production_diff=bool(checkpoint.get("production_diff")),
-        feature_envy_metric_progress=bool(delta.get("metric_progress")),
+        checkpoint_required=True,
+        checkpoint_smell=resolved.smell,
+        checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
+        baseline_metrics=dict(checkpoint.get("baseline_metrics") or {}),
+        current_metrics=dict(checkpoint.get("current_metrics") or {}),
+        metric_delta=delta,
+        has_production_diff=bool(checkpoint.get("production_diff")),
+        metric_progress=bool(delta.get("metric_progress")),
+        checkpoint=checkpoint,
     )
     return context, checkpoint
 
@@ -449,7 +441,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": artifacts,
             "failure_pack": failure_pack,
         }
-    guard_context, checkpoint = _feature_envy_checkpoint_context(resolved)
+    evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
+    guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
     build_test_result = None
@@ -481,12 +474,16 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             checkpoint["build_test_success"] = (
                 bool(build_test_result.get("success")) if build_test_result is not None else None
             )
-            finalize_feature_envy_checkpoint(
+            finalized = finalize_checkpoint(
                 resolved.project_root,
-                resolved.locations[0].raw,
+                resolved.smell,
+                checkpoint_location(resolved),
                 checkpoint_id,
                 full_payload,
             )
+            if finalized is not None:
+                checkpoint.clear()
+                checkpoint.update(finalized)
     artifact_dir = _verify_artifact_dir(args, resolved.project_root)
     artifacts = _write_verify_artifacts(artifact_dir, full_payload)
     failure_pack = None
@@ -918,6 +915,32 @@ def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tupl
     return "UNKNOWN_VERIFY_FAILURE", ["Read the linked artifacts before choosing a repair route."]
 
 
+def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit: int = 190) -> list[str]:
+    """Keep the authoritative guard target visible in the continuation prompt."""
+    if not isinstance(payload, dict):
+        return []
+    smell_guard = payload.get("smell_guard")
+    if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
+        return []
+    highlights: list[str] = []
+    for result in smell_guard.get("results") or []:
+        if not isinstance(result, dict) or result.get("success") is not False:
+            continue
+        message = " ".join(str(result.get("message") or "").split())
+        if not message:
+            continue
+        prefix = "GUARD_TARGET "
+        available = max(1, limit - len(prefix))
+        if len(message) > available:
+            head = max(1, int(available * 0.65))
+            tail = max(1, available - head - 5)
+            message = f"{message[:head]} ... {message[-tail:]}"
+        highlights.append(prefix + message)
+        if len(highlights) >= 1:
+            break
+    return highlights
+
+
 def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[str, str]) -> dict[str, Any]:
     paths = _artifact_paths_from_verify_payload(payload, artifact_paths)
     bundle = _failure_text_bundle(payload, paths)
@@ -941,13 +964,20 @@ def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[
         "timeout",
         "modal",
     ]
+    checkpoint = payload.get("checkpoint") if isinstance(payload, dict) else None
+    # Continuation prompts only retain the first three highlights.  Put the
+    # ordinary guard target first so the model sees the current score,
+    # threshold, or remaining family before the compact checkpoint deltas.
+    highlights = _smell_guard_failure_highlights(payload)
+    highlights.extend(checkpoint_feedback_highlights(checkpoint))
+    highlights.extend(_highlight_patterns(bundle, patterns))
     return {
         "failure_category": category,
         "failure_group": failure_group,
         "retryable": bool(failure_group),
         "verify_status": payload.get("status") if isinstance(payload, dict) else "",
         "artifact_paths": paths,
-        "highlights": _highlight_patterns(bundle, patterns),
+        "highlights": highlights,
         "recommendations": recommendations,
         "repair_contract": {
             "repair_agent_may_edit": True,

@@ -230,96 +230,70 @@ runs/<run-name>/samples/<sample>/opencode.runtime.json
 - `verificationMode="sample_optimized"`
 - `verificationMode="project_full"`
 
-## 9. Docker 完整镜像
+## 9. GitHub 协作边界
 
-如果需要构建完整镜像：
+协作服务器直接 clone 本仓库，并把仓库根目录只读挂载到环境镜像的
+`/agent-src`。仓库是 agent 源码的唯一真相：
+
+- `.opencode/`：agent、command、skill 和插件
+- `runtime/`：Python bridge、guard 和 checkpoint runtime
+- `scripts/`：dataset runner、baseline 验证和源码自检
+- `docker/java-refactor-delivery/entrypoint.sh`：环境镜像调用的运行入口
+- `package.json`、`package-lock.json`、`opencode.json`：固定依赖与配置
+
+环境镜像负责提供 IDEA、Java 项目、delivery dataset、OpenCode/Node 依赖、
+离线构建缓存、项目版本清单和项目级验证配置。上述环境材料不进入本仓库。
+`runs/`、`node_modules/`、Python cache、本地项目配置和临时 worktree 也由
+`.gitignore` 排除。
+
+clone 后先验证源码契约：
 
 ```bash
-docker build \
-  -f docker/java-refactor-delivery/Dockerfile \
-  --build-arg NODE_VERSION=18.19.1 \
-  --build-arg OPENCODE_VERSION=1.17.8 \
-  -t opencode-java-refactor-delivery:0.1.1-amd64 \
-  .
+npm ci
+npm run check
+npm run check:self
 ```
 
-镜像构建阶段会安装与参考补丁一致的 Node `18.19.1`、校验 OpenCode `1.17.8`、安装 `@opencode-ai/plugin@1.15.10`，并执行 `scripts/self_check_smell_verify.mjs`。
+## 10. 使用环境镜像
 
-Docker 内部自检：
-
-```bash
-docker run --rm opencode-java-refactor-delivery:0.1.1-amd64 self-check
-```
-
-镜像内部 `self-check` 会额外读取真实数据集样本：
+下面的 `<environment-image>` 由环境提供方给出。无需构建或修改镜像：
 
 ```bash
-python3 scripts/run_smell_dataset.py \
-  --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
-  --sample-id 8 \
-  --model zai/glm-4.7 \
-  --verification-mode local \
-  --dry-run
-```
+git clone <repository-url> opencode-java-refactor
+cd opencode-java-refactor
+mkdir -p runs
 
-该步骤只验证 dataset runner 能读取真实 CSV 并选中固定样本，不访问模型 API。
-
-交付前 baseline build/sample-test 门禁：
-
-```bash
-mkdir -p "$PWD/runs"
 docker run --rm \
-  -v "$PWD/runs:/runs" \
-  opencode-java-refactor-delivery:0.1.1-amd64 \
-  baseline-check
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  <environment-image> self-check
 ```
 
-`baseline-check` 不调用模型。它逐条处理数据集样本：为当前样本创建独立 Git checkout，在同一个 checkout 中先执行该项目配置的 build，build 通过后立即执行该样本的 test command，然后才进入下一条样本。相同 test command 不跨样本去重或复用 build 结果。任一样本的 build 或 test 失败时命令返回非零，并把完整报告写到 `runs/baseline-preflight.json`。
-
-镜像构建时还会统一验证环境口径：把 CSV 的 `project_path` 映射到 `/opt/projects/<project_name>`，固定 `TZ=Asia/Shanghai`，并让编译/行为测试跳过 Checkstyle 与 Spotless 这类格式门禁。baseline 预检会拒绝仍读取源码文本的锚点测试，以及长参数样本中通过完整参数列表反射目标方法的结构耦合测试。项目测试文件必须已经进入对应项目的 Git `HEAD`，仅覆盖工作区文件不能通过隔离 checkout 校验。
-
-定点检查可使用 `--project`、`--smell` 和 `--sample-id`：
+断网 baseline 验证不调用模型：
 
 ```bash
 docker run --rm \
-  -v "$PWD/runs:/runs" \
-  opencode-java-refactor-delivery:0.1.1-amd64 \
-  baseline-check \
-  --project Mindustry-v154.3 \
-  --smell long_method \
-  --sample-id 1
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  <environment-image> baseline-check
 ```
 
-镜像会在专用 Gradle User Home 中通过官方 init DSL 禁用 cache cleanup，避免离线依赖在 build 与 sample test 之间被 Gradle GC 删除。
-
-Docker 批量 dry-run：
-
-```bash
-docker run --rm opencode-java-refactor-delivery:0.1.1-amd64 \
-  --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
-  --sample-id 8 \
-  --model zai/glm-4.7 \
-  --dry-run
-```
-
-Docker 真实运行：
+运行一个真实样本时，key 仅通过环境变量或临时只读 secret 文件提供：
 
 ```bash
 docker run --rm \
-  -v "$PWD/runs:/runs" \
-  -e SMELL_OPENCODE_API_KEY="<api-key>" \
-  opencode-java-refactor-delivery:0.1.1-amd64 \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  -e SMELL_OPENCODE_API_KEY \
+  <environment-image> \
   --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
   --sample-id 8 \
   --model zai/glm-4.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \
   --opencode-base-url https://api.z.ai/api/coding/paas/v4 \
-  --verification-mode local \
+  --verification-mode sample_optimized \
   --agent java-refactor-agent
 ```
 
-IDEA 路径只需把最后的 agent 改为：
-
-```bash
---agent java-refactor-agent-idea
-```
+IDEA 路径使用 `--agent java-refactor-agent-idea`。更新 agent 时只需在服务器
+拉取新的 Git commit 并启动新容器，不需要重建环境镜像。

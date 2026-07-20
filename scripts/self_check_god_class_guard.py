@@ -12,7 +12,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runtime" / "python"))
 
-from smell_core.java.semantic_detector import run_java_semantic_detector  # noqa: E402
+from smell_core.java.semantic_detector import SemanticFinding, run_java_semantic_detector  # noqa: E402
+from smell_core.java.smell_guards import _find_matching_god_class_finding  # noqa: E402
 
 
 def _method(index: int, controls: int) -> str:
@@ -59,6 +60,30 @@ def main() -> int:
     # must disappear once fewer than two candidate signals remain.
     reduced = "class Candidate {\n" + "\n".join(_method(i, 4) for i in range(5)) + "\n}\n"
     assert _finding(reduced) == [], "reduced class must be below the dataset rule"
+
+    # A refactoring can move the original dataset line outside the class while
+    # leaving the same God Class in place. Missing class metadata must fail
+    # closed by choosing the nearest same-file finding instead of returning a
+    # false PASS solely because the stale line no longer overlaps the class.
+    shifted = SemanticFinding(
+        smell_type="god_class",
+        file="src/Candidate.java",
+        class_name="Candidate",
+        method="",
+        begin_line=1,
+        end_line=50,
+        score=1.0,
+        rule_id="god_class",
+        evidence="nom=20;wmc=80;loc=300;atfd=12;class=Candidate",
+    )
+    root = Path("/tmp/god-class-guard-root")
+    target_file = root / "src" / "Candidate.java"
+    assert _find_matching_god_class_finding(
+        [shifted], target_file=target_file, project_root=root, class_name="", line=100
+    ) == shifted
+    assert _find_matching_god_class_finding(
+        [shifted], target_file=target_file, project_root=root, class_name="Candidate", line=100
+    ) == shifted
 
     print("god_class guard calibration self-check: PASS")
     return 0

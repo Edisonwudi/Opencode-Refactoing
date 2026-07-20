@@ -107,8 +107,8 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
         default="local",
     )
     parser.add_argument("--loop-mode", choices=sorted(LOOP_MODES), default="verify-failure")
-    parser.add_argument("--loop-max", type=int, default=2)
-    parser.add_argument("--loop-no-progress-limit", type=int, default=1)
+    parser.add_argument("--loop-max", type=int, default=3)
+    parser.add_argument("--loop-no-progress-limit", type=int, default=2)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--sample-deadline", type=int, default=1800)
     parsed = parser.parse_args(tokens)

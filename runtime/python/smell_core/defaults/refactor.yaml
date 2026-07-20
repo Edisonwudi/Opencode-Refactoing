@@ -6,6 +6,85 @@ defaults:
   run_build: true
   run_tests: true
   output_root: runs
+generic_smells: &generic_smells
+  long_method:
+    instruction: Extract cohesive helpers or introduce guard clauses to reduce the target function while preserving behavior.
+    constraints:
+    - Keep changes focused on the labeled function and production source.
+    verification:
+    - Reduce the target function's meaningful line count and pass configured project tests.
+    guards:
+    - type: long_method
+      max_lines: 60
+    retry_hint_template: Reduce the labeled function further without weakening tests.
+  long_parameter_list:
+    instruction: Reduce the target function's parameter burden with a cohesive parameter object or narrower API.
+    constraints:
+    - Update production callers and preserve the public contract where required.
+    verification:
+    - Reduce the labeled declaration's parameter count and pass configured project tests.
+    guards:
+    - type: long_parameter_list
+      max_params: 5
+    retry_hint_template: Reduce the labeled declaration's parameter count before retrying.
+  nested_complexity:
+    instruction: Flatten the target function with guard clauses and cohesive helpers while preserving behavior.
+    constraints:
+    - Change the labeled control flow rather than unrelated code.
+    verification:
+    - Reduce the target function's measured complexity and pass configured project tests.
+    guards:
+    - type: nested_complexity
+      max_complexity: 20
+    retry_hint_template: Reduce the labeled function's nesting or branching further.
+  switch_statements:
+    instruction: Replace switch-heavy branching with clearer dispatch or focused helpers while preserving behavior.
+    constraints:
+    - Keep every existing branch behavior covered.
+    verification:
+    - Reduce case count or density in the labeled function and pass configured project tests.
+    guards:
+    - type: switch_statements
+      max_branches: 8
+      max_density: 10.0
+    retry_hint_template: Reduce switch-heavy branching in the labeled function further.
+  code_clone_type1:
+    instruction: Centralize the exact duplicated behavior shared by the two labeled functions.
+    constraints:
+    - Preserve both call paths and avoid unrelated cleanup.
+    verification:
+    - Reduce the exact-clone token count and pass configured project tests.
+    guards:
+    - type: code_clone_type1
+      min_tokens: 80
+    retry_hint_template: The labeled pair still contains exact duplicated logic.
+  data_clumps:
+    instruction: Replace the recurring labeled parameter group with a cohesive language-appropriate abstraction.
+    constraints:
+    - Update the repeated production call sites without modifying tests.
+    verification:
+    - Reduce occurrences of the labeled group and pass configured project tests.
+    guards:
+    - type: data_clumps
+    retry_hint_template: The labeled parameter group still recurs across too many functions.
+  god_class:
+    instruction: Move one cohesive responsibility out of the labeled class or C module into a focused collaborator.
+    constraints:
+    - Preserve behavior and keep the extraction focused on one responsibility cluster.
+    verification:
+    - Reduce the labeled class or module metric and pass configured project tests.
+    guards:
+    - type: god_class
+    retry_hint_template: Move a measurable responsibility out of the labeled class or module.
+  dead_code:
+    instruction: Remove the exact labeled unused declaration while preserving behavior.
+    constraints:
+    - Do not remove public APIs, framework hooks, or referenced declarations.
+    verification:
+    - Remove the labeled declaration and pass configured project tests.
+    guards:
+    - type: dead_code
+    retry_hint_template: Remove the exact labeled dead declaration or report its concrete reference.
 languages:
   java:
     detect_extensions:
@@ -191,3 +270,21 @@ languages:
         retry_hint_template: The rejecting or empty inheritance pattern remains. Follow the
           reported refactor_path and change production structure or behavior; do not edit
           the regression test or replace the body with logging or a placeholder.
+  c:
+    detect_extensions:
+    - .c
+    - .h
+    smells: *generic_smells
+  cpp:
+    detect_extensions:
+    - .cpp
+    - .cc
+    - .cxx
+    - .hpp
+    - .hh
+    - .hxx
+    smells: *generic_smells
+  python:
+    detect_extensions:
+    - .py
+    smells: *generic_smells

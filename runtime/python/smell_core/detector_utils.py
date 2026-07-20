@@ -66,6 +66,9 @@ def _normalize_group_type(value: str) -> str:
 
 
 def parse_parent_from_evidence(evidence: str) -> str:
-    """Extract ``parent=ClassName`` from an evidence string for refused_bequest matching."""
-    match = re.search(r"(?:^|;\s*)parent=([^;,\s]+)", evidence, flags=re.IGNORECASE)
-    return match.group(1).strip().lower() if match else ""
+    """Extract the primary parent from ``parent=`` or dataset ``parents=`` evidence."""
+    match = re.search(r"(?:^|;\s*)parents?=([^;]+)", evidence, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    value = re.split(r"[|,]", match.group(1), maxsplit=1)[0]
+    return value.strip().lower()

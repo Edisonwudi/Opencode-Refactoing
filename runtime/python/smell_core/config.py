@@ -483,6 +483,9 @@ def resolve_run_config(
     merged_profile = profile.merged_with(smell_override)
     build = _merge_command_config(language_config.build, override.build if override else None)
     project_test = _merge_command_config(language_config.test, override.test if override else None)
+    if override and override.root.resolve() != project_root_path:
+        build = _rebase_command_config(build, override.root.resolve(), project_root_path)
+        project_test = _rebase_command_config(project_test, override.root.resolve(), project_root_path)
     normalized_verification_mode = _resolve_verification_mode(
         verification_mode,
         sample_test_command=sample_test_command,
@@ -499,8 +502,19 @@ def resolve_run_config(
     cwd = build_root
     if override and override.cwd:
         cwd_path = Path(override.cwd)
-        cwd = cwd_path if cwd_path.is_absolute() else (project_root_path / cwd_path)
+        if cwd_path.is_absolute():
+            try:
+                cwd = project_root_path / cwd_path.resolve().relative_to(override.root.resolve())
+            except ValueError:
+                cwd = cwd_path
+        else:
+            cwd = project_root_path / cwd_path
         cwd = cwd.resolve()
+    resolved_env = dict(override.env) if override else {}
+    if override and override.root.resolve() != project_root_path:
+        canonical = str(override.root.resolve())
+        execution = str(project_root_path)
+        resolved_env = {key: str(value).replace(canonical, execution) for key, value in resolved_env.items()}
     return ResolvedRunConfig(
         project_root=project_root_path,
         dataset_root=dataset_root,
@@ -513,7 +527,7 @@ def resolve_run_config(
         build=build,
         test=test,
         llm=copy.deepcopy(refactor_config.llm),
-        env=dict(override.env) if override else {},
+        env=resolved_env,
         cwd=cwd,
         profile=merged_profile,
         project_override=override,
@@ -711,6 +725,15 @@ def _merge_command_config(base: CommandConfig, override: Optional[CommandConfig]
     return CommandConfig(
         command=base.command,
         script=base.script,
+    )
+
+
+def _rebase_command_config(config: CommandConfig, canonical_root: Path, execution_root: Path) -> CommandConfig:
+    canonical = str(canonical_root)
+    execution = str(execution_root)
+    return CommandConfig(
+        command=config.command.replace(canonical, execution) if config.command is not None else None,
+        script=config.script.replace(canonical, execution) if config.script is not None else None,
     )
 
 
