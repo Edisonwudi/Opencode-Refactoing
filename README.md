@@ -77,6 +77,16 @@ docker run --rm \
 `self-check` 会校验：只读挂载、lockfile hash、运行时依赖、项目版本清单、
 项目级验证配置，全部就位才放行。
 
+**非 Java 镜像注意**：`self-check` 默认走 Java dataset 路径，非 Java 镜像
+必须显式指定本语言的 dataset:
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  opencode-smell-python-refactor-env:0.1.1-amd64-delivery-20260720 \
+  self-check --dataset-smoke-dataset /opt/dataset/smells/python/long_method_30.csv
+```
+
 ### 1.7 跑一个真实样本
 
 ```bash
@@ -114,6 +124,47 @@ git pull    # agent 源码即最新版;镜像无需任何操作
 ```
 
 只有环境本身（IDE、依赖缓存、dataset）变化才需要重新交付镜像（回到 1.2)。
+
+### 1.10 非 Java 语言（python / c / cpp）
+
+非 Java 与 Java 共用同一套 checkpoint 契约、runner 和容器入口，差异只在
+镜像、dataset 路径和 agent 选择。
+
+**dataset 与异味范围**：镜像内路径为
+`/opt/dataset/smells/<lang>/<smell>_30.csv`（每语言 8 种异味 × 30 样本：
+long_method、long_parameter_list、nested_complexity、switch_statements、
+data_clumps、code_clone_type1、god_class、dead_code)。非 Java 目前**没有**
+feature_envy / mysterious_name / refused_bequest（后两者检测器仅实现 Java)。
+
+**agent 选择**：非 Java 样本**省略 `--agent`**(runner 按 CSV 的 `language`
+列自动选用 `smell-refactor-agent`)，或显式 `--agent smell-refactor-agent`;
+不要传 `--idea` / `java-refactor-agent-idea`（会被 `IDEA_UNSUPPORTED_LANGUAGE`
+拒绝）。
+
+**跑一个 python 样本**（c/cpp 只换镜像名和 CSV 路径）：
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  -e SMELL_OPENCODE_API_KEY \
+  opencode-smell-python-refactor-env:0.1.1-amd64-delivery-20260720 \
+  --dataset /opt/dataset/smells/python/long_method_30.csv \
+  --sample-id 1 \
+  --model minimax/MiniMax-M2.7 \
+  --opencode-api-key-env SMELL_OPENCODE_API_KEY \
+  --opencode-base-url "$SMELL_OPENCODE_BASE_URL" \
+  --verification-mode project_full
+```
+
+注意：
+
+- 非 Java 的 build/test 配置来自镜像内 `/opt/buildenv/projects.docker.yaml`
+  （仓库内的 `defaults/projects.yaml` 是空的）；**在容器外直接跑 runner**
+  时需显式 `--projects <yaml>`。
+- 镜像内项目：python 17 个（django、requests、airflow 等）、c 11 个
+  (redis、nginx、curl 等）、cpp 12 个（rocksdb、protobuf、fmt 等）。
+- 验收语义（resolved / improved、loop 预算、有效 PASS 硬规则）与 Java 完全一致。
 
 ---
 
@@ -226,8 +277,8 @@ python3 scripts/run_smell_dataset.py \
 ## 6. 仓库结构
 
 ```text
-.opencode/agents/            两个公开 agent(直改 / IDEA 增强)
-.opencode/commands/          java-refactor-run[-idea](loop policy 入口)
+.opencode/agents/            三个公开 agent(java-refactor-agent[-idea]、smell-refactor-agent)
+.opencode/commands/          java-refactor-run[-idea]、smell-refactor-run(loop policy 入口)
 .opencode/plugins/smell.ts   smell_verify 工具 + loop 状态机
 .opencode/skills/            编辑模式与 IDEA 重构路径知识
 runtime/python/bridge/       smell_bridge(verify/capture-baseline/guard 入口)
