@@ -17,10 +17,15 @@ CHECKPOINT_SCHEMA_VERSION = 2
 
 
 def _run_git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    # Project sources are not guaranteed to be UTF-8 (e.g. POCO carries Latin-1
+    # bytes).  surrogateescape keeps undecodable bytes as lone surrogates so the
+    # diff text round-trips byte-exactly when written back with the same policy.
     return subprocess.run(
         ["git", *args],
         cwd=str(root),
         text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -236,7 +241,7 @@ def prepare_checkpoint(config: Any, evidence: str) -> dict[str, Any]:
         "changed_production_source_files": production_sources,
         "changed_production_java_files": production_sources if config.language == "java" else [],
         "production_diff": has_production_diff,
-        "production_diff_hash": hashlib.sha256(production_patch.encode("utf-8")).hexdigest(),
+        "production_diff_hash": hashlib.sha256(production_patch.encode("utf-8", errors="surrogateescape")).hexdigest(),
         "baseline_metrics": baseline_metrics,
         "current_metrics": current,
         "delta": delta,
@@ -249,8 +254,10 @@ def prepare_checkpoint(config: Any, evidence: str) -> dict[str, Any]:
     _write_json(checkpoint_dir / "manifest.json", manifest)
     _write_json(checkpoint_dir / "metrics.json", current)
     _write_json(checkpoint_dir / "delta.json", delta)
-    (checkpoint_dir / "source.patch").write_text(patch, encoding="utf-8")
-    (checkpoint_dir / "production.patch").write_text(production_patch, encoding="utf-8")
+    # Patches must round-trip the exact bytes git emitted; surrogateescape is the
+    # same policy _run_git used to decode them, so non-UTF-8 source bytes survive.
+    (checkpoint_dir / "source.patch").write_text(patch, encoding="utf-8", errors="surrogateescape")
+    (checkpoint_dir / "production.patch").write_text(production_patch, encoding="utf-8", errors="surrogateescape")
     state["latest"] = checkpoint_id
     state["next_sequence"] = sequence + 1
     _write_json(state_path, state)

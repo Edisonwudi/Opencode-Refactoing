@@ -157,9 +157,11 @@ def resolve_revision(
 def _git(repo: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     # safe.directory=* avoids "dubious ownership" when the project tree is owned by
     # root but the process runs as a non-root user (e.g. the `smell` runuser).
+    # surrogateescape keeps non-UTF-8 paths/messages decodable instead of raising.
     return subprocess.run(
         ["git", "-c", "safe.directory=*", "-C", str(repo), *args],
         capture_output=True, text=True,
+        encoding="utf-8", errors="surrogateescape",
     )
 
 

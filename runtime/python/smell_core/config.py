@@ -669,6 +669,8 @@ def _derive_git_worktree_common_root(project_root: Path) -> Optional[Path]:
         proc = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "--git-common-dir"],
             text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,

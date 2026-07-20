@@ -87,7 +87,8 @@ def _write_json_artifact(path: Path, payload: Any) -> str:
 
 def _write_text_artifact(path: Path, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # surrogateescape keeps non-UTF-8 bytes (diff/build output) byte-exact on disk.
+    path.write_text(content, encoding="utf-8", errors="surrogateescape")
     return str(path)
 
 
@@ -445,13 +446,26 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
+    # Contract improvement gate: a real production diff that reduces any valid
+    # target metric vs baseline is an accepted improvement, even when the
+    # strict detector still reports the smell. The detector verdict stays in
+    # smell_guard for reporting; without this gate the loop burns the whole
+    # sample deadline on samples where "detector fully silent" is unreachable.
+    improvement_pass = bool(
+        guard_context is not None
+        and getattr(guard_context, "has_production_diff", False)
+        and getattr(guard_context, "metric_progress", False)
+    )
     build_test_result = None
-    if not failed_smell and args.run_build_test and resolved.verification_mode != "local":
+    if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(resolved)
     snapshot = _snapshot_project(resolved.project_root) if args.snapshot else None
-    success = not failed_smell and (
+    success = (not failed_smell or improvement_pass) and (
         build_test_result is None or bool(build_test_result.get("success"))
     )
+    resolution = ""
+    if success:
+        resolution = "resolved" if not failed_smell else "improved"
     smell_guard = {
         "success": not failed_smell,
         "results": smell_results,
@@ -460,7 +474,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     }
     full_payload = {
         "success": success,
-        "status": _verify_status(success, smell_guard, build_test_result),
+        "status": _verify_status(success, smell_guard, build_test_result, improvement_pass=improvement_pass),
+        "resolution": resolution,
         "smell_guard": smell_guard,
         "build_test_guard": build_test_result,
         "snapshot": snapshot,
@@ -494,6 +509,7 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     payload = {
         "success": success,
         "status": full_payload["status"],
+        "resolution": resolution,
         "smell_guard": smell_guard,
         "build_test_guard": _summarize_build_test_guard(build_test_result),
         "snapshot": _summarize_snapshot(snapshot, artifacts),
@@ -514,10 +530,11 @@ def _verify_status(
     success: bool,
     smell_guard: dict[str, Any],
     build_test_result: Optional[dict[str, Any]],
+    improvement_pass: bool = False,
 ) -> str:
     if success:
         return "PASS"
-    if smell_guard.get("success") is False:
+    if smell_guard.get("success") is False and not improvement_pass:
         return "SMELL_GUARD_FAILED"
     if build_test_result and build_test_result.get("success") is False:
         if build_test_result.get("verification_mode") == "sample_optimized":
@@ -639,10 +656,14 @@ def _write_verify_artifacts(artifact_dir: Path, full_payload: dict[str, Any]) ->
 
 
 def _run_git(args: list[str], cwd: Path) -> dict[str, Any]:
+    # surrogateescape mirrors smell_core.checkpoints: non-UTF-8 source bytes in
+    # git diff output must survive a write-back round-trip byte-exactly.
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
