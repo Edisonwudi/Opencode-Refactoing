@@ -154,7 +154,9 @@ def _is_production_source(path: str, language: str) -> bool:
         "java": (".java",),
         "python": (".py",),
         "c": (".c", ".h"),
-        "cpp": (".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"),
+        # C++ projects routinely keep production code in .h headers (rocksdb);
+        # without it a header-only repair can never produce a production diff.
+        "cpp": (".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h"),
     }.get(language, ())
     if not normalized.endswith(extensions):
         return False
@@ -163,7 +165,9 @@ def _is_production_source(path: str, language: str) -> bool:
         marker in lowered
         for marker in (
             "/src/test/", "/src/it/", "/tests/", "/test/",
-            "/build-refactoragent/", "/cmake-build-", "/.venv/", "/dist/",
+            # Plain build/ trees (CMake probe sources, Gradle generated
+            # sources) are outputs, never production sources.
+            "/build/", "/build-refactoragent/", "/cmake-build-", "/.venv/", "/dist/",
         )
     )
 
