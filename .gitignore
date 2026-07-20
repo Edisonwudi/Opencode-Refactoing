@@ -11,10 +11,8 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# ---------- OpenCode plugin runtime (auto-generated) ----------
+# ---------- OpenCode plugin runtime ----------
 .opencode/node_modules/
-.opencode/package.json
-.opencode/package-lock.json
 .opencode/bun.lock
 
 # ---------- Python ----------
