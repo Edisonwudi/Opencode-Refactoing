@@ -466,6 +466,19 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolution = ""
     if success:
         resolution = "resolved" if not failed_smell else "improved"
+    continue_hint = ""
+    if resolution == "improved":
+        remaining = [str(item.get("message") or "") for item in failed_smell if item.get("message")]
+        continue_hint = (
+            "Progress accepted (resolution=improved): the checkpoint confirms a real "
+            "production diff with metric reduction vs baseline. The detector still "
+            "reports the smell, so keep refactoring toward resolution=resolved. "
+            "Remaining detector signals: "
+            + " | ".join(remaining[:3])
+            + " Best partial progress is already saved; do not undo these metric "
+            "gains. Make the next cohesive extraction or simplification, then call "
+            "smell_verify again."
+        )
     smell_guard = {
         "success": not failed_smell,
         "results": smell_results,
@@ -476,6 +489,7 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "success": success,
         "status": _verify_status(success, smell_guard, build_test_result, improvement_pass=improvement_pass),
         "resolution": resolution,
+        "continue_hint": continue_hint,
         "smell_guard": smell_guard,
         "build_test_guard": build_test_result,
         "snapshot": snapshot,
@@ -510,6 +524,7 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "success": success,
         "status": full_payload["status"],
         "resolution": resolution,
+        "continue_hint": continue_hint,
         "smell_guard": smell_guard,
         "build_test_guard": _summarize_build_test_guard(build_test_result),
         "snapshot": _summarize_snapshot(snapshot, artifacts),

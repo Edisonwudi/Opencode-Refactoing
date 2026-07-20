@@ -145,6 +145,13 @@ command 参数与任务正文作为一个完整字符串从 stdin 传入。批�
 重试次数。没有通过 command 启动的直接 `smell_verify` 会使用默认 policy
 （`verify-failure`、最多 2 次 continuation）。
 
+verify 的 `resolution` 分两层：`resolved` 表示检测器不再报告目标异味，是唯一
+提前终止通行证；`improved` 表示 checkpoint 确认"真实生产 diff + 任一目标指标
+相对基线下降"（此时 build/test 也会强制执行）。`improved` 不会终止 loop：插件
+按同一预算让 session 继续冲 `resolved`，并把剩余检测器信号和"不要回撤已保存
+的 best partial 收益"注入 continue 提示；预算（deadline、max_continuations、
+no_progress）耗尽时按最终工作树的真实状态结算 `resolved / improved / failed`。
+
 `--sample-deadline` 是唯一的时间预算入口。批处理 runner、command loop 和最终独立 verify 都从该值派生：loop 使用原值，runner 只额外保留 60 秒给 OpenCode 正常退出，最终 verify 使用同一预算。runner 不再提供独立的 `--timeout`、`--verify-timeout` 或基于日志静默的 `--opencode-log-idle-timeout`，避免外层时限提前截断 loop。
 
 如果 OpenCode 到达截止时间但最终独立 verify 仍完整通过，结果记为 `PASS_AFTER_OPENCODE_TIMEOUT`；该状态表示重构验收通过，但模型进程未在预算内正常结束。

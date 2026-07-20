@@ -1057,6 +1057,41 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   hooks.applyCommandLoopDecision(second, state)
   const secondPayload = JSON.parse(second.output)
   assertEqual("command_decision_no_progress", secondPayload.loop.termination_reason, "NO_PROGRESS", "termination")
+
+  // Round-3 semantics: an improved PASS keeps the loop running toward
+  // resolved (with the bridge continue_hint), and only identical best-partial
+  // objectives across verifies count as no-progress.
+  const improvedState = {
+    policy: state.policy,
+    startedAt: Date.now(),
+    continuationCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const improved = {
+    success: true,
+    status: "PASS",
+    resolution: "improved",
+    continue_hint: "keep going to resolved",
+    checkpoint: { best_partial: { objectives: { loc: 400 } } },
+  }
+  const improvedFirst = { output: JSON.stringify(improved), metadata: {} }
+  hooks.applyCommandLoopDecision(improvedFirst, improvedState)
+  const improvedFirstPayload = JSON.parse(improvedFirst.output)
+  assertEqual("improved_decision_continue", improvedFirstPayload.loop.decision, "continue", "decision")
+  assertEqual("improved_instruction_hint", improvedFirstPayload.loop.instruction, "keep going to resolved", "instruction")
+  const improvedSecond = { output: JSON.stringify(improved), metadata: {} }
+  hooks.applyCommandLoopDecision(improvedSecond, improvedState)
+  const improvedSecondPayload = JSON.parse(improvedSecond.output)
+  assertEqual("improved_no_progress_stop", improvedSecondPayload.loop.termination_reason, "PASS", "termination")
+  assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
+
+  const resolved = { success: true, status: "PASS", resolution: "resolved" }
+  const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
+  hooks.applyCommandLoopDecision(resolvedResult, improvedState)
+  const resolvedPayload = JSON.parse(resolvedResult.output)
+  assertEqual("resolved_decision_stop", resolvedPayload.loop.decision, "stop", "decision")
+  assertEqual("resolved_termination", resolvedPayload.loop.termination_reason, "PASS", "termination")
   return { passed: true }
 }
 

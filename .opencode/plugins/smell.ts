@@ -1315,6 +1315,18 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     return
   }
   const passed = payload.success === true || payload.status === "PASS"
+  const resolution = typeof payload.resolution === "string" ? payload.resolution : ""
+  // An improved PASS accepts real progress (production diff + metric
+  // reduction) but the detector still reports the smell. Keep the loop
+  // running toward resolved within the same budget instead of terminating;
+  // only resolution=resolved (or an exhausted budget) stops the session.
+  const improvedOnly = passed && resolution === "improved"
+  const checkpointObj = payload.checkpoint && typeof payload.checkpoint === "object" && !Array.isArray(payload.checkpoint)
+    ? payload.checkpoint as Record<string, unknown>
+    : undefined
+  const bestPartial = checkpointObj?.best_partial && typeof checkpointObj.best_partial === "object" && !Array.isArray(checkpointObj.best_partial)
+    ? checkpointObj.best_partial as Record<string, unknown>
+    : undefined
   const pack = payload.failure_pack
   const category = pack && typeof pack === "object" && !Array.isArray(pack)
     ? String((pack as Record<string, unknown>).failure_category || "")
@@ -1330,8 +1342,10 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
   let decision: "continue" | "stop" = "stop"
   let terminationReason = "PASS"
 
-  if (!passed) {
-    const fingerprint = failureFingerprint(payload)
+  if (!passed || improvedOnly) {
+    const fingerprint = improvedOnly
+      ? "improved:" + JSON.stringify(bestPartial?.objectives ?? null)
+      : failureFingerprint(payload)
     if (state.lastFailureFingerprint && state.lastFailureFingerprint === fingerprint) {
       state.noProgressCount += 1
     } else {
@@ -1340,15 +1354,15 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     state.lastFailureFingerprint = fingerprint
 
     if (state.policy.loop.mode === "off" || state.policy.loop.max_continuations <= 0) {
-      terminationReason = "LOOP_DISABLED"
-    } else if (!retryable) {
+      terminationReason = improvedOnly ? "PASS" : "LOOP_DISABLED"
+    } else if (!improvedOnly && !retryable) {
       terminationReason = "NON_REPAIRABLE_FAILURE"
     } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
-      terminationReason = "SAMPLE_DEADLINE_REACHED"
+      terminationReason = improvedOnly ? "PASS" : "SAMPLE_DEADLINE_REACHED"
     } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
-      terminationReason = "NO_PROGRESS"
+      terminationReason = improvedOnly ? "PASS" : "NO_PROGRESS"
     } else if (state.continuationCount >= state.policy.loop.max_continuations) {
-      terminationReason = "MAX_CONTINUATIONS_REACHED"
+      terminationReason = improvedOnly ? "PASS" : "MAX_CONTINUATIONS_REACHED"
     } else {
       state.continuationCount += 1
       decision = "continue"
@@ -1368,7 +1382,11 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
     failure_category: category,
     failure_group: group,
-    instruction: decision === "continue" ? state.policy.loop.instruction : "",
+    instruction: decision === "continue"
+      ? (improvedOnly && typeof payload.continue_hint === "string" && payload.continue_hint
+          ? payload.continue_hint
+          : state.policy.loop.instruction)
+      : "",
   }
   payload.loop = loop
   normalized.output = safeJsonStringify(payload)
