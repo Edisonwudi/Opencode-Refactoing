@@ -14,6 +14,7 @@ from .analysis import (
     extract_snippet,
     method_basename,
     normalize_for_clone,
+    python_switch_metrics,
 )
 from .data_clumps import (
     data_clump_occurrence_threshold as generic_data_clump_occurrence_threshold,
@@ -193,10 +194,18 @@ def _switch_statements(config: Any, evidence: str) -> dict[str, Any]:
             "objectives": {"switch_case_count": 0, "switch_density": 0.0},
             "target_missing": True,
         }
-    switch_count, case_count, density = compute_switch_metrics(snippet.body_text)
+    if config.language == "python":
+        # Python has no switch; count dispatch branches (if/elif chains, match
+        # statements) via tree-sitter.  The regex metric counted the word "case"
+        # inside '#' comments (django special-case false positive).
+        switch_count, case_count, density = python_switch_metrics(snippet)
+        detector = "tree_sitter_generic"
+    else:
+        switch_count, case_count, density = compute_switch_metrics(snippet.body_text)
+        detector = "java_syntactic_detector"
     return {
         "ok": True,
-        "detector": "java_syntactic_detector",
+        "detector": detector,
         "objectives": {
             "switch_case_count": float(case_count),
             "switch_density": round(float(density), 6),

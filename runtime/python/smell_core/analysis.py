@@ -265,6 +265,26 @@ def estimate_switch_branches(snippet: SourceSnippet, language: str) -> int:
     return _estimate_switch_branches_from_node(body_node, language, source_bytes)
 
 
+def python_switch_metrics(snippet: SourceSnippet) -> Tuple[int, int, float]:
+    """Switch-equivalent metrics for Python, which has no switch statement.
+
+    The switch_statements smell maps to type-code dispatch: multi-branch
+    if/elif/else chains and match statements.  Returns (switch_count,
+    case_count, density); case_count mirrors estimate_switch_branches so the
+    checkpoint objective and the ordinary guard read the same number.
+    """
+    wrapped_source = _wrap_body_source(snippet.body_text, "python")
+    if wrapped_source is None:
+        return _python_switch_metrics_from_text(snippet.body_text)
+    function_node, source_bytes = _find_first_function_node(wrapped_source, "python")
+    if function_node is None:
+        return _python_switch_metrics_from_text(snippet.body_text)
+    body_node = function_node.child_by_field_name("body")
+    if body_node is None:
+        return _python_switch_metrics_from_text(snippet.body_text)
+    return _python_dispatch_metrics(body_node)
+
+
 def extract_snippet(target: LocationTarget, language: str) -> Optional[SourceSnippet]:
     source_bytes = target.file_path.read_bytes()
     root = _parse_tree(target.file_path, language, source_bytes)
@@ -645,21 +665,59 @@ def _estimate_complexity_from_node(body_node: Node, language: str, source_bytes:
 
 def _estimate_switch_branches_from_node(body_node: Node, language: str, source_bytes: bytes) -> int:
     if language == "python":
-        return _count_python_if_elif_branches(body_node)
+        return _count_python_dispatch_branches(body_node)
     return _estimate_switch_branches_from_text(_node_text(source_bytes, body_node), language)
 
 
-def _count_python_if_elif_branches(body_node: Node) -> int:
+def _python_match_case_count(match_node: Node) -> int:
+    """case_clause children of a match_statement (they live inside its block)."""
+    for child in match_node.children:
+        if child.type == "block":
+            return sum(1 for case in child.children if case.type == "case_clause")
+    return sum(1 for case in match_node.children if case.type == "case_clause")
+
+
+def _count_python_dispatch_branches(body_node: Node) -> int:
+    """Largest branch fan-out across if/elif/else chains and match statements."""
     max_branches = 0
     for node in _iter_nodes(body_node):
-        if node.type != "if_statement":
-            continue
-        branches = 1
-        branches += sum(1 for child in node.children if child.type == "elif_clause")
-        if any(child.type == "else_clause" for child in node.children):
-            branches += 1
-        max_branches = max(max_branches, branches)
+        if node.type == "if_statement":
+            branches = 1
+            branches += sum(1 for child in node.children if child.type == "elif_clause")
+            if any(child.type == "else_clause" for child in node.children):
+                branches += 1
+            max_branches = max(max_branches, branches)
+        elif node.type == "match_statement":
+            max_branches = max(max_branches, _python_match_case_count(node))
     return max_branches
+
+
+def _python_dispatch_metrics(body_node: Node) -> Tuple[int, int, float]:
+    """(switch_count, case_count, density) for Python dispatch constructs."""
+    switches = 0
+    max_branches = 0
+    for node in _iter_nodes(body_node):
+        if node.type == "if_statement":
+            elif_count = sum(1 for child in node.children if child.type == "elif_clause")
+            branches = 1 + elif_count
+            if any(child.type == "else_clause" for child in node.children):
+                branches += 1
+            max_branches = max(max_branches, branches)
+            if elif_count:
+                switches += 1
+        elif node.type == "match_statement":
+            case_count = _python_match_case_count(node)
+            max_branches = max(max_branches, case_count)
+            if case_count:
+                switches += 1
+    density = (max_branches / switches) if switches else 0.0
+    return switches, max_branches, density
+
+
+def _python_switch_metrics_from_text(text: str) -> Tuple[int, int, float]:
+    cleaned = strip_comments(text, "python")
+    case_count = len(re.findall(r"^\s*(if|elif|else)\b", cleaned, flags=re.MULTILINE))
+    return 0, case_count, 0.0
 
 
 def _control_nesting_depth(node: Node, control_types: set) -> int:
