@@ -7,6 +7,8 @@
 
 插件只暴露一个异味领域工具：`smell_verify`。异味上下文由手动输入或批量 runner 注入，agent 负责修复和最终验收。
 
+> **拿到本仓库 + 四个镜像压缩包？** 直接看第 11 节「交付使用流程」，按编号顺序执行即可。
+
 ## 1. 确认目录内容
 
 本包包含：
@@ -305,69 +307,94 @@ docker run --rm \
 IDEA 路径使用 `--agent java-refactor-agent-idea`。更新 agent 时只需在服务器
 拉取新的 Git commit 并启动新容器，不需要重建环境镜像。
 
-## 11. 项目准备好后的使用流程（交付版）
+## 11. 交付使用流程（拿到仓库 + 镜像后按顺序执行）
 
-本仓库通过 GitHub 分发源码；四种语言的环境镜像以压缩包形式单独交付
-（镜像体积约 19GB/个，不进入 Git 仓库）。
+交付物只有两类：本仓库（agent 源码）和四个镜像压缩包（约 19GB/个，不进 Git）。
+以下是端到端的完整操作顺序。
 
-### 11.1 准备
+### 第 1 步：拿到仓库
 
-1. 克隆仓库并验证源码契约：
+```bash
+git clone https://github.com/Edisonwudi/Opencode-Refactoing.git
+cd Opencode-Refactoing
+```
 
-   ```bash
-   git clone <repository-url> opencode-refactor
-   cd opencode-refactor
-   npm ci && (cd .opencode && npm ci && cd ..)
-   python3 -m pip install pyyaml
-   npm run check && npm run check:self
-   ```
+### 第 2 步：把镜像压缩包放进仓库的 `images/` 目录
 
-2. 载入交付镜像（以 Java 为例，其余语言同理）：
+```bash
+mkdir -p images
+cp /path/to/smell-refactor-env-{java,python,c,cpp}.tar.gz images/
+cp /path/to/SHA256SUMS images/
+```
 
-   ```bash
-   docker load -i smell-refactor-env-java.tar.gz
-   # 得到镜像 opencode-java-refactor-env:<tag>
-   ```
+`images/` 已被 `.gitignore` 排除，不会误提交。先校验完整性：
 
-   交付包内的 `SHA256SUMS` 用于校验压缩包完整性：`sha256sum -c SHA256SUMS`。
+```bash
+(cd images && sha256sum -c SHA256SUMS)
+```
 
-3. 准备模型 key：放进环境变量或单独 secret 文件，不要写入仓库、
-   日志或命令行：
+四个包的 tag 与 hash 对照见 `delivery/README.md`。
 
-   ```bash
-   export SMELL_OPENCODE_API_KEY="<api-key>"
-   ```
+### 第 3 步：载入镜像
 
-### 11.2 日常使用
+```bash
+docker load -i images/smell-refactor-env-java.tar.gz
+docker load -i images/smell-refactor-env-python.tar.gz
+docker load -i images/smell-refactor-env-c.tar.gz
+docker load -i images/smell-refactor-env-cpp.tar.gz
+docker images | grep refactor-env   # 确认四个镜像都在
+```
 
-1. 自检（不调用模型，验证镜像与源码契约）：
+### 第 4 步：安装本仓库的本地依赖并自检源码
 
-   ```bash
-   docker run --rm \
-     --mount type=bind,src="$PWD",dst=/agent-src,readonly \
-     --mount type=bind,src="$PWD/runs",dst=/runs \
-     opencode-java-refactor-env:<tag> self-check
-   ```
+```bash
+npm ci && (cd .opencode && npm ci && cd ..)
+python3 -m pip install pyyaml
+npm run check && npm run check:self
+```
 
-2. 跑单个样本（按第 6 节的 runner 参数；key 仅以环境变量名引用）：
+### 第 5 步：配置模型 key（不进任何文件/日志/命令行）
 
-   ```bash
-   docker run --rm \
-     --mount type=bind,src="$PWD",dst=/agent-src,readonly \
-     --mount type=bind,src="$PWD/runs",dst=/runs \
-     -e SMELL_OPENCODE_API_KEY \
-     opencode-java-refactor-env:<tag> \
-     --dataset /opt/dataset/java/delivery_schema/<smell>.csv \
-     --sample-id <id> --model <provider/model> \
-     --opencode-api-key-env SMELL_OPENCODE_API_KEY \
-     --verification-mode sample_optimized
-   ```
+```bash
+export SMELL_OPENCODE_API_KEY="<api-key>"   # 或用只读 secret 文件
+```
 
-3. 更新 agent：在服务器 `git pull` 仓库即可，环境镜像无需重建；
-   verify 的两层结果语义（`resolved` / `improved`）见第 5 节。
+### 第 6 步：容器自检（不调用模型）
 
-### 11.3 交付物清单
+以 Java 镜像为例（其余语言同理，换镜像名即可）：
 
-- 本仓库：agent 源码、checkpoint 契约与适配器、runner、自检、文档。
-- 镜像压缩包 ×4（java / python / c / cpp）+ `SHA256SUMS`，离线包含
-  IDE、语言项目、依赖缓存与 dataset；只读挂载本仓库后使用。
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  opencode-java-refactor-env:0.1.0-mounted-source-godclass-bounded-3a10c8ad \
+  self-check
+```
+
+### 第 7 步：跑一个真实样本
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  -e SMELL_OPENCODE_API_KEY \
+  opencode-java-refactor-env:0.1.0-mounted-source-godclass-bounded-3a10c8ad \
+  --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
+  --sample-id 8 \
+  --model zai/glm-4.7 \
+  --opencode-api-key-env SMELL_OPENCODE_API_KEY \
+  --opencode-base-url https://api.z.ai/api/coding/paas/v4 \
+  --verification-mode sample_optimized \
+  --agent java-refactor-agent
+```
+
+结果在 `runs/<run-name>/` 下（`results.csv`、各样本的 `verify.json`、`diff.patch`）。
+verify 的两层结果语义（`resolved` / `improved`）见第 5 节；批量参数见第 6 节。
+
+### 第 8 步：日常更新
+
+```bash
+git pull            # agent 源码即最新版,镜像无需任何操作
+```
+
+只有环境本身（IDE、依赖缓存、dataset）变化时才需要重新交付镜像，重复第 2–3 步。

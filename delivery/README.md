@@ -12,14 +12,14 @@
 ## 使用
 
 ```bash
-# 校验完整性
-sha256sum -c SHA256SUMS
-
-# 载入镜像(以 Java 为例)
-docker load -i smell-refactor-env-java.tar.gz
+# 1. 将本目录的 4 个 tar.gz 与 SHA256SUMS 放入仓库根目录的 images/ 下
+# 2. 校验完整性
+(cd images && sha256sum -c SHA256SUMS)
+# 3. 载入镜像(以 Java 为例)
+docker load -i images/smell-refactor-env-java.tar.gz
 ```
 
-载入后按仓库根目录 `README.md` 第 11 节「项目准备好后的使用流程」操作:
+完整的端到端操作顺序见仓库根目录 `README.md` 第 11 节「交付使用流程」:
 将本仓库只读挂载为 `/agent-src`,先跑 `self-check`,再按 dataset 样本运行。
 
 ## 说明

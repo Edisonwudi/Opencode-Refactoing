@@ -65,3 +65,6 @@ runs/
 
 # ---------- Editor / tooling ----------
 .zcode/
+
+# Delivery image tarballs (several GB each; distributed out-of-band)
+/images/
