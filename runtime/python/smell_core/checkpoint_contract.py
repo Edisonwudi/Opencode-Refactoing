@@ -91,6 +91,12 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
     if delta.get("metric_progress") is True:
         return None
     reason = str(delta.get("reason") or "NO_STRUCTURAL_PROGRESS")
+    if reason == "TARGET_NOT_LOCATED":
+        # target_missing means the adapter could not measure the target; it is
+        # not a smell verdict. Arbitrating "genuinely removed" vs "made
+        # unreachable" belongs to the strict guard (which rescans for the
+        # original signature), so the contract stays silent here.
+        return None
     messages = {
         "EDIT_REQUIRED": "the unchanged production baseline is not an accepted repair",
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",

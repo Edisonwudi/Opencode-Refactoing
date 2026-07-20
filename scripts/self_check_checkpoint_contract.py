@@ -73,7 +73,9 @@ def main() -> int:
         {"checkpoint_id": "c002", "adapter": "long_parameter_list", "delta": evaluate_checkpoint_contract(
             baseline, missing, has_production_diff=True, smell="long_parameter_list").to_dict()},
     )
-    assert gate is not None and "could not be located" in gate["message"], gate
+    # TARGET_NOT_LOCATED is a measurement state, not a smell verdict: the
+    # contract stays silent and the strict guard arbitrates.
+    assert gate is None, gate
 
     for smell in sorted(EXPECTED):
         checkpoint = {
