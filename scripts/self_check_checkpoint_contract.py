@@ -59,6 +59,22 @@ def main() -> int:
     )
     assert improved.reason == "METRIC_PROGRESS" and improved.metric_progress
 
+    # target_missing is a measurement failure, not a reduction: for every
+    # smell except the absence-goal pair it must fail closed.
+    missing = {"ok": True, "target_missing": True, "objectives": {"primary": 0, "secondary": 0}}
+    for smell in sorted(EXPECTED - {"dead_code", "mysterious_name"}):
+        verdict = evaluate_checkpoint_contract(baseline, missing, has_production_diff=True, smell=smell)
+        assert verdict.reason == "TARGET_NOT_LOCATED" and not verdict.metric_progress, (smell, verdict.reason)
+    for smell in ("dead_code", "mysterious_name"):
+        verdict = evaluate_checkpoint_contract(baseline, missing, has_production_diff=True, smell=smell)
+        assert verdict.reason == "METRIC_PROGRESS" and verdict.metric_progress, (smell, verdict.reason)
+    gate = checkpoint_gate_result(
+        "long_parameter_list",
+        {"checkpoint_id": "c002", "adapter": "long_parameter_list", "delta": evaluate_checkpoint_contract(
+            baseline, missing, has_production_diff=True, smell="long_parameter_list").to_dict()},
+    )
+    assert gate is not None and "could not be located" in gate["message"], gate
+
     for smell in sorted(EXPECTED):
         checkpoint = {
             "checkpoint_id": "c001",

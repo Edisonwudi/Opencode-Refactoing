@@ -32,8 +32,10 @@ from .semantic_detector import (
 )
 from .ast_ncss import run_ast_ncss
 from .syntactic_detector import (
+    _finding,
     find_matching_clone_pair,
     find_matching_syntactic_finding,
+    load_project_model,
     parse_mysterious_evidence,
     run_java_syntactic_detector,
 )
@@ -113,6 +115,8 @@ def run_java_syntactic_guard(
         original_param_type_fingerprint=target.param_type_fingerprint if guard_type == "long_parameter_list" else None,
         evidence=evidence,
     )
+    if not match and guard_type == "long_parameter_list":
+        match = _find_lingering_lpl_signature(config, target, thresholds)
     if match:
         return {
             "type": guard_type,
@@ -141,6 +145,45 @@ def run_java_syntactic_guard(
         ),
         "details": {"detector": "java_syntactic_detector"},
     }
+
+
+def _find_lingering_lpl_signature(
+    config: ResolvedRunConfig,
+    target: Any,
+    thresholds: Dict[str, object],
+) -> Optional[Any]:
+    """Fail-closed fallback for long_parameter_list.
+
+    The finding matcher anchors on the original arity, so an agent can make
+    the target "unfindable" (line drift, added overloads, signature edits)
+    while the original long signature still exists in the file. When the
+    matcher comes back empty, rescan the target file directly: any same-name
+    method whose parameter count still exceeds the LPL threshold means the
+    smell was never repaired.
+    """
+    try:
+        _, methods = load_project_model(config.project_root, [target.file_path])
+    except Exception:
+        return None
+    threshold = int(thresholds.get("long_parameter_list", 5) or 5)
+    target_method = _normalize_method(target.method)
+    lingering = [
+        method
+        for method in methods
+        if (not target_method or _normalize_method(method.method_name) == target_method)
+        and len(method.parameter_names or []) > threshold
+    ]
+    if not lingering:
+        return None
+    worst = max(lingering, key=lambda item: len(item.parameter_names or []))
+    count = len(worst.parameter_names or [])
+    return _finding(
+        "long_parameter_list",
+        worst,
+        float(count),
+        "custom:long_parameter_list_lingering",
+        f"param_count={count}; threshold={threshold}; matcher_fallback=lingering-signature",
+    )
 
 
 def _run_java_ast_ncss_guard(

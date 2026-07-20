@@ -214,6 +214,7 @@ def prepare_checkpoint(config: Any, evidence: str) -> dict[str, Any]:
         baseline_metrics,
         current,
         has_production_diff=has_production_diff,
+        smell=str(config.smell),
     )
     delta = {
         **evaluation.to_dict(),

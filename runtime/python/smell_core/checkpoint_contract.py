@@ -37,6 +37,7 @@ def evaluate_checkpoint_contract(
     current: Mapping[str, Any],
     *,
     has_production_diff: bool,
+    smell: str = "",
 ) -> ContractEvaluation:
     """Compare adapter snapshots using the shared strict-decrease contract."""
     before = _numeric_objectives(baseline.get("objectives"))
@@ -56,15 +57,27 @@ def evaluate_checkpoint_contract(
         for name in shared
     }
     available = bool(baseline.get("ok")) and bool(shared) and any(before[name] > 0 for name in shared)
+    # When the adapter can no longer locate the target entity, its objectives
+    # are recorded as zero — that is a measurement failure, not a reduction.
+    # Only smells whose goal is the target's absence (dead_code deletion,
+    # mysterious_name rename) may treat target_missing as progress; every
+    # other smell must be measured on a located target or fail closed. Legit
+    # removals (e.g. an LPL signature genuinely replaced) still pass through
+    # the strict guard, which verifies the original signature is gone.
+    absence_goal = smell in ("dead_code", "mysterious_name")
+    target_unlocated = current.get("target_missing") is True and not absence_goal
     progress = bool(
         has_production_diff
         and available
+        and not target_unlocated
         and any(item["absolute_reduction"] > 0 for item in deltas.values())
     )
     if not has_production_diff:
         reason = "EDIT_REQUIRED"
     elif not available:
         reason = "BASELINE_METRIC_UNAVAILABLE"
+    elif target_unlocated:
+        reason = "TARGET_NOT_LOCATED"
     elif not progress:
         reason = "NO_STRUCTURAL_PROGRESS"
     else:
@@ -82,6 +95,7 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         "EDIT_REQUIRED": "the unchanged production baseline is not an accepted repair",
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
+        "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
     }
     return {
         "type": smell,

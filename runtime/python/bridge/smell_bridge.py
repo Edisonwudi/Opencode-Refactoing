@@ -549,8 +549,8 @@ def _verify_status(
 ) -> str:
     if success:
         return "PASS"
-    if smell_guard.get("success") is False and not improvement_pass:
-        return "SMELL_GUARD_FAILED"
+    # Build/test regressions outrank the smell verdict when the improvement
+    # gate passed (the smell improved; the edit broke something else).
     if build_test_result and build_test_result.get("success") is False:
         if build_test_result.get("verification_mode") == "sample_optimized":
             details = build_test_result.get("details") or {}
@@ -567,6 +567,8 @@ def _verify_status(
         if test.get("success") is False:
             return "TEST_FAILED"
         return "BUILD_TEST_FAILED"
+    if smell_guard.get("success") is False:
+        return "SMELL_GUARD_FAILED"
     return "VERIFY_FAILED"
 
 
