@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Production-diff filtering and Python switch metrics for non-Java checkpoints.
 
-Covers three integration gaps found by the non-Java checkpoint audit:
+Covers four integration gaps found by the non-Java checkpoint audit:
 
 1. C++ projects keep production code in ``.h`` headers (rocksdb); the header
    must count as a production source for ``language=cpp``.
@@ -10,6 +10,9 @@ Covers three integration gaps found by the non-Java checkpoint audit:
 3. Python has no switch statement; the switch_statements objective must count
    dispatch branches (if/elif chains, match statements) via tree-sitter, not
    the word "case" inside ``#`` comments.
+4. A god-class repair must reduce class_loc by at least
+   ``min_relative_reduction`` vs the immutable baseline; a token extraction
+   below the floor must fail both the ordinary guard and the improvement gate.
 """
 from __future__ import annotations
 
@@ -202,11 +205,71 @@ def check_python_switch_metric() -> None:
     print("  scenario python-switch-metric: baseline_cases=10 repaired=PASS cases 10->1")
 
 
+def _py_god_class(methods: int, padding: int = 8) -> str:
+    lines = ["class Big:"]
+    for index in range(methods):
+        lines.append(f"    def m{index}(self, v):")
+        lines.append(f"        value = v + {index}")
+        for n in range(padding):
+            lines.append(f"        value += {n}")
+        lines.append("        return value")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def check_god_class_min_reduction() -> None:
+    with tempfile.TemporaryDirectory(prefix="god-class-floor-") as raw:
+        project = Path(raw)
+        source = project / "big.py"
+        source.write_text(_py_god_class(11), encoding="utf-8")
+        init_repo(project)
+        git(project, "add", ".")
+        git(project, "commit", "-qm", "baseline")
+        common = (
+            "--project-root", str(project),
+            "--language", "python",
+            "--smell", "god_class",
+            "--location", f"{source}:class=Big|line=1",
+        )
+        baseline = run_bridge(project, "capture-baseline", *common)
+        assert baseline["success"] is True, baseline
+        baseline_loc = float(baseline["metrics"]["objectives"]["class_loc"])
+        assert baseline_loc > 100, baseline
+
+        # Token extraction (<5% of the class) must be rejected by the guard
+        # AND must not be rescued by the improvement gate.
+        trimmed = source.read_text(encoding="utf-8").splitlines()
+        del trimmed[3:7]  # drop four body lines (~3% reduction)
+        source.write_text("\n".join(trimmed) + "\n", encoding="utf-8")
+        marginal = run_bridge(project, "verify", *common, "--skip-build-test")
+        assert marginal["success"] is False, marginal
+        assert marginal["status"] == "SMELL_GUARD_FAILED", marginal
+        guard = marginal["smell_guard"]["results"][0]
+        assert guard["type"] == "god_class" and guard["success"] is False, guard
+        assert "below the required" in guard["message"], guard
+        delta = marginal["checkpoint"]["delta"]
+        assert delta["metric_progress"] is True, delta  # contract still sees the progress
+        reduction = delta["objectives"]["class_loc"]["relative_reduction"]
+        assert 0 < reduction < 0.05, delta
+
+        # A real split (a whole method moved out, >=5%) passes resolved.
+        lines = _py_god_class(11).splitlines()
+        body = "\n".join(lines[:-12]) + "\n"
+        source.write_text(body + "\n", encoding="utf-8")
+        repaired = run_bridge(project, "verify", *common, "--skip-build-test")
+        assert repaired["success"] is True, repaired
+        assert repaired.get("resolution") == "resolved", repaired
+        reduction = repaired["checkpoint"]["delta"]["objectives"]["class_loc"]["relative_reduction"]
+        assert reduction >= 0.05, reduction
+    print("  scenario god-class-floor: marginal=SMELL_GUARD_FAILED(real reduction veto) repaired=PASS resolved")
+
+
 def main() -> int:
     print("Non-Java production filter / switch metric self-check")
     check_cpp_header_is_production()
     check_build_dir_not_production()
     check_python_switch_metric()
+    check_god_class_min_reduction()
     print("Non-Java production filter / switch metric self-check passed")
     return 0
 

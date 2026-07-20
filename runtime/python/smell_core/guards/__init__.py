@@ -141,7 +141,7 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
         elif guard_type == "dead_code":
             outcomes.append(_run_dead_code_guard(config, guard))
         elif guard_type == "god_class" and config.language != "java":
-            outcomes.append(_run_generic_god_class_guard(config, context))
+            outcomes.append(_run_generic_god_class_guard(config, guard, context))
         else:
             outcomes.append(
                 {
@@ -156,21 +156,59 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
 
 def _run_generic_god_class_guard(
     config: ResolvedRunConfig,
+    guard: Dict[str, object],
     context: Optional[GuardRunContext],
 ) -> Dict[str, object]:
     text = extract_class_text(config.locations[0], config.language) if config.locations else None
     loc = count_meaningful_lines(text or "", config.language)
     checkpoint_ready = bool(context and context.checkpoint_required)
+    # A god-class repair must move a meaningful share of the class out; a token
+    # extraction of a few lines is not a repair.  The reduction is the one the
+    # checkpoint contract computed against the immutable baseline.
+    min_reduction = float(guard.get("min_relative_reduction", 0.05))
+    relative_reduction = god_class_relative_reduction(context)
+    reduction_ok = relative_reduction >= min_reduction
+    success = text is not None and checkpoint_ready and reduction_ok
+    if success:
+        message = (
+            f"Class metric reduced to {loc} LOC "
+            f"(-{relative_reduction:.1%} vs baseline, threshold {min_reduction:.0%})."
+        )
+    elif not reduction_ok:
+        message = (
+            f"god_class guard: class metric reduction {relative_reduction:.1%} is below the "
+            f"required {min_reduction:.0%}; move a cohesive responsibility cluster out of the class."
+        )
+    else:
+        message = "God-class verification requires a measurable target and the checkpoint reduction contract."
     return {
         "type": "god_class",
-        "success": text is not None and checkpoint_ready,
-        "message": (
-            f"Generic class/module metric is measurable at {loc} LOC; checkpoint reduction passed."
-            if text is not None and checkpoint_ready
-            else "God-class verification requires a measurable target and the checkpoint reduction contract."
-        ),
-        "details": {"class_loc": loc, "checkpoint_required": checkpoint_ready},
+        "success": success,
+        "message": message,
+        "details": {
+            "class_loc": loc,
+            "checkpoint_required": checkpoint_ready,
+            "relative_reduction": round(relative_reduction, 6),
+            "min_relative_reduction": min_reduction,
+        },
     }
+
+
+def god_class_relative_reduction(context: Optional[GuardRunContext]) -> float:
+    """Relative class_loc reduction from the checkpoint delta (0 when unavailable)."""
+    delta = getattr(context, "metric_delta", None) if context is not None else None
+    if not isinstance(delta, dict):
+        return 0.0
+    objectives = delta.get("objectives")
+    if not isinstance(objectives, dict):
+        return 0.0
+    values = objectives.get("class_loc")
+    if not isinstance(values, dict):
+        return 0.0
+    reduction = values.get("relative_reduction")
+    if isinstance(reduction, bool) or not isinstance(reduction, (int, float)):
+        return 0.0
+    return max(0.0, float(reduction))
 
 
 def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:

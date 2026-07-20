@@ -32,7 +32,7 @@ from smell_core.checkpoints import (  # noqa: E402
 )
 from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
 from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
-from smell_core.guards import GuardRunContext, run_build_test_guard, run_smell_guards  # noqa: E402
+from smell_core.guards import GuardRunContext, god_class_relative_reduction, run_build_test_guard, run_smell_guards  # noqa: E402
 from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
     IdeaRefactorPreflightError,
@@ -413,6 +413,17 @@ def _checkpoint_context(resolved, evidence: str) -> tuple[Optional[GuardRunConte
     return context, checkpoint
 
 
+def _god_class_min_reduction(resolved) -> float:
+    """Minimum relative class_loc reduction required of a non-Java god-class repair."""
+    for guard in resolved.profile.guards:
+        if str(guard.get("type", "")).strip() == "god_class":
+            try:
+                return float(guard.get("min_relative_reduction", 0.05))
+            except (TypeError, ValueError):
+                return 0.05
+    return 0.05
+
+
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
     if args.skip_build_test and os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1":
@@ -456,6 +467,11 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         and getattr(guard_context, "has_production_diff", False)
         and getattr(guard_context, "metric_progress", False)
     )
+    # God-class (non-Java) additionally requires a meaningful reduction: its
+    # ordinary guard only checks measurability, so a token extraction of a few
+    # lines would otherwise pass both the guard and this gate.
+    if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
+        improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
     build_test_result = None
     if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(resolved)
