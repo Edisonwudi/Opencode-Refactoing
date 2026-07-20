@@ -304,3 +304,70 @@ docker run --rm \
 
 IDEA 路径使用 `--agent java-refactor-agent-idea`。更新 agent 时只需在服务器
 拉取新的 Git commit 并启动新容器，不需要重建环境镜像。
+
+## 11. 项目准备好后的使用流程（交付版）
+
+本仓库通过 GitHub 分发源码；四种语言的环境镜像以压缩包形式单独交付
+（镜像体积约 19GB/个，不进入 Git 仓库）。
+
+### 11.1 准备
+
+1. 克隆仓库并验证源码契约：
+
+   ```bash
+   git clone <repository-url> opencode-refactor
+   cd opencode-refactor
+   npm ci && (cd .opencode && npm ci && cd ..)
+   python3 -m pip install pyyaml
+   npm run check && npm run check:self
+   ```
+
+2. 载入交付镜像（以 Java 为例，其余语言同理）：
+
+   ```bash
+   docker load -i smell-refactor-env-java.tar.gz
+   # 得到镜像 opencode-java-refactor-env:<tag>
+   ```
+
+   交付包内的 `SHA256SUMS` 用于校验压缩包完整性：`sha256sum -c SHA256SUMS`。
+
+3. 准备模型 key：放进环境变量或单独 secret 文件，不要写入仓库、
+   日志或命令行：
+
+   ```bash
+   export SMELL_OPENCODE_API_KEY="<api-key>"
+   ```
+
+### 11.2 日常使用
+
+1. 自检（不调用模型，验证镜像与源码契约）：
+
+   ```bash
+   docker run --rm \
+     --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+     --mount type=bind,src="$PWD/runs",dst=/runs \
+     opencode-java-refactor-env:<tag> self-check
+   ```
+
+2. 跑单个样本（按第 6 节的 runner 参数；key 仅以环境变量名引用）：
+
+   ```bash
+   docker run --rm \
+     --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+     --mount type=bind,src="$PWD/runs",dst=/runs \
+     -e SMELL_OPENCODE_API_KEY \
+     opencode-java-refactor-env:<tag> \
+     --dataset /opt/dataset/java/delivery_schema/<smell>.csv \
+     --sample-id <id> --model <provider/model> \
+     --opencode-api-key-env SMELL_OPENCODE_API_KEY \
+     --verification-mode sample_optimized
+   ```
+
+3. 更新 agent：在服务器 `git pull` 仓库即可，环境镜像无需重建；
+   verify 的两层结果语义（`resolved` / `improved`）见第 5 节。
+
+### 11.3 交付物清单
+
+- 本仓库：agent 源码、checkpoint 契约与适配器、runner、自检、文档。
+- 镜像压缩包 ×4（java / python / c / cpp）+ `SHA256SUMS`，离线包含
+  IDE、语言项目、依赖缓存与 dataset；只读挂载本仓库后使用。
