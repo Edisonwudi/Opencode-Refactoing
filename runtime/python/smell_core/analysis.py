@@ -95,6 +95,13 @@ class FunctionSignature:
     parameter_fingerprints: list[str]
 
 
+@dataclass(frozen=True)
+class MemberAccess:
+    receiver: str
+    member: str
+    line: int
+
+
 def signature_parameter_type_fingerprint(signature_text: str, language: str) -> Optional[str]:
     if language != "java":
         return None
@@ -357,6 +364,347 @@ def iter_function_signatures(project_root: Path, language: str) -> list[Function
                 )
             )
     return signatures
+
+
+def parse_function_nodes(file_path: Path, language: str) -> list[tuple[Node, bytes]]:
+    """Parse one file and return each function definition node with the raw source."""
+    source_bytes = file_path.read_bytes()
+    root = _parse_tree(file_path, language, source_bytes)
+    function_types = FUNCTION_NODE_TYPES.get(language, set())
+    return [(node, source_bytes) for node in _iter_nodes(root) if node.type in function_types]
+
+
+def extract_member_accesses(target: LocationTarget, language: str) -> Optional[list[MemberAccess]]:
+    """Member accesses of the function matching the target, or None when unresolved."""
+    return _extract_accesses(target, language, iter_member_accesses)
+
+
+def extract_effective_member_accesses(target: LocationTarget, language: str) -> Optional[list[MemberAccess]]:
+    """Alias-folded member accesses of the function matching the target."""
+    return _extract_accesses(target, language, iter_effective_member_accesses)
+
+
+def extract_simple_aliases(target: LocationTarget, language: str) -> Optional[dict[str, str]]:
+    """Final simple-alias map (alias local -> root receiver) of the target function."""
+    return _extract_accesses(target, language, final_simple_aliases)
+
+
+def _extract_accesses(target: LocationTarget, language: str, iter_fn):
+    if not target.file_path.is_file():
+        return None
+    source_bytes = target.file_path.read_bytes()
+    root = _parse_tree(target.file_path, language, source_bytes)
+    function_node = _find_matching_function(root, source_bytes, target, language)
+    if function_node is None:
+        return None
+    body_node = function_node.child_by_field_name("body")
+    if body_node is None:
+        return None
+    return iter_fn(body_node, source_bytes, language)
+
+
+_MEMBER_ACCESS_NODE_TYPES = {
+    "python": {"attribute"},
+    "c": {"field_expression"},
+    "cpp": {"field_expression"},
+}
+
+
+def iter_member_accesses(body_node: Node, source_bytes: bytes, language: str) -> list[MemberAccess]:
+    """Member accesses inside a function body, tagged with the root receiver identifier."""
+    node_types = _MEMBER_ACCESS_NODE_TYPES.get(language, set())
+    accesses: list[MemberAccess] = []
+    for node in _iter_nodes(body_node):
+        if node.type not in node_types:
+            continue
+        receiver_node = node.child_by_field_name("object") or node.child_by_field_name("argument")
+        member_node = node.child_by_field_name("attribute") or node.child_by_field_name("field")
+        accesses.append(
+            MemberAccess(
+                receiver=_root_receiver_identifier(receiver_node, source_bytes),
+                member=_node_text(source_bytes, member_node).strip(),
+                line=_node_start_line(node),
+            )
+        )
+    return accesses
+
+
+def iter_effective_member_accesses(body_node: Node, source_bytes: bytes, language: str) -> list[MemberAccess]:
+    """iter_member_accesses with simple-alias folding applied.
+
+    A simple alias assignment (python ``x = r.f`` / ``x = r.f.g`` — including
+    pairwise tuple unpacking and walrus; c/cpp an initializer or plain
+    assignment_expression whose value is exactly one call-free member-access
+    chain) makes the local ``x`` stand for the chain's root receiver: every
+    later read of ``x`` counts as one access to that receiver, whether bare
+    (condition, operand, call argument, return) or as the root of a member
+    access (``x.f2`` counts once, not twice).  Rebinding ``x`` to a non-alias
+    value ends the alias; rebinding to another chain repoints it.  Compound
+    updates (``x += 1``, ``x++``) count one read and then end the alias;
+    ``del x`` counts one read and drops the name.  Anything uncertain (calls,
+    operators, mismatched destructuring) is not an alias.
+    """
+    access_types = _MEMBER_ACCESS_NODE_TYPES.get(language, set())
+    if not access_types:
+        return []
+    access_ids: set[int] = set()
+    store_ids: set[int] = set()
+    bindings: dict[int, list[tuple[str, Optional[str], bool]]] = {}
+    for node in _iter_nodes(body_node):
+        if node.type in access_types:
+            access_ids.add(node.id)
+        node_bindings = _simple_alias_bindings(node, source_bytes, language)
+        if node_bindings:
+            bindings[node.id] = [(name, root, read_first) for name, _, root, read_first in node_bindings]
+            for _, target_node, _, _ in node_bindings:
+                if target_node is not None:
+                    store_ids.add(target_node.id)
+    aliases: dict[str, str] = {}
+    folded: list[MemberAccess] = []
+    for node in _iter_nodes(body_node):
+        for name, root, read_first in bindings.get(node.id, ()):
+            if read_first:
+                target = aliases.get(name)
+                if target:
+                    folded.append(MemberAccess(receiver=target, member=name, line=_node_start_line(node)))
+            if root:
+                aliases[name] = _resolve_alias(root, aliases)
+            else:
+                aliases.pop(name, None)
+        if node.id in access_ids:
+            receiver_node = node.child_by_field_name("object") or node.child_by_field_name("argument")
+            member_node = node.child_by_field_name("attribute") or node.child_by_field_name("field")
+            receiver = _root_receiver_identifier(receiver_node, source_bytes)
+            folded.append(
+                MemberAccess(
+                    receiver=_resolve_alias(receiver, aliases),
+                    member=_node_text(source_bytes, member_node).strip(),
+                    line=_node_start_line(node),
+                )
+            )
+        elif node.type == "identifier" and node.id not in store_ids:
+            name = _node_text(source_bytes, node).strip()
+            target = aliases.get(name)
+            if target and _is_alias_read(node, access_ids, body_node):
+                folded.append(MemberAccess(receiver=target, member=name, line=_node_start_line(node)))
+    return folded
+
+
+def final_simple_aliases(body_node: Node, source_bytes: bytes, language: str) -> dict[str, str]:
+    """Final simple-alias map (alias local name -> resolved root receiver)."""
+    aliases: dict[str, str] = {}
+    for node in _iter_nodes(body_node):
+        for name, _, root, _ in _simple_alias_bindings(node, source_bytes, language):
+            if root:
+                aliases[name] = _resolve_alias(root, aliases)
+            else:
+                aliases.pop(name, None)
+    return aliases
+
+
+def _simple_alias_bindings(node: Node, source_bytes: bytes, language: str) -> list[tuple[str, Optional[Node], Optional[str], bool]]:
+    """(name, store_target_node, alias_root, read_first) bindings of one statement.
+
+    alias_root is the root receiver identifier when the bound value is exactly
+    one call-free member-access chain; None means "bound to a non-alias value"
+    and ends any previous alias for that name.  read_first marks compound
+    updates and deletions (``x += 1``, ``x++``, ``del x``): the current alias
+    value is read once before the name is rebound.
+    """
+    if language == "python":
+        if node.type == "assignment":
+            left = node.child_by_field_name("left")
+            if left is None:
+                return []
+            if left.type == "identifier":
+                root = _alias_chain_root(node.child_by_field_name("right"), source_bytes)
+                return [(_node_text(source_bytes, left).strip(), left, root, False)]
+            if left.type == "pattern_list":
+                return _python_unpack_bindings(node, left, source_bytes)
+            return [
+                (_node_text(source_bytes, ident).strip(), ident, None, False)
+                for ident in _iter_identifier_nodes(left)
+            ]
+        if node.type == "named_expression":
+            named = node.named_children
+            if len(named) >= 2 and named[0].type == "identifier":
+                root = _alias_chain_root(named[-1], source_bytes)
+                return [(_node_text(source_bytes, named[0]).strip(), named[0], root, False)]
+            return []
+        if node.type == "augmented_assignment":
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                return [(_node_text(source_bytes, left).strip(), left, None, True)]
+            # ``x.f += 1`` / ``x[i] += 1`` reads x without rebinding it.
+            return []
+        if node.type == "delete_statement":
+            return [
+                (_node_text(source_bytes, child).strip(), child, None, True)
+                for child in node.named_children
+                if child.type == "identifier"
+            ]
+        if node.type == "for_statement":
+            left = node.child_by_field_name("left")
+            if left is None:
+                return []
+            return [
+                (_node_text(source_bytes, ident).strip(), ident, None, False)
+                for ident in _iter_identifier_nodes(left)
+            ]
+        return []
+    if language in {"c", "cpp"}:
+        if node.type == "declaration":
+            type_node = node.child_by_field_name("type")
+            type_id = type_node.id if type_node is not None else None
+            results: list[tuple[str, Optional[Node], Optional[str], bool]] = []
+            for child in node.named_children:
+                if type_id is not None and child.id == type_id:
+                    continue
+                name_node = _find_declarator_name_node(child)
+                if name_node is None:
+                    continue
+                root = None
+                if child.type == "init_declarator":
+                    root = _alias_chain_root(child.child_by_field_name("value"), source_bytes)
+                results.append((_node_text(source_bytes, name_node).strip(), name_node, root, False))
+            return results
+        if node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            if left is None or left.type != "identifier":
+                return []
+            name = _node_text(source_bytes, left).strip()
+            operator = node.children[1].type if len(node.children) > 1 else "="
+            if operator != "=":
+                # Compound assignment (+=, -=, ...): reads the current value,
+                # then the name holds a computed non-alias value.
+                return [(name, left, None, True)]
+            root = _alias_chain_root(node.child_by_field_name("right"), source_bytes)
+            return [(name, left, root, False)]
+        if node.type == "update_expression":
+            argument = node.child_by_field_name("argument")
+            if argument is not None and argument.type == "identifier":
+                return [(_node_text(source_bytes, argument).strip(), argument, None, True)]
+        return []
+    return []
+
+
+def _python_unpack_bindings(node: Node, left: Node, source_bytes: bytes) -> list[tuple[str, Optional[Node], Optional[str], bool]]:
+    """Pairwise tuple-unpack bindings: ``x, y = r.f, r.g`` aliases x->r, y->r."""
+    right = node.child_by_field_name("right")
+    targets = [child for child in left.named_children]
+    values = list(right.named_children) if right is not None and right.type == "expression_list" else []
+    pairwise = (
+        len(targets) > 1
+        and len(targets) == len(values)
+        and all(child.type == "identifier" for child in targets)
+    )
+    if not pairwise:
+        return [
+            (_node_text(source_bytes, ident).strip(), ident, None, False)
+            for ident in _iter_identifier_nodes(left)
+        ]
+    return [
+        (
+            _node_text(source_bytes, target).strip(),
+            target,
+            _alias_chain_root(value, source_bytes),
+            False,
+        )
+        for target, value in zip(targets, values)
+    ]
+
+
+def _alias_chain_root(node: Optional[Node], source_bytes: bytes) -> Optional[str]:
+    """Root identifier when node is exactly one call-free member-access chain."""
+    if node is None or node.type not in {"attribute", "field_expression"}:
+        return None
+    current: Optional[Node] = node
+    while current is not None and current.type in {"attribute", "field_expression"}:
+        current = current.child_by_field_name("object") or current.child_by_field_name("argument")
+    if current is not None and current.type == "identifier":
+        return _node_text(source_bytes, current).strip()
+    return None
+
+
+def _resolve_alias(name: str, aliases: dict[str, str]) -> str:
+    seen: set[str] = set()
+    current = name
+    while current in aliases and current not in seen:
+        seen.add(current)
+        current = aliases[current]
+    return current
+
+
+def _is_alias_read(node: Node, access_ids: set[int], body_node: Node) -> bool:
+    parent = node.parent
+    if parent is not None:
+        if parent.type == "keyword_argument":
+            name_node = parent.child_by_field_name("name")
+            if name_node is not None and name_node.id == node.id:
+                return False
+        if parent.type == "function_definition":
+            name_node = parent.child_by_field_name("name")
+            if name_node is not None and name_node.id == node.id:
+                return False
+    current = parent
+    while current is not None and current is not body_node:
+        if current.id in access_ids:
+            return False
+        current = current.parent
+    return True
+
+
+def _iter_identifier_nodes(node: Node):
+    for child in _iter_nodes(node):
+        if child.type == "identifier":
+            yield child
+
+
+def iter_local_variable_names(body_node: Node, source_bytes: bytes, language: str) -> list[tuple[str, int]]:
+    """Local variable names assigned or declared inside a function body."""
+    names: list[tuple[str, int]] = []
+    if language == "python":
+        for node in _iter_nodes(body_node):
+            if node.type != "assignment":
+                continue
+            left = node.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                names.append((_node_text(source_bytes, left).strip(), _node_start_line(node)))
+        return names
+    if language in {"c", "cpp"}:
+        for node in _iter_nodes(body_node):
+            if node.type != "declaration":
+                continue
+            type_node = node.child_by_field_name("type")
+            type_id = type_node.id if type_node is not None else None
+            for child in node.named_children:
+                if type_id is not None and child.id == type_id:
+                    continue
+                name_node = _find_declarator_name_node(child)
+                if name_node is not None:
+                    names.append((_node_text(source_bytes, name_node).strip(), _node_start_line(child)))
+        return names
+    return names
+
+
+def _root_receiver_identifier(node: Optional[Node], source_bytes: bytes) -> str:
+    while node is not None:
+        if node.type in {"identifier", "this"}:
+            return _node_text(source_bytes, node).strip()
+        if node.type == "attribute":
+            node = node.child_by_field_name("object")
+            continue
+        if node.type == "field_expression":
+            node = node.child_by_field_name("argument")
+            continue
+        if node.type == "call":
+            node = node.child_by_field_name("function")
+            continue
+        if node.type == "parenthesized_expression":
+            node = node.named_children[0] if node.named_children else None
+            continue
+        return ""
+    return ""
 
 
 @lru_cache(maxsize=None)

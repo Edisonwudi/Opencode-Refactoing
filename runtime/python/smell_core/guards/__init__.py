@@ -32,6 +32,14 @@ from ..data_clumps import (
     data_clump_occurrence_threshold,
     detect_data_clump_occurrences,
 )
+from ..feature_envy import (
+    analyze_feature_envy_target as analyze_generic_feature_envy_target,
+    feature_envy_receiver_from_evidence,
+)
+from ..mysterious_name import (
+    detect_mysterious_names as detect_generic_mysterious_names,
+    find_matching_name_finding,
+)
 from ..checkpoint_contract import checkpoint_gate_result
 from .context import GuardRunContext
 from .registry import get_clone_guard, get_smell_guard, get_syntactic_guard
@@ -138,6 +146,12 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
             outcomes.append(_run_code_clone_guard(config, guard))
         elif guard_type == "data_clumps":
             outcomes.append(_run_data_clumps_guard(config, guard))
+        elif guard_type == "feature_envy" and config.language != "java":
+            outcomes.append(_run_generic_feature_envy_guard(config, guard))
+        elif guard_type == "mysterious_name":
+            # Java is intercepted by the registered smell handler above; this
+            # generic branch only ever serves non-Java languages.
+            outcomes.append(_run_generic_mysterious_name_guard(config, guard))
         elif guard_type == "dead_code":
             outcomes.append(_run_dead_code_guard(config, guard))
         elif guard_type == "god_class" and config.language != "java":
@@ -493,6 +507,143 @@ def _run_data_clumps_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
             "occurrence_count": occurrence_count,
             "occurrence_threshold": threshold,
         },
+    }
+
+
+def _run_generic_feature_envy_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+    target = config.locations[0] if config.locations else None
+    if target is None:
+        return {
+            "type": "feature_envy",
+            "success": False,
+            "message": "feature_envy guard: missing target location.",
+            "details": {"detector": "tree_sitter_generic"},
+        }
+    evidence = str(guard.get("evidence") or "")
+    expected_receiver = feature_envy_receiver_from_evidence(evidence)
+    try:
+        profile = analyze_generic_feature_envy_target(
+            config.project_root,
+            language=config.language,
+            target_file=target.file_path,
+            method=target.method,
+            line=target.line,
+            expected_receiver=expected_receiver,
+        )
+    except Exception as exc:
+        return {
+            "type": "feature_envy",
+            "success": False,
+            "message": f"feature_envy guard: generic detector unavailable: {exc}",
+            "details": {"detector": "tree_sitter_generic", "error": str(exc)},
+        }
+    if not profile.get("ok"):
+        return {
+            "type": "feature_envy",
+            "success": True,
+            "message": "feature_envy guard: the reported target no longer resolves.",
+            "details": {"detector": "tree_sitter_generic", "error": profile.get("error", "")},
+        }
+    dominant = str(profile.get("dominant_receiver_type") or "")
+    dominant_count = int(profile.get("dominant_receiver_access") or 0)
+    ratio = float(profile.get("dominant_receiver_ratio") or 0.0)
+    details = {
+        "detector": "tree_sitter_generic",
+        "dominant_receiver": dominant,
+        "dominant_receiver_access": dominant_count,
+        "dominant_receiver_ratio": ratio,
+        "method_loc": profile.get("method_loc"),
+        "strict_detector_hit": bool(profile.get("strict_detector_hit")),
+    }
+    if profile.get("strict_detector_hit"):
+        return {
+            "type": "feature_envy",
+            "success": False,
+            "message": (
+                f"feature_envy guard: target still accesses foreign receiver '{dominant}' "
+                f"{dominant_count} time(s) ({ratio:.0%} of member accesses); move that logic "
+                "to the envied receiver or reduce the accesses below the detector thresholds."
+            ),
+            "details": details,
+        }
+    return {
+        "type": "feature_envy",
+        "success": True,
+        "message": (
+            f"feature_envy guard: strict detector no longer flags the target "
+            f"(dominant receiver '{dominant}' {dominant_count} access(es), ratio {ratio:.0%})."
+        ),
+        "details": details,
+    }
+
+
+def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+    from ..java.syntactic_detector import parse_mysterious_evidence
+
+    evidence = str(guard.get("evidence") or "")
+    kind, name = parse_mysterious_evidence(evidence)
+    if not name:
+        return {
+            "type": "mysterious_name",
+            "success": False,
+            "message": "mysterious_name guard: missing kind=...; name=... evidence; cannot validate the rename.",
+            "details": {"detector": "tree_sitter_generic"},
+        }
+    target = config.locations[0] if config.locations else None
+    if target is None or not target.file_path.is_file():
+        return {
+            "type": "mysterious_name",
+            "success": True,
+            "message": f"mysterious_name guard: the target of reported {kind or 'name'} '{name}' no longer resolves.",
+            "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
+        }
+    try:
+        findings = detect_generic_mysterious_names(target.file_path, language=config.language)
+    except Exception as exc:
+        return {
+            "type": "mysterious_name",
+            "success": False,
+            "message": f"mysterious_name guard: generic detector unavailable: {exc}",
+            "details": {"detector": "tree_sitter_generic", "error": str(exc)},
+        }
+    try:
+        snippet = extract_snippet(target, config.language)
+    except Exception:
+        snippet = None
+    if snippet is None:
+        return {
+            "type": "mysterious_name",
+            "success": True,
+            "message": f"mysterious_name guard: the function owning reported {kind or 'name'} '{name}' no longer resolves.",
+            "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
+        }
+    match = find_matching_name_finding(
+        findings,
+        kind=kind,
+        name=name,
+        scope=(snippet.start_line, snippet.end_line),
+    )
+    if match is not None:
+        return {
+            "type": "mysterious_name",
+            "success": False,
+            "message": (
+                f"mysterious_name guard: reported {match.kind} '{name}' is still present "
+                f"({match.reason}); rename it to a descriptive identifier."
+            ),
+            "details": {
+                "detector": "tree_sitter_generic",
+                "target_kind": kind,
+                "target_name": name,
+                "finding": match.evidence,
+                "line": match.line,
+            },
+        }
+    return {
+        "type": "mysterious_name",
+        "success": True,
+        "message": f"mysterious_name guard: reported {kind or 'name'} '{name}' no longer appears in the target.",
+        "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
     }
 
 

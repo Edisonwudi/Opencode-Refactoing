@@ -20,6 +20,14 @@ from .data_clumps import (
     data_clump_occurrence_threshold as generic_data_clump_occurrence_threshold,
     detect_data_clump_occurrences as detect_generic_data_clump_occurrences,
 )
+from .feature_envy import (
+    analyze_feature_envy_target as analyze_generic_feature_envy_target,
+    feature_envy_receiver_from_evidence,
+)
+from .mysterious_name import (
+    detect_mysterious_names as detect_generic_mysterious_names,
+    find_matching_name_finding,
+)
 from .java.ast_ncss import run_ast_ncss
 from .java.data_clumps import data_clump_occurrence_threshold, detect_data_clump_occurrences
 from .java.detector_utils import parse_parent_from_evidence
@@ -224,6 +232,41 @@ def _mysterious_name(config: Any, evidence: str) -> dict[str, Any]:
             "objectives": {},
             "error": "target_name_missing_from_evidence",
         }
+    if config.language != "java":
+        if not target.file_path.is_file():
+            return {
+                "ok": True,
+                "detector": "tree_sitter_generic",
+                "objectives": {"target_suspicious_name_present": 0},
+                "target_missing": True,
+                "target_kind": kind,
+                "target_name": name,
+            }
+        snippet = extract_snippet(target, config.language)
+        if snippet is None:
+            return {
+                "ok": True,
+                "detector": "tree_sitter_generic",
+                "objectives": {"target_suspicious_name_present": 0},
+                "target_missing": True,
+                "target_kind": kind,
+                "target_name": name,
+            }
+        findings = detect_generic_mysterious_names(target.file_path, language=config.language)
+        match = find_matching_name_finding(
+            findings,
+            kind=kind,
+            name=name,
+            scope=(snippet.start_line, snippet.end_line),
+        )
+        return {
+            "ok": True,
+            "detector": "tree_sitter_generic",
+            "objectives": {"target_suspicious_name_present": 1 if match else 0},
+            "finding_present": match is not None,
+            "target_kind": kind,
+            "target_name": name,
+        }
     if not target.file_path.is_file():
         return {
             "ok": True,
@@ -294,6 +337,36 @@ def _dead_code(config: Any, evidence: str) -> dict[str, Any]:
 
 def _feature_envy(config: Any, evidence: str) -> dict[str, Any]:
     target = _target(config)
+    if config.language != "java":
+        expected_receiver = feature_envy_receiver_from_evidence(evidence)
+        profile = analyze_generic_feature_envy_target(
+            config.project_root,
+            language=config.language,
+            target_file=target.file_path,
+            method=target.method,
+            line=target.line,
+            expected_receiver=expected_receiver,
+        )
+        if not profile.get("ok"):
+            if profile.get("error") == "target_method_not_found":
+                return {
+                    "ok": True,
+                    "detector": "tree_sitter_generic",
+                    "expected_receiver_type": expected_receiver,
+                    "objectives": {"expected_receiver_access": 0},
+                    "target_missing": True,
+                }
+            return {"ok": False, "objectives": {}, "error": profile.get("error", "unknown")}
+        if not expected_receiver:
+            expected_receiver = str(profile.get("dominant_receiver_type") or "")
+            profile["expected_receiver_type"] = expected_receiver
+            profile["expected_receiver_access"] = int(profile.get("dominant_receiver_access") or 0)
+        return {
+            **profile,
+            "adapter": "feature_envy",
+            "detector": "tree_sitter_generic",
+            "objectives": {"expected_receiver_access": int(profile.get("expected_receiver_access") or 0)},
+        }
     receiver_match = re.search(r"(?:^|;\s*)envied_type=([^;]+)", evidence, flags=re.IGNORECASE)
     expected_receiver = receiver_match.group(1).strip() if receiver_match else ""
     profile = analyze_feature_envy_target(

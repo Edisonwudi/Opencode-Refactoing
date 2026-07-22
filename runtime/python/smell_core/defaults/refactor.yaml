@@ -86,6 +86,25 @@ generic_smells: &generic_smells
     guards:
     - type: dead_code
     retry_hint_template: Remove the exact labeled dead declaration or report its concrete reference.
+  feature_envy:
+    instruction: Move behavior toward the envied receiver — add a method to the receiver's type (or module) that owns the receiver-data-heavy logic, or extract that cohesive logic into a helper taking the receiver as its parameter — while preserving behavior.
+    constraints:
+    - Keep changes focused on the labeled function and its dominant foreign receiver.
+    - Caching receiver fields into local variables, rewriting access syntax, or otherwise reducing the measured access count without moving behavior does not count as refactoring.
+    verification:
+    - Reduce member accesses on the envied receiver and pass configured project tests.
+    guards:
+    - type: feature_envy
+    retry_hint_template: Reduce accesses to the envied receiver in the labeled function further.
+  mysterious_name:
+    instruction: Rename the unclear identifier at the target location to a descriptive name while preserving behavior.
+    constraints:
+    - Update all references consistently and keep the rename focused on the reported identifier.
+    verification:
+    - The reported identifier no longer appears at the target and configured tests pass.
+    guards:
+    - type: mysterious_name
+    retry_hint_template: Rename the unclear identifier reported by the smell evidence before retrying.
 languages:
   java:
     detect_extensions:
