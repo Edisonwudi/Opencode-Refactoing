@@ -26,10 +26,7 @@ from smell_core.feature_envy import (  # noqa: E402
     feature_envy_receiver_from_evidence,
 )
 
-DATASET_ROOT = Path(
-    "/Users/a1-6/Code/Extension_develop/smell_datasets/"
-    "final_non_java_dataset_20260511_command_validated_replacements_20260612"
-)
+DATASET_ROOT = Path(__file__).resolve().parents[1] / "dataset" / "nonjava"
 LANGUAGES = ("c", "cpp", "python")
 
 

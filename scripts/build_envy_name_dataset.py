@@ -57,10 +57,7 @@ from smell_core.mysterious_name import (  # noqa: E402
     suspicious_name_reason,
 )
 
-DEFAULT_DATASET_ROOT = Path(
-    "/Users/a1-6/Code/Extension_develop/smell_datasets/"
-    "final_non_java_dataset_20260511_command_validated_replacements_20260612"
-)
+DEFAULT_DATASET_ROOT = ROOT / "dataset" / "nonjava"
 CACHE_DIR = ROOT / "runs" / "build_envy_name_dataset"
 
 PROJECT_ROOTS = {

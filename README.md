@@ -131,9 +131,12 @@ git pull    # agent 源码即最新版;镜像无需任何操作
 镜像、dataset 路径和 agent 选择。
 
 **dataset 与异味范围**：镜像内路径为
-`/opt/dataset/smells/<lang>/<smell>_30.csv`（每语言 8 种异味 × 30 样本：
-long_method、long_parameter_list、nested_complexity、switch_statements、
-data_clumps、code_clone_type1、god_class、dead_code)。检测层面非 Java 现已
+`/opt/dataset/smells/<lang>/<smell>_30.csv`，权威源 CSV 在本仓库
+`dataset/nonjava/<lang>/<smell>_30.csv`（每语言 10 种异味 × 30 样本；
+快照脚本用 `NONJAVA_DATASET_ROOT` 指向该目录重写路径后打进镜像）。
+8 种基础异味：long_method、long_parameter_list、nested_complexity、
+switch_statements、data_clumps、code_clone_type1、god_class、dead_code。
+检测层面非 Java 现已
 支持全部 10 种通用异味：feature_envy 与 mysterious_name 走 tree-sitter 通用
 检测（feature_envy 的接收者按根标识符统计，无类型解析；evidence 优先
 `envied_receiver=<名字>`，回退 `envied_type=<类型名>`);feature_envy 计数
