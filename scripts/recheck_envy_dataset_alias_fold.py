@@ -29,9 +29,21 @@ from smell_core.feature_envy import (  # noqa: E402
 DATASET_ROOT = Path(__file__).resolve().parents[1] / "dataset" / "nonjava"
 LANGUAGES = ("c", "cpp", "python")
 
+# CSVs are stored in container path format (/opt/projects/<lang>/<name>);
+# remap to the local checkouts (at the pinned commits) for validation.
+LOCAL_PROJECT_ROOTS = {
+    "c": Path("/Users/a1-6/Code/Project/C_Project"),
+    "cpp": Path("/Users/a1-6/Code/Project/CPP_Project"),
+    "python": Path("/Users/a1-6/Code/Project/Python_Project"),
+}
+
+
+def _local_project_root(row: dict) -> Path:
+    return LOCAL_PROJECT_ROOTS[row["language"]] / row["project_name"]
+
 
 def _profile(row: dict, *, fold_aliases: bool) -> dict:
-    root = Path(row["project_path"])
+    root = _local_project_root(row)
     return analyze_feature_envy_target(
         root,
         language=row["language"],

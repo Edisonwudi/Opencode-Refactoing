@@ -132,10 +132,11 @@ git pull    # agent 源码即最新版;镜像无需任何操作
 
 **dataset 与异味范围**：镜像内路径为
 `/opt/dataset/smells/<lang>/<smell>_30.csv`，权威源 CSV 在本仓库
-`dataset/nonjava/<lang>/<smell>_30.csv`（每语言 10 种异味 × 30 样本；
-快照脚本用 `NONJAVA_DATASET_ROOT` 指向该目录重写路径后打进镜像）。
+`dataset/nonjava/<lang>/<smell>_30.csv`（每语言 10 种异味 × 30 样本，
+**已是容器路径格式**——`/opt/projects/<lang>/<name>`，与快照 payload
+逐字节一致，容器内可直接通过 `/agent-src` 挂载使用）。
 Java 数据集的权威源同样在本仓库 `dataset/java/delivery_schema/<smell>.csv`
-（对应镜像内 `/opt/dataset/java/delivery_schema/`)。
+（对应镜像内 `/opt/dataset/java/delivery_schema/`，同为容器路径格式）。
 8 种基础异味：long_method、long_parameter_list、nested_complexity、
 switch_statements、data_clumps、code_clone_type1、god_class、dead_code。
 检测层面非 Java 现已

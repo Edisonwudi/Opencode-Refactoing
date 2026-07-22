@@ -5,8 +5,15 @@ Scans the 40 pinned non-Java project checkouts with the smell_core
 tree-sitter primitives, curates 30 samples per (language, smell), validates
 every sample with the authoritative detectors
 (``analyze_feature_envy_target`` / ``detect_mysterious_names``) and writes
-``<lang>/{feature_envy,mysterious_name}_30.csv`` into the upstream curation
-root consumed by opencode-smell-environments' prepare_nonjava_snapshot.py.
+``<lang>/{feature_envy,mysterious_name}_30.csv`` into ``dataset/nonjava/``
+in this repository.
+
+Dataset CSVs are stored in container (image) path format
+(``/opt/projects/<lang>/<name>``), matching
+``scripts/convert_dataset_to_image_paths.py``: candidates and the scan cache
+keep local checkout paths, and the conversion happens at the write boundary
+(``write_csv``).  Reads of existing CSV rows only use path-free keys
+(project_name, file, begin_line), so both path formats round-trip cleanly.
 
 Candidate generation mirrors the detector logic exactly (same thresholds,
 same dominant-receiver selection) and final samples are re-checked through
@@ -65,6 +72,17 @@ PROJECT_ROOTS = {
     "cpp": Path("/Users/a1-6/Code/Project/CPP_Project"),
     "python": Path("/Users/a1-6/Code/Project/Python_Project"),
 }
+# Dataset CSVs store image-format roots; local checkouts back them.
+CONTAINER_PROJECT_PREFIX = "/opt/projects"
+
+
+def _container_project_root(language: str, project_name: str) -> str:
+    return f"{CONTAINER_PROJECT_PREFIX}/{language}/{project_name}"
+
+
+def _local_project_root(language: str, project_name: str) -> Path:
+    """Local checkout for a project, regardless of CSV path format."""
+    return PROJECT_ROOTS[language] / project_name
 PROJECTS = {
     "c": ["cJSON", "curl", "git", "libevent", "libssh2", "libuv", "lua", "nginx", "redis", "rrdtool", "tmux"],
     "cpp": [
@@ -734,24 +752,26 @@ def select_valid(candidates: list[dict], backups: list[dict], smell: str) -> tup
 
 
 def write_csv(path: Path, language: str, smell: str, rows: list[dict]) -> None:
+    """Write rows in container (image) path format; candidates stay local."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
         writer.writeheader()
         for index, candidate in enumerate(rows, start=1):
-            abs_file = str(Path(candidate["project_root"]) / candidate["file"])
+            container_root = _container_project_root(language, candidate["project_name"])
+            container_file = f"{container_root}/{candidate['file']}"
             writer.writerow({
                 "sample_id": index,
                 "language": language,
                 "smell_type": smell,
                 "project_name": candidate["project_name"],
-                "project_path": candidate["project_root"],
+                "project_path": container_root,
                 "file": candidate["file"],
                 "method": candidate["method"],
                 "begin_line": candidate["begin_line"],
                 "end_line": candidate["end_line"],
                 "metric_value": candidate["metric_value"],
-                "location": f"{abs_file}:method={candidate['method']}|line={candidate['begin_line']}",
+                "location": f"{container_file}:method={candidate['method']}|line={candidate['begin_line']}",
                 "is_test": 0,
                 "evidence": candidate["evidence"],
             })
@@ -779,7 +799,7 @@ def main() -> int:
     for language in args.languages:
         cache.setdefault(language, {})
         for project in PROJECTS[language]:
-            root = PROJECT_ROOTS[language] / project
+            root = _local_project_root(language, project)
             if project in cache[language]:
                 continue
             if not root.is_dir():
