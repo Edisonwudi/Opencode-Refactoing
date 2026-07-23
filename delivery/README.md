@@ -28,3 +28,33 @@ docker load -i images/smell-refactor-env-java.tar.gz
   更新只需 `git pull`,无需重建镜像。
 - 交付目录(实验服务器):`D:\smell-refactor-delivery-20260720\images\`,
   内含 4 个压缩包与同内容 `SHA256SUMS`。
+
+## 增量更新:feature_envy 与 mysterious_name(2026-07-22)
+
+本批次镜像内 dataset 为 8 种通用异味。此后仓库新增了对 python/c/cpp 的
+feature_envy 与 mysterious_name 支持,**无需更新镜像**,只需:
+
+1. `git pull`(新检测器、guard、反投机逻辑全部随源码生效);
+2. 运行这两种异味时,`--dataset` 指向仓库内随附的 CSV(已是容器路径
+   格式,经 `/agent-src` 挂载直接可用):
+
+```bash
+docker run --rm \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  -e SMELL_OPENCODE_API_KEY \
+  opencode-smell-python-refactor-env:0.1.1-amd64-delivery-20260720 \
+  --dataset /agent-src/dataset/nonjava/python/feature_envy_30.csv \
+  --sample-id 1 \
+  --model minimax/MiniMax-M2.7 \
+  --opencode-api-key-env SMELL_OPENCODE_API_KEY \
+  --opencode-base-url "$SMELL_OPENCODE_BASE_URL" \
+  --verification-mode project_full
+```
+
+- c/cpp 换镜像名与 CSV 路径即可;mysterious_name 换 CSV 文件名。
+- 原有 8 种异味不受影：`/opt/dataset/...`（镜像内）与
+  `/agent-src/dataset/nonjava/...`（仓库内）内容一致,均可使用。
+- Java 侧无变化（镜像 dataset 本已覆盖全部 11 种异味)。
+- 下次镜像交付批次会把 10 种异味 dataset 烤回镜像,届时两种路径完全
+  等价,该说明可移除。

@@ -169,6 +169,11 @@ docker run --rm \
   --verification-mode project_full
 ```
 
+`--dataset` 也可指向仓库内 CSV(如
+`/agent-src/dataset/nonjava/python/feature_envy_30.csv`),与镜像内内容
+一致;feature_envy 与 mysterious_name 目前**只有**仓库内路径可用(旧
+镜像 dataset 未含这两种)。
+
 注意：
 
 - 非 Java 的 build/test 配置来自镜像内 `/opt/buildenv/projects.docker.yaml`
