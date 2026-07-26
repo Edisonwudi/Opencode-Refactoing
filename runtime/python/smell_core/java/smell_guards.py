@@ -10,13 +10,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..analysis import count_meaningful_lines, extract_snippet
+from ..analysis import count_meaningful_lines, extract_snippet, strip_comments
 from ..config import ResolvedRunConfig
 from ..guards.context import GuardRunContext
 from .detector_utils import (
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
+    parse_expected_state_field as _parse_expected_state_field,
     parse_parent_from_evidence as _parse_parent_from_evidence,
     parse_structural_expectation as _parse_structural_expectation,
 )
@@ -485,7 +486,40 @@ def _run_semantic_guard(
     if guard_type == "refused_bequest":
         structural_expectation = _parse_structural_expectation(evidence)
         if structural_expectation:
-            if structural_expectation != "capability_split":
+            if structural_expectation == "state_getter":
+                expected_state_field = _parse_expected_state_field(evidence)
+                if not expected_state_field:
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: state_getter requires "
+                            "expected_state_field evidence."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                        },
+                    }
+                if not _target_method_returns_expected_state(
+                    config,
+                    target,
+                    expected_state_field,
+                ):
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: state getter must directly return "
+                            f"the declared backing field {expected_state_field!r}."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "expected_state_field": expected_state_field,
+                        },
+                    }
+            elif structural_expectation != "capability_split":
                 return {
                     "type": guard_type,
                     "success": False,
@@ -498,41 +532,42 @@ def _run_semantic_guard(
                         "structural_expectation": structural_expectation,
                     },
                 }
-            profile = analyze_refused_bequest_target(
-                config.project_root,
-                target_file=target.file_path,
-                method=target.method,
-                line=target.line,
-                reported_parent=_parse_parent_from_evidence(evidence),
-            )
-            if not profile.get("ok"):
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: capability-split profile could not "
-                        f"be resolved: {profile.get('error', 'unknown error')}."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                        "capability_profile": profile,
-                    },
-                }
-            if not profile.get("capability_split_satisfied"):
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: the reported parent capability is "
-                        "still inherited and still exposes the target method."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                        "capability_profile": profile,
-                    },
-                }
+            else:
+                profile = analyze_refused_bequest_target(
+                    config.project_root,
+                    target_file=target.file_path,
+                    method=target.method,
+                    line=target.line,
+                    reported_parent=_parse_parent_from_evidence(evidence),
+                )
+                if not profile.get("ok"):
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: capability-split profile could not "
+                            f"be resolved: {profile.get('error', 'unknown error')}."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "capability_profile": profile,
+                        },
+                    }
+                if not profile.get("capability_split_satisfied"):
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: the reported parent capability is "
+                            "still inherited and still exposes the target method."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "capability_profile": profile,
+                        },
+                    }
     if guard_type == "refused_bequest" and _requires_unsupported_throw_removal(evidence):
         unsupported_throw = _target_method_unsupported_throw(config, target)
         if unsupported_throw:
@@ -1051,6 +1086,27 @@ def _target_method_empty_override(config: ResolvedRunConfig, target) -> bool:
     if snippet is None:
         return False
     return count_meaningful_lines(snippet.body_text, config.language) == 0
+
+
+def _target_method_returns_expected_state(
+    config: ResolvedRunConfig,
+    target,
+    expected_state_field: str,
+) -> bool:
+    try:
+        snippet = extract_snippet(target, config.language)
+    except Exception:
+        return False
+    if snippet is None:
+        return False
+    body = strip_comments(snippet.body_text, config.language).strip()
+    field = re.escape(expected_state_field)
+    return bool(
+        re.fullmatch(
+            rf"\{{?\s*return\s+(?:this\.)?{field}\s*;\s*\}}?",
+            body,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

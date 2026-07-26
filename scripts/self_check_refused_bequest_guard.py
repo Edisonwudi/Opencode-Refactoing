@@ -21,6 +21,7 @@ from smell_core.java.semantic_detector import (  # noqa: E402
 from smell_core.java.smell_guards import _run_semantic_guard  # noqa: E402
 from smell_core.location import parse_location_descriptor  # noqa: E402
 from smell_core.detector_utils import (  # noqa: E402
+    parse_expected_state_field,
     parse_parent_from_evidence,
     parse_structural_expectation,
 )
@@ -66,15 +67,19 @@ def _capability_guard(
     child_declaration: str,
     *,
     structural: bool = True,
+    structural_expectation: str = "",
+    expected_state_field: str = "",
 ):
     with tempfile.TemporaryDirectory(prefix="refused-bequest-capability-guard-") as temp_dir:
         root = Path(temp_dir)
         source = root / "Fixture.java"
         source.write_text(parent_declaration + child_declaration, encoding="utf-8")
-        evidence = (
-            "parents=ParentCapability; flags=explicit_unsupported_throw"
-            + ("; structural_expectation=capability_split" if structural else "")
-        )
+        expectation = structural_expectation or ("capability_split" if structural else "")
+        evidence = "parents=ParentCapability; flags=explicit_unsupported_throw"
+        if expectation:
+            evidence += f"; structural_expectation={expectation}"
+        if expected_state_field:
+            evidence += f"; expected_state_field={expected_state_field}"
         config = SimpleNamespace(
             project_root=root,
             language="java",
@@ -100,6 +105,13 @@ def main() -> int:
         raise AssertionError("structural expectation must be parsed from dataset evidence")
     if parse_structural_expectation("flags=explicit_unsupported_throw"):
         raise AssertionError("missing structural expectation must remain empty")
+    if (
+        parse_expected_state_field(
+            "structural_expectation=state_getter; expected_state_field=isMultipleValues"
+        )
+        != "isMultipleValues"
+    ):
+        raise AssertionError("state getter backing field must be parsed from dataset evidence")
 
     parent_contract = """\
 interface ParentCapability {
@@ -223,14 +235,35 @@ class Child {
 class Child implements ParentCapability {
   private final Object state = new Object();
   public Object target() {
-    return state;
+    return this.state;
   }
 }
 """,
-        structural=False,
+        structural_expectation="state_getter",
+        expected_state_field="state",
     )
     if not state_getter_guard["success"]:
-        raise AssertionError("non-structural implementations must preserve existing guard behavior")
+        raise AssertionError("state getter must accept a direct return of its declared backing field")
+
+    for invalid_return in ("false", "true", "otherState"):
+        invalid_state_getter_guard = _capability_guard(
+            parent_contract,
+            f"""\
+class Child implements ParentCapability {{
+  private final Object state = new Object();
+  private final Object otherState = new Object();
+  public Object target() {{
+    return {invalid_return};
+  }}
+}}
+""",
+            structural_expectation="state_getter",
+            expected_state_field="state",
+        )
+        if invalid_state_getter_guard["success"]:
+            raise AssertionError(
+                f"state getter must reject returning {invalid_return} instead of its backing field"
+            )
 
     logging_only = """\
 class Child extends Parent {

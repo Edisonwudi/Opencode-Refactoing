@@ -82,3 +82,13 @@ def parse_structural_expectation(evidence: str) -> str:
         flags=re.IGNORECASE,
     )
     return match.group(1).strip().lower() if match else ""
+
+
+def parse_expected_state_field(evidence: str) -> str:
+    """Extract the backing field required by a ``state_getter`` contract."""
+    match = re.search(
+        r"(?:^|;\s*)expected_state_field=([A-Za-z_$][A-Za-z0-9_$]*)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
