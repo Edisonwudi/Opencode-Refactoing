@@ -327,44 +327,6 @@ roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "local
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
 
-capability_split_sample = Sample(
-    sample_id="structural",
-    language="java",
-    smell="refused_bequest",
-    project_name="p",
-    project_root=Path("/tmp/p"),
-    location="Child.java:method=target|line=10",
-    evidence=(
-        "parents=ParentCapability; flags=explicit_unsupported_throw; "
-        "refactor_path=split_incompatible_capability; "
-        "structural_expectation=capability_split"
-    ),
-    test_location="src/test/java/ChildContractTest.java",
-    raw={},
-)
-capability_split_prompt = R._task_prompt(
-    capability_split_sample,
-    args,
-    "sample_optimized",
-    "java-refactor-agent",
-)
-check_true(
-    "capability_split_prompt_adapter",
-    "narrow adapter or composition boundary" in capability_split_prompt,
-)
-check_true(
-    "capability_split_prompt_preserves_concrete_contract",
-    "Keep concrete compatibility behavior required by immutable tests" in capability_split_prompt,
-)
-check_true(
-    "capability_split_prompt_rejects_body_only",
-    "A target-method-body-only edit is insufficient" in capability_split_prompt,
-)
-check_true(
-    "capability_split_prompt_requires_type_diff",
-    "the diff must change a relevant type declaration or integration call site outside the target method" in capability_split_prompt,
-)
-
 print()
 if failures:
     print(f"FAILED: {len(failures)} checks")

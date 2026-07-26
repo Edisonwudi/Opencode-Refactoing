@@ -24,7 +24,6 @@ if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
 from smell_core.config import VERIFICATION_MODES  # noqa: E402
-from smell_core.detector_utils import parse_evidence_value  # noqa: E402
 from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
@@ -590,22 +589,6 @@ def _task_prompt(
     )
     if idea_enabled and args.idea_refactor_cli:
         lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
-    if (
-        sample.smell == "refused_bequest"
-        and parse_evidence_value(sample.evidence, "structural_expectation").lower()
-        == "capability_split"
-    ):
-        lines.extend(
-            [
-                "",
-                "Capability-split acceptance contract:",
-                "- Inspect the reported parent capability, every relevant implementation, and the integration call sites before editing.",
-                "- Keep concrete compatibility behavior required by immutable tests, but remove the inappropriate parent relationship through a narrow adapter or composition boundary.",
-                "- A target-method-body-only edit is insufficient, including a new return value, delegated throw, helper, annotation removal, or parent default implementation.",
-                "- Before calling smell_verify, the diff must change a relevant type declaration or integration call site outside the target method.",
-                "- Prefer existing project abstractions and factories; introduce one focused adapter only when no existing boundary can carry the parent contract.",
-            ]
-        )
     lines.append("")
     lines.append(
         f"Repair this one {sample.language} smell from the dataset row. "

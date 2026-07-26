@@ -28,19 +28,6 @@ def normalize_method(value: Optional[str]) -> str:
     return re.split(r"[.#\s]+", before_params)[-1].lower()
 
 
-def parse_evidence_value(evidence: str, name: str) -> str:
-    """Extract one semicolon-delimited ``name=value`` field from evidence."""
-    field = str(name or "").strip()
-    if not field:
-        return ""
-    match = re.search(
-        rf"(?:^|;\s*){re.escape(field)}=([^;]+)",
-        str(evidence or ""),
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).strip() if match else ""
-
-
 def parse_group_from_evidence(evidence: str) -> str:
     """Extract ``group=...`` from an evidence string, if present."""
     match = re.search(r"(?:^|;\s*)group=([^;]+)", evidence, flags=re.IGNORECASE)
