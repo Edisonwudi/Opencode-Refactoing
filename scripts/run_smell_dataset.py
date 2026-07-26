@@ -32,6 +32,7 @@ from smell_core.project_revision import (  # noqa: E402
     load_revisions,
     resolve_revision,
     verify_checkout,
+    verify_test_oracle,
 )
 
 
@@ -1050,6 +1051,13 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
             sample, _execution_checkout_run_dir(run_dir), target_commit=rev.project_commit
         )
         audit = verify_checkout(prepared.project_root, rev)
+        audit.update(
+            verify_test_oracle(
+                prepared.project_root,
+                prepared.test_location,
+                sample.raw.get("test_oracle_sha256", ""),
+            )
+        )
         row.update({
             "status": "CHECKOUT_OK",
             "execution_project_root": str(prepared.project_root),
@@ -1113,6 +1121,13 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         )
         if args.worktree:
             revision_audit = verify_checkout(execution_sample.project_root, rev)
+        revision_audit.update(
+            verify_test_oracle(
+                execution_sample.project_root,
+                execution_sample.test_location,
+                sample.raw.get("test_oracle_sha256", ""),
+            )
+        )
     except ProjectRevisionError as exc:
         # Fail fast: record the deviation and abort this sample without running
         # opencode/verify or touching runtime HEAD.
