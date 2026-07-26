@@ -72,3 +72,13 @@ def parse_parent_from_evidence(evidence: str) -> str:
         return ""
     value = re.split(r"[|,]", match.group(1), maxsplit=1)[0]
     return value.strip().lower()
+
+
+def parse_structural_expectation(evidence: str) -> str:
+    """Extract an explicit structural acceptance contract from dataset evidence."""
+    match = re.search(
+        r"(?:^|;\s*)structural_expectation=([^;]+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip().lower() if match else ""
