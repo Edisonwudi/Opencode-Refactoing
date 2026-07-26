@@ -1,0 +1,14 @@
+project_name,location,definition_status,benchmark_suitability,rationale
+Mindustry-v154.3,core/src/mindustry/world/blocks/defense/turrets/ContinuousTurret.java:ContinuousTurretBuild.updateCooling,BORDERLINE_TEMPLATE_METHOD,REJECT,parent method is an overridable algorithm hook and the no-op is a deliberate specialization
+Mindustry-v154.3,core/src/mindustry/world/blocks/defense/turrets/ContinuousTurret.java:ContinuousTurretBuild.updateReload,BORDERLINE_TEMPLATE_METHOD,REJECT,parent method is an overridable algorithm hook and continuous firing deliberately has no reload phase
+Mindustry-v154.3,core/src/mindustry/world/blocks/defense/turrets/LaserTurret.java:LaserTurretBuild.updateCooling,BORDERLINE_TEMPLATE_METHOD,REJECT,cooling is implemented in updateTile and the hook is deliberately suppressed
+Mindustry-v154.3,core/src/mindustry/world/blocks/defense/turrets/LaserTurret.java:LaserTurretBuild.updateReload,BORDERLINE_TEMPLATE_METHOD,REJECT,reload is implemented in updateTile and the hook is deliberately suppressed
+commons-io,src/main/java/org/apache/commons/io/input/MarkShieldInputStream.java:reset,INTENTIONAL_CAPABILITY_SHIELD,REJECT,class purpose and tests explicitly require mark and reset shielding
+h2database,h2/src/main/org/h2/mvstore/db/MVDelegateIndex.java:update,TRUE_RB_CAPABILITY_MISMATCH,DESIGN_ONLY,delegate index exposes mutation capability owned by its main index
+h2database,h2/src/main/org/h2/mvstore/db/MVDelegateIndex.java:remove,TRUE_RB_CAPABILITY_MISMATCH,DESIGN_ONLY,delegate index exposes mutation capability owned by its main index
+h2database,h2/src/main/org/h2/mvstore/db/MVDelegateIndex.java:truncate,TRUE_RB_CAPABILITY_MISMATCH,DESIGN_ONLY,delegate index exposes mutation capability owned by its main index
+h2database,h2/src/main/org/h2/table/TableLink.java:checkWritingAllowed,VALID_POLICY_SPECIALIZATION,REJECT,remote target database is intentionally responsible for the write check
+tika,tika-xmp/src/main/java/org/apache/tika/xmp/XMPMetadata.java:names,NOT_RB_MISSING_IMPLEMENTATION,REJECT,source explicitly states that the Metadata API behavior is not implemented
+tika,tika-xmp/src/main/java/org/apache/tika/xmp/XMPMetadata.java:equals,NOT_RB_MISSING_IMPLEMENTATION,REJECT,source explicitly states that semantic equality is not implemented
+wumpz-jhotdraw-10.2.4,jhotdraw-core/src/main/java/org/jhotdraw/draw/tool/TextAreaEditingTool.java:mouseDragged,TRUE_RB_EVENT_CAPABILITY_MISMATCH,DESIGN_ONLY_API_RISK,text editing tool inherits drag-event capability but rejects it
+wumpz-jhotdraw-10.2.4,jhotdraw-core/src/main/java/org/jhotdraw/draw/tool/TextEditingTool.java:mouseDragged,TRUE_RB_EVENT_CAPABILITY_MISMATCH,DESIGN_ONLY_TEST_CONFLICT,text editing tool inherits drag-event capability but the existing dataset test freezes the rejecting behavior
