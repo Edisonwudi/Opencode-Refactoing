@@ -69,9 +69,16 @@ def main() -> int:
         skipped = verify_test_oracle(repo, "", "")
         assert skipped["test_oracle_alignment"] == "NOT_DECLARED"
         print("  ok   undeclared oracle")
-        skipped_with_file = verify_test_oracle(repo, "src/ExampleTest.java", "")
-        assert skipped_with_file["test_oracle_alignment"] == "NOT_DECLARED"
-        print("  ok   optional oracle")
+        _expect_error(
+            "TEST_ORACLE_SCHEMA_INVALID",
+            lambda: verify_test_oracle(repo, "src/ExampleTest.java", ""),
+        )
+        print("  ok   file without oracle hash")
+        _expect_error(
+            "TEST_ORACLE_SCHEMA_INVALID",
+            lambda: verify_test_oracle(repo, "", expected),
+        )
+        print("  ok   oracle hash without file")
 
     print("project revision self-check: PASS")
     return 0

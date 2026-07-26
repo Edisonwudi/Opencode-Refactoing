@@ -195,23 +195,31 @@ def verify_test_oracle(
 
     The project manifest remains the sole checkout authority.  This check only
     proves that the pinned tree contains the same test oracle that the dataset
-    was curated against, avoiding a second per-sample revision path.
+    was curated against, avoiding a second per-sample revision path.  The file
+    and hash form one declaration: either both are absent or both are required.
     """
     test_file = str(test_file or "").strip()
     expected_sha256 = str(expected_sha256 or "").strip().lower()
-    if not expected_sha256:
+    if bool(test_file) != bool(expected_sha256):
+        raise ProjectRevisionError(
+            "TEST_ORACLE_SCHEMA_INVALID",
+            "test_file and test_oracle_sha256 must be declared together",
+            test_file=test_file,
+            expected_test_oracle_sha256=expected_sha256,
+        )
+    if not test_file:
         return {
             "test_oracle_alignment": "NOT_DECLARED",
-            "test_file": test_file,
+            "test_file": "",
             "expected_test_oracle_sha256": "",
             "actual_test_oracle_sha256": "",
         }
-    if not test_file or len(expected_sha256) != 64 or any(
+    if len(expected_sha256) != 64 or any(
         char not in "0123456789abcdef" for char in expected_sha256
     ):
         raise ProjectRevisionError(
             "TEST_ORACLE_SCHEMA_INVALID",
-            "test_file and a 64-character lowercase/uppercase SHA256 are required together",
+            "test_oracle_sha256 must be a 64-character SHA256",
             test_file=test_file,
             expected_test_oracle_sha256=expected_sha256,
         )
