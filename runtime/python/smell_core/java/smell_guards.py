@@ -18,7 +18,6 @@ from .detector_utils import (
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
     parse_parent_from_evidence as _parse_parent_from_evidence,
-    parse_structural_expectation as _parse_structural_expectation,
 )
 from .data_clumps import (
     data_clump_group_from_evidence,
@@ -28,7 +27,6 @@ from .data_clumps import (
 from .semantic_detector import (
     SemanticFinding,
     _build_project_model,
-    analyze_refused_bequest_target,
     find_matching_semantic_finding,
     run_java_semantic_detector,
 )
@@ -482,57 +480,6 @@ def _run_semantic_guard(
                 "evidence": match.evidence,
             },
         }
-    if guard_type == "refused_bequest":
-        structural_expectation = _parse_structural_expectation(evidence)
-        if structural_expectation:
-            if structural_expectation != "capability_split":
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: unsupported structural expectation "
-                        f"{structural_expectation!r}."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                    },
-                }
-            profile = analyze_refused_bequest_target(
-                config.project_root,
-                target_file=target.file_path,
-                method=target.method,
-                line=target.line,
-                reported_parent=_parse_parent_from_evidence(evidence),
-            )
-            if not profile.get("ok"):
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: capability-split profile could not "
-                        f"be resolved: {profile.get('error', 'unknown error')}."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                        "capability_profile": profile,
-                    },
-                }
-            if not profile.get("capability_split_satisfied"):
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: the reported parent capability is "
-                        "still inherited and still exposes the target method."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                        "capability_profile": profile,
-                    },
-                }
     if guard_type == "refused_bequest" and _requires_unsupported_throw_removal(evidence):
         unsupported_throw = _target_method_unsupported_throw(config, target)
         if unsupported_throw:
