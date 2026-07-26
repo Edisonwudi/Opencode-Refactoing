@@ -5,8 +5,12 @@
 - 本文件对应 `refused_bequest_proposed_30_20260727.csv`。
 - 当前共 30 个方法行、9 个 `case_id`、8 个独立 `refactor_group_id`、5 个项目，MyBatis 为 0。
 - H2 `Page.NonLeaf` 与 `Page.Leaf` 虽保留两个异味 `case_id`，但属于同一次层次拆分，只计一个独立重构任务。
-- 30 行都只是 `ACCEPT_CONDITIONAL` 候选，不是已经进入 canonical 数据集的 30 个最终通过样本。
-- 条件的含义是：源码证据支持 Refused Bequest，且存在具体重构路径；但行为 Oracle 尚未实现并在原始/重构后版本上实际通过。
+- 30 行仍是 `ACCEPT_CONDITIONAL` 候选，不是已经进入 canonical 数据集的 30 个最终通过样本。
+- 8 个重构组的行为 Oracle 已实现，并在重构前固定提交上实际通过；对应的
+  `test_commit`、`test_tree`、测试文件 SHA256 和命令记录在
+  `refused_bequest_proposed_30_groups_20260727.csv`。
+- `refused_bequest_oracle_ready_30_20260727.csv` 是复用现有 delivery schema 的可执行候选清单。
+  其中 `PRE_REFACTOR_PASS` 只表示行为基线通过，重构后仍须同时通过行为 Oracle 与异味消除 guard。
 - 实验抽样、训练/测试切分和成功率都必须按
   `refused_bequest_proposed_30_groups_20260727.csv` 中的 `refactor_group_id`
   聚类。不能把同一继承设计缺陷下的多个拒绝方法当成彼此独立样本。
@@ -15,15 +19,15 @@
 
 | `case_id` | 方法行 | 结论 | 主要风险和进入 canonical 的条件 |
 |---|---:|---|---|
-| `canal_bidirectional_ipacket` | 11 | CONDITIONAL | 同一个双向 `IPacket` 能力污染；需逐 packet 的协议字节 fixture 和调用链 Oracle |
-| `h2_page_nonleaf` | 4 | CONDITIONAL | 定义强，但 `Page` 是公开层级；需外部兼容编译和多层 B-tree 持久化 Oracle |
-| `h2_page_leaf` | 5 | CONDITIONAL | 定义强，但 `Page` 是公开层级；需外部兼容编译和多层 B-tree 持久化 Oracle |
-| `arc_tiled_drawable` | 1 | CONDITIONAL | 必须改变 `TiledDrawable` 的公开父类或改用组合，复用已有 `TransformDrawable` 窄能力；需调用方编译和渲染 Oracle |
-| `jhotdraw_text_area_editing_tool` | 1 | CONDITIONAL | 删除拒绝 override 后应继承安全 no-op；需真实编辑工作流和拖拽不异常的修复验收 |
-| `jhotdraw_text_editing_tool` | 1 | CONDITIONAL | 必须删除人工异常冻结测试并重建真实编辑工作流 Oracle |
-| `h2_offheap_store_backup` | 1 | CONDITIONAL | 内存 store 拒绝持久化备份能力；需公开 API/`BackupCommand` 分派兼容、内存生命周期和两种持久化 store 的 ZIP 备份 Oracle |
-| `arc_mix_filter` | 2 | CONDITIONAL | 多输入 filter 拒绝单输入能力；需双输入 GL 渲染 Oracle |
-| `mindustry_consume_item_explode` | 4 | CONDITIONAL | 源码明确“不消费任何物品”；需库存、爆炸、UI、统计 Oracle |
+| `canal_bidirectional_ipacket` | 11 | PRE_REFACTOR_PASS | 协议方向字节 Oracle 已通过；重构后仍需能力拆分 guard 和调用方编译 |
+| `h2_page_nonleaf` | 4 | PRE_REFACTOR_PASS | 多层 B-tree 插入、修改、删除、遍历和持久化重开 Oracle 已通过；公开层级兼容仍待重构后确认 |
+| `h2_page_leaf` | 5 | PRE_REFACTOR_PASS | 与 NonLeaf 共用同一 B-tree 行为 Oracle；必须作为同一重构组验收 |
+| `arc_tiled_drawable` | 1 | PRE_REFACTOR_PASS | 四参数平铺绘制与 tint/尺寸 Oracle 已通过；公开父类及调用方兼容仍待重构后确认 |
+| `jhotdraw_text_area_editing_tool` | 1 | PRE_REFACTOR_PASS | 原人工异常冻结测试已删除，真实编辑、提交、撤销、重做 Oracle 已通过 |
+| `jhotdraw_text_editing_tool` | 1 | PRE_REFACTOR_PASS | 与 TextArea 工具共用真实编辑工作流 Oracle；拒绝 override 的删除由 guard 验收 |
+| `h2_offheap_store_backup` | 1 | PRE_REFACTOR_PASS | OffHeap 生命周期及持久化数据库 ZIP 备份 Oracle 已通过；分派兼容仍待重构后确认 |
+| `arc_mix_filter` | 2 | PRE_REFACTOR_PASS | 双纹理输入与绑定单元 Oracle 已通过；单输入能力拆分由 guard 验收 |
+| `mindustry_consume_item_explode` | 4 | PRE_REFACTOR_PASS | 通过 Block/Building 真实入口验证爆炸、库存、UI、统计和 item-acceptance，未直接调用待删除方法 |
 
 ## JHotDraw 测试来源处理
 

@@ -505,6 +505,12 @@ def analyze_refused_bequest_target(
     capability_split_satisfied = not inherits_parent or bool(
         parent_record and not child_declares_target and not parent_declares_target
     )
+    rejecting_override_removed = bool(
+        parent_record
+        and inherits_parent
+        and parent_declares_target
+        and not child_declares_target
+    )
     return {
         "ok": True,
         "file": target_rel,
@@ -517,6 +523,7 @@ def analyze_refused_bequest_target(
         "child_declares_target": child_declares_target,
         "parent_declares_target": parent_declares_target,
         "capability_split_satisfied": capability_split_satisfied,
+        "rejecting_override_removed": rejecting_override_removed,
     }
 
 

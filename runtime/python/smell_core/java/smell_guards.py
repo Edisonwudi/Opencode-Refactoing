@@ -519,7 +519,10 @@ def _run_semantic_guard(
                             "expected_state_field": expected_state_field,
                         },
                     }
-            elif structural_expectation != "capability_split":
+            elif structural_expectation not in {
+                "capability_split",
+                "rejecting_override_removed",
+            }:
                 return {
                     "type": guard_type,
                     "success": False,
@@ -554,14 +557,26 @@ def _run_semantic_guard(
                             "capability_profile": profile,
                         },
                     }
-                if not profile.get("capability_split_satisfied"):
+                expectation_satisfied = (
+                    profile.get("capability_split_satisfied")
+                    if structural_expectation == "capability_split"
+                    else profile.get("rejecting_override_removed")
+                )
+                if not expectation_satisfied:
+                    if structural_expectation == "rejecting_override_removed":
+                        failure_message = (
+                            "refused_bequest guard: the rejecting child override is still "
+                            "declared, or the reported safe parent method cannot be resolved."
+                        )
+                    else:
+                        failure_message = (
+                            "refused_bequest guard: the reported parent capability is "
+                            "still inherited and still exposes the target method."
+                        )
                     return {
                         "type": guard_type,
                         "success": False,
-                        "message": (
-                            "refused_bequest guard: the reported parent capability is "
-                            "still inherited and still exposes the target method."
-                        ),
+                        "message": failure_message,
                         "details": {
                             "detector": "python_semantic_detector",
                             "structural_expectation": structural_expectation,

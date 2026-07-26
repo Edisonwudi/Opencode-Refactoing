@@ -106,6 +106,14 @@ def main() -> int:
     if parse_structural_expectation("flags=explicit_unsupported_throw"):
         raise AssertionError("missing structural expectation must remain empty")
     if (
+        parse_structural_expectation(
+            "flags=explicit_unsupported_throw; "
+            "structural_expectation=rejecting_override_removed"
+        )
+        != "rejecting_override_removed"
+    ):
+        raise AssertionError("rejecting override expectation must be parsed from dataset evidence")
+    if (
         parse_expected_state_field(
             "structural_expectation=state_getter; expected_state_field=isMultipleValues"
         )
@@ -228,6 +236,51 @@ class Child {
     )
     if not parent_removed_guard["success"]:
         raise AssertionError("guard must accept removal of the incompatible parent relation")
+
+    rejecting_override_parent = """\
+class ParentCapability {
+  Object target() {
+    return null;
+  }
+}
+"""
+    rejecting_override_present = _capability_guard(
+        rejecting_override_parent,
+        """\
+class Child extends ParentCapability {
+  @Override public Object target() {
+    return new Object();
+  }
+}
+""",
+        structural_expectation="rejecting_override_removed",
+    )
+    if rejecting_override_present["success"]:
+        raise AssertionError("rejecting override contract must fail while the child still declares the method")
+
+    rejecting_override_removed = _capability_guard(
+        rejecting_override_parent,
+        """\
+class Child extends ParentCapability {
+}
+""",
+        structural_expectation="rejecting_override_removed",
+    )
+    if not rejecting_override_removed["success"]:
+        raise AssertionError("rejecting override contract must accept inheritance of the safe parent method")
+
+    rejecting_override_parent_removed = _capability_guard(
+        rejecting_override_parent,
+        """\
+class Child {
+}
+""",
+        structural_expectation="rejecting_override_removed",
+    )
+    if rejecting_override_parent_removed["success"]:
+        raise AssertionError(
+            "rejecting override contract is specific to inheriting the reported safe parent method"
+        )
 
     state_getter_guard = _capability_guard(
         parent_contract,

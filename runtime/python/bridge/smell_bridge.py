@@ -34,6 +34,7 @@ from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
 from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
 from smell_core.guards import GuardRunContext, god_class_relative_reduction, run_build_test_guard, run_smell_guards  # noqa: E402
 from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
+from smell_core.detector_utils import parse_structural_expectation  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
     IdeaRefactorPreflightError,
     IdeaRefactorPreflightOptions,
@@ -130,6 +131,14 @@ def _resolve(args: argparse.Namespace):
 def _is_idea_backed(language: str) -> bool:
     support = get_language(language)
     return bool(support and support.idea_backed)
+
+
+def _requires_strict_smell_resolution(smell: str, evidence: str) -> bool:
+    """Return whether metric improvement is progress-only, never final acceptance."""
+    return bool(
+        smell == "refused_bequest"
+        and parse_structural_expectation(evidence)
+    )
 
 
 def _location_payload(resolved) -> list[dict[str, Any]]:
@@ -472,23 +481,37 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     # lines would otherwise pass both the guard and this gate.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
         improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
+    strict_resolution_required = _requires_strict_smell_resolution(
+        resolved.smell,
+        evidence,
+    )
+    accepted_improvement_pass = improvement_pass and not strict_resolution_required
     build_test_result = None
     if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(resolved)
     snapshot = _snapshot_project(resolved.project_root) if args.snapshot else None
-    success = (not failed_smell or improvement_pass) and (
+    success = (not failed_smell or accepted_improvement_pass) and (
         build_test_result is None or bool(build_test_result.get("success"))
     )
     resolution = ""
     if success:
         resolution = "resolved" if not failed_smell else "improved"
+    elif improvement_pass and (
+        build_test_result is None or bool(build_test_result.get("success"))
+    ):
+        resolution = "improved"
     continue_hint = ""
     if resolution == "improved":
         remaining = [str(item.get("message") or "") for item in failed_smell if item.get("message")]
+        progress_disposition = (
+            "Progress recorded but not accepted as final"
+            if strict_resolution_required
+            else "Progress accepted"
+        )
         continue_hint = (
-            "Progress accepted (resolution=improved): the checkpoint confirms a real "
-            "production diff with metric reduction vs baseline. The detector still "
-            "reports the smell, so keep refactoring toward resolution=resolved. "
+            f"{progress_disposition} (resolution=improved): the checkpoint confirms a real "
+            "production diff with metric reduction vs baseline. The detector or structural "
+            "guard still reports the smell, so keep refactoring toward resolution=resolved. "
             "Remaining detector signals: "
             + " | ".join(remaining[:3])
             + " Best partial progress is already saved; do not undo these metric "
