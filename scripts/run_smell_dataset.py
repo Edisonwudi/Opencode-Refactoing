@@ -952,6 +952,13 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     failure_pack = last_payload.get("failure_pack") if isinstance(last_payload, dict) else None
     checkpoint = last_payload.get("checkpoint") if isinstance(last_payload, dict) else None
     delta = checkpoint.get("delta") if isinstance(checkpoint, dict) else None
+    snapshot = last_payload.get("snapshot") if isinstance(last_payload, dict) else None
+    diff_stat = snapshot.get("diff_stat") if isinstance(snapshot, dict) else None
+    diff_stat_stdout = diff_stat.get("stdout") if isinstance(diff_stat, dict) else ""
+    last_has_production_diff = bool(
+        (isinstance(delta, dict) and delta.get("has_production_diff") is True)
+        or (isinstance(diff_stat_stdout, str) and diff_stat_stdout.strip())
+    )
     return {
         "smell_verify_calls": calls,
         "last_loop_decision": last_decision,
@@ -959,6 +966,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "last_status": last_status,
         "last_failure_retryable": failure_pack.get("retryable") if isinstance(failure_pack, dict) else None,
         "last_metric_progress": delta.get("metric_progress") if isinstance(delta, dict) else None,
+        "last_has_production_diff": last_has_production_diff,
         "last_output_parsed": last_payload is not None,
     }
 
@@ -983,11 +991,23 @@ def _runner_closure_action(
     # its internal budget was exhausted while the latest retryable checkpoint
     # still made measurable progress, resume the same session. The runner's
     # existing max_continuations remains the outer hard cap.
+    retryable_progress = (
+        trace.get("last_metric_progress") is True
+        or (
+            trace.get("last_status") in {
+                "BUILD_FAILED",
+                "BUILD_COMPILE_ERROR",
+                "TEST_FAILED",
+                "SAMPLE_TEST_FAILED",
+            }
+            and trace.get("last_has_production_diff") is True
+        )
+    )
     if (
         trace.get("last_loop_decision") == "stop"
         and trace.get("last_termination_reason") == "MAX_CONTINUATIONS_REACHED"
         and trace.get("last_failure_retryable") is True
-        and trace.get("last_metric_progress") is True
+        and retryable_progress
         and continuations_dispatched < max_continuations
     ):
         return "continue_after_internal_cap"
@@ -1006,7 +1026,8 @@ def _runner_continuation_prompt(action: str, continuation: int, max_continuation
         )
     reason = (
         "The plugin stopped only because its internal continuation budget was exhausted, "
-        "but the latest retryable checkpoint still made measurable progress."
+        "but the latest retryable checkpoint still made measurable progress or reduced the "
+        "task to a compile/test repair with a non-empty production diff."
         if action == "continue_after_internal_cap"
         else "The previous smell_verify result requested another corrective iteration."
     )

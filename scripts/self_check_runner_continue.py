@@ -219,6 +219,39 @@ check(
     R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
     "stop",
 )
+compile_cap_payload = {
+    "status": "BUILD_FAILED",
+    "failure_pack": {"retryable": True},
+    "checkpoint": {"delta": {"metric_progress": False}},
+    "snapshot": {"diff_stat": {"stdout": " Foo.java | 2 +-\n 1 file changed"}},
+    "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
+}
+compile_cap_trace = R._verification_trace(verify_event(compile_cap_payload))
+check("compile_cap_has_diff", compile_cap_trace["last_has_production_diff"], True)
+check(
+    "compile_cap_nonempty_diff_resumes",
+    R._runner_closure_action(
+        compile_cap_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=2,
+    ),
+    "continue_after_internal_cap",
+)
+compile_cap_no_diff = {
+    **compile_cap_payload,
+    "snapshot": {"diff_stat": {"stdout": ""}},
+}
+check(
+    "compile_cap_empty_diff_stops",
+    R._runner_closure_action(
+        R._verification_trace(verify_event(compile_cap_no_diff)),
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=2,
+    ),
+    "stop",
+)
 for name, mutation in (
     ("cap_without_progress_stops", {"checkpoint": {"delta": {"metric_progress": False}}}),
     ("cap_non_retryable_stops", {"failure_pack": {"retryable": False}}),
