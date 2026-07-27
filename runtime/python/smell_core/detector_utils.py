@@ -92,3 +92,23 @@ def parse_expected_state_field(evidence: str) -> str:
         flags=re.IGNORECASE,
     )
     return match.group(1).strip() if match else ""
+
+
+def parse_target_parameter_count(evidence: str) -> Optional[int]:
+    """Extract a pinned target-method arity used to distinguish Java overloads."""
+    matches = re.findall(
+        r"(?:^|;\s*)target_parameter_count=(\d+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return int(matches[-1]) if matches else None
+
+
+def parse_target_class(evidence: str) -> str:
+    """Extract a pinned target class; the final field overrides group defaults."""
+    matches = re.findall(
+        r"(?:^|;\s*)target_class=([^;]+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return matches[-1].strip() if matches else ""

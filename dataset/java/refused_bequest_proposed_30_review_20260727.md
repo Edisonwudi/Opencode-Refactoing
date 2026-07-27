@@ -9,11 +9,31 @@
 - 8 个重构组的行为 Oracle 已实现，并在重构前固定提交上实际通过；对应的
   `test_commit`、`test_tree`、测试文件 SHA256 和命令记录在
   `refused_bequest_proposed_30_groups_20260727.csv`。
-- `refused_bequest_oracle_ready_30_20260727.csv` 是复用现有 delivery schema 的可执行候选清单。
-  其中 `PRE_REFACTOR_PASS` 只表示行为基线通过，重构后仍须同时通过行为 Oracle 与异味消除 guard。
-- 实验抽样、训练/测试切分和成功率都必须按
-  `refused_bequest_proposed_30_groups_20260727.csv` 中的 `refactor_group_id`
-  聚类。不能把同一继承设计缺陷下的多个拒绝方法当成彼此独立样本。
+- `refused_bequest_oracle_ready_30_20260727.csv` 是 30 个目标方法的审计目录，
+  不直接交给 runner，避免把同一设计缺陷重复统计。
+- `refused_bequest_oracle_groups_8_20260727.csv` 才是复用现有 delivery schema
+  和 runner 的执行清单：一个 `refactor_group_id` 对应一个 checkout、一次重构、
+  一次行为测试，结构 guard 必须逐项通过组内全部 location。
+- `PRE_REFACTOR_PASS` 只表示行为基线通过，重构后仍须同时通过行为 Oracle
+  与异味消除 guard。严格 Refused Bequest Oracle 禁止使用 `local` 验证；
+  测试命令返回 0 还不够，runner 会要求固定测试类产生新的非空 JUnit XML 报告。
+- 实验抽样、训练/测试切分和成功率必须按 8 个 `refactor_group_id` 统计，
+  不能把同一继承设计缺陷下的多个拒绝方法当成彼此独立样本。
+
+## 行为 Oracle 与结构重构的兼容性
+
+- Canal 只验证客户端写包和服务端读包；被删除的是相反方向的拒绝能力。
+- H2 通过 MVStore 和 JDBC 公开流程验证，不直接调用 Page/OffHeap 的拒绝方法。
+  Page 的 9 个目标会在重构前固定为 4 个 `Page.NonLeaf` 和 5 个
+  `Page.Leaf`，删除方法后不再依赖可能漂移的旧行号定位类。
+- JHotDraw 只验证编辑、提交、撤销和重做，不要求保留 `mouseDragged` 异常。
+- Arc 只验证四参数平铺绘制和双输入 MixFilter；guard 用目标参数个数区分
+  待删除重载与必须保留的合法重载。
+- Mindustry 通过 `Block`/`Building` 框架入口验证，合法的 `extends Consume`
+  重构不需要保留四个空 override。
+
+因此测试与异味消除没有先天冲突；无法同时通过时应优先判断为重构不完整、
+公开调用方未迁移或 guard 契约错误，而不是放宽行为测试。
 
 ## 候选构成
 

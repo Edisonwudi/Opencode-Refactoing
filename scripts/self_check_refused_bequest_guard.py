@@ -24,6 +24,8 @@ from smell_core.detector_utils import (  # noqa: E402
     parse_expected_state_field,
     parse_parent_from_evidence,
     parse_structural_expectation,
+    parse_target_class,
+    parse_target_parameter_count,
 )
 
 
@@ -69,6 +71,9 @@ def _capability_guard(
     structural: bool = True,
     structural_expectation: str = "",
     expected_state_field: str = "",
+    target_parameter_count: int | None = None,
+    target_class: str = "",
+    target_line: int = 6,
 ):
     with tempfile.TemporaryDirectory(prefix="refused-bequest-capability-guard-") as temp_dir:
         root = Path(temp_dir)
@@ -80,17 +85,51 @@ def _capability_guard(
             evidence += f"; structural_expectation={expectation}"
         if expected_state_field:
             evidence += f"; expected_state_field={expected_state_field}"
+        if target_parameter_count is not None:
+            evidence += f"; target_parameter_count={target_parameter_count}"
+        if target_class:
+            evidence += f"; target_class={target_class}"
         config = SimpleNamespace(
             project_root=root,
             language="java",
             locations=[
                 parse_location_descriptor(
-                    "Fixture.java:method=target|line=6",
+                    f"Fixture.java:method=target|line={target_line}",
                     root,
                 )
             ],
         )
         return _run_semantic_guard(config, "refused_bequest", evidence)
+
+
+def _group_capability_guard(child_declaration: str):
+    with tempfile.TemporaryDirectory(prefix="refused-bequest-group-guard-") as temp_dir:
+        root = Path(temp_dir)
+        source = root / "Fixture.java"
+        source.write_text(
+            """\
+class ParentCapability {
+  void first() {}
+  void second() {}
+}
+"""
+            + child_declaration,
+            encoding="utf-8",
+        )
+        config = SimpleNamespace(
+            project_root=root,
+            language="java",
+            locations=[
+                parse_location_descriptor("Fixture.java:method=first|line=6", root),
+                parse_location_descriptor("Fixture.java:method=second|line=7", root),
+            ],
+        )
+        return _run_semantic_guard(
+            config,
+            "refused_bequest",
+            "parents=ParentCapability; flags=empty_override; "
+            "structural_expectation=capability_split",
+        )
 
 
 def main() -> int:
@@ -105,6 +144,15 @@ def main() -> int:
         raise AssertionError("structural expectation must be parsed from dataset evidence")
     if parse_structural_expectation("flags=explicit_unsupported_throw"):
         raise AssertionError("missing structural expectation must remain empty")
+    if (
+        parse_target_parameter_count(
+            "structural_expectation=capability_split; target_parameter_count=9"
+        )
+        != 9
+    ):
+        raise AssertionError("target method arity must be parsed from dataset evidence")
+    if parse_target_class("target_class=Outer.Inner") != "Outer.Inner":
+        raise AssertionError("target class must be parsed from dataset evidence")
     if (
         parse_structural_expectation(
             "flags=explicit_unsupported_throw; "
@@ -169,8 +217,10 @@ class Child {
 }
 """,
     )
-    if not parent_removed["capability_split_satisfied"]:
-        raise AssertionError("removing the incompatible parent relationship must satisfy a split")
+    if parent_removed["capability_split_satisfied"]:
+        raise AssertionError(
+            "removing only the parent relationship must not preserve the rejected target method"
+        )
 
     contract_reduced = _capability_profile(
         """\
@@ -234,8 +284,93 @@ class Child {
 }
 """,
     )
-    if not parent_removed_guard["success"]:
-        raise AssertionError("guard must accept removal of the incompatible parent relation")
+    if parent_removed_guard["success"]:
+        raise AssertionError(
+            "guard must reject removing only the parent while retaining the rejected method"
+        )
+
+    overloaded_target_removed = _capability_guard(
+        """\
+class ParentCapability {
+  void target(Object value) {}
+}
+""",
+        """\
+class Child {
+  void target(Object first, Object second) {}
+}
+""",
+        target_parameter_count=1,
+    )
+    if not overloaded_target_removed["success"]:
+        raise AssertionError(
+            "capability split must allow a supported overload after the rejected arity is removed"
+        )
+
+    rejected_overload_retained = _capability_guard(
+        """\
+class ParentCapability {
+  void target(Object value) {}
+}
+""",
+        """\
+class Child {
+  void target(Object value) {}
+  void target(Object first, Object second) {}
+}
+""",
+        target_parameter_count=1,
+    )
+    if rejected_overload_retained["success"]:
+        raise AssertionError(
+            "capability split must reject retaining the refused overload after parent removal"
+        )
+
+    pinned_class_ignores_stale_line = _capability_guard(
+        """\
+class Decoy {
+  void target() {}
+}
+class ParentCapability {
+  void target() {}
+}
+""",
+        """\
+class Child {
+  void supported() {}
+}
+""",
+        target_class="Child",
+        target_line=2,
+    )
+    if not pinned_class_ignores_stale_line["success"]:
+        raise AssertionError(
+            "pinned target class must take precedence over a stale line in another class"
+        )
+
+    incomplete_group = _group_capability_guard(
+        """\
+class Child extends ParentCapability {
+  @Override void first() {}
+  void supported() {}
+}
+"""
+    )
+    if incomplete_group["success"]:
+        raise AssertionError("group guard must reject when any grouped target remains unresolved")
+    if incomplete_group["details"]["target_count"] != 2:
+        raise AssertionError("group guard must report every grouped target")
+
+    resolved_group = _group_capability_guard(
+        """\
+class Child {
+  void supported() {}
+  // keep both original target lines anchored inside this class
+}
+"""
+    )
+    if not resolved_group["success"]:
+        raise AssertionError("group guard must accept only when every grouped target is resolved")
 
     rejecting_override_parent = """\
 class ParentCapability {

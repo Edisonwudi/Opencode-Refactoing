@@ -435,7 +435,20 @@ def _god_class_min_reduction(resolved) -> float:
 
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
-    if args.skip_build_test and os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1":
+    evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
+    strict_resolution_required = _requires_strict_smell_resolution(
+        resolved.smell,
+        evidence,
+    )
+    build_test_required = bool(
+        os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
+        or strict_resolution_required
+    )
+    if build_test_required and (
+        args.skip_build_test
+        or not args.run_build_test
+        or resolved.verification_mode == "local"
+    ):
         full_payload = {
             "success": False,
             "status": "BUILD_TEST_REQUIRED",
@@ -462,7 +475,6 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": artifacts,
             "failure_pack": failure_pack,
         }
-    evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
     guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
@@ -481,10 +493,6 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     # lines would otherwise pass both the guard and this gate.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
         improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
-    strict_resolution_required = _requires_strict_smell_resolution(
-        resolved.smell,
-        evidence,
-    )
     accepted_improvement_pass = improvement_pass and not strict_resolution_required
     build_test_result = None
     if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":

@@ -431,10 +431,13 @@ def analyze_refused_bequest_target(
     method: Optional[str],
     line: Optional[int],
     reported_parent: str,
+    target_parameter_count: Optional[int] = None,
+    target_class_name: str = "",
+    project_model: Optional[ProjectModel] = None,
 ) -> Dict[str, Any]:
     """Return the positive hierarchy contract for one Refused Bequest target."""
     root = project_root.expanduser().resolve()
-    model = _build_project_model(root, include_tests=False)
+    model = project_model or _build_project_model(root, include_tests=False)
     target_rel = _normalize_rel_path(target_file, root)
     target_method = _normalize_method(method)
     parent_name = str(reported_parent or "").strip()
@@ -456,11 +459,31 @@ def analyze_refused_bequest_target(
         if _normalize_path(item.file) == target_rel
         and _normalize_method(item.method_name) == target_method
     }
-    candidates = (
-        [item for item in file_classes if item.begin_line <= line <= item.end_line]
-        if line is not None
-        else []
-    )
+    pinned_class = str(target_class_name or "").strip().lower()
+    candidates = []
+    if pinned_class:
+        candidates = [
+            item
+            for item in file_classes
+            if item.class_name.lower() == pinned_class
+            or item.qualified_name.lower() == pinned_class
+            or item.qualified_name.lower().endswith(f".{pinned_class}")
+        ]
+        if not candidates:
+            return {
+                "ok": False,
+                "error": "pinned_target_class_not_found",
+                "file": target_rel,
+                "method": target_method,
+                "target_class_name": target_class_name,
+                "reported_parent": parent_name,
+            }
+    if not candidates:
+        candidates = (
+            [item for item in file_classes if item.begin_line <= line <= item.end_line]
+            if line is not None
+            else []
+        )
     if not candidates:
         candidates = [item for item in file_classes if item.qualified_name in method_owners]
     if not candidates:
@@ -494,16 +517,27 @@ def analyze_refused_bequest_target(
         or item.qualified_name.lower() == parent_name.lower()
     ]
     parent_record = parent_candidates[0] if parent_candidates else None
-    child_declares_target = target_method in {
-        _normalize_method(name) for name in target_class.declared_method_names
-    }
-    parent_declares_target = bool(
-        parent_record
-        and target_method
-        in {_normalize_method(name) for name in parent_record.declared_method_names}
-    )
-    capability_split_satisfied = not inherits_parent or bool(
-        parent_record and not child_declares_target and not parent_declares_target
+    def declares_target(record: Optional[ClassRecord]) -> bool:
+        if record is None:
+            return False
+        if target_parameter_count is None:
+            return target_method in {
+                _normalize_method(name) for name in record.declared_method_names
+            }
+        return any(
+            _normalize_method(item.method_name) == target_method
+            and len(item.parameter_descriptors) == target_parameter_count
+            for item in record.methods
+        )
+
+    child_declares_target = declares_target(target_class)
+    parent_declares_target = declares_target(parent_record)
+    capability_split_satisfied = bool(
+        not child_declares_target
+        and (
+            not inherits_parent
+            or (parent_record and not parent_declares_target)
+        )
     )
     rejecting_override_removed = bool(
         parent_record
@@ -515,6 +549,8 @@ def analyze_refused_bequest_target(
         "ok": True,
         "file": target_rel,
         "method": target_method,
+        "target_parameter_count": target_parameter_count,
+        "pinned_target_class": target_class_name,
         "target_class": target_class.qualified_name,
         "reported_parent": parent_name,
         "parent_resolved": parent_record is not None,

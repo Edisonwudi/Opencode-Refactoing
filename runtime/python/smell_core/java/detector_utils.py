@@ -10,4 +10,6 @@ from ..detector_utils import (  # noqa: F401
     parse_expected_state_field,
     parse_parent_from_evidence,
     parse_structural_expectation,
+    parse_target_class,
+    parse_target_parameter_count,
 )

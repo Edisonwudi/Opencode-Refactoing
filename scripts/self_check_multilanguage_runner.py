@@ -6,7 +6,10 @@ import csv
 import subprocess
 import sys
 import tempfile
+import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -14,6 +17,7 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
 import run_smell_dataset as runner  # noqa: E402
 from smell_core.config import CommandConfig, _rebase_command_config  # noqa: E402
+from smell_core.guards import _sample_test_execution_evidence  # noqa: E402
 
 
 def main() -> int:
@@ -42,6 +46,36 @@ def main() -> int:
             )
 
         sample = runner._load_samples(dataset)[0]
+        assert (
+            runner._effective_verification_mode(
+                sample,
+                argparse.Namespace(verification_mode="auto"),
+            )
+            == "project_full"
+        )
+        strict_oracle = replace(
+            sample,
+            language="java",
+            smell="refused_bequest",
+            evidence="parents=Parent; structural_expectation=capability_split",
+            test_command="mvn test",
+        )
+        assert (
+            runner._effective_verification_mode(
+                strict_oracle,
+                argparse.Namespace(verification_mode="auto"),
+            )
+            == "sample_optimized"
+        )
+        try:
+            runner._effective_verification_mode(
+                strict_oracle,
+                argparse.Namespace(verification_mode="local"),
+            )
+        except ValueError as exc:
+            assert "STRICT_ORACLE_LOCAL_FORBIDDEN" in str(exc)
+        else:
+            raise AssertionError("strict Refused Bequest Oracle must reject local verification")
         prompt = runner._task_prompt(
             sample,
             argparse.Namespace(idea_refactor_cli=""),
@@ -80,6 +114,45 @@ def main() -> int:
         )
         assert direct.returncode == 0, direct.stderr
         assert "python" in direct.stdout
+
+        report_dir = project / "build" / "test-results" / "test"
+        report_dir.mkdir(parents=True)
+        started_ns = time.time_ns()
+        report = report_dir / "TEST-example.PinnedBehaviorTest.xml"
+        report.write_text(
+            '<testsuite name="example.PinnedBehaviorTest" tests="2" failures="0"/>',
+            encoding="utf-8",
+        )
+        execution = _sample_test_execution_evidence(
+            SimpleNamespace(
+                project_root=project,
+                sample_test_location="src/test/java/example/PinnedBehaviorTest.java",
+            ),
+            started_ns,
+        )
+        assert execution["success"] is True
+        assert execution["tests"] == 2
+        missing_execution = _sample_test_execution_evidence(
+            SimpleNamespace(
+                project_root=project,
+                sample_test_location="src/test/java/example/MissingBehaviorTest.java",
+            ),
+            started_ns,
+        )
+        assert missing_execution["success"] is False
+        skipped_report = report_dir / "TEST-example.SkippedBehaviorTest.xml"
+        skipped_report.write_text(
+            '<testsuite name="example.SkippedBehaviorTest" tests="1" skipped="1"/>',
+            encoding="utf-8",
+        )
+        skipped_execution = _sample_test_execution_evidence(
+            SimpleNamespace(
+                project_root=project,
+                sample_test_location="src/test/java/example/SkippedBehaviorTest.java",
+            ),
+            started_ns,
+        )
+        assert skipped_execution["success"] is False
 
     print("Multilanguage runner self-check passed")
     return 0
