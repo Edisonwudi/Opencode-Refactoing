@@ -281,6 +281,27 @@ class Child extends IntermediateParent {
             "guard must report the ancestor that received the rejected capability"
         )
 
+    common_hook_base_guard = _capability_guard(
+        """\
+class CommonHookBase {
+  void target() {}
+}
+class ParentCapability extends CommonHookBase {
+}
+""",
+        """\
+class Child extends CommonHookBase {
+}
+""",
+        target_class="Child",
+        target_line=7,
+    )
+    if not common_hook_base_guard["success"]:
+        raise AssertionError(
+            "guard must accept leaving the reported parent when a pre-existing "
+            "common base supplies the optional hook"
+        )
+
     helper_hidden_guard = _capability_guard(
         parent_contract,
         """\

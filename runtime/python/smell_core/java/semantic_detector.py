@@ -561,10 +561,13 @@ def analyze_refused_bequest_target(
             inherited_rejecting_owners.append(inherited_record.qualified_name)
     capability_split_satisfied = bool(
         not child_declares_target
-        and not inherited_rejecting_owners
         and (
             not inherits_parent
-            or (parent_record and not parent_declares_target)
+            or (
+                parent_record
+                and not parent_declares_target
+                and not inherited_rejecting_owners
+            )
         )
     )
     rejecting_override_removed = bool(
