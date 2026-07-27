@@ -940,10 +940,19 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("unified_budget_round2", calls.length, 2, "calls")
     assertEqual("unified_budget_value2", rt.peek("s1").continuation, 2, "continuation")
 
+    // The plugin may authorize one cap recovery while keeping the public
+    // continuation value at max. A fresh generation must still dispatch in
+    // every OpenCode surface.
+    record(rt, { continuation: 2, max: 2 })
+    rt.handleIdle("s1")
+    await flush()
+    assertEqual("unified_cap_recovery_round", calls.length, 3, "calls")
+    assertEqual("unified_cap_recovery_value", rt.peek("s1").continuation, 2, "continuation")
+
     record(rt, { decision: "stop", continuation: 2, max: 2 })
     assertEqual("unified_budget_stop_dispatch", rt.handleIdle("s1"), false, "dispatch")
     await flush()
-    assertEqual("unified_budget_stop_calls", calls.length, 2, "calls")
+    assertEqual("unified_budget_stop_calls", calls.length, 3, "calls")
   }
 
   // A generation dispatches once; PASS or malformed output revokes pending.
@@ -1033,6 +1042,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     },
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -1065,6 +1075,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     policy: state.policy,
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -1092,6 +1103,74 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const resolvedPayload = JSON.parse(resolvedResult.output)
   assertEqual("resolved_decision_stop", resolvedPayload.loop.decision, "stop", "decision")
   assertEqual("resolved_termination", resolvedPayload.loop.termination_reason, "PASS", "termination")
+
+  const capPolicy = {
+    ...state.policy,
+    loop: {
+      ...state.policy.loop,
+      no_progress_limit: 3,
+      allowed_failure_groups: ["smell", "compile", "test"],
+    },
+  }
+  const capState = {
+    policy: capPolicy,
+    startedAt: Date.now(),
+    continuationCount: 2,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const progressingAtCap = {
+    ...failure,
+    checkpoint: { delta: { metric_progress: true } },
+  }
+  const capRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(capRecovery, capState)
+  const capRecoveryPayload = JSON.parse(capRecovery.output)
+  assertEqual("cap_progress_recovers_once", capRecoveryPayload.loop.decision, "continue", "decision")
+  assertEqual("cap_recovery_count_bounded", capRecoveryPayload.loop.continuation, 2, "continuation")
+  assertEqual("cap_recovery_marked", capRecoveryPayload.loop.cap_recovery_used, true, "cap_recovery_used")
+  const capRecoveryAgain = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(capRecoveryAgain, capState)
+  const capRecoveryAgainPayload = JSON.parse(capRecoveryAgain.output)
+  assertEqual("cap_recovery_only_once", capRecoveryAgainPayload.loop.decision, "stop", "decision")
+  assertEqual("cap_recovery_then_max", capRecoveryAgainPayload.loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
+
+  const compileCapState = {
+    ...capState,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const compileAtCap = {
+    success: false,
+    status: "BUILD_FAILED",
+    failure_pack: {
+      failure_category: "BUILD_FAILED",
+      failure_group: "compile",
+      retryable: true,
+      verify_status: "BUILD_FAILED",
+      highlights: ["compile repair remains"],
+    },
+    snapshot: { diff_stat: { stdout: " Foo.java | 2 +-" } },
+  }
+  const compileRecovery = { output: JSON.stringify(compileAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(compileRecovery, compileCapState)
+  assertEqual("compile_diff_recovers_at_cap", JSON.parse(compileRecovery.output).loop.decision, "continue", "decision")
+
+  const noProgressCapState = {
+    ...capState,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const noProgressAtCap = {
+    ...failure,
+    checkpoint: { delta: { metric_progress: false } },
+  }
+  const noCapRecovery = { output: JSON.stringify(noProgressAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(noCapRecovery, noProgressCapState)
+  assertEqual("cap_without_progress_stops", JSON.parse(noCapRecovery.output).loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
   return { passed: true }
 }
 

@@ -187,8 +187,13 @@ check(
     "continue",
 )
 check(
-    "continue_cap_shared",
+    "plugin_cap_recovery_transport",
     R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "continue",
+)
+check(
+    "transport_hard_cap",
+    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=3, max_continuations=2),
     "stop",
 )
 pass_trace = R._verification_trace(verify_event({"status": "PASS", "loop": {"decision": "stop"}}))
@@ -225,17 +230,9 @@ cap_payload = {
     "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
 }
 cap_trace = R._verification_trace(verify_event(cap_payload))
-check("cap_termination_reason", cap_trace["last_termination_reason"], "MAX_CONTINUATIONS_REACHED")
-check("cap_retryable", cap_trace["last_failure_retryable"], True)
-check("cap_metric_progress", cap_trace["last_metric_progress"], True)
 check(
-    "cap_progress_resumes_same_session",
+    "runner_does_not_reinterpret_plugin_stop",
     R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
-    "continue_after_internal_cap",
-)
-check(
-    "cap_progress_obeys_outer_budget",
-    R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
     "stop",
 )
 compile_cap_payload = {
@@ -246,16 +243,15 @@ compile_cap_payload = {
     "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
 }
 compile_cap_trace = R._verification_trace(verify_event(compile_cap_payload))
-check("compile_cap_has_diff", compile_cap_trace["last_has_production_diff"], True)
 check(
-    "compile_cap_nonempty_diff_resumes",
+    "runner_does_not_reinterpret_compile_stop",
     R._runner_closure_action(
         compile_cap_trace,
         reminder_used=False,
         continuations_dispatched=0,
         max_continuations=2,
     ),
-    "continue_after_internal_cap",
+    "stop",
 )
 compile_cap_no_diff = {
     **compile_cap_payload,
@@ -285,11 +281,6 @@ for name, mutation in (
     )
 check_true("verify_prompt_marker", "verify-required" in R._runner_continuation_prompt("verify_required", 0, 2, "repair"))
 check_true("continue_prompt_marker", "continue 1/2" in R._runner_continuation_prompt("continue", 1, 2, "repair"))
-check_true(
-    "cap_prompt_explains_budget_boundary",
-    "internal continuation budget was exhausted"
-    in R._runner_continuation_prompt("continue_after_internal_cap", 1, 2, "repair"),
-)
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")

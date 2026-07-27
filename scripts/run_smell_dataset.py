@@ -892,7 +892,6 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_status = ""
-    last_termination_reason = ""
     for raw in (events_text or "").splitlines():
         try:
             event = json.loads(raw)
@@ -912,7 +911,6 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             meta_loop = metadata.get("loop")
             if isinstance(meta_loop, dict):
                 last_decision = str(meta_loop.get("decision") or "")
-                last_termination_reason = str(meta_loop.get("termination_reason") or "")
             auto = metadata.get("auto_continuation")
             if isinstance(auto, dict):
                 last_status = str(auto.get("status") or "")
@@ -928,28 +926,12 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
-    if not last_termination_reason and isinstance(loop, dict):
-        last_termination_reason = str(loop.get("termination_reason") or "")
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
-    failure_pack = last_payload.get("failure_pack") if isinstance(last_payload, dict) else None
-    checkpoint = last_payload.get("checkpoint") if isinstance(last_payload, dict) else None
-    delta = checkpoint.get("delta") if isinstance(checkpoint, dict) else None
-    snapshot = last_payload.get("snapshot") if isinstance(last_payload, dict) else None
-    diff_stat = snapshot.get("diff_stat") if isinstance(snapshot, dict) else None
-    diff_stat_stdout = diff_stat.get("stdout") if isinstance(diff_stat, dict) else ""
-    last_has_production_diff = bool(
-        (isinstance(delta, dict) and delta.get("has_production_diff") is True)
-        or (isinstance(diff_stat_stdout, str) and diff_stat_stdout.strip())
-    )
     return {
         "smell_verify_calls": calls,
         "last_loop_decision": last_decision,
-        "last_termination_reason": last_termination_reason,
         "last_status": last_status,
-        "last_failure_retryable": failure_pack.get("retryable") if isinstance(failure_pack, dict) else None,
-        "last_metric_progress": delta.get("metric_progress") if isinstance(delta, dict) else None,
-        "last_has_production_diff": last_has_production_diff,
         "last_output_parsed": last_payload is not None,
     }
 
@@ -964,36 +946,14 @@ def _runner_closure_action(
     """Return the next synchronous runner action for a completed OpenCode turn."""
     if int(trace.get("smell_verify_calls") or 0) == 0:
         return "stop" if reminder_used else "verify_required"
+    # The plugin owns all semantic continuation policy across UI and batch.
+    # This is only a transport safety bound: the configured continuations plus
+    # the plugin's single, explicitly authorized cap recovery.
     if (
         trace.get("last_loop_decision") == "continue"
-        and continuations_dispatched < max_continuations
+        and continuations_dispatched < max_continuations + 1
     ):
         return "continue"
-    # The plugin's in-turn continuation budget and the runner's cross-process
-    # budget protect different boundaries. If the plugin stopped only because
-    # its internal budget was exhausted while the latest retryable checkpoint
-    # still made measurable progress, resume the same session. The runner's
-    # existing max_continuations remains the outer hard cap.
-    retryable_progress = (
-        trace.get("last_metric_progress") is True
-        or (
-            trace.get("last_status") in {
-                "BUILD_FAILED",
-                "BUILD_COMPILE_ERROR",
-                "TEST_FAILED",
-                "SAMPLE_TEST_FAILED",
-            }
-            and trace.get("last_has_production_diff") is True
-        )
-    )
-    if (
-        trace.get("last_loop_decision") == "stop"
-        and trace.get("last_termination_reason") == "MAX_CONTINUATIONS_REACHED"
-        and trace.get("last_failure_retryable") is True
-        and retryable_progress
-        and continuations_dispatched < max_continuations
-    ):
-        return "continue_after_internal_cap"
     return "stop"
 
 
@@ -1007,17 +967,10 @@ def _runner_continuation_prompt(action: str, continuation: int, max_continuation
                 "Treat its loop.decision as authoritative and do not modify or weaken tests.",
             ]
         )
-    reason = (
-        "The plugin stopped only because its internal continuation budget was exhausted, "
-        "but the latest retryable checkpoint still made measurable progress or reduced the "
-        "task to a compile/test repair with a non-empty production diff."
-        if action == "continue_after_internal_cap"
-        else "The previous smell_verify result requested another corrective iteration."
-    )
     return "\n".join(
         [
             f"[runner-verification-closure continue {continuation}/{max_continuations}]",
-            reason,
+            "The previous smell_verify result requested another corrective iteration.",
             instruction,
             "Continue the same task in this session, then call smell_verify again.",
             "Use the latest failure pack and remaining-occurrence evidence as the repair scope.",

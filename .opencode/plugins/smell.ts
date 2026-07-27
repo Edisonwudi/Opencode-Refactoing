@@ -35,6 +35,7 @@ type CommandLoopState = {
   policy: CommandPolicy
   startedAt: number
   continuationCount: number
+  capRecoveryUsed: boolean
   noProgressCount: number
   lastFailureFingerprint: string
 }
@@ -1272,9 +1273,33 @@ function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
     policy,
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
+}
+
+function hasActionableProgressAtCap(payload: Record<string, unknown>, failureGroup: string): boolean {
+  const checkpoint = payload.checkpoint && typeof payload.checkpoint === "object" && !Array.isArray(payload.checkpoint)
+    ? payload.checkpoint as Record<string, unknown>
+    : undefined
+  const delta = checkpoint?.delta && typeof checkpoint.delta === "object" && !Array.isArray(checkpoint.delta)
+    ? checkpoint.delta as Record<string, unknown>
+    : undefined
+  if (delta?.metric_progress === true) {
+    return true
+  }
+  if (failureGroup !== "compile" && failureGroup !== "test") {
+    return false
+  }
+  const snapshot = payload.snapshot && typeof payload.snapshot === "object" && !Array.isArray(payload.snapshot)
+    ? payload.snapshot as Record<string, unknown>
+    : undefined
+  const diffStat = snapshot?.diff_stat && typeof snapshot.diff_stat === "object" && !Array.isArray(snapshot.diff_stat)
+    ? snapshot.diff_stat as Record<string, unknown>
+    : undefined
+  return delta?.has_production_diff === true
+    || (typeof diffStat?.stdout === "string" && diffStat.stdout.trim().length > 0)
 }
 
 function failureFingerprint(payload: Record<string, unknown>): string {
@@ -1362,7 +1387,22 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
       terminationReason = improvedOnly ? "PASS" : "NO_PROGRESS"
     } else if (state.continuationCount >= state.policy.loop.max_continuations) {
-      terminationReason = improvedOnly ? "PASS" : "MAX_CONTINUATIONS_REACHED"
+      if (
+        !improvedOnly
+        && retryable
+        && !state.capRecoveryUsed
+        && hasActionableProgressAtCap(payload, group)
+      ) {
+        // One final, bounded repair is part of the shared command policy so
+        // TUI/Web/serve/attach and batch runs receive identical behavior.
+        // Keep the public continuation count at the configured maximum; the
+        // separate flag prevents a second recovery.
+        state.capRecoveryUsed = true
+        decision = "continue"
+        terminationReason = ""
+      } else {
+        terminationReason = improvedOnly ? "PASS" : "MAX_CONTINUATIONS_REACHED"
+      }
     } else {
       state.continuationCount += 1
       decision = "continue"
@@ -1375,6 +1415,7 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     termination_reason: terminationReason,
     continuation: state.continuationCount,
     max_continuations: state.policy.loop.max_continuations,
+    cap_recovery_used: state.capRecoveryUsed,
     remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
     no_progress_count: state.noProgressCount,
     no_progress_limit: state.policy.loop.no_progress_limit,
