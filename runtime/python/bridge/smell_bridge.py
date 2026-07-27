@@ -463,7 +463,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         }
         artifact_dir = _verify_artifact_dir(args, resolved.project_root)
         artifacts = _write_verify_artifacts(artifact_dir, full_payload)
-        failure_pack = _build_failure_pack(full_payload, artifacts)
+        failure_pack = _build_failure_pack(
+            full_payload,
+            artifacts,
+            smell=resolved.smell,
+            evidence=evidence,
+        )
         full_payload["failure_pack"] = failure_pack
         artifacts["verify_full"] = _write_json_artifact(artifact_dir / "verify.full.json", full_payload)
         return {
@@ -564,7 +569,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     artifacts = _write_verify_artifacts(artifact_dir, full_payload)
     failure_pack = None
     if not success:
-        failure_pack = _build_failure_pack(full_payload, artifacts)
+        failure_pack = _build_failure_pack(
+            full_payload,
+            artifacts,
+            smell=resolved.smell,
+            evidence=evidence,
+        )
         full_payload["failure_pack"] = failure_pack
         artifacts["verify_full"] = _write_json_artifact(artifact_dir / "verify.full.json", full_payload)
     payload = {
@@ -966,7 +976,13 @@ def _capability_split_failure(payload: Optional[dict[str, Any]]) -> Optional[dic
     return None
 
 
-def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tuple[str, list[str]]:
+def _classify_failure_pack(
+    payload: Optional[dict[str, Any]],
+    text: str,
+    *,
+    smell: str = "",
+    evidence: str = "",
+) -> tuple[str, list[str]]:
     if payload is None:
         return "UNKNOWN_VERIFY_FAILURE", ["No verify artifact or inline verify payload was available."]
     status = str(payload.get("status") or "").strip()
@@ -984,7 +1000,11 @@ def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tupl
         ]
     smell_guard = payload.get("smell_guard") or {}
     if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
-        if _capability_split_failure(payload):
+        capability_split_required = bool(
+            smell == "refused_bequest"
+            and parse_structural_expectation(evidence) == "capability_split"
+        )
+        if _capability_split_failure(payload) or capability_split_required:
             return "STRUCTURAL_ROUTE_MISMATCH", [
                 "The required capability split is still incomplete. Do not implement or delegate the reported method as the final repair.",
                 "Split the parent capability, migrate real implementers and production callers to narrow types, and remove the unsupported operation from the refusing type's inherited contract.",
@@ -1067,10 +1087,21 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
     ]
 
 
-def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[str, str]) -> dict[str, Any]:
+def _build_failure_pack(
+    payload: Optional[dict[str, Any]],
+    artifact_paths: dict[str, str],
+    *,
+    smell: str = "",
+    evidence: str = "",
+) -> dict[str, Any]:
     paths = _artifact_paths_from_verify_payload(payload, artifact_paths)
     bundle = _failure_text_bundle(payload, paths)
-    category, recommendations = _classify_failure_pack(payload, bundle)
+    category, recommendations = _classify_failure_pack(
+        payload,
+        bundle,
+        smell=smell,
+        evidence=evidence,
+    )
     failure_group = REPAIRABLE_CATEGORY_GROUPS.get(category, "")
     patterns = [
         "DependencyResolutionException",

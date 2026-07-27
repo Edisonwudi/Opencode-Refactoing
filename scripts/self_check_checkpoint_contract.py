@@ -255,6 +255,35 @@ def main() -> int:
     ), structural_pack
     assert "implement or delegate" in structural_pack["recommendations"][0], structural_pack
 
+    checkpoint_only_structural_pack = _build_failure_pack({
+        "status": "SMELL_GUARD_FAILED",
+        "smell_guard": {
+            "success": False,
+            "results": [{
+                "type": "refused_bequest",
+                "success": False,
+                "message": (
+                    "refused_bequest checkpoint contract: production source changed, "
+                    "but no checkpoint objective decreased."
+                ),
+                "details": {
+                    "detector": "checkpoint_contract",
+                    "reason": "NO_STRUCTURAL_PROGRESS",
+                },
+            }],
+        },
+    }, {}, smell="refused_bequest", evidence=(
+        "parents=IPacket; structural_expectation=capability_split; "
+        "refactor_path=split_readable_packets_from_writable_packets"
+    ))
+    assert (
+        checkpoint_only_structural_pack["failure_category"]
+        == "STRUCTURAL_ROUTE_MISMATCH"
+    ), checkpoint_only_structural_pack
+    assert checkpoint_only_structural_pack["failure_group"] == "smell", (
+        checkpoint_only_structural_pack
+    )
+
     print(f"checkpoint-contract-self-check PASS smells={len(EXPECTED)} unchanged_pass=0 strict_decrease=PASS feedback=PASS")
     return 0
 
