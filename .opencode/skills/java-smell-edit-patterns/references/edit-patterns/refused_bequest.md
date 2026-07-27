@@ -15,6 +15,27 @@ contracts, delegating to real owners, splitting interfaces, or pushing behavior 
 - Use the evidence `refactor_path` as the primary route and inspect the referenced existing
   helper, overload, state field, sibling protocol, or capability boundary before editing.
 
+## Hierarchy migration protocol
+
+Apply this protocol whenever evidence supplies `structural_expectation`, especially
+`capability_split`:
+
+1. Before editing, inspect the reported class, its parent and interfaces, sibling
+   implementations, and every production call site of the target contract.
+2. Treat `refactor_path` as one cohesive hierarchy migration even when the task names one
+   target method. A disappearing target declaration is not sufficient by itself.
+3. Remove the unwanted capability from classes that refuse it while preserving the
+   capability for real implementers.
+4. Never relocate an empty, throwing, null-returning, constant, placeholder, or
+   compatibility no-op implementation into an ancestor, interface default, or sibling.
+5. Change declarations, implementations, production types, and callers consistently.
+   Compile after the structural edit and before the final `smell_verify`.
+6. When evidence supplies `refactor_group_id`, use it only to identify the shared design
+   boundary and related production code. Do not edit or weaken tests.
+7. Inspect the complete production diff before acceptance. Reject API widening, scattered
+   casts, or compatibility shims unless existing callers make them necessary and behavior
+   verification covers them.
+
 ## Common avoid
 
 - Hiding refused behavior behind a rename.

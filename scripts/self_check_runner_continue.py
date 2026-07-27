@@ -393,18 +393,19 @@ refused = Sample(
     raw={},
 )
 refused_prompt = R._task_prompt(refused, args, "project_full", "java-refactor-agent")
-check_true(
-    "refused_prompt_maps_callers",
-    "every production call site of the target contract" in refused_prompt,
-)
-check_true(
-    "refused_prompt_rejects_relocation",
-    "Do not relocate an empty, throwing, null-returning" in refused_prompt,
-)
-check_true(
-    "refused_prompt_names_group",
-    "Refactor group packet_capabilities identifies the shared design boundary" in refused_prompt,
-)
+check("runner_prompt_has_no_smell_protocol", "Refused Bequest structural protocol:" in refused_prompt, False)
+refused_skill = (
+    ROOT
+    / ".opencode"
+    / "skills"
+    / "java-smell-edit-patterns"
+    / "references"
+    / "edit-patterns"
+    / "refused_bequest.md"
+).read_text(encoding="utf-8")
+check_true("refused_skill_maps_callers", "every production call site of the target contract" in refused_skill)
+check_true("refused_skill_rejects_relocation", "Never relocate an empty, throwing, null-returning" in refused_skill)
+check_true("refused_skill_uses_group_boundary", "`refactor_group_id`" in refused_skill)
 
 print()
 if failures:
