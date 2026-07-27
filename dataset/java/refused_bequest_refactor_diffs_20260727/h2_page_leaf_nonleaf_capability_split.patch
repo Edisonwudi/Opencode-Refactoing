@@ -1,0 +1,703 @@
+diff --git a/h2/src/main/org/h2/mvstore/Cursor.java b/h2/src/main/org/h2/mvstore/Cursor.java
+index f196437..fd96e30 100644
+--- a/h2/src/main/org/h2/mvstore/Cursor.java
++++ b/h2/src/main/org/h2/mvstore/Cursor.java
+@@ -61,7 +61,7 @@ public boolean hasNext() {
+                 } else {
+                     // traverse down to the leaf taking the leftmost path
+                     while (!page.isLeaf()) {
+-                        page = page.getChildPage(index);
++                        page = Page.NonLeafOperations.from(page).getChildPage(index);
+                         index = reverse ? upperBound(page) - 1 : 0;
+                         if (keeper == null) {
+                             cursorPos = new CursorPos<>(page, index, cursorPos);
+@@ -80,7 +80,7 @@ public boolean hasNext() {
+                             return false;
+                         }
+                         current = last = key;
+-                        lastValue = page.getValue(index);
++                        lastValue = Page.LeafOperations.from(page).getValue(index);
+                         lastPage = page;
+                     }
+                 }
+diff --git a/h2/src/main/org/h2/mvstore/CursorPos.java b/h2/src/main/org/h2/mvstore/CursorPos.java
+index 7af2b93..6b188fa 100644
+--- a/h2/src/main/org/h2/mvstore/CursorPos.java
++++ b/h2/src/main/org/h2/mvstore/CursorPos.java
+@@ -87,7 +87,7 @@ static <K,V> CursorPos<K,V> traverseDown(Page<K,V> page, K key, CursorPos<K,V> e
+                 assert cursorPos.page.isLeaf();
+                 return cursorPos;
+             }
+-            page = page.getChildPage(index);
++            page = Page.NonLeafOperations.from(page).getChildPage(index);
+         }
+     }
+ 
+@@ -120,4 +120,3 @@ public String toString() {
+                 '}';
+     }
+ }
+-
+diff --git a/h2/src/main/org/h2/mvstore/MVMap.java b/h2/src/main/org/h2/mvstore/MVMap.java
+index ea01659..bada47a 100644
+--- a/h2/src/main/org/h2/mvstore/MVMap.java
++++ b/h2/src/main/org/h2/mvstore/MVMap.java
+@@ -191,7 +191,7 @@ public final K getKey(long index) {
+             }
+             int i = 0, size = getChildPageCount(p);
+             for (; i < size; i++) {
+-                long c = p.getCounts(i);
++                long c = Page.NonLeafOperations.from(p).getCounts(i);
+                 if (index < c + offset) {
+                     break;
+                 }
+@@ -200,7 +200,7 @@ public final K getKey(long index) {
+             if (i == size) {
+                 return null;
+             }
+-            p = p.getChildPage(i);
++            p = Page.NonLeafOperations.from(p).getChildPage(i);
+         }
+     }
+ 
+@@ -264,9 +264,9 @@ public final long getKeyIndex(K key) {
+                 x = -x;
+             }
+             for (int i = 0; i < x; i++) {
+-                offset += p.getCounts(i);
++                offset += Page.NonLeafOperations.from(p).getCounts(i);
+             }
+-            p = p.getChildPage(x);
++            p = Page.NonLeafOperations.from(p).getChildPage(x);
+         }
+     }
+ 
+@@ -289,7 +289,7 @@ private K getFirstLast(Page<K,V> p, boolean first) {
+             if (p.isLeaf()) {
+                 return p.getKey(first ? 0 : p.getKeyCount() - 1);
+             }
+-            p = p.getChildPage(first ? 0 : getChildPageCount(p) - 1);
++            p = Page.NonLeafOperations.from(p).getChildPage(first ? 0 : getChildPageCount(p) - 1);
+         }
+     }
+ 
+@@ -395,7 +395,7 @@ private K getMinMax(Page<K,V> p, K key, boolean min, boolean excluding) {
+             if (x < 0 || x >= getChildPageCount(p)) {
+                 return null;
+             }
+-            K k = getMinMax(p.getChildPage(x), key, min, excluding);
++            K k = getMinMax(Page.NonLeafOperations.from(p).getChildPage(x), key, min, excluding);
+             if (k != null) {
+                 return k;
+             }
+@@ -1183,15 +1183,15 @@ private void copy(Page<K,V> source, Page<K,V> parent, int index) {
+         if (parent == null) {
+             setInitialRoot(target, MVStore.INITIAL_VERSION);
+         } else {
+-            parent.setChild(index, target);
++            Page.NonLeafOperations.from(parent).setChild(index, target);
+         }
+         if (!source.isLeaf()) {
+             for (int i = 0; i < getChildPageCount(target); i++) {
+-                if (source.getChildPagePos(i) != 0) {
++                if (Page.NonLeafOperations.from(source).getChildPagePos(i) != 0) {
+                     // position 0 means no child
+                     // (for example the last entry of an r-tree node)
+                     // (the MVMap is also used for r-trees for compacting)
+-                    copy(source.getChildPage(i), target, i);
++                    copy(Page.NonLeafOperations.from(source).getChildPage(i), target, i);
+                 }
+             }
+             target.setComplete();
+@@ -1245,9 +1245,9 @@ private RootReference<K,V> flushAppendBuffer(RootReference<K,V> rootReference, b
+                 if (available > 0) {
+                     p = p.copy();
+                     if (keyCount <= available) {
+-                        p.expand(keyCount, keysBuffer, valuesBuffer);
++                        Page.LeafOperations.from(p).expand(keyCount, keysBuffer, valuesBuffer);
+                     } else {
+-                        p.expand(available, keysBuffer, valuesBuffer);
++                        Page.LeafOperations.from(p).expand(available, keysBuffer, valuesBuffer);
+                         keyCount -= available;
+                         if (fullFlush) {
+                             K[] keys = p.createKeyStorage(keyCount);
+@@ -1299,8 +1299,8 @@ private RootReference<K,V> flushAppendBuffer(RootReference<K,V> rootReference, b
+                         index = pos.index;
+                         pos = pos.parent;
+                         p = p.copy();
+-                        p.setChild(index, page);
+-                        p.insertNode(index, key, c);
++                        Page.NonLeafOperations.from(p).setChild(index, page);
++                        Page.NonLeafOperations.from(p).insertNode(index, key, c);
+                         keyCount = p.getKeyCount();
+                         int at = keyCount - (p.isLeaf() ? 1 : 2);
+                         if (keyCount <= keysPerPage &&
+@@ -1344,7 +1344,7 @@ private static <K,V> Page<K,V> replacePage(CursorPos<K,V> path, Page<K,V> replac
+             if (parent.getKeyCount() > 0) {
+                 Page<K,V> child = replacement;
+                 replacement = parent.copy();
+-                replacement.setChild(path.index, child);
++                Page.NonLeafOperations.from(replacement).setChild(path.index, child);
+                 unsavedMemory += replacement.getMemory();
+             }
+             path = path.parent;
+@@ -1725,7 +1725,7 @@ public <K> CursorPos<K,V> decide(CursorPos<K,V> tip, K key, V providedValue) {
+             Page<K,V> p = tip.page;
+             assert p.isLeaf();
+             int index = tip.index;
+-            V result = index < 0 ? null : p.getValue(index);
++            V result = index < 0 ? null : Page.LeafOperations.from(p).getValue(index);
+             Decision decision = decide(result, providedValue, tip);
+             CursorPos<K,V> pos = tip.parent;
+             MVMap<K, V> map = p.map;
+@@ -1751,7 +1751,7 @@ public <K> CursorPos<K,V> decide(CursorPos<K,V> tip, K key, V providedValue) {
+                         if (keyCount <= 1) {
+                             if (keyCount == 1) {
+                                 assert index <= 1;
+-                                p = p.getChildPage(1 - index);
++                                p = Page.NonLeafOperations.from(p).getChildPage(1 - index);
+                             } else {
+                                 // if root happens to be such single-childed
+                                 // (with no keys) internal node, then just
+@@ -1770,7 +1770,7 @@ public <K> CursorPos<K,V> decide(CursorPos<K,V> tip, K key, V providedValue) {
+                     V value = selectValue(result, providedValue);
+                     p = p.copy();
+                     if (index < 0) {
+-                        p.insertLeaf(-index - 1, key, value);
++                        Page.LeafOperations.from(p).insertLeaf(-index - 1, key, value);
+                         int keyCount;
+                         MVStore store = map.store;
+                         while ((keyCount = p.getKeyCount()) > store.getKeysPerPage()
+@@ -1796,11 +1796,11 @@ public <K> CursorPos<K,V> decide(CursorPos<K,V> tip, K key, V providedValue) {
+                             index = pos.index;
+                             pos = pos.parent;
+                             p = p.copy();
+-                            p.setChild(index, split);
+-                            p.insertNode(index, k, c);
++                            Page.NonLeafOperations.from(p).setChild(index, split);
++                            Page.NonLeafOperations.from(p).insertNode(index, k, c);
+                         }
+                     } else {
+-                        p.setValue(index, value);
++                        Page.LeafOperations.from(p).setValue(index, value);
+                     }
+                     return new CursorPos<>(p, unsavedMemory, pos);
+                 }
+@@ -1917,7 +1917,7 @@ public V operate(K key, V value, DecisionMaker<V> decisionMaker) {
+                 }
+                 Page<K,V> p = tip.page;
+                 int index = tip.index;
+-                V result = index < 0 ? null : p.getValue(index);
++                V result = index < 0 ? null : Page.LeafOperations.from(p).getValue(index);
+                 return result;
+             } finally {
+                 if(locked) {
+diff --git a/h2/src/main/org/h2/mvstore/Page.java b/h2/src/main/org/h2/mvstore/Page.java
+index 0c52101..fb75b91 100644
+--- a/h2/src/main/org/h2/mvstore/Page.java
++++ b/h2/src/main/org/h2/mvstore/Page.java
+@@ -36,6 +36,70 @@
+  */
+ public abstract class Page<K,V> implements Cloneable {
+ 
++    /**
++     * Operations supported only by leaf pages.
++     *
++     * @param <K> key type
++     * @param <V> value type
++     */
++    public interface LeafOperations<K,V> {
++
++        /**
++         * Narrow a page after its leaf kind has been established.
++         *
++         * @param page the known leaf page
++         * @return its leaf-only operations
++         */
++        @SuppressWarnings("unchecked")
++        static <K,V> LeafOperations<K,V> from(Page<K,V> page) {
++            if (!page.isLeaf()) {
++                throw new IllegalArgumentException("Not a leaf page");
++            }
++            return (LeafOperations<K,V>) page;
++        }
++
++        V getValue(int index);
++
++        void expand(int extraKeyCount, K[] extraKeys, V[] extraValues);
++
++        V setValue(int index, V value);
++
++        void insertLeaf(int index, K key, V value);
++    }
++
++    /**
++     * Operations supported only by non-leaf pages.
++     *
++     * @param <K> key type
++     * @param <V> value type
++     */
++    public interface NonLeafOperations<K,V> {
++
++        /**
++         * Narrow a page after its non-leaf kind has been established.
++         *
++         * @param page the known non-leaf page
++         * @return its non-leaf-only operations
++         */
++        @SuppressWarnings("unchecked")
++        static <K,V> NonLeafOperations<K,V> from(Page<K,V> page) {
++            if (page.isLeaf()) {
++                throw new IllegalArgumentException("Not a non-leaf page");
++            }
++            return (NonLeafOperations<K,V>) page;
++        }
++
++        Page<K,V> getChildPage(int index);
++
++        long getChildPagePos(int index);
++
++        long getCounts(int index);
++
++        void setChild(int index, Page<K,V> child);
++
++        void insertNode(int index, K key, Page<K,V> childPage);
++    }
++
+     /**
+      * Map this page belongs to
+      */
+@@ -236,11 +300,11 @@ static <K,V> V get(Page<K,V> p, K key) {
+         while (true) {
+             int index = p.binarySearch(key);
+             if (p.isLeaf()) {
+-                return index >= 0 ? p.getValue(index) : null;
++                return index >= 0 ? Page.LeafOperations.from(p).getValue(index) : null;
+             } else if (index++ < 0) {
+                 index = -index;
+             }
+-            p = p.getChildPage(index);
++            p = Page.NonLeafOperations.from(p).getChildPage(index);
+         }
+     }
+ 
+@@ -294,30 +358,6 @@ public K getKey(int index) {
+         return keys[index];
+     }
+ 
+-    /**
+-     * Get the child page at the given index.
+-     *
+-     * @param index the index
+-     * @return the child page
+-     */
+-    public abstract Page<K,V> getChildPage(int index);
+-
+-    /**
+-     * Get the position of the child.
+-     *
+-     * @param index the index
+-     * @return the position
+-     */
+-    public abstract long getChildPagePos(int index);
+-
+-    /**
+-     * Get the value at the given index.
+-     *
+-     * @param index the index
+-     * @return the value
+-     */
+-    public abstract V getValue(int index);
+-
+     /**
+      * Get the number of keys in this page.
+      *
+@@ -440,16 +480,6 @@ final K[] splitKeys(int aCount, int bCount) {
+         return bKeys;
+     }
+ 
+-    /**
+-     * Append additional key/value mappings to this Page.
+-     * New mappings suppose to be in correct key order.
+-     *
+-     * @param extraKeyCount number of mappings to be added
+-     * @param extraKeys to be added
+-     * @param extraValues to be added
+-     */
+-    abstract void expand(int extraKeyCount, K[] extraKeys, V[] extraValues);
+-
+     /**
+      * Expand the keys array.
+      *
+@@ -481,22 +511,6 @@ public Page<K,V> remove(long positionsToRemove) {
+      */
+     public abstract long getTotalCount();
+ 
+-    /**
+-     * Get the number of key-value pairs for a given child.
+-     *
+-     * @param index the child index
+-     * @return the descendant count
+-     */
+-    abstract long getCounts(int index);
+-
+-    /**
+-     * Replace the child page.
+-     *
+-     * @param index the index
+-     * @param c the new child page
+-     */
+-    public abstract void setChild(int index, Page<K,V> c);
+-
+     /**
+      * Replace the key at an index in this page.
+      *
+@@ -518,33 +532,6 @@ public final void setKey(int index, K key) {
+         keys[index] = key;
+     }
+ 
+-    /**
+-     * Replace the value at an index in this page.
+-     *
+-     * @param index the index
+-     * @param value the new value
+-     * @return the old value
+-     */
+-    public abstract V setValue(int index, V value);
+-
+-    /**
+-     * Insert a key-value pair into this leaf.
+-     *
+-     * @param index the index
+-     * @param key the key
+-     * @param value the value
+-     */
+-    public abstract void insertLeaf(int index, K key, V value);
+-
+-    /**
+-     * Insert a child page into this node.
+-     *
+-     * @param index the index
+-     * @param key the key
+-     * @param childPage the child page
+-     */
+-    public abstract void insertNode(int index, K key, Page<K,V> childPage);
+-
+     /**
+      * Insert a key into the key array
+      *
+@@ -855,9 +842,9 @@ private long getDiskSpaceUsedAccurate() {
+         long r = diskSpaceUsed;
+         if (!isLeaf()) {
+             for (int i = 0, l = getRawChildPageCount(); i < l; i++) {
+-                long pos = getChildPagePos(i);
++                long pos = Page.NonLeafOperations.from(this).getChildPagePos(i);
+                 if (pos != 0) {
+-                    r += getChildPage(i).getDiskSpaceUsedAccurate();
++                    r += Page.NonLeafOperations.from(this).getChildPage(i).getDiskSpaceUsedAccurate();
+                 }
+             }
+         }
+@@ -871,26 +858,29 @@ private long getDiskSpaceUsedApproximation(int maxLevel, boolean f) {
+             if (--maxLevel == 0 && l > 4) {
+                 if (f) {
+                     for (int i = 0; i < l; i++) {
+-                        long pos = getChildPagePos(i);
++                        long pos = Page.NonLeafOperations.from(this).getChildPagePos(i);
+                         if (pos != 0) {
+-                            r += getChildPage(i).getDiskSpaceUsedApproximation(maxLevel, f) * l;
++                            r += Page.NonLeafOperations.from(this).getChildPage(i)
++                                    .getDiskSpaceUsedApproximation(maxLevel, f) * l;
+                             break;
+                         }
+                     }
+                 } else {
+                     for (int i = l; --i >= 0;) {
+-                        long pos = getChildPagePos(i);
++                        long pos = Page.NonLeafOperations.from(this).getChildPagePos(i);
+                         if (pos != 0) {
+-                            r += getChildPage(i).getDiskSpaceUsedApproximation(maxLevel, f) * l;
++                            r += Page.NonLeafOperations.from(this).getChildPage(i)
++                                    .getDiskSpaceUsedApproximation(maxLevel, f) * l;
+                             break;
+                         }
+                     }
+                 }
+             } else {
+                 for (int i = 0; i < l; i++) {
+-                    long pos = getChildPagePos(i);
++                    long pos = Page.NonLeafOperations.from(this).getChildPagePos(i);
+                     if (pos != 0) {
+-                        r += getChildPage(i).getDiskSpaceUsedApproximation(maxLevel, f);
++                        r += Page.NonLeafOperations.from(this).getChildPage(i)
++                                .getDiskSpaceUsedApproximation(maxLevel, f);
+                         f = !f;
+                     }
+                 }
+@@ -1131,7 +1121,7 @@ public String toString() {
+     }
+ 
+ 
+-    private static class NonLeaf<K,V> extends Page<K,V> {
++    private static class NonLeaf<K,V> extends Page<K,V> implements NonLeafOperations<K,V> {
+         /**
+          * The child page references.
+          */
+@@ -1187,11 +1177,6 @@ public long getChildPagePos(int index) {
+             return children[index].getPos();
+         }
+ 
+-        @Override
+-        public V getValue(int index) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         int calculateTraversalIndex(K key) {
+            int index = binarySearch(key);
+@@ -1228,11 +1213,6 @@ public Page<K,V> split(int at) {
+             return newPage;
+         }
+ 
+-        @Override
+-        public void expand(int keyCount, Object[] extraKeys, Object[] extraValues) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         public long getTotalCount() {
+             assert !isComplete() || totalCount == calculateTotalCount() :
+@@ -1254,7 +1234,7 @@ void recalculateTotalCount() {
+         }
+ 
+         @Override
+-        long getCounts(int index) {
++        public long getCounts(int index) {
+             return children[index].count;
+         }
+ 
+@@ -1269,16 +1249,6 @@ public void setChild(int index, Page<K,V> c) {
+             }
+         }
+ 
+-        @Override
+-        public V setValue(int index, V value) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        @Override
+-        public void insertLeaf(int index, K key, V value) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         public void insertNode(int index, K key, Page<K,V> childPage) {
+             int childCount = getRawChildPageCount();
+@@ -1491,7 +1461,7 @@ public void dump(StringBuilder buff) {
+ 
+ 
+ 
+-    private static class Leaf<K,V> extends Page<K,V> {
++    private static class Leaf<K,V> extends Page<K,V> implements LeafOperations<K,V> {
+         /**
+          * The storage for values.
+          */
+@@ -1521,16 +1491,6 @@ public Page<K,V> copy(MVMap<K, V> map, boolean eraseChildrenRefs) {
+             return new Leaf<>(map, this);
+         }
+ 
+-        @Override
+-        public Page<K,V> getChildPage(int index) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        @Override
+-        public long getChildPagePos(int index) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         public V getValue(int index) {
+             return values == null ? null : values[index];
+@@ -1601,16 +1561,6 @@ public long getTotalCount() {
+             return getKeyCount();
+         }
+ 
+-        @Override
+-        long getCounts(int index) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        @Override
+-        public void setChild(int index, Page<K,V> c) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         public V setValue(int index, V value) {
+             values = values.clone();
+@@ -1646,11 +1596,6 @@ public void insertLeaf(int index, K key, V value) {
+             }
+         }
+ 
+-        @Override
+-        public void insertNode(int index, K key, Page<K,V> childPage) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+         @Override
+         public void remove(int index) {
+             int keyCount = getKeyCount();
+diff --git a/h2/src/main/org/h2/mvstore/rtree/MVRTreeMap.java b/h2/src/main/org/h2/mvstore/rtree/MVRTreeMap.java
+index 3f43201..c42b31d 100644
+--- a/h2/src/main/org/h2/mvstore/rtree/MVRTreeMap.java
++++ b/h2/src/main/org/h2/mvstore/rtree/MVRTreeMap.java
+@@ -86,7 +86,7 @@ public V get(Page<Spatial,V> p, Spatial key) {
+         if (!p.isLeaf()) {
+             for (int i = 0; i < keyCount; i++) {
+                 if (contains(p, i, key)) {
+-                    V o = get(p.getChildPage(i), key);
++                    V o = get(Page.NonLeafOperations.from(p).getChildPage(i), key);
+                     if (o != null) {
+                         return o;
+                     }
+@@ -95,7 +95,7 @@ public V get(Page<Spatial,V> p, Spatial key) {
+         } else {
+             for (int i = 0; i < keyCount; i++) {
+                 if (keyType.equals(p.getKey(i), key)) {
+-                    return p.getValue(i);
++                    return Page.LeafOperations.from(p).getValue(i);
+                 }
+             }
+         }
+@@ -190,7 +190,7 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+                     index = i;
+                 }
+             }
+-            result = index < 0 ? null : p.getValue(index);
++            result = index < 0 ? null : Page.LeafOperations.from(p).getValue(index);
+             Decision decision = decisionMaker.decide(result, value);
+             switch (decision) {
+                 case REPEAT:
+@@ -204,10 +204,10 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+                 case PUT:
+                     value = decisionMaker.selectValue(result, value);
+                     if(index < 0) {
+-                        p.insertLeaf(p.getKeyCount(), key, value);
++                        Page.LeafOperations.from(p).insertLeaf(p.getKeyCount(), key, value);
+                     } else {
+                         p.setKey(index, key);
+-                        p.setValue(index, value);
++                        Page.LeafOperations.from(p).setValue(index, value);
+                     }
+                     break;
+             }
+@@ -218,7 +218,7 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+         int index = -1;
+         for (int i = 0; i < p.getKeyCount(); i++) {
+             if (contains(p, i, key)) {
+-                Page<Spatial,V> c = p.getChildPage(i);
++                Page<Spatial,V> c = Page.NonLeafOperations.from(p).getChildPage(i);
+                 if(get(c, key) != null) {
+                     index = i;
+                     break;
+@@ -240,7 +240,7 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+                 }
+             }
+         }
+-        Page<Spatial,V> c = p.getChildPage(index);
++        Page<Spatial,V> c = Page.NonLeafOperations.from(p).getChildPage(index);
+         if (removedPages != null) {
+             removedPages.add(c);
+         }
+@@ -250,8 +250,8 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+             // split on the way down
+             Page<Spatial,V> split = split(c);
+             p.setKey(index, getBounds(c));
+-            p.setChild(index, c);
+-            p.insertNode(index, getBounds(split), split);
++            Page.NonLeafOperations.from(p).setChild(index, c);
++            Page.NonLeafOperations.from(p).insertNode(index, getBounds(split), split);
+             // now we are not sure where to add
+             result = operate(p, key, value, decisionMaker, removedPages);
+         } else {
+@@ -263,7 +263,7 @@ private V operate(Page<Spatial,V> p, Spatial key, V value, DecisionMaker<? super
+                 p.setKey(index, bounds);
+             }
+             if (c.getTotalCount() > 0) {
+-                p.setChild(index, c);
++                Page.NonLeafOperations.from(p).setChild(index, c);
+             } else {
+                 p.remove(index);
+             }
+@@ -406,11 +406,11 @@ private Page<Spatial,V> newPage(boolean leaf) {
+     private static <V> void move(Page<Spatial,V> source, Page<Spatial,V> target, int sourceIndex) {
+         Spatial k = source.getKey(sourceIndex);
+         if (source.isLeaf()) {
+-            V v = source.getValue(sourceIndex);
+-            target.insertLeaf(0, k, v);
++            V v = Page.LeafOperations.from(source).getValue(sourceIndex);
++            Page.LeafOperations.from(target).insertLeaf(0, k, v);
+         } else {
+-            Page<Spatial,V> c = source.getChildPage(sourceIndex);
+-            target.insertNode(0, k, c);
++            Page<Spatial,V> c = Page.NonLeafOperations.from(source).getChildPage(sourceIndex);
++            Page.NonLeafOperations.from(target).insertNode(0, k, c);
+         }
+         source.remove(sourceIndex);
+     }
+@@ -427,7 +427,7 @@ public void addNodeKeys(ArrayList<Spatial> list, Page<Spatial,V> p) {
+             int keyCount = p.getKeyCount();
+             for (int i = 0; i < keyCount; i++) {
+                 list.add(p.getKey(i));
+-                addNodeKeys(list, p.getChildPage(i));
++                addNodeKeys(list, Page.NonLeafOperations.from(p).getChildPage(i));
+             }
+         }
+     }
+@@ -515,7 +515,7 @@ void fetchNext() {
+                         int index = pos.index++;
+                         Spatial c = p.getKey(index);
+                         if (filter == null || check(false, c, filter)) {
+-                            Page<Spatial,V> child = pos.page.getChildPage(index);
++                            Page<Spatial,V> child = Page.NonLeafOperations.from(pos.page).getChildPage(index);
+                             pos = new CursorPos<>(child, 0, pos);
+                             found = true;
+                             break;
+diff --git a/h2/src/main/org/h2/mvstore/tx/CommitDecisionMaker.java b/h2/src/main/org/h2/mvstore/tx/CommitDecisionMaker.java
+index d580b6a..b01c47d 100644
+--- a/h2/src/main/org/h2/mvstore/tx/CommitDecisionMaker.java
++++ b/h2/src/main/org/h2/mvstore/tx/CommitDecisionMaker.java
+@@ -62,7 +62,7 @@ public <K> CursorPos<K, VersionedValue<V>> decide(CursorPos<K, VersionedValue<V>
+         boolean update = false;
+         long toRemove = 0L;
+         for (int src = 0; src < p.getKeyCount(); src++) {
+-            VersionedValue<V> value = p.getValue(src);
++            VersionedValue<V> value = Page.LeafOperations.from(p).getValue(src);
+             long operationId = value.getOperationId();
+             if (operationId != NO_OPERATION_ID && TransactionStore.getTransactionId(operationId) == transactionId) {
+                 long entryId = value.getEntryId();
+@@ -99,7 +99,7 @@ public <K> CursorPos<K, VersionedValue<V>> decide(CursorPos<K, VersionedValue<V>
+                     if (keyCount <= 1) {
+                         if (keyCount == 1) {
+                             assert index <= 1;
+-                            p = p.getChildPage(1 - index).copy();
++                            p = Page.NonLeafOperations.from(p).getChildPage(1 - index).copy();
+                         } else {
+                             // if root happens to be such single-childed
+                             // (with no keys) internal node, then just
+@@ -120,12 +120,12 @@ public <K> CursorPos<K, VersionedValue<V>> decide(CursorPos<K, VersionedValue<V>
+         }
+         if (update) {
+             for (int i = 0; i < p.getKeyCount(); i++) {
+-                VersionedValue<V> value = p.getValue(i);
++                VersionedValue<V> value = Page.LeafOperations.from(p).getValue(i);
+                 long operationId = value.getOperationId();
+                 if (operationId != NO_OPERATION_ID && TransactionStore.getTransactionId(operationId) == transactionId) {
+                     V currentValue = value.getCurrentValue();
+                     assert currentValue != null;
+-                    p.setValue(i, VersionedValueCommitted.getInstance(currentValue));
++                    Page.LeafOperations.from(p).setValue(i, VersionedValueCommitted.getInstance(currentValue));
+                 }
+             }
+         }
