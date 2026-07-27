@@ -697,6 +697,8 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
     """
     verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
     verify_success = bool(verify_payload.get("success")) if isinstance(verify_payload, dict) else False
+    if opencode_returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE:
+        return "PROVIDER_QUOTA_FAILED"
     if opencode_returncode != 0:
         if opencode_returncode == 124 and verify_returncode == 0 and verify_success and verify_status == "PASS":
             return "PASS_AFTER_OPENCODE_TIMEOUT"
@@ -705,6 +707,22 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
 
 
 OPENCODE_SHUTDOWN_GRACE_SECONDS = 60
+OPENCODE_FATAL_PROVIDER_RETURN_CODE = 86
+
+
+def _fatal_provider_error(log_text: str) -> str:
+    """Classify non-retryable provider quota failures found in OpenCode logs."""
+    text = str(log_text or "")
+    lowered = text.casefold()
+    if "token plan 用量上限" in lowered or "已达到 token plan" in lowered:
+        return "MINIMAX_TOKEN_PLAN_EXHAUSTED"
+    if (
+        "insufficient_quota" in lowered
+        or "billing_hard_limit_reached" in lowered
+        or "credit balance is too low" in lowered
+    ):
+        return "PROVIDER_INSUFFICIENT_QUOTA"
+    return ""
 
 
 def _opencode_timeout_seconds(sample_deadline: int) -> int:
@@ -1192,7 +1210,39 @@ def _run_opencode(
             hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
         )
         timeout_code = 0
+        log_scan_offset = 0
+        log_scan_tail = ""
         while proc.poll() is None:
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as log_reader:
+                    log_reader.seek(log_scan_offset)
+                    log_chunk = log_reader.read()
+                    log_scan_offset = log_reader.tell()
+            except OSError:
+                log_chunk = ""
+            provider_failure = _fatal_provider_error(log_scan_tail + log_chunk)
+            log_scan_tail = (log_scan_tail + log_chunk)[-256:]
+            if provider_failure:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=10)
+                timeout_code = OPENCODE_FATAL_PROVIDER_RETURN_CODE
+                provider_failure_path = _attempt_artifact_path(
+                    sample_dir, "provider.failure.json", attempt_suffix
+                )
+                provider_failure_path.write_text(
+                    json.dumps(
+                        {
+                            "failure_category": "PROVIDER_QUOTA_FAILED",
+                            "provider_failure": provider_failure,
+                            "retryable": False,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                break
             if time.monotonic() > deadline:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=10)

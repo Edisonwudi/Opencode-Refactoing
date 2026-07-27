@@ -60,6 +60,25 @@ check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "S
 check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
 check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS_AFTER_OPENCODE_TIMEOUT")
 check("opencode_timeout_verify_fail", R._compute_status(124, 0, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+check(
+    "provider_quota_overrides_verify",
+    R._compute_status(R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, 0, make_payload("PASS")),
+    "PROVIDER_QUOTA_FAILED",
+)
+
+print("== fatal provider error ==")
+check(
+    "minimax_token_plan",
+    R._fatal_provider_error("AI_APICallError: 已达到 Token Plan 用量上限：请升级套餐。 (2056)"),
+    "MINIMAX_TOKEN_PLAN_EXHAUSTED",
+)
+check(
+    "generic_insufficient_quota",
+    R._fatal_provider_error('{"error":{"code":"insufficient_quota"}}'),
+    "PROVIDER_INSUFFICIENT_QUOTA",
+)
+check("transient_rate_limit_not_fatal", R._fatal_provider_error("HTTP 429 rate limit"), "")
+check("ordinary_model_error_not_fatal", R._fatal_provider_error("tool call failed"), "")
 
 print("== dataset evidence identity ==")
 god_row = {"smell_type": "god_class", "class": "Configuration", "evidence": "nom=143;wmc=162"}
