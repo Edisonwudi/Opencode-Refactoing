@@ -737,6 +737,41 @@ def _task_prompt(
     ]
     if sample.evidence:
         lines.append(f"Smell evidence: {sample.evidence}")
+    if sample.smell == "refused_bequest":
+        structural_expectation = parse_structural_expectation(sample.evidence)
+        refactor_groups = _evidence_values(sample.evidence, "refactor_group_id")
+        refactor_group = refactor_groups[0] if refactor_groups else ""
+        if structural_expectation:
+            lines.extend(
+                [
+                    "Refused Bequest structural protocol:",
+                    (
+                        "- Before editing, inspect the reported class, its parent/interfaces, "
+                        "sibling implementations, and every production call site of the target "
+                        "contract."
+                    ),
+                    (
+                        "- Treat refactor_path as a cohesive hierarchy migration even though this "
+                        "experiment row names one method. Do not stop after merely making the "
+                        "target declaration disappear."
+                    ),
+                    (
+                        "- For capability_split, remove the unwanted capability from classes that "
+                        "refuse it while preserving it for real implementers. Do not relocate an "
+                        "empty, throwing, null-returning, placeholder, or compatibility no-op "
+                        "implementation into an ancestor, interface default, or sibling."
+                    ),
+                    (
+                        "- Change declarations, implementations, types, and callers consistently; "
+                        "compile after the structural edit before running the final smell_verify."
+                    ),
+                ]
+            )
+            if refactor_group:
+                lines.append(
+                    f"- Refactor group {refactor_group} identifies the shared design boundary; "
+                    "use it to inspect related production code, never to edit or weaken tests."
+                )
     lines.extend(
         [
             f"Verification mode: {verification_mode}",

@@ -327,6 +327,33 @@ roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "local
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
 
+refused = Sample(
+    sample_id="2",
+    language="java",
+    smell="refused_bequest",
+    project_name="p",
+    project_root=Path("/tmp/p"),
+    location="Child.java:method=reject|line=10",
+    evidence=(
+        "parents=Parent; structural_expectation=capability_split; "
+        "refactor_path=split_read_from_write; refactor_group_id=packet_capabilities"
+    ),
+    raw={},
+)
+refused_prompt = R._task_prompt(refused, args, "project_full", "java-refactor-agent")
+check_true(
+    "refused_prompt_maps_callers",
+    "every production call site of the target contract" in refused_prompt,
+)
+check_true(
+    "refused_prompt_rejects_relocation",
+    "Do not relocate an empty, throwing, null-returning" in refused_prompt,
+)
+check_true(
+    "refused_prompt_names_group",
+    "Refactor group packet_capabilities identifies the shared design boundary" in refused_prompt,
+)
+
 print()
 if failures:
     print(f"FAILED: {len(failures)} checks")
