@@ -1079,6 +1079,21 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("command_decision_continue", firstPayload.loop.decision, "continue", "decision")
   assertEqual("command_decision_count", firstPayload.loop.continuation, 1, "continuation")
   assertEqual("command_decision_instruction", firstPayload.loop.instruction, "repair narrowly", "instruction")
+  const routeLockedPrompt = hooks.commandPolicyPrompt({
+    ...state.policy,
+    task: [
+      "Project root: /tmp/project",
+      "Smell type: refused_bequest",
+      "Target location: Child.java:method=toBytes|line=10",
+      "Smell evidence: parents=Packet; structural_expectation=capability_split; refactor_path=split_read_from_write",
+    ].join("\n"),
+  })
+  assertCond(
+    "command_prompt_capability_split_route_lock",
+    routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
+      && routeLockedPrompt.includes("A body-only implementation or delegation"),
+    "capability split route lock missing from initial command prompt",
+  )
   const restoredAfterRestart = hooks.restoreCommandLoopState(
     JSON.stringify(hooks.commandLoopStateSnapshot(state)),
   )
@@ -1131,6 +1146,33 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const improvedSecondPayload = JSON.parse(improvedSecond.output)
   assertEqual("improved_no_progress_stop", improvedSecondPayload.loop.termination_reason, "PASS", "termination")
   assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
+
+  const structuralState = {
+    policy: state.policy,
+    startedAt: Date.now(),
+    continuationCount: 0,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const structuralImproved = {
+    ...improved,
+    failure_pack: {
+      failure_category: "STRUCTURAL_ROUTE_MISMATCH",
+      failure_group: "smell",
+      retryable: true,
+    },
+  }
+  const structuralResult = { output: JSON.stringify(structuralImproved), metadata: {} }
+  hooks.applyCommandLoopDecision(structuralResult, structuralState)
+  const structuralPayload = JSON.parse(structuralResult.output)
+  assertEqual("structural_decision_continue", structuralPayload.loop.decision, "continue", "decision")
+  assertCond(
+    "structural_instruction_overrides_metric_hint",
+    structuralPayload.loop.instruction.startsWith("Capability split is mandatory.")
+      && !structuralPayload.loop.instruction.includes("keep going to resolved"),
+    "generic metric continue_hint overrode structural route correction",
+  )
 
   const resolved = { success: true, status: "PASS", resolution: "resolved" }
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }

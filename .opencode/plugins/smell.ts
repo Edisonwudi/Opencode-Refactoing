@@ -1242,6 +1242,21 @@ function commandPolicyPrompt(policy: CommandPolicy): string {
     "When loop.decision is stop, stop and report loop.termination_reason. Never modify or weaken tests.",
   ]
   const smell = String(taskField(policy.task, "Smell type") || "")
+  const evidence = String(taskField(policy.task, "Smell evidence") || "")
+  if (
+    smell === "refused_bequest"
+    && /(?:^|;)\s*structural_expectation\s*=\s*capability_split(?:\s*;|$)/i.test(evidence)
+  ) {
+    lines.push(
+      "",
+      "Mandatory Refused Bequest route lock:",
+      "- required_route: capability_split",
+      "- A body-only implementation or delegation of the reported method cannot pass, even when build and behavior tests pass.",
+      "- Before the first edit, inspect the parent contract, relevant sibling implementers, and production callers.",
+      "- Split the parent into narrow supported capabilities, migrate implementers and callers, and remove the unsupported operation from the refusing type's inherited contract.",
+      "- Do not relocate the rejecting/empty/null behavior to an ancestor, interface default, adapter, or compatibility shim.",
+    )
+  }
   if (checkpointSmells.has(smell)) {
     lines.push(
       "",
@@ -1496,9 +1511,11 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     failure_category: category,
     failure_group: group,
     instruction: decision === "continue"
-      ? (improvedOnly && typeof payload.continue_hint === "string" && payload.continue_hint
-          ? payload.continue_hint
-          : state.policy.loop.instruction)
+      ? (category === "STRUCTURAL_ROUTE_MISMATCH"
+          ? "Capability split is mandatory. Revert or replace any body-only implementation of the reported method; split the parent capability, migrate real implementers and production callers to narrow types, remove the unsupported inherited operation, then call smell_verify again. Do not modify or weaken tests."
+          : improvedOnly && typeof payload.continue_hint === "string" && payload.continue_hint
+            ? payload.continue_hint
+            : state.policy.loop.instruction)
       : "",
   }
   payload.loop = loop
