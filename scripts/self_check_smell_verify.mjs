@@ -1027,6 +1027,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
 function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
   assertCond("command_decision_hook", typeof hooks?.applyCommandLoopDecision === "function", "missing applyCommandLoopDecision")
+  assertCond("command_state_snapshot_hook", typeof hooks?.commandLoopStateSnapshot === "function", "missing commandLoopStateSnapshot")
+  assertCond("command_state_restore_hook", typeof hooks?.restoreCommandLoopState === "function", "missing restoreCommandLoopState")
   const state = {
     policy: {
       task: "task",
@@ -1063,6 +1065,25 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("command_decision_continue", firstPayload.loop.decision, "continue", "decision")
   assertEqual("command_decision_count", firstPayload.loop.continuation, 1, "continuation")
   assertEqual("command_decision_instruction", firstPayload.loop.instruction, "repair narrowly", "instruction")
+  const restoredAfterRestart = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(state)),
+  )
+  assertCond("command_state_restored", Boolean(restoredAfterRestart), "state did not restore")
+  assertEqual("command_state_count_survives_restart", restoredAfterRestart.continuationCount, 1, "continuationCount")
+  assertEqual(
+    "command_state_fingerprint_survives_restart",
+    restoredAfterRestart.lastFailureFingerprint,
+    state.lastFailureFingerprint,
+    "lastFailureFingerprint",
+  )
+  const restartedSecond = { output: JSON.stringify(failure), metadata: {} }
+  hooks.applyCommandLoopDecision(restartedSecond, restoredAfterRestart)
+  assertEqual(
+    "command_state_no_progress_survives_restart",
+    JSON.parse(restartedSecond.output).loop.termination_reason,
+    "NO_PROGRESS",
+    "termination",
+  )
   const second = { output: JSON.stringify(failure), metadata: {} }
   hooks.applyCommandLoopDecision(second, state)
   const secondPayload = JSON.parse(second.output)
@@ -1130,6 +1151,17 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("cap_progress_recovers_once", capRecoveryPayload.loop.decision, "continue", "decision")
   assertEqual("cap_recovery_count_bounded", capRecoveryPayload.loop.continuation, 2, "continuation")
   assertEqual("cap_recovery_marked", capRecoveryPayload.loop.cap_recovery_used, true, "cap_recovery_used")
+  const restoredCapState = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(capState)),
+  )
+  const restartedCapRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(restartedCapRecovery, restoredCapState)
+  assertEqual(
+    "cap_recovery_survives_restart",
+    JSON.parse(restartedCapRecovery.output).loop.termination_reason,
+    "MAX_CONTINUATIONS_REACHED",
+    "termination",
+  )
   const capRecoveryAgain = { output: JSON.stringify(progressingAtCap), metadata: {} }
   hooks.applyCommandLoopDecision(capRecoveryAgain, capState)
   const capRecoveryAgainPayload = JSON.parse(capRecoveryAgain.output)

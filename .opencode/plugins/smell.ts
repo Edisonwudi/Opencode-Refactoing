@@ -40,6 +40,9 @@ type CommandLoopState = {
   lastFailureFingerprint: string
 }
 
+const COMMAND_LOOP_STATE_VERSION = 1
+const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
+
 const pluginFile = fileURLToPath(import.meta.url)
 const pluginRoot = path.resolve(path.dirname(pluginFile), "..", "..")
 const bridgeFile = path.resolve(
@@ -1279,6 +1282,74 @@ function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
   }
 }
 
+function commandLoopStateSnapshot(state: CommandLoopState): Record<string, unknown> {
+  return {
+    schema_version: COMMAND_LOOP_STATE_VERSION,
+    policy: {
+      ...state.policy,
+      // The original task can contain a large group manifest. It is not used
+      // after command initialization, so do not duplicate it in every tool
+      // event or runner handoff.
+      task: "Continue the current smell refactoring task.",
+    },
+    started_at: state.startedAt,
+    continuation_count: state.continuationCount,
+    cap_recovery_used: state.capRecoveryUsed,
+    no_progress_count: state.noProgressCount,
+    last_failure_fingerprint: state.lastFailureFingerprint,
+  }
+}
+
+function restoreCommandLoopState(raw: string | undefined): CommandLoopState | undefined {
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (parsed.schema_version !== COMMAND_LOOP_STATE_VERSION) return undefined
+    const policy = parsed.policy as CommandPolicy | undefined
+    const loop = policy?.loop
+    if (
+      !policy
+      || !["local", "auto", "sample_optimized", "project_full"].includes(policy.verification_mode)
+      || !loop
+      || !["off", "verify-failure"].includes(loop.mode)
+      || !Number.isInteger(loop.max_continuations)
+      || loop.max_continuations < 0
+      || loop.max_continuations > 5
+      || !Number.isInteger(loop.no_progress_limit)
+      || loop.no_progress_limit < 0
+      || !Array.isArray(loop.allowed_failure_groups)
+      || !loop.allowed_failure_groups.every((item) => typeof item === "string")
+      || typeof loop.instruction !== "string"
+      || !Number.isFinite(loop.sample_deadline_seconds)
+      || loop.sample_deadline_seconds <= 0
+    ) return undefined
+    const startedAt = Number(parsed.started_at)
+    const continuationCount = Number(parsed.continuation_count)
+    const noProgressCount = Number(parsed.no_progress_count)
+    if (
+      !Number.isFinite(startedAt)
+      || !Number.isInteger(continuationCount)
+      || continuationCount < 0
+      || continuationCount > loop.max_continuations
+      || !Number.isInteger(noProgressCount)
+      || noProgressCount < 0
+    ) return undefined
+    return {
+      policy,
+      startedAt,
+      continuationCount,
+      capRecoveryUsed: parsed.cap_recovery_used === true,
+      noProgressCount,
+      lastFailureFingerprint:
+        typeof parsed.last_failure_fingerprint === "string"
+          ? parsed.last_failure_fingerprint
+          : "",
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function hasActionableProgressAtCap(payload: Record<string, unknown>, failureGroup: string): boolean {
   const checkpoint = payload.checkpoint && typeof payload.checkpoint === "object" && !Array.isArray(payload.checkpoint)
     ? payload.checkpoint as Record<string, unknown>
@@ -1478,7 +1549,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         let commandState = commandLoopStates.get(sessionID)
         if (!commandState && sessionID) {
           const requestedMode = String(resolved.verificationMode || "local") as CommandPolicy["verification_mode"]
-          commandState = newCommandLoopState(defaultCommandPolicy(requestedMode))
+          commandState = restoreCommandLoopState(process.env[COMMAND_LOOP_STATE_ENV])
+            || newCommandLoopState(defaultCommandPolicy(requestedMode))
           commandLoopStates.set(sessionID, commandState)
         }
         if (commandState) {
@@ -1489,6 +1561,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
         if (commandState) {
           applyCommandLoopDecision(normalized, commandState)
+          normalized.metadata.command_loop_state = toJsonSafe(commandLoopStateSnapshot(commandState))
         }
         // Consume the authoritative loop decision and arm same-session
         // continuation. This path is identical for TUI, run, serve, web,
@@ -1814,6 +1887,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   commandPolicyPrompt,
   defaultCommandPolicy,
   newCommandLoopState,
+  commandLoopStateSnapshot,
+  restoreCommandLoopState,
   failureFingerprint,
   applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,

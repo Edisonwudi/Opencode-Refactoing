@@ -156,13 +156,17 @@ check("non_json_ignored", R._parse_session_id_from_json_events('not json\n{"sess
 check("sid_trimmed", R._parse_session_id_from_json_events('{"sessionID":"  ses_trim  "}'), "ses_trim")
 
 print("== synchronous verification closure ==")
-def verify_event(payload: dict, status: str = "completed") -> str:
+def verify_event(payload: dict, status: str = "completed", metadata: dict | None = None) -> str:
     return json.dumps({
         "type": "tool_use",
         "sessionID": "ses_loop",
         "part": {
             "tool": "smell_verify",
-            "state": {"status": status, "output": json.dumps(payload)},
+            "state": {
+                "status": status,
+                "output": json.dumps(payload),
+                **({"metadata": metadata} if metadata is not None else {}),
+            },
         },
     })
 
@@ -187,15 +191,38 @@ check(
     "continue",
 )
 check(
-    "plugin_cap_recovery_transport",
+    "bare_continue_has_no_extra_transport",
     R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "stop",
+)
+cap_continue_trace = R._verification_trace(verify_event({
+    "status": "SMELL_GUARD_FAILED",
+    "loop": {"decision": "continue", "cap_recovery_used": True},
+}))
+check("trace_cap_recovery", cap_continue_trace["last_cap_recovery_used"], True)
+check(
+    "plugin_cap_recovery_transport",
+    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
     "continue",
 )
 check(
     "transport_hard_cap",
-    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=3, max_continuations=2),
+    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=3, max_continuations=2),
     "stop",
 )
+persisted_state = {
+    "schema_version": 1,
+    "continuation_count": 2,
+    "cap_recovery_used": False,
+}
+state_trace = R._verification_trace(verify_event(
+    {"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}},
+    metadata={
+        "loop": {"decision": "continue", "cap_recovery_used": False},
+        "command_loop_state": persisted_state,
+    },
+))
+check("trace_command_loop_state", state_trace["command_loop_state"], persisted_state)
 pass_trace = R._verification_trace(verify_event({"status": "PASS", "loop": {"decision": "stop"}}))
 check(
     "pass_stops",

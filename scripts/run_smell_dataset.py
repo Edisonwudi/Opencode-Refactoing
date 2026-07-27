@@ -892,6 +892,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_status = ""
+    last_cap_recovery_used = False
+    last_command_loop_state: dict[str, Any] | None = None
     for raw in (events_text or "").splitlines():
         try:
             event = json.loads(raw)
@@ -911,6 +913,10 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             meta_loop = metadata.get("loop")
             if isinstance(meta_loop, dict):
                 last_decision = str(meta_loop.get("decision") or "")
+                last_cap_recovery_used = meta_loop.get("cap_recovery_used") is True
+            command_loop_state = metadata.get("command_loop_state")
+            if isinstance(command_loop_state, dict):
+                last_command_loop_state = command_loop_state
             auto = metadata.get("auto_continuation")
             if isinstance(auto, dict):
                 last_status = str(auto.get("status") or "")
@@ -926,6 +932,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
+        last_cap_recovery_used = loop.get("cap_recovery_used") is True
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
     return {
@@ -933,6 +940,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "last_loop_decision": last_decision,
         "last_status": last_status,
         "last_output_parsed": last_payload is not None,
+        "last_cap_recovery_used": last_cap_recovery_used,
+        "command_loop_state": last_command_loop_state,
     }
 
 
@@ -947,11 +956,15 @@ def _runner_closure_action(
     if int(trace.get("smell_verify_calls") or 0) == 0:
         return "stop" if reminder_used else "verify_required"
     # The plugin owns all semantic continuation policy across UI and batch.
-    # This is only a transport safety bound: the configured continuations plus
-    # the plugin's single, explicitly authorized cap recovery.
+    # This is only a transport safety bound. The extra transport is available
+    # only when the plugin explicitly persisted that its one cap recovery was
+    # consumed; a bare `continue` must never manufacture an extra retry.
+    transport_limit = max_continuations + (
+        1 if trace.get("last_cap_recovery_used") is True else 0
+    )
     if (
         trace.get("last_loop_decision") == "continue"
-        and continuations_dispatched < max_continuations + 1
+        and continuations_dispatched < transport_limit
     ):
         return "continue"
     return "stop"
@@ -1017,6 +1030,7 @@ def _run_opencode(
     *,
     session_id: str = "",
     continuation_prompt: str = "",
+    command_loop_state: dict[str, Any] | None = None,
     attempt_suffix: str = "",
     hard_timeout_seconds: int | None = None,
 ) -> tuple[int, str]:
@@ -1036,6 +1050,12 @@ def _run_opencode(
     # The custom command owns the native in-session loop. Disable the legacy
     # session.idle mechanism so there is exactly one controller.
     env["SMELL_BATCH_RUN"] = "1"
+    if session_id and command_loop_state:
+        env["SMELL_COMMAND_LOOP_STATE_JSON"] = json.dumps(
+            command_loop_state, separators=(",", ":"), sort_keys=True
+        )
+    else:
+        env.pop("SMELL_COMMAND_LOOP_STATE_JSON", None)
     if agent == "java-refactor-agent-idea":
         env["SMELL_IDEA_PREPARED"] = "1"
     env["SMELL_BRIDGE_FILE"] = str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py")
@@ -1415,6 +1435,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     controller_attempts: list[dict[str, Any]] = []
     session_id = ""
     continuation_prompt = ""
+    command_loop_state: dict[str, Any] | None = None
     continuations_dispatched = 0
     reminders_dispatched = 0
     reminder_used = False
@@ -1434,6 +1455,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             verification_mode,
             session_id=session_id,
             continuation_prompt=continuation_prompt,
+            command_loop_state=command_loop_state,
             attempt_suffix=attempt_suffix,
             hard_timeout_seconds=remaining,
         )
@@ -1453,6 +1475,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 **trace,
             }
         )
+        restored_state = trace.get("command_loop_state")
+        if isinstance(restored_state, dict):
+            command_loop_state = restored_state
         if opencode_returncode != 0 or not session_id:
             break
         action = _runner_closure_action(
