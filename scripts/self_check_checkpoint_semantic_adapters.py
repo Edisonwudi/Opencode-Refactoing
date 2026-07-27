@@ -8,10 +8,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
+sys.path.insert(0, str(ROOT / "runtime" / "python"))
+
+from smell_core.checkpoint_adapters import capture_metric_snapshot  # noqa: E402
+from smell_core.location import parse_location_descriptor  # noqa: E402
 
 
 def _method(index: int, controls: int) -> str:
@@ -43,6 +48,22 @@ class Child extends Parent {
   @Override void second() { owner.run(); }
 }
 """
+NULL_RETURN_BEFORE = """\
+interface Packet {
+  byte[] toBytes();
+}
+class ReadOnlyPacket implements Packet {
+  public byte[] toBytes() { return null; }
+}
+"""
+NULL_RETURN_AFTER = """\
+interface Packet {
+  byte[] toBytes();
+}
+class ReadOnlyPacket implements Packet {
+  public byte[] toBytes() { return new byte[0]; }
+}
+"""
 
 
 def _run(args: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -61,6 +82,24 @@ def _bridge(project: Path, env: dict[str, str], command: str, smell: str, locati
     if result.returncode:
         raise AssertionError(f"{smell} {command}: {result.stderr}\n{result.stdout}")
     return json.loads(result.stdout)
+
+
+def _refused_snapshot(source_text: str, evidence: str) -> dict:
+    with tempfile.TemporaryDirectory(prefix="checkpoint-refused-snapshot-") as temp_dir:
+        project = Path(temp_dir)
+        (project / "Fixture.java").write_text(source_text, encoding="utf-8")
+        config = SimpleNamespace(
+            project_root=project,
+            language="java",
+            smell="refused_bequest",
+            locations=[
+                parse_location_descriptor(
+                    "Fixture.java:method=toBytes|line=5",
+                    project,
+                )
+            ],
+        )
+        return capture_metric_snapshot(config, evidence)
 
 
 def _case(smell: str, before: str, after: str, location: str, evidence: str, objective: str) -> tuple[float, float]:
@@ -101,9 +140,24 @@ def main() -> int:
         "refused_bequest", REFUSED_BEFORE, REFUSED_AFTER, "Fixture.java:method=first|line=9",
         "parent=Parent; refactor_path=implement_contract", "refusal_score",
     )
+    refused_null = _case(
+        "refused_bequest",
+        NULL_RETURN_BEFORE,
+        NULL_RETURN_AFTER,
+        "Fixture.java:method=toBytes|line=5",
+        "parents=Packet; flags=returns_null; refactor_path=implement_contract",
+        "rejection_signals",
+    )
+    ungated_null = _refused_snapshot(
+        NULL_RETURN_BEFORE,
+        "parents=Packet; refactor_path=implement_contract",
+    )
+    assert ungated_null["objectives"]["rejection_signals"] == 0, ungated_null
     print(
         "checkpoint-semantic-adapters-self-check PASS unchanged_pass=0 "
-        f"god_class_nom={god[0]:g}->{god[1]:g} refused_score={refused[0]:g}->{refused[1]:g}"
+        f"god_class_nom={god[0]:g}->{god[1]:g} "
+        f"refused_score={refused[0]:g}->{refused[1]:g} "
+        f"refused_null_signals={refused_null[0]:g}->{refused_null[1]:g}"
     )
     return 0
 
