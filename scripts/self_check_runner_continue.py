@@ -124,6 +124,7 @@ check("policy_instruction", resolved.loop.instruction, "Use the pack")
 quoted_argv = parse_command_policy("--loop-max=2 '--loop-instruction=修复最新 failure pack 并保持行为不变' -- task")
 check("policy_instruction_quoted_argv", quoted_argv.loop.instruction, "修复最新 failure pack 并保持行为不变")
 check_true("policy_allows_guard", resolved.loop.allows("SMELL_GUARD_FAILED"))
+check_true("policy_allows_structural_route_mismatch", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"))
 check("policy_blocks_compile", resolved.loop.allows("BUILD_COMPILE_ERROR"), False)
 check("policy_task", resolved.task, "Project root: /tmp/p")
 disabled = parse_command_policy('--loop-max=0 -- Project root: /tmp/p')
@@ -424,6 +425,10 @@ refused_skill = (
 check_true("refused_skill_maps_callers", "every production call site of the target contract" in refused_skill)
 check_true("refused_skill_rejects_relocation", "Never relocate an empty, throwing, null-returning" in refused_skill)
 check_true("refused_skill_uses_group_boundary", "`refactor_group_id`" in refused_skill)
+check_true(
+    "refused_skill_locks_capability_split_route",
+    "Do not implement or delegate the reported rejecting/empty/null-returning method" in refused_skill,
+)
 
 print()
 if failures:

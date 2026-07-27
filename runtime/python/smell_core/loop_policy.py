@@ -11,6 +11,7 @@ LOOP_MODES = {"off", "verify-failure"}
 FAILURE_GROUPS = {"smell", "compile", "test"}
 REPAIRABLE_CATEGORY_GROUPS = {
     "SMELL_GUARD_FAILED": "smell",
+    "STRUCTURAL_ROUTE_MISMATCH": "smell",
     "BUILD_COMPILE_ERROR": "compile",
     "TEST_BEHAVIOR_REGRESSION": "test",
     "TEST_REFLECTION_ENTRY_STALE": "test",

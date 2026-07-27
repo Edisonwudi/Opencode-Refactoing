@@ -945,6 +945,27 @@ def _looks_like_dependency_resolution_failure(text: str) -> bool:
     )
 
 
+def _capability_split_failure(payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the failed positive capability contract, when present."""
+    if not isinstance(payload, dict):
+        return None
+    smell_guard = payload.get("smell_guard")
+    if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
+        return None
+    for result in smell_guard.get("results") or []:
+        if not isinstance(result, dict) or result.get("success") is not False:
+            continue
+        details = result.get("details")
+        if not isinstance(details, dict) or details.get("structural_expectation") != "capability_split":
+            continue
+        profile = details.get("capability_profile")
+        if not isinstance(profile, dict) or profile.get("ok") is not True:
+            continue
+        if profile.get("capability_split_satisfied") is not True:
+            return profile
+    return None
+
+
 def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tuple[str, list[str]]:
     if payload is None:
         return "UNKNOWN_VERIFY_FAILURE", ["No verify artifact or inline verify payload was available."]
@@ -963,6 +984,11 @@ def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tupl
         ]
     smell_guard = payload.get("smell_guard") or {}
     if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+        if _capability_split_failure(payload):
+            return "STRUCTURAL_ROUTE_MISMATCH", [
+                "The required capability split is still incomplete. Do not implement or delegate the reported method as the final repair.",
+                "Split the parent capability, migrate real implementers and production callers to narrow types, and remove the unsupported operation from the refusing type's inherited contract.",
+            ]
         return "SMELL_GUARD_FAILED", ["Smell guard did not pass; continue the refactoring rather than repairing tests."]
     build_test = payload.get("build_test_guard") or {}
     if isinstance(build_test, dict):
@@ -1008,6 +1034,18 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
     if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
         return []
     highlights: list[str] = []
+    profile = _capability_split_failure(payload)
+    max_highlights = 2 if profile else 1
+    if profile:
+        target = str(profile.get("target_class") or "?")
+        method = str(profile.get("method") or "?")
+        parent = str(profile.get("reported_parent") or "?")
+        highlights.append(
+            "CAPABILITY_SPLIT_REQUIRED "
+            f"target={target} method={method} parent={parent}; "
+            "implementing the method body is not accepted; split the parent capability "
+            "and migrate implementers and callers."
+        )
     for result in smell_guard.get("results") or []:
         if not isinstance(result, dict) or result.get("success") is not False:
             continue
@@ -1021,9 +1059,12 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
             tail = max(1, available - head - 5)
             message = f"{message[:head]} ... {message[-tail:]}"
         highlights.append(prefix + message)
-        if len(highlights) >= 1:
+        if len(highlights) >= max_highlights:
             break
-    return highlights
+    return [
+        item if len(item) <= limit else item[: max(1, limit - 3)].rstrip() + "..."
+        for item in highlights
+    ]
 
 
 def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[str, str]) -> dict[str, Any]:

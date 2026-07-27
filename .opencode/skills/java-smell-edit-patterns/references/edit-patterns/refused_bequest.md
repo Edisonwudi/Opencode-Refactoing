@@ -15,6 +15,35 @@ contracts, delegating to real owners, splitting interfaces, or pushing behavior 
 - Use the evidence `refactor_path` as the primary route and inspect the referenced existing
   helper, overload, state field, sibling protocol, or capability boundary before editing.
 
+## Route lock for structural expectations
+
+An evidence `structural_expectation` is an acceptance contract, not one optional route
+among the generic Refused Bequest alternatives. It overrides the implementation and
+delegation routes below.
+
+For `structural_expectation=capability_split`:
+
+1. Do not implement or delegate the reported rejecting/empty/null-returning method as
+   the final repair. That may remove a body-level symptom while leaving the refused
+   capability in the inheritance contract.
+2. Before editing, make a small capability matrix: list the parent operations, the
+   relevant concrete types, and which operations each type genuinely supports.
+3. Introduce or reuse narrow capability types, assign real implementers to them, migrate
+   production declarations and callers, and remove the unsupported method from the
+   refusing type's inherited contract.
+4. Treat a passing build or behavior test with the reported parent capability still
+   inherited as an incomplete route, not evidence that implementing the method was valid.
+
+Map the evidence path by intent rather than falling back to a generic body implementation:
+
+- readable/writable or inbound/outbound paths require directional interfaces;
+- leaf/non-leaf paths require operations owned by the matching page kind plus caller
+  narrowing;
+- a path naming a narrower base plus composition requires moving the subtype to that base
+  and composing only its supported collaborator behavior;
+- `rejecting_override_removed` requires deleting the rejecting override only after
+  confirming the inherited parent behavior is safe.
+
 ## Hierarchy migration protocol
 
 Apply this protocol whenever evidence supplies `structural_expectation`, especially

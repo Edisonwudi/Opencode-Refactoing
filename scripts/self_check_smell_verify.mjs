@@ -883,6 +883,20 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
   }
 
+  const structuralFailure = hooks.classifyFailureForContinue({
+    failure_category: "STRUCTURAL_ROUTE_MISMATCH",
+    verify_status: "SMELL_GUARD_FAILED",
+    highlights: ["CAPABILITY_SPLIT_REQUIRED target=ReadOnlyPacket method=toBytes parent=Packet"],
+    artifact_paths: {},
+  })
+  assertEqual("structural_route_mismatch_repairable", structuralFailure.ok, true, "ok")
+  assertEqual(
+    "structural_route_mismatch_category",
+    structuralFailure.category,
+    "STRUCTURAL_ROUTE_MISMATCH",
+    "category",
+  )
+
   function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED" } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status))
     payload.loop = {

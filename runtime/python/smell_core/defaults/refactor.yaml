@@ -279,6 +279,10 @@ languages:
           edit, delete, skip, or weaken it to make the refactoring pass.
         - Follow the evidence refactor_path when it names an existing helper, state field,
           overload, protocol sibling, or capability split.
+        - When structural_expectation is capability_split, do not implement or delegate
+          the reported method as the final repair. Split the parent capability, migrate
+          real implementers and callers, and remove the unsupported operation from the
+          refusing type's inherited contract.
         - A log statement, comment, swallowed exception, or placeholder constant is not an
           implementation of an inherited contract.
         verification:
