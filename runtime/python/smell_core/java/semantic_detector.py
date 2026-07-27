@@ -532,8 +532,36 @@ def analyze_refused_bequest_target(
 
     child_declares_target = declares_target(target_class)
     parent_declares_target = declares_target(parent_record)
+    inherited_rejecting_owners: List[str] = []
+    for inherited_name in sorted(inherited_names):
+        inherited_record = model.classes.get(inherited_name)
+        if inherited_record is None:
+            simple_name = inherited_name.rsplit(".", 1)[-1].lower()
+            inherited_record = next(
+                (
+                    item
+                    for item in model.classes.values()
+                    if item.class_name.lower() == simple_name
+                    or item.qualified_name.lower() == inherited_name.lower()
+                ),
+                None,
+            )
+        if inherited_record is None:
+            continue
+        rejecting_target = any(
+            _normalize_method(item.method_name) == target_method
+            and (
+                target_parameter_count is None
+                or len(item.parameter_descriptors) == target_parameter_count
+            )
+            and _is_stub_method(item)
+            for item in inherited_record.methods
+        )
+        if rejecting_target:
+            inherited_rejecting_owners.append(inherited_record.qualified_name)
     capability_split_satisfied = bool(
         not child_declares_target
+        and not inherited_rejecting_owners
         and (
             not inherits_parent
             or (parent_record and not parent_declares_target)
@@ -558,6 +586,7 @@ def analyze_refused_bequest_target(
         "inherits_reported_parent": inherits_parent,
         "child_declares_target": child_declares_target,
         "parent_declares_target": parent_declares_target,
+        "inherited_rejecting_owners": inherited_rejecting_owners,
         "capability_split_satisfied": capability_split_satisfied,
         "rejecting_override_removed": rejecting_override_removed,
     }

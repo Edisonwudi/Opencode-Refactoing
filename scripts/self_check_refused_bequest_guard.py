@@ -255,6 +255,32 @@ class Child implements ParentCapability {
     if moved_to_parent_guard["success"]:
         raise AssertionError("guard must reject moving rejection into a parent default method")
 
+    moved_to_intermediate_parent_guard = _capability_guard(
+        parent_contract,
+        """\
+abstract class IntermediateParent implements ParentCapability {
+  public Object target() {
+    return null;
+  }
+}
+class Child extends IntermediateParent {
+}
+""",
+        target_class="Child",
+        target_line=9,
+    )
+    if moved_to_intermediate_parent_guard["success"]:
+        raise AssertionError(
+            "guard must reject moving rejection into an intermediate ancestor"
+        )
+    rejecting_owners = moved_to_intermediate_parent_guard["details"]["capability_profile"][
+        "inherited_rejecting_owners"
+    ]
+    if not any(owner.endswith("IntermediateParent") for owner in rejecting_owners):
+        raise AssertionError(
+            "guard must report the ancestor that received the rejected capability"
+        )
+
     helper_hidden_guard = _capability_guard(
         parent_contract,
         """\

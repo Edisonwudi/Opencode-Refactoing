@@ -651,6 +651,12 @@ def _run_semantic_guard(
                             "refused_bequest guard: the rejecting child override is still "
                             "declared, or the reported safe parent method cannot be resolved."
                         )
+                    elif profile.get("inherited_rejecting_owners"):
+                        failure_message = (
+                            "refused_bequest guard: the rejected capability was relocated "
+                            "to an inherited ancestor instead of being split. Rejecting "
+                            f"ancestor(s): {', '.join(profile['inherited_rejecting_owners'])}."
+                        )
                     else:
                         failure_message = (
                             "refused_bequest guard: the reported parent capability is "
