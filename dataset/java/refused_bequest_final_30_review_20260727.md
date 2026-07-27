@@ -102,3 +102,13 @@ The authoritative method and group files are:
 
 - `refused_bequest_final_30_20260727.csv`
 - `refused_bequest_final_groups_5_20260727.csv`
+
+## Delivery promotion
+
+The canonical delivery CSV uses Mindustry commit
+`caba5695eec442148c829f45c24ca08946b2c23a`, which is the project HEAD pinned in
+the delivery image. The frozen refactor audit above used
+`ee7f3e6c3fd750717f799f5e1cd446d3b580726d`. The target
+`ConsumeItemExplode.java` blob and `ConsumeItemExplodeBehaviorTest.java` blob
+are identical at both commits; their trees differ only in three unrelated test
+harness files. The Oracle SHA-256 remains unchanged.
