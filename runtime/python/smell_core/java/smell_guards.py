@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,12 +39,16 @@ from .semantic_detector import (
 )
 from .ast_ncss import run_ast_ncss
 from .syntactic_detector import (
+    JavaClassInfo,
+    JavaMethodInfo,
     _finding,
     find_matching_clone_pair,
     find_matching_syntactic_finding,
+    load_java_source_model,
     load_project_model,
     parse_mysterious_evidence,
     run_java_syntactic_detector,
+    tokenize_clone,
 )
 
 
@@ -252,7 +257,11 @@ def _run_java_ast_ncss_guard(
     }
 
 
-def run_java_clone_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Optional[Dict[str, object]]:
+def run_java_clone_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext] = None,
+) -> Optional[Dict[str, object]]:
     """Early-return hook for code_clone_type1 on Java projects."""
     if config.language != "java":
         return None
@@ -336,17 +345,315 @@ def run_java_clone_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
         target_resolution = "partial_clone_target_changed"
     else:
         target_resolution = "clone_pair_changed"
+    structural = _verify_clone_structural_resolution(
+        config,
+        first,
+        second,
+        min_tokens=int(guard.get("min_tokens", 80)),
+        changed_java_files=context.changed_java_files if context else [],
+    )
+    if not structural["success"]:
+        return {
+            "type": "code_clone_type1",
+            "success": False,
+            "message": f"code_clone_type1 guard: {structural['message']}",
+            "details": {
+                "detector": "java_syntactic_detector",
+                "target_resolution": target_resolution,
+                "left_clone_finding_found": left_finding is not None,
+                "right_clone_finding_found": right_finding is not None,
+                **structural["details"],
+            },
+        }
     return {
         "type": "code_clone_type1",
         "success": True,
-        "message": "code_clone_type1 guard: Java syntactic detector no longer reports the target clone pair.",
+        "message": (
+            "code_clone_type1 guard: the target clone pair is gone and the "
+            "shared structural resolution is proven."
+        ),
         "details": {
             "detector": "java_syntactic_detector",
             "target_resolution": target_resolution,
             "left_clone_finding_found": left_finding is not None,
             "right_clone_finding_found": right_finding is not None,
+            **structural["details"],
         },
     }
+
+
+_CALL_RE = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(")
+_NON_DELEGATION_CALLS = {
+    "if", "for", "while", "switch", "catch", "synchronized", "try",
+    "do", "return", "throw", "new", "assert", "this",
+}
+
+
+def _verify_clone_structural_resolution(
+    config: ResolvedRunConfig,
+    first: Any,
+    second: Any,
+    *,
+    min_tokens: int,
+    changed_java_files: List[Path],
+) -> Dict[str, object]:
+    baseline = _load_clone_baseline(config, (first, second))
+    if baseline is None:
+        return {
+            "success": False,
+            "message": "structural proof unavailable because the Git baseline targets could not be resolved.",
+            "details": {"structural_resolution": "baseline_unavailable"},
+        }
+    baseline_classes, baseline_methods, baseline_targets = baseline
+    relevant_files = _clone_relevant_files(config, (first, second), changed_java_files)
+    try:
+        current_classes, current_methods = load_project_model(config.project_root, relevant_files)
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": f"structural proof unavailable: {exc}",
+            "details": {"structural_resolution": "current_model_unavailable", "error": str(exc)},
+        }
+    current_targets = [
+        _find_clone_target_method(current_methods, loc, baseline_target)
+        for loc, baseline_target in zip((first, second), baseline_targets)
+    ]
+
+    moved = _find_moved_clone_occurrences(
+        current_methods,
+        baseline_targets,
+        min_tokens=min_tokens,
+    )
+    if len(moved) >= 2:
+        return {
+            "success": False,
+            "message": "the original clone body was copied or moved to multiple methods instead of centralized.",
+            "details": {
+                "structural_resolution": "moved_clone_still_duplicated",
+                "moved_clone_occurrences": moved,
+            },
+        }
+
+    proof = _shared_clone_route_proof(
+        baseline_classes,
+        baseline_targets,
+        current_classes,
+        current_methods,
+        current_targets,
+    )
+    if not proof["proven"]:
+        return {
+            "success": False,
+            "message": (
+                "the original pair changed, but no shared helper, owner delegation, "
+                "or inherited implementation proves clone elimination."
+            ),
+            "details": {
+                "structural_resolution": "shared_route_unproven",
+                "left_target_found": current_targets[0] is not None,
+                "right_target_found": current_targets[1] is not None,
+                **proof,
+            },
+        }
+    return {
+        "success": True,
+        "message": "shared structural resolution proven.",
+        "details": {
+            "structural_resolution": proof["route"],
+            "shared_calls": proof.get("shared_calls", []),
+            "moved_clone_occurrences": moved,
+        },
+    }
+
+
+def _load_clone_baseline(
+    config: ResolvedRunConfig,
+    locations: Tuple[Any, Any],
+) -> Optional[Tuple[List[JavaClassInfo], List[JavaMethodInfo], List[JavaMethodInfo]]]:
+    classes: List[JavaClassInfo] = []
+    methods: List[JavaMethodInfo] = []
+    seen: set[str] = set()
+    for loc in locations:
+        rel_path = str(loc.project_path).replace("\\", "/")
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        result = subprocess.run(
+            ["git", "-C", str(config.project_root), "show", f"HEAD:{rel_path}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            return None
+        parsed_classes, parsed_methods = load_java_source_model(loc.file_path, rel_path, result.stdout)
+        classes.extend(parsed_classes)
+        methods.extend(parsed_methods)
+    targets = [
+        _find_clone_target_method(methods, loc, None)
+        for loc in locations
+    ]
+    if any(target is None for target in targets):
+        return None
+    return classes, methods, [target for target in targets if target is not None]
+
+
+def _clone_relevant_files(
+    config: ResolvedRunConfig,
+    locations: Tuple[Any, Any],
+    changed_java_files: List[Path],
+) -> List[Path]:
+    files: Dict[str, Path] = {}
+    for candidate in [loc.file_path for loc in locations] + list(changed_java_files):
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = config.project_root / path
+        if path.exists() and path.suffix == ".java":
+            files[str(path.resolve())] = path.resolve()
+    return list(files.values())
+
+
+def _find_clone_target_method(
+    methods: List[JavaMethodInfo],
+    location: Any,
+    baseline_target: Optional[JavaMethodInfo],
+) -> Optional[JavaMethodInfo]:
+    expected_path = _normalize_path(str(location.project_path))
+    expected_name = _normalize_method(location.method) or (
+        _normalize_method(baseline_target.method_name) if baseline_target else ""
+    )
+    candidates = [
+        method
+        for method in methods
+        if _normalize_path(method.rel_path) == expected_path
+        and (not expected_name or _normalize_method(method.method_name) == expected_name)
+    ]
+    if not candidates:
+        return None
+    if baseline_target:
+        same_class = [method for method in candidates if method.class_name == baseline_target.class_name]
+        if not same_class:
+            return None
+        candidates = same_class
+        same_arity = [
+            method for method in candidates
+            if len(method.parameter_names) == len(baseline_target.parameter_names)
+        ]
+        if same_arity:
+            candidates = same_arity
+    line = int(location.line or location.start_line or 0)
+    if line:
+        return min(candidates, key=lambda method: abs(method.begin_line - line))
+    return candidates[0]
+
+
+def _method_calls(method: Optional[JavaMethodInfo]) -> set[str]:
+    if method is None:
+        return set()
+    return {
+        name
+        for name in _CALL_RE.findall(method.body_text)
+        if name not in _NON_DELEGATION_CALLS
+    }
+
+
+def _find_moved_clone_occurrences(
+    current_methods: List[JavaMethodInfo],
+    baseline_targets: List[JavaMethodInfo],
+    *,
+    min_tokens: int,
+) -> List[Dict[str, object]]:
+    baseline_tokens = tokenize_clone(baseline_targets[0].body_text)
+    if len(baseline_tokens) < min_tokens:
+        return []
+    occurrences = []
+    for method in current_methods:
+        if tokenize_clone(method.body_text) != baseline_tokens:
+            continue
+        occurrences.append({
+            "file": method.rel_path,
+            "class": method.class_name,
+            "method": method.signature,
+            "begin_line": method.begin_line,
+        })
+    return occurrences
+
+
+def _shared_clone_route_proof(
+    baseline_classes: List[JavaClassInfo],
+    baseline_targets: List[JavaMethodInfo],
+    current_classes: List[JavaClassInfo],
+    current_methods: List[JavaMethodInfo],
+    current_targets: List[Optional[JavaMethodInfo]],
+) -> Dict[str, object]:
+    left, right = current_targets
+    baseline_common = _method_calls(baseline_targets[0]) & _method_calls(baseline_targets[1])
+    if left is not None and right is not None:
+        current_common = _method_calls(left) & _method_calls(right)
+        introduced_common = _proven_shared_calls(
+            current_common - baseline_common,
+            current_methods,
+        )
+        if introduced_common:
+            return {"proven": True, "route": "shared_callee", "shared_calls": introduced_common}
+        left_new_calls = _method_calls(left) - _method_calls(baseline_targets[0])
+        right_new_calls = _method_calls(right) - _method_calls(baseline_targets[1])
+        if baseline_targets[1].method_name in left_new_calls or baseline_targets[0].method_name in right_new_calls:
+            return {"proven": True, "route": "existing_owner_delegation", "shared_calls": []}
+
+    inherited = []
+    for baseline_target, current_target in zip(baseline_targets, current_targets):
+        if current_target is not None:
+            continue
+        baseline_class = next(
+            (item for item in baseline_classes if item.class_name == baseline_target.class_name),
+            None,
+        )
+        current_class = next(
+            (item for item in current_classes if item.class_name == baseline_target.class_name),
+            None,
+        )
+        if baseline_class is None or current_class is None or not current_class.parent_name:
+            continue
+        parent_method = next(
+            (
+                method for method in current_methods
+                if method.class_name == current_class.parent_name
+                and _normalize_method(method.method_name) == _normalize_method(baseline_target.method_name)
+                and len(method.parameter_names) == len(baseline_target.parameter_names)
+            ),
+            None,
+        )
+        if parent_method is not None:
+            inherited.append(f"{current_class.class_name}->{current_class.parent_name}.{parent_method.signature}")
+    missing_count = sum(target is None for target in current_targets)
+    if missing_count and len(inherited) == missing_count:
+        return {"proven": True, "route": "shared_parent_inheritance", "shared_calls": inherited}
+    return {
+        "proven": False,
+        "route": "none",
+        "baseline_common_calls": sorted(baseline_common),
+        "current_left_calls": sorted(_method_calls(left)),
+        "current_right_calls": sorted(_method_calls(right)),
+    }
+
+
+def _proven_shared_calls(
+    call_names: set[str],
+    current_methods: List[JavaMethodInfo],
+) -> List[str]:
+    """Keep calls that resolve to one owner, not same-named per-class helpers."""
+    proven = []
+    for call_name in sorted(call_names):
+        definitions = [
+            method
+            for method in current_methods
+            if method.method_name == call_name
+        ]
+        owners = {(method.rel_path, method.class_name) for method in definitions}
+        if len(owners) <= 1:
+            proven.append(call_name)
+    return proven
 
 
 # ---------------------------------------------------------------------------

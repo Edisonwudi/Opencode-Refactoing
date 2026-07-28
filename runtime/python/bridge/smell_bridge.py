@@ -136,8 +136,11 @@ def _is_idea_backed(language: str) -> bool:
 def _requires_strict_smell_resolution(smell: str, evidence: str) -> bool:
     """Return whether metric improvement is progress-only, never final acceptance."""
     return bool(
-        smell == "refused_bequest"
-        and parse_structural_expectation(evidence)
+        smell == "code_clone_type1"
+        or (
+            smell == "refused_bequest"
+            and parse_structural_expectation(evidence)
+        )
     )
 
 
@@ -442,7 +445,10 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     )
     build_test_required = bool(
         os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
-        or strict_resolution_required
+        or (
+            resolved.smell == "refused_bequest"
+            and strict_resolution_required
+        )
     )
     if build_test_required and (
         args.skip_build_test

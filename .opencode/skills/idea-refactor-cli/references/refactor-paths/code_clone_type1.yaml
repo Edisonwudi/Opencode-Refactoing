@@ -72,6 +72,9 @@ code_clone_type1:
       163        }
       164    }
     source: { project: commons-lang-3.20.0, class: FastDateParser, verified: "2026-05-09" }
+    notes:
+      - "After pull-up, remove every child duplicate and shadowing duplicate state. Compile-check constructors and final-field assignment before verification."
+      - "A parent implementation plus one leftover child copy is still a clone and must not be accepted."
   - id: different-parent-shared-helper-clone
     when: "the clones live under different parent branches with no good superclass target, so the shared behavior should move to an external helper"
     before: |
@@ -117,6 +120,9 @@ code_clone_type1:
       216        return ExceptionUtils.getContextedMessage(this, exceptionContext);
       217    }
     source: { project: commons-lang-3.20.0, class: ContextedException / ContextedRuntimeException / ExceptionUtils, verified: "2026-05-09" }
+    notes:
+      - "Both callers must resolve through the same helper. Two same-shaped private helpers only move the clone."
+      - "Keep concrete generic types at each caller; use typed adapters or projections rather than unchecked List casts."
   - id: existing-owner-delegation-clone
     when: "one clone target already has a semantically owned implementation in a dedicated service, utility, or domain owner, so the other clone should delegate to that owner instead of creating a new helper"
     before: |
@@ -212,3 +218,4 @@ code_clone_type1:
     notes:
       - "Use this path for overload families where the public signatures are part of the API and should remain stable."
       - "Do not replace primitive overloads with a broad Object/generic API or a helper that makes call sites uglier; keep type-specific wrappers and share only the loop/control core."
+      - "For primitive variants, use an index predicate/comparator or typed adapter that compiles for every overload; do not force boolean, short, or other primitives through an incompatible generic functional interface."

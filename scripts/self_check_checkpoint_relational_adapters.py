@@ -25,7 +25,34 @@ class C { void third(boolean confReq, int maxTokSize, long qop) {} }
 """
 CLONE_BODY = "int total = 0; for (int i = 0; i < 20; i++) { total += i; } if (total > 10) { total--; } consume(total);"
 CLONE_BEFORE = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ {CLONE_BODY} }}\n  void consume(int value) {{}}\n}}\n"
-CLONE_AFTER = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ int total = 0; consume(total); }}\n  void consume(int value) {{}}\n}}\n"
+CLONE_MUTATION_ONLY = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ int total = 0; consume(total); }}\n  void consume(int value) {{}}\n}}\n"
+CLONE_MOVED_TWICE = f"""\
+class Fixture {{
+  void left() {{ leftShared(); }}
+  void right() {{ rightShared(); }}
+  void leftShared() {{ {CLONE_BODY} }}
+  void rightShared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+CLONE_AFTER = f"""\
+class Fixture {{
+  void left() {{ shared(); }}
+  void right() {{ shared(); }}
+  void shared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+CLONE_PARENT_BEFORE = f"""\
+class Parent {{}}
+class Left extends Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+class Right extends Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+"""
+CLONE_PARENT_AFTER = f"""\
+class Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+class Left extends Parent {{}}
+class Right extends Parent {{}}
+"""
 
 
 def _run(args: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -46,7 +73,15 @@ def _bridge(project: Path, env: dict[str, str], command: str, smell: str, locati
     return json.loads(result.stdout)
 
 
-def _case(smell: str, before: str, after: str, location: str, evidence: str, objective: str) -> tuple[float, float]:
+def _case(
+    smell: str,
+    before: str,
+    after: str,
+    location: str,
+    evidence: str,
+    objective: str,
+    rejected_intermediates: tuple[str, ...] = (),
+) -> tuple[float, float]:
     with tempfile.TemporaryDirectory(prefix=f"checkpoint-{smell}-") as temp_dir:
         project = Path(temp_dir)
         source = project / "Fixture.java"
@@ -66,6 +101,10 @@ def _case(smell: str, before: str, after: str, location: str, evidence: str, obj
         before_value = float(baseline["metrics"]["objectives"][objective])
         unchanged = _bridge(project, env, "verify", smell, location, evidence)
         assert unchanged["smell_guard"]["results"][0]["details"]["reason"] == "EDIT_REQUIRED", unchanged
+        for rejected in rejected_intermediates:
+            source.write_text(rejected, encoding="utf-8")
+            invalid = _bridge(project, env, "verify", smell, location, evidence)
+            assert invalid.get("status") == "SMELL_GUARD_FAILED", invalid
         source.write_text(after, encoding="utf-8")
         repaired = _bridge(project, env, "verify", smell, location, evidence)
         if repaired.get("status") != "PASS":
@@ -87,10 +126,19 @@ def main() -> int:
         "Fixture.java:method=left|line=2 <-> Fixture.java:method=right|line=3",
         "tokens=30; group_size=2",
         "clone_token_count",
+        rejected_intermediates=(CLONE_MUTATION_ONLY, CLONE_MOVED_TWICE),
+    )
+    parent_clone = _case(
+        "code_clone_type1", CLONE_PARENT_BEFORE, CLONE_PARENT_AFTER,
+        "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
+        "tokens=30; group_size=2",
+        "clone_token_count",
     )
     print(
         "checkpoint-relational-adapters-self-check PASS unchanged_pass=0 "
-        f"data_clumps={data[0]:g}->{data[1]:g} code_clone_type1={clone[0]:g}->{clone[1]:g}"
+        f"data_clumps={data[0]:g}->{data[1]:g} "
+        f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
+        f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g}"
     )
     return 0
 

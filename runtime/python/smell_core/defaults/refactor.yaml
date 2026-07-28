@@ -52,8 +52,10 @@ generic_smells: &generic_smells
     instruction: Centralize the exact duplicated behavior shared by the two labeled functions.
     constraints:
     - Preserve both call paths and avoid unrelated cleanup.
+    - Centralize the clone in one shared owner; do not perturb tokens or copy it into parallel helpers.
     verification:
-    - Reduce the exact-clone token count and pass configured project tests.
+    - Prove a shared callee, owner delegation, or inherited implementation; reject moved duplicate bodies.
+    - Pass configured project build and tests.
     guards:
     - type: code_clone_type1
       min_tokens: 80

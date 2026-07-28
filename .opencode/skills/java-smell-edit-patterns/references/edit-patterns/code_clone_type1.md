@@ -8,15 +8,30 @@ or shared core.
 
 ## Common verification fit
 
-- The original pair should no longer contain two large identical blocks.
-- If only one side changes, confirm the remaining target is not still paired with the
-  other clone.
+- Before editing, name one structural route and the shared symbol that will own the
+  duplicated behavior.
+- The original pair should no longer contain two large identical blocks, and both
+  targets must resolve through that one owner: a shared callee, owner delegation, or
+  inherited parent implementation.
+- Search the changed production files for the original block. It may remain once in
+  the shared owner, but must not reappear in two private helpers or in a parent plus
+  a leftover child override.
+- Compile immediately after the first cohesive structural edit, then run
+  `smell_verify`. Repair the exact compiler diagnostic before attempting another
+  route.
 
 ## Common avoid
 
+- Changing literals, operators, statement order, or only one clone side merely to
+  break exact-token equality.
+- Moving the two blocks into separate helpers, even if the reported target methods
+  become short.
 - Leaving both clone blocks intact after adding a helper.
 - Creating a new abstraction when an existing owner or parent is the intended
   normalization point.
+- Using unchecked casts to force `List<A>` and `List<B>` through one helper, or
+  routing primitive overloads through an incompatible object/generic functional
+  interface.
 
 ## Routes
 
@@ -53,7 +68,9 @@ Route-specific edit steps:
 
 1. Confirm both clone methods are sibling overrides with the same parent contract.
 2. Add the common implementation to the parent with the narrowest usable visibility.
-3. Delete child overrides that now inherit the parent behavior.
+3. Delete child overrides and any shadowing duplicate state that now belongs to the
+   parent.
+4. Compile-check constructors and every `final` field assignment after the move.
 
 Verification fit delta: The clone disappears because the duplicated child bodies no longer exist.
 
@@ -73,7 +90,9 @@ Route-specific edit steps:
 1. Pick the closest existing utility or package-local helper location shared by both
    callers.
 2. Move the common block into a helper with explicit inputs and outputs.
-3. Replace both clone blocks and update imports or visibility.
+3. Preserve each caller's concrete generic type. Prefer typed adapters or a
+   caller-supplied projection over unchecked casts.
+4. Replace both clone blocks and update imports or visibility.
 
 Verification fit delta: Both clone sites should call the same helper rather than retain parallel bodies.
 
@@ -112,7 +131,9 @@ Source operation shape: `idea_edit`. See [`operation-translations.md`](operation
 Route-specific edit steps:
 
 1. Compare overloads and isolate the type-specific conversion points.
-2. Create a private core method for the shared algorithm.
+2. Create a private core method for the shared control flow. For primitive
+   overloads, pass an index predicate/comparator or keep typed adapters; do not box
+   values into an incompatible generic interface.
 3. Rewrite overloads as adapters that call the core with converted values.
 
 Verification fit delta: The large common body should exist only in the core method.

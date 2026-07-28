@@ -145,7 +145,7 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
         elif guard_type == "switch_statements":
             outcomes.append(_run_switch_statements_guard(config, guard))
         elif guard_type == "code_clone_type1":
-            outcomes.append(_run_code_clone_guard(config, guard))
+            outcomes.append(_run_code_clone_guard(config, guard, context))
         elif guard_type == "data_clumps":
             outcomes.append(_run_data_clumps_guard(config, guard))
         elif guard_type == "feature_envy" and config.language != "java":
@@ -905,10 +905,14 @@ def _strip_comments_preserving_lines(text: str, language: str) -> list[str]:
     return lines
 
 
-def _run_code_clone_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+def _run_code_clone_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext] = None,
+) -> Dict[str, object]:
     clone_handler = get_clone_guard(config.language)
     if clone_handler is not None:
-        syntactic = clone_handler(config, guard)
+        syntactic = clone_handler(config, guard, context)
         if syntactic is not None:
             return syntactic
     first, second = extract_pair_snippets(config.locations, config.language)

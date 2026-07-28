@@ -392,6 +392,18 @@ def load_project_model(project_root: Path, java_files: Sequence[Path]) -> Tuple[
     return all_classes, all_methods
 
 
+def load_java_source_model(
+    file_path: Path,
+    rel_path: str,
+    text: str,
+) -> Tuple[List[JavaClassInfo], List[JavaMethodInfo]]:
+    """Parse an in-memory Java source snapshot with the regular detector model."""
+    line_starts = _build_line_starts(text)
+    classes = _extract_class_ranges(file_path, rel_path, text, line_starts)
+    methods = _scan_java_methods(file_path, rel_path, text, line_starts, classes)
+    return classes, methods
+
+
 def _detect_long_method(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
     rows = []
     for method in methods:

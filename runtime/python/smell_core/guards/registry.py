@@ -19,7 +19,10 @@ GuardHandlerFn = Callable[[ResolvedRunConfig, Dict[str, Any], Optional[GuardRunC
 SyntacticGuardFn = Callable[[ResolvedRunConfig, str, Dict[str, Any]], Optional[Dict[str, object]]]
 
 # Type alias for clone guard callables.
-CloneGuardFn = Callable[[ResolvedRunConfig, Dict[str, Any]], Optional[Dict[str, object]]]
+CloneGuardFn = Callable[
+    [ResolvedRunConfig, Dict[str, Any], Optional[GuardRunContext]],
+    Optional[Dict[str, object]],
+]
 
 # --- Registries ---
 
@@ -49,7 +52,7 @@ def register_syntactic_guard(language: str, handler: SyntacticGuardFn) -> None:
 def register_clone_guard(language: str, handler: CloneGuardFn) -> None:
     """Register a language-specific clone guard.
 
-    Called as ``handler(config, guard)`` — returns a result dict or ``None``.
+    Called as ``handler(config, guard, context)`` — returns a result dict or ``None``.
     """
     _CLONE_GUARDS[language] = handler
 
