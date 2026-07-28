@@ -191,6 +191,8 @@ const MAX_STDOUT_STDERR_LEN = 4000
 
 const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
 const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
+const DIRECT_BUILD_COMMAND_RE =
+  /(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:\.\/)?(?:mvnw|mvn|gradlew|gradle)\b/
 // Conservative allowlist of repairable failure categories. These are the
 // category strings the Python bridge actually emits from
 // `_classify_failure_pack`. BUILD_FAILED is intentionally NOT listed: only an
@@ -1786,6 +1788,13 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       if (input.tool !== "bash") return
       const command = String(output.args?.command ?? "")
       if (!command) return
+      const sessionID = typeof input.sessionID === "string" ? input.sessionID : ""
+      if (sessionID && commandLoopStates.has(sessionID) && DIRECT_BUILD_COMMAND_RE.test(command)) {
+        throw new Error(
+          "Do not run Maven or Gradle directly during a smell-refactor command. "
+          + "Call smell_verify now; it owns the pinned offline build/test command and loop decision.",
+        )
+      }
       const rewritesJava =
         /\.java\b/.test(command) &&
         /\b(sed\s+-i|perl\s+-i|python3?\s+.*(write_text|open\(.+,.*w)|cat\s*>|tee\s+)/.test(command)

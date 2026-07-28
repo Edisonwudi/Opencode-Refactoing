@@ -32,6 +32,8 @@ Workflow:
 4. Execute the plan with OpenCode read/search/edit tools. Do not rewrite Java
    files with shell text commands.
 5. Call `smell_verify` as the acceptance gate.
+   Do not run Maven or Gradle directly during this command. `smell_verify` owns
+   the pinned offline build/test invocation and avoids duplicate validation.
    Default verification is `verificationMode="local"`, which runs the local
    Python smell guard and records a diff/status snapshot without requiring
    project build or test commands. Use `verificationMode="auto"`,

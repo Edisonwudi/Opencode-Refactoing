@@ -30,7 +30,9 @@ Workflow:
 3. Execute the smallest coherent refactoring that reduces the reported smell.
    Avoid unrelated cleanup and do not modify or weaken tests.
 4. Call `smell_verify` as the acceptance gate using the verification mode from
-   the task. Do not substitute syntax-only checks for configured project tests.
+   the task. Do not run Maven, Gradle, or their wrappers directly during this
+   command; `smell_verify` owns the pinned build/test invocation and loop
+   decision. Do not substitute syntax-only checks for configured project tests.
 5. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. Repair only the reported smell, compile, or test regression.
 
