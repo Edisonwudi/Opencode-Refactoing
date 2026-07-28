@@ -18,6 +18,8 @@ or shared core.
 ## Common avoid
 
 - Leaving both clone blocks intact after adding a helper.
+- Moving the clone body into two helpers or overloads instead of keeping one shared
+  implementation.
 - Creating a new abstraction when an existing owner or parent is the intended
   normalization point.
 - Changing literals or operators only to evade clone detection.
@@ -124,4 +126,5 @@ Route-specific edit steps:
 
 Verification fit delta: The large common body should exist only in the core method.
 
-Avoid: Do not collapse public overloads if callers rely on their narrow types.
+Avoid: Do not collapse public overloads if callers rely on their narrow types, and
+do not replace typed array access with reflection or an `Object` type dispatcher.

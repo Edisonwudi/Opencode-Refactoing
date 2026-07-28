@@ -384,6 +384,9 @@ def run_java_clone_guard(
 
 
 _CALL_RE = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(")
+_QUALIFIED_CALL_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9_$]*)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
 _NON_DELEGATION_CALLS = {
     "if", "for", "while", "switch", "catch", "synchronized", "try",
     "do", "return", "throw", "new", "assert", "this",
@@ -457,7 +460,25 @@ def _verify_clone_structural_resolution(
             },
         }
 
+    new_reflective_array_calls = _find_new_reflective_array_calls(
+        baseline_methods,
+        current_methods,
+    )
+    if new_reflective_array_calls:
+        return {
+            "success": False,
+            "message": (
+                "the refactoring introduced reflective array dispatch; preserve "
+                "typed access through adapters instead."
+            ),
+            "details": {
+                "structural_resolution": "new_reflective_array_dispatch",
+                "reflective_array_calls": new_reflective_array_calls,
+            },
+        }
+
     moved = _find_moved_clone_occurrences(
+        baseline_methods,
         current_methods,
         baseline_targets,
         min_tokens=min_tokens,
@@ -493,6 +514,7 @@ def _verify_clone_structural_resolution(
 
     proof = _shared_clone_route_proof(
         baseline_classes,
+        baseline_methods,
         baseline_targets,
         current_classes,
         current_methods,
@@ -615,6 +637,7 @@ def _method_calls(method: Optional[JavaMethodInfo]) -> set[str]:
 
 
 def _find_moved_clone_occurrences(
+    baseline_methods: List[JavaMethodInfo],
     current_methods: List[JavaMethodInfo],
     baseline_targets: List[JavaMethodInfo],
     *,
@@ -623,9 +646,16 @@ def _find_moved_clone_occurrences(
     baseline_tokens = tokenize_clone(baseline_targets[0].body_text)
     if len(baseline_tokens) < min_tokens:
         return []
+    unchanged_baseline_occurrences = {
+        _method_identity(method)
+        for method in baseline_methods
+        if tokenize_clone(method.body_text) == baseline_tokens
+    }
     occurrences = []
     for method in current_methods:
         if tokenize_clone(method.body_text) != baseline_tokens:
+            continue
+        if _method_identity(method) in unchanged_baseline_occurrences:
             continue
         occurrences.append({
             "file": method.rel_path,
@@ -726,6 +756,35 @@ def _find_new_parameterized_casts(
     return current_hits[baseline_count:]
 
 
+_REFLECTIVE_ARRAY_CALL_RE = re.compile(
+    r"\b(?:java\s*\.\s*lang\s*\.\s*reflect\s*\.\s*)?"
+    r"Array\s*\.\s*(?:get|set|getLength)\s*\("
+)
+
+
+def _find_new_reflective_array_calls(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+) -> List[Dict[str, object]]:
+    baseline_count = sum(
+        len(_REFLECTIVE_ARRAY_CALL_RE.findall(method.body_text))
+        for method in baseline_methods
+    )
+    current_hits: List[Dict[str, object]] = []
+    for method in current_methods:
+        calls = _REFLECTIVE_ARRAY_CALL_RE.findall(method.body_text)
+        if not calls:
+            continue
+        current_hits.extend({
+            "file": method.rel_path,
+            "class": method.class_name,
+            "method": method.signature,
+        } for _ in calls)
+    if len(current_hits) <= baseline_count:
+        return []
+    return current_hits[baseline_count:]
+
+
 def _find_parallel_new_helpers(
     baseline_methods: List[JavaMethodInfo],
     current_methods: List[JavaMethodInfo],
@@ -769,6 +828,7 @@ def _find_parallel_new_helpers(
 
 def _shared_clone_route_proof(
     baseline_classes: List[JavaClassInfo],
+    baseline_methods: List[JavaMethodInfo],
     baseline_targets: List[JavaMethodInfo],
     current_classes: List[JavaClassInfo],
     current_methods: List[JavaMethodInfo],
@@ -800,6 +860,65 @@ def _shared_clone_route_proof(
             }
         if baseline_targets[1].method_name in left_new_calls or baseline_targets[0].method_name in right_new_calls:
             return {"proven": True, "route": "existing_owner_delegation", "shared_calls": []}
+        qualified_left = set(_QUALIFIED_CALL_RE.findall(left.body_text))
+        qualified_right = set(_QUALIFIED_CALL_RE.findall(right.body_text))
+        shared_qualified = _proven_qualified_owner_calls(
+            qualified_left & qualified_right,
+            current_methods,
+        )
+        if shared_qualified:
+            return {
+                "proven": True,
+                "route": "qualified_owner_delegation",
+                "shared_calls": shared_qualified,
+            }
+        owner_delegation = _proven_target_owner_delegation(
+            left,
+            right,
+            qualified_left,
+            qualified_right,
+            current_methods,
+        )
+        if owner_delegation:
+            return {
+                "proven": True,
+                "route": "qualified_owner_delegation",
+                "shared_calls": owner_delegation,
+            }
+
+    missing_indexes = [
+        index for index, target in enumerate(current_targets)
+        if target is None
+    ]
+    if len(missing_indexes) == 1:
+        missing_index = missing_indexes[0]
+        surviving_index = 1 - missing_index
+        surviving_target = current_targets[surviving_index]
+        missing_class = baseline_targets[missing_index].class_name
+        baseline_class_calls = set().union(*(
+            _method_calls(method)
+            for method in baseline_methods
+            if method.class_name == missing_class
+        ))
+        current_class_calls = set().union(*(
+            _method_calls(method)
+            for method in current_methods
+            if method.class_name == missing_class
+        ))
+        replacement_calls = (
+            current_class_calls
+            - baseline_class_calls
+        ) & _method_calls(surviving_target)
+        proven_replacements = _proven_shared_calls(
+            replacement_calls,
+            current_methods,
+        )
+        if proven_replacements:
+            return {
+                "proven": True,
+                "route": "removed_target_to_shared_callee",
+                "shared_calls": proven_replacements,
+            }
 
     inherited = []
     for baseline_target, current_target in zip(baseline_targets, current_targets):
@@ -836,6 +955,44 @@ def _shared_clone_route_proof(
         "current_left_calls": sorted(_method_calls(left)),
         "current_right_calls": sorted(_method_calls(right)),
     }
+
+
+def _proven_qualified_owner_calls(
+    calls: set[Tuple[str, str]],
+    current_methods: List[JavaMethodInfo],
+) -> List[str]:
+    proven = []
+    for owner, call_name in sorted(calls):
+        if any(
+            method.class_name == owner and method.method_name == call_name
+            for method in current_methods
+        ):
+            proven.append(f"{owner}.{call_name}")
+    return proven
+
+
+def _proven_target_owner_delegation(
+    left: JavaMethodInfo,
+    right: JavaMethodInfo,
+    qualified_left: set[Tuple[str, str]],
+    qualified_right: set[Tuple[str, str]],
+    current_methods: List[JavaMethodInfo],
+) -> List[str]:
+    proven = []
+    for owner_target, qualified_calls in (
+        (right, qualified_left),
+        (left, qualified_right),
+    ):
+        owner_calls = _method_calls(owner_target)
+        for owner, call_name in qualified_calls:
+            if owner != owner_target.class_name or call_name not in owner_calls:
+                continue
+            if any(
+                method.class_name == owner and method.method_name == call_name
+                for method in current_methods
+            ):
+                proven.append(f"{owner}.{call_name}")
+    return sorted(set(proven))
 
 
 def _proven_shared_calls(
