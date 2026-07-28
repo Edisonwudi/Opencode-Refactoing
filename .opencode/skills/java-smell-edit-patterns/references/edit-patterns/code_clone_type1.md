@@ -121,20 +121,8 @@ Route-specific edit steps:
 
 1. Compare overloads and isolate the type-specific conversion points.
 2. Create a private core method for the shared algorithm, using small typed adapters
-   when the overload value types differ. For primitive arrays, pass lengths plus an
-   index callback that captures each concrete array; keep array access in the typed
-   caller instead of inspecting array types in the core.
+   when the overload value types differ.
 3. Rewrite overloads as adapters that call the core with converted values.
-
-Primitive-array core shape:
-
-```java
-Result shared(Object left, Object right, int leftLength, int rightLength,
-              IntConsumer handleIndex) {
-    // identity/null/length checks, then handleIndex.accept(i) in the shared loop
-}
-// Each typed overload passes null-safe lengths and i -> use(left[i], right[i]).
-```
 
 Verification fit delta: The large common body should exist only in the core method.
 
