@@ -197,6 +197,7 @@ def load_samples(
 def validate_test_files(sample: Sample) -> None:
     """Fail when a declared test artifact is absent or not part of project HEAD."""
     project_root = Path(sample.project_path)
+    validate_test_report_contract(sample, project_root)
     for declared_path in sample.test_file.split(";"):
         relative_path = declared_path.strip()
         if not relative_path:
@@ -224,6 +225,28 @@ def validate_test_files(sample: Sample) -> None:
             raise ValueError(
                 f"{sample.key} test_file is not synchronized in project HEAD: {relative_path}"
             )
+
+
+def validate_test_report_contract(sample: Sample, project_root: Path) -> None:
+    """Require dataset commands to override a project-level JUnit XML opt-out."""
+    if not sample.test_file.strip():
+        return
+    pom = project_root / "pom.xml"
+    if not pom.is_file():
+        return
+    content = pom.read_text(encoding="utf-8", errors="replace")
+    reports_disabled_by_default = bool(
+        re.search(r"<closeTestReports>\s*true\s*</closeTestReports>", content)
+        and re.search(
+            r"<disableXmlReport>\s*\$\{closeTestReports\}\s*</disableXmlReport>",
+            content,
+        )
+    )
+    if reports_disabled_by_default and "-DcloseTestReports=false" not in sample.test_command:
+        raise ValueError(
+            f"{sample.key} test_command must enable JUnit XML with "
+            "-DcloseTestReports=false"
+        )
 
 
 def target_method(raw_group_occurrences: object) -> str:
