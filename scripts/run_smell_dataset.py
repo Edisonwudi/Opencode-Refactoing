@@ -33,9 +33,21 @@ from smell_core.project_revision import (  # noqa: E402
     resolve_revision,
     verify_checkout,
 )
+from normalize_maven_offline_repo import metadata_fingerprint  # noqa: E402
 
 
 OPENCODE_BATCH_API_KEY_ENV = "SMELL_OPENCODE_API_KEY"
+MAVEN_OFFLINE_REPOSITORY = Path(
+    os.environ.get(
+        "MAVEN_OFFLINE_REPOSITORY",
+        "/opt/buildenv/offline-home/.m2/repository",
+    )
+)
+MAVEN_SETTINGS_FILES = (
+    Path("/opt/buildenv/maven-offline-settings.xml"),
+    Path("/opt/buildenv/maven-global-settings.xml"),
+    Path("/opt/buildenv/offline-home/.m2/settings.xml"),
+)
 ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 ZAI_PROVIDER_MODELS: dict[str, Any] = {
     "glm-4.7": {
@@ -1025,6 +1037,52 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def _record_buildenv_mutation(
+    run_dir: Path,
+    row: dict[str, Any],
+    *,
+    sample_index: int,
+    before: str,
+    after: str,
+) -> None:
+    original_status = str(row.get("status") or "")
+    evidence = {
+        "status": "BUILDENV_MUTATED",
+        "sample_index": sample_index,
+        "sample_id": row.get("sample_id"),
+        "project_name": row.get("project_name"),
+        "original_status": original_status,
+        "repository": str(MAVEN_OFFLINE_REPOSITORY),
+        "before_fingerprint": before,
+        "after_fingerprint": after,
+    }
+    evidence_path = run_dir / f"buildenv-integrity-failure-{sample_index}.json"
+    evidence_path.write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    row["status"] = "BUILDENV_MUTATED"
+    row["note"] = (
+        f"{row.get('note') or ''};"
+        f"original_status={original_status};"
+        f"evidence={evidence_path}"
+    ).lstrip(";")
+
+    sample_dir = Path(str(row.get("sample_dir") or ""))
+    result_path = sample_dir / "result.json"
+    if result_path.is_file():
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            result = {}
+        result.update(row)
+        result["buildenv_integrity"] = evidence
+        result_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+
+
 def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     """Diagnostic mode: create a REAL isolated checkout pinned to project_commit, verify it
     against the manifest, and record the revision audit — but do NOT invoke opencode/verify.
@@ -1419,6 +1477,17 @@ def main(argv: list[str] | None = None) -> int:
 
     results_path = run_dir / "results.csv"
     failures = 0
+    java_batch = bool(samples) and all(sample.language == "java" for sample in samples)
+    buildenv_fingerprint = ""
+    if java_batch:
+        if not MAVEN_OFFLINE_REPOSITORY.is_dir():
+            parser.error(
+                f"Java batch requires Maven offline repository: {MAVEN_OFFLINE_REPOSITORY}"
+            )
+        buildenv_fingerprint = metadata_fingerprint(
+            MAVEN_OFFLINE_REPOSITORY,
+            MAVEN_SETTINGS_FILES,
+        )
     for index, sample in enumerate(samples, start=1):
         print(f"[{index}/{len(samples)}] {sample.sample_id} {sample.project_name} {sample.smell} {sample.location}", flush=True)
         try:
@@ -1446,10 +1515,26 @@ def main(argv: list[str] | None = None) -> int:
                 "sample_dir": "",
                 "note": str(exc),
             }
+        if java_batch:
+            current_fingerprint = metadata_fingerprint(
+                MAVEN_OFFLINE_REPOSITORY,
+                MAVEN_SETTINGS_FILES,
+            )
+            if current_fingerprint != buildenv_fingerprint:
+                _record_buildenv_mutation(
+                    run_dir,
+                    row,
+                    sample_index=index,
+                    before=buildenv_fingerprint,
+                    after=current_fingerprint,
+                )
         if not _is_accepted_status(row.get("status")):
             failures += 1
         _append_result(results_path, row)
         print(f"  -> {row.get('status')} {row.get('sample_dir')}", flush=True)
+        if row.get("status") == "BUILDENV_MUTATED":
+            print("  -> aborting batch: shared build environment changed", flush=True)
+            break
     return 1 if failures else 0
 
 

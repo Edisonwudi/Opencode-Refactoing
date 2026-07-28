@@ -5,6 +5,28 @@ DATASET_ROOT="${DATASET_ROOT:-/opt/dataset/java/delivery_schema}"
 RUNS_ROOT="${RUNS_ROOT:-/runs}"
 RUN_AS_USER="${RUN_AS_USER:-smell}"
 MODEL_EGRESS_ONLY="${MODEL_EGRESS_ONLY:-1}"
+MAVEN_OFFLINE_REPOSITORY="${MAVEN_OFFLINE_REPOSITORY:-/opt/buildenv/offline-home/.m2/repository}"
+MAVEN_OFFLINE_REPOSITORY_ID="${MAVEN_OFFLINE_REPOSITORY_ID:-local-all}"
+MAVEN_OFFLINE_SETTINGS="${MAVEN_OFFLINE_SETTINGS:-/opt/buildenv/maven-offline-settings.xml}"
+MAVEN_GLOBAL_SETTINGS="${MAVEN_GLOBAL_SETTINGS:-/opt/buildenv/maven-global-settings.xml}"
+MAVEN_USER_SETTINGS="${MAVEN_USER_SETTINGS:-/opt/buildenv/offline-home/.m2/settings.xml}"
+
+check_maven_offline_settings() {
+  local candidate
+  for candidate in "$MAVEN_GLOBAL_SETTINGS" "$MAVEN_USER_SETTINGS"; do
+    if [[ ! -f "$candidate" ]] || ! cmp -s "$MAVEN_OFFLINE_SETTINGS" "$candidate"; then
+      echo "Maven settings are not pinned to the bundled offline mirror: $candidate" >&2
+      return 1
+    fi
+  done
+}
+
+check_maven_offline_repository() {
+  python3 /opt/opencode-refactor/scripts/normalize_maven_offline_repo.py \
+    --check \
+    --repository "$MAVEN_OFFLINE_REPOSITORY" \
+    --repository-id "$MAVEN_OFFLINE_REPOSITORY_ID"
+}
 
 ensure_local_hostname() {
   local current_hostname
@@ -21,6 +43,8 @@ ensure_local_hostname() {
 }
 
 ensure_local_hostname
+check_maven_offline_settings
+check_maven_offline_repository
 
 prepare_opencode_auth_json_for_run_user() {
   local source="${OPENCODE_AUTH_JSON:-}"

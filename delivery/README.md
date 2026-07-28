@@ -58,3 +58,34 @@ docker run --rm \
 - Java 侧无变化（镜像 dataset 本已覆盖全部 11 种异味)。
 - 下次镜像交付批次会把 10 种异味 dataset 烤回镜像,届时两种路径完全
   等价,该说明可移除。
+
+## Java 离线 Maven 仓库验收
+
+构建 Java 镜像时，必须在最终镜像层执行：
+
+```bash
+python3 /opt/opencode-refactor/scripts/normalize_maven_offline_repo.py \
+  --repository /opt/buildenv/offline-home/.m2/repository \
+  --repository-id local-all
+```
+
+该命令会把 Maven Resolver 的 `_remote.repositories` 来源统一为
+`maven-offline-settings.xml` 实际使用的 `local-all`，并删除
+`.lastUpdated` 残留。构建时还必须把同一份离线 settings 安装到
+`/opt/buildenv/maven-global-settings.xml` 和
+`/opt/buildenv/offline-home/.m2/settings.xml`：前者覆盖显式使用 `-gs`
+的构建脚本，后者覆盖只设置 `HOME` 的样本测试命令。镜像入口会先确认三份
+settings 完全一致，再以 `--check` 模式验证 resolver 元数据；发现
+`central`、`central-https` 等外部仓库来源时直接拒绝启动，不能依赖某次
+批处理运行临时修复共享缓存。
+
+交付验收必须从未运行过的全新容器开始，使用 `--network none` 执行至少：
+
+- MyBatis + JDK 17（覆盖 Derby 10.16.1.1）；
+- MyBatis + JDK 21（覆盖 Derby 10.17.1.0）；
+- 一个新的容器重复 JDK 17，证明结果不依赖前一容器写入的缓存。
+
+批处理应以非 root 用户运行，并将 `/opt/buildenv` 作为只读挂载或使用
+Docker `--read-only`（仅给 `/tmp`、`/runs` 和样本 worktree 提供独立可写
+挂载）。每个样本必须使用独立容器或独立构建缓存，禁止跨样本共享可写的
+Maven 仓库。

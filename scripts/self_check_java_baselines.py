@@ -373,6 +373,7 @@ class ExecutionPlan:
             "build": {"command": self.build_command, "script": self.build_script},
             "test": {"command": self.test_command, "script": self.test_script},
             "normalized_cwd": self.normalized_cwd,
+            "environment": dict(self.environment),
             "environment_fingerprint": self.environment_fingerprint,
             "maven_settings_sha256": self.maven_settings_sha256,
             "gradle_init_sha256": self.gradle_init_sha256,
