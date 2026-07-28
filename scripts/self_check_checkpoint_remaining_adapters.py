@@ -121,6 +121,10 @@ class Fixture {
 """
 MYSTERIOUS_BEFORE = "class Fixture {\n  void aa() {}\n}\n"
 MYSTERIOUS_AFTER = "class Fixture {\n  void describe() {}\n}\n"
+MYSTERIOUS_LOCAL_BEFORE = "class Fixture {\n  void target() { int var = 1; System.out.println(var); }\n}\n"
+MYSTERIOUS_LOCAL_AFTER = "class Fixture {\n  void target() { int value = 1; System.out.println(value); }\n}\n"
+MYSTERIOUS_PARAM_BEFORE = "class Fixture {\n  void target(Object obj) { System.out.println(obj); }\n}\n"
+MYSTERIOUS_PARAM_AFTER = "class Fixture {\n  void target(Object value) { System.out.println(value); }\n}\n"
 DEAD_BEFORE = "class Fixture {\n  private void unusedHelper() {}\n  void live() {}\n}\n"
 DEAD_AFTER = "class Fixture {\n  void live() {}\n}\n"
 
@@ -141,6 +145,22 @@ def main() -> int:
             MYSTERIOUS_AFTER,
             "Fixture.java:method=aa|line=2",
             "kind=method; name=aa; reason=too_short",
+            "target_suspicious_name_present",
+        ),
+        "mysterious_name_local_var": _case(
+            "mysterious_name",
+            MYSTERIOUS_LOCAL_BEFORE,
+            MYSTERIOUS_LOCAL_AFTER,
+            "Fixture.java:method=target|line=2",
+            "kind=local; name=var; reason=low_info_name",
+            "target_suspicious_name_present",
+        ),
+        "mysterious_name_param_obj": _case(
+            "mysterious_name",
+            MYSTERIOUS_PARAM_BEFORE,
+            MYSTERIOUS_PARAM_AFTER,
+            "Fixture.java:method=target|line=2",
+            "kind=param; name=obj; reason=low_info_name",
             "target_suspicious_name_present",
         ),
         "dead_code": _case(

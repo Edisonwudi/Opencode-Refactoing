@@ -37,9 +37,12 @@ from .java.semantic_detector import (
     run_java_semantic_detector,
 )
 from .java.syntactic_detector import (
+    VAR_DECL_RE,
     compute_switch_metrics,
     find_matching_clone_pair,
     find_matching_syntactic_finding,
+    load_project_model,
+    mask_comments_and_strings,
     parse_mysterious_evidence,
     run_java_syntactic_detector,
 )
@@ -232,6 +235,59 @@ def _mysterious_name(config: Any, evidence: str) -> dict[str, Any]:
             "objectives": {},
             "error": "target_name_missing_from_evidence",
         }
+    if config.language == "java":
+        try:
+            _, methods = load_project_model(config.project_root, [target.file_path])
+        except Exception as exc:
+            return {
+                "ok": False,
+                "detector": "java_exact_identifier_anchor",
+                "objectives": {},
+                "error": str(exc),
+            }
+        target_method = str(target.method or "").split("(", 1)[0].strip()
+        target_line = int(target.line or target.start_line or 0)
+        candidates = list(methods)
+        if target_method:
+            candidates = [method for method in candidates if method.method_name == target_method]
+        elif target_line:
+            containing = [
+                method
+                for method in candidates
+                if method.begin_line <= target_line <= method.end_line
+            ]
+            if containing:
+                candidates = containing
+            elif candidates:
+                candidates = [
+                    min(candidates, key=lambda method: abs(method.begin_line - target_line))
+                ]
+        if not candidates:
+            return {
+                "ok": True,
+                "detector": "java_exact_identifier_anchor",
+                "objectives": {"target_suspicious_name_present": 0},
+                "target_missing": True,
+                "target_kind": kind,
+                "target_name": name,
+            }
+        if kind == "method":
+            present = any(method.method_name == name for method in candidates)
+        elif kind == "param":
+            present = any(name in method.parameter_names for method in candidates)
+        else:
+            present = any(
+                name in VAR_DECL_RE.findall(mask_comments_and_strings(method.body_text))
+                for method in candidates
+            )
+        return {
+            "ok": True,
+            "detector": "java_exact_identifier_anchor",
+            "objectives": {"target_suspicious_name_present": 1 if present else 0},
+            "finding_present": present,
+            "target_kind": kind,
+            "target_name": name,
+        }
     if config.language != "java":
         if not target.file_path.is_file():
             return {
@@ -267,50 +323,6 @@ def _mysterious_name(config: Any, evidence: str) -> dict[str, Any]:
             "target_kind": kind,
             "target_name": name,
         }
-    if not target.file_path.is_file():
-        return {
-            "ok": True,
-            "detector": "java_syntactic_detector",
-            "objectives": {"target_suspicious_name_present": 0},
-            "target_missing": True,
-            "target_kind": kind,
-            "target_name": name,
-        }
-    detection = run_java_syntactic_detector(
-        config.project_root,
-        target_files=[target.file_path],
-        thresholds={"mysterious_name_min_len": 2},
-        include_code_clone=False,
-        include_mysterious_name=True,
-    )
-    if not detection.ok:
-        return {
-            "ok": False,
-            "detector": "java_syntactic_detector",
-            "objectives": {},
-            "error": detection.error,
-        }
-    match = find_matching_syntactic_finding(
-        detection.findings.get("mysterious_name", []),
-        target_file=target.file_path,
-        project_root=config.project_root,
-        method=target.method,
-        line=target.line,
-        original_start_line=target.start_line,
-        original_param_count=target.parameter_count,
-        original_param_type_fingerprint=target.param_type_fingerprint,
-        evidence=evidence,
-    )
-    return {
-        "ok": True,
-        "detector": "java_syntactic_detector",
-        "objectives": {"target_suspicious_name_present": 1 if match else 0},
-        "finding_present": match is not None,
-        "target_kind": kind,
-        "target_name": name,
-    }
-
-
 def _dead_code(config: Any, evidence: str) -> dict[str, Any]:
     target = _target(config)
     target_name = method_basename(target.method) or _method_hint(evidence)
