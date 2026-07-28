@@ -126,6 +126,16 @@ Route-specific edit steps:
    caller instead of inspecting array types in the core.
 3. Rewrite overloads as adapters that call the core with converted values.
 
+Primitive-array core shape:
+
+```java
+Result shared(Object left, Object right, int leftLength, int rightLength,
+              IntConsumer handleIndex) {
+    // identity/null/length checks, then handleIndex.accept(i) in the shared loop
+}
+// Each typed overload passes null-safe lengths and i -> use(left[i], right[i]).
+```
+
 Verification fit delta: The large common body should exist only in the core method.
 
 Avoid: Do not collapse public overloads if callers rely on their narrow types, and
