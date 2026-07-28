@@ -434,6 +434,25 @@ def _verify_clone_structural_resolution(
             },
         }
 
+    parallel_helpers = _find_parallel_new_helpers(
+        baseline_methods,
+        current_methods,
+        current_targets,
+        min_tokens=min_tokens,
+    )
+    if parallel_helpers:
+        return {
+            "success": False,
+            "message": (
+                "new parallel helpers still duplicate one another; centralize the "
+                "shared behavior and remove superseded wrappers."
+            ),
+            "details": {
+                "structural_resolution": "parallel_new_helpers_duplicated",
+                "parallel_new_helpers": parallel_helpers,
+            },
+        }
+
     proof = _shared_clone_route_proof(
         baseline_classes,
         baseline_targets,
@@ -579,6 +598,56 @@ def _find_moved_clone_occurrences(
     return occurrences
 
 
+def _method_identity(method: JavaMethodInfo) -> Tuple[str, str, str]:
+    return (
+        _normalize_path(method.rel_path),
+        method.class_name,
+        method.signature,
+    )
+
+
+def _find_parallel_new_helpers(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+    current_targets: List[Optional[JavaMethodInfo]],
+    *,
+    min_tokens: int,
+) -> List[List[Dict[str, object]]]:
+    """Reject exact helper clones introduced by the refactoring itself."""
+    baseline_identities = {_method_identity(method) for method in baseline_methods}
+    target_identities = {
+        _method_identity(method)
+        for method in current_targets
+        if method is not None
+    }
+    groups: Dict[Tuple[str, ...], List[JavaMethodInfo]] = {}
+    for method in current_methods:
+        identity = _method_identity(method)
+        if identity in baseline_identities or identity in target_identities:
+            continue
+        tokens = tuple(tokenize_clone(method.body_text))
+        parallel_min_tokens = max(20, min(min_tokens, 30))
+        if len(tokens) < parallel_min_tokens:
+            continue
+        groups.setdefault(tokens, []).append(method)
+
+    duplicated: List[List[Dict[str, object]]] = []
+    for methods in groups.values():
+        owners = {(method.rel_path, method.class_name) for method in methods}
+        if len(owners) < 2:
+            continue
+        duplicated.append([
+            {
+                "file": method.rel_path,
+                "class": method.class_name,
+                "method": method.signature,
+                "begin_line": method.begin_line,
+            }
+            for method in methods
+        ])
+    return duplicated
+
+
 def _shared_clone_route_proof(
     baseline_classes: List[JavaClassInfo],
     baseline_targets: List[JavaMethodInfo],
@@ -598,6 +667,18 @@ def _shared_clone_route_proof(
             return {"proven": True, "route": "shared_callee", "shared_calls": introduced_common}
         left_new_calls = _method_calls(left) - _method_calls(baseline_targets[0])
         right_new_calls = _method_calls(right) - _method_calls(baseline_targets[1])
+        one_hop_common = _proven_one_hop_shared_calls(
+            left_new_calls,
+            right_new_calls,
+            current_methods,
+            excluded_calls=baseline_common,
+        )
+        if one_hop_common:
+            return {
+                "proven": True,
+                "route": "typed_adapter_to_shared_callee",
+                "shared_calls": one_hop_common,
+            }
         if baseline_targets[1].method_name in left_new_calls or baseline_targets[0].method_name in right_new_calls:
             return {"proven": True, "route": "existing_owner_delegation", "shared_calls": []}
 
@@ -654,6 +735,32 @@ def _proven_shared_calls(
         if len(owners) <= 1:
             proven.append(call_name)
     return proven
+
+
+def _proven_one_hop_shared_calls(
+    left_calls: set[str],
+    right_calls: set[str],
+    current_methods: List[JavaMethodInfo],
+    *,
+    excluded_calls: set[str],
+) -> List[str]:
+    """Allow distinct typed adapters when both immediately reach one shared owner."""
+    if not left_calls or not right_calls or left_calls == right_calls:
+        return []
+    left_adapter_calls: set[str] = set()
+    right_adapter_calls: set[str] = set()
+    for call_name in left_calls:
+        definitions = [method for method in current_methods if method.method_name == call_name]
+        if len(definitions) == 1:
+            left_adapter_calls.update(_method_calls(definitions[0]))
+    for call_name in right_calls:
+        definitions = [method for method in current_methods if method.method_name == call_name]
+        if len(definitions) == 1:
+            right_adapter_calls.update(_method_calls(definitions[0]))
+    return _proven_shared_calls(
+        (left_adapter_calls & right_adapter_calls) - excluded_calls,
+        current_methods,
+    )
 
 
 # ---------------------------------------------------------------------------

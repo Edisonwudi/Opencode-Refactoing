@@ -219,3 +219,6 @@ code_clone_type1:
       - "Use this path for overload families where the public signatures are part of the API and should remain stable."
       - "Do not replace primitive overloads with a broad Object/generic API or a helper that makes call sites uglier; keep type-specific wrappers and share only the loop/control core."
       - "For primitive variants, use an index predicate/comparator or typed adapter that compiles for every overload; do not force boolean, short, or other primitives through an incompatible generic functional interface."
+      - "Keep the first cohesive edit to the two reported overloads. Broaden the family only when compilation or the structural Oracle proves the pair cannot be centralized independently."
+      - "Do not use java.lang.reflect.Array plus a Class<?> discriminator or type-switch for primitive access. Capture the concrete arrays in an index callback/predicate instead."
+      - "After Oracle feedback, inspect the complete production diff and remove superseded wrappers, duplicate adapters, and unused imports before final verification."

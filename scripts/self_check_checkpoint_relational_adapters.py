@@ -43,6 +43,32 @@ class Fixture {{
   void consume(int value) {{}}
 }}
 """
+CLONE_TYPED_ADAPTER_AFTER = f"""\
+class Fixture {{
+  void left() {{ leftAdapter(); }}
+  void right() {{ rightAdapter(); }}
+  void leftAdapter() {{ shared(1); }}
+  void rightAdapter() {{ shared(2); }}
+  void shared(int variant) {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+CLONE_SHARED_WITH_PARALLEL_HELPERS = f"""\
+class Fixture {{
+  void left() {{ shared(); }}
+  void right() {{ shared(); }}
+  void shared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+class LeftAdapter {{
+  void leftover() {{ int count = 0; for (int i = 0; i < 20; i++) {{ count += i; }} consume(count); }}
+  void consume(int value) {{}}
+}}
+class RightAdapter {{
+  void leftover() {{ int count = 0; for (int i = 0; i < 20; i++) {{ count += i; }} consume(count); }}
+  void consume(int value) {{}}
+}}
+"""
 CLONE_PARENT_BEFORE = f"""\
 class Parent {{}}
 class Left extends Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
@@ -126,7 +152,11 @@ def main() -> int:
         "Fixture.java:method=left|line=2 <-> Fixture.java:method=right|line=3",
         "tokens=30; group_size=2",
         "clone_token_count",
-        rejected_intermediates=(CLONE_MUTATION_ONLY, CLONE_MOVED_TWICE),
+        rejected_intermediates=(
+            CLONE_MUTATION_ONLY,
+            CLONE_MOVED_TWICE,
+            CLONE_SHARED_WITH_PARALLEL_HELPERS,
+        ),
     )
     parent_clone = _case(
         "code_clone_type1", CLONE_PARENT_BEFORE, CLONE_PARENT_AFTER,
@@ -134,11 +164,18 @@ def main() -> int:
         "tokens=30; group_size=2",
         "clone_token_count",
     )
+    typed_adapter_clone = _case(
+        "code_clone_type1", CLONE_BEFORE, CLONE_TYPED_ADAPTER_AFTER,
+        "Fixture.java:method=left|line=2 <-> Fixture.java:method=right|line=3",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+    )
     print(
         "checkpoint-relational-adapters-self-check PASS unchanged_pass=0 "
         f"data_clumps={data[0]:g}->{data[1]:g} "
         f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
-        f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g}"
+        f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g} "
+        f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g}"
     )
     return 0
 

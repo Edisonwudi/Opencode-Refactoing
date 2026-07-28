@@ -19,6 +19,12 @@ or shared core.
 - Compile immediately after the first cohesive structural edit, then run
   `smell_verify`. Repair the exact compiler diagnostic before attempting another
   route.
+- Keep the first edit scoped to the reported clone pair. Broaden an overload family
+  only when compilation or the structural Oracle proves that the pair cannot be
+  centralized independently.
+- Before final verification, inspect the complete production diff and delete
+  superseded helpers, wrappers, imports, or duplicated adapters left by an earlier
+  attempt.
 
 ## Common avoid
 
@@ -32,6 +38,9 @@ or shared core.
 - Using unchecked casts to force `List<A>` and `List<B>` through one helper, or
   routing primitive overloads through an incompatible object/generic functional
   interface.
+- Replacing typed primitive access with `java.lang.reflect.Array`, a `Class<?>`
+  discriminator, and a type-switch. That trades a local clone for slower, less
+  readable runtime dispatch.
 
 ## Routes
 
@@ -132,9 +141,13 @@ Route-specific edit steps:
 
 1. Compare overloads and isolate the type-specific conversion points.
 2. Create a private core method for the shared control flow. For primitive
-   overloads, pass an index predicate/comparator or keep typed adapters; do not box
-   values into an incompatible generic interface.
+   overloads, pass an index callback/predicate that closes over the concrete arrays,
+   or keep thin typed adapters; do not box values into an incompatible generic
+   interface. The shared core may own bounds, null, and loop control, while the
+   callback performs the concrete typed comparison.
 3. Rewrite overloads as adapters that call the core with converted values.
+4. Refactor only the two reported overloads first. Do not sweep every sibling
+   overload merely because it has a similar shape.
 
 Verification fit delta: The large common body should exist only in the core method.
 
