@@ -67,6 +67,13 @@ The runner must fail before model execution with an explicit evidence status
 when these conditions are not met. It must not silently clear or ignore an
 invalid declaration.
 
+`sample_optimized` is selected only when both `test_file` and `test_command`
+are declared. A command without a pinned test file is project-level
+verification, not a sample Oracle. An explicit `sample_optimized` declaration
+without `test_file` fails validation. Structurally constrained Refused Bequest
+samples must declare both fields and cannot fall back to project-level or local
+verification.
+
 ### Immutable Oracle contract
 
 The existing single-file `test_oracle_sha256` behavior remains compatible.

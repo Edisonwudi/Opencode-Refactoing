@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,7 @@ from smell_core.project_revision import (  # noqa: E402
 )
 from run_smell_dataset import (  # noqa: E402
     Sample as RunnerSample,
+    _effective_verification_mode,
     _prepare_worktree,
     _remove_worktree_checkout,
 )
@@ -64,9 +65,11 @@ class Sample:
     project_name: str
     project_path: str
     location: str
+    evidence: str
     test_file: str
     test_command: str
     target_method: str
+    verification_mode: str = ""
     legacy_test_commit: str = ""
     test_oracle_sha256: str = ""
 
@@ -161,9 +164,11 @@ def load_samples(
                     project_name=str(row.get("project_name") or "").strip(),
                     project_path=str(row.get("project_path") or "").strip(),
                     location=str(row.get("location") or "").strip(),
+                    evidence=str(row.get("evidence") or "").strip(),
                     test_file=str(row.get("test_file") or "").strip(),
                     test_command=str(row.get("test_command") or "").strip(),
                     target_method=target_method(row.get("group_occurrences")),
+                    verification_mode=str(row.get("verification_mode") or "").strip(),
                     legacy_test_commit=str(row.get("test_commit") or "").strip(),
                     test_oracle_sha256=str(row.get("test_oracle_sha256") or "").strip(),
                 )
@@ -268,6 +273,10 @@ def resolve(
     *,
     project_override_root: str | None = None,
 ):
+    verification_mode = _effective_verification_mode(
+        as_runner_sample(sample),
+        argparse.Namespace(verification_mode="auto"),
+    )
     resolved = resolve_run_config(
         refactor_config=refactor_config,
         project_overrides=project_overrides,
@@ -276,7 +285,7 @@ def resolve(
         smell=sample.smell,
         location=sample.location,
         cli_language="java",
-        verification_mode="sample_optimized",
+        verification_mode=verification_mode,
         sample_test_location=sample.test_file,
         sample_test_command=sample.test_command,
     )
@@ -288,6 +297,22 @@ def resolve(
         if not path.startswith(f"{java_home}/bin:"):
             raise ValueError(f"{sample.key} project PATH does not start with JAVA_HOME/bin")
     return resolved
+
+
+def as_runner_sample(sample: Sample) -> RunnerSample:
+    return RunnerSample(
+        sample_id=sample.sample_id,
+        language="java",
+        smell=sample.smell,
+        project_name=sample.project_name,
+        project_root=Path(sample.project_path).resolve(),
+        location=sample.location,
+        evidence=sample.evidence,
+        raw={},
+        test_location=sample.test_file,
+        test_command=sample.test_command,
+        verification_mode=sample.verification_mode,
+    )
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -468,18 +493,10 @@ def materialize_execution_plan(
 @contextmanager
 def isolated_worktree(sample: Sample, checkout_id: str, *, target_commit: str | None = None):
     canonical_root = Path(sample.project_path).resolve()
-    runner_sample = RunnerSample(
+    runner_sample = replace(
+        as_runner_sample(sample),
         sample_id=checkout_id[:16],
-        language="java",
-        smell=sample.smell,
-        project_name=sample.project_name,
         project_root=canonical_root,
-        location=sample.location,
-        evidence="",
-        raw={},
-        test_location=sample.test_file,
-        test_command=sample.test_command,
-        verification_mode="sample_optimized",
     )
     temp_root = Path(tempfile.mkdtemp(prefix="baseline-preflight-"))
     prepared = _prepare_worktree(runner_sample, temp_root, target_commit=target_commit)
@@ -490,9 +507,13 @@ def isolated_worktree(sample: Sample, checkout_id: str, *, target_commit: str | 
         project_name=sample.project_name,
         project_path=str(prepared.project_root),
         location=prepared.location,
+        evidence=sample.evidence,
         test_file=prepared.test_location,
         test_command=prepared.test_command,
         target_method=sample.target_method,
+        verification_mode=sample.verification_mode,
+        legacy_test_commit=sample.legacy_test_commit,
+        test_oracle_sha256=sample.test_oracle_sha256,
     )
     try:
         validate_test_files(isolated)

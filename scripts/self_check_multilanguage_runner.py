@@ -58,6 +58,7 @@ def main() -> int:
             language="java",
             smell="refused_bequest",
             evidence="parents=Parent; structural_expectation=capability_split",
+            test_location="src/test/java/ExampleTest.java",
             test_command="mvn test",
         )
         assert (
@@ -67,6 +68,41 @@ def main() -> int:
             )
             == "sample_optimized"
         )
+        project_full_command = replace(
+            sample,
+            language="java",
+            test_command="mvn test",
+        )
+        assert (
+            runner._effective_verification_mode(
+                project_full_command,
+                argparse.Namespace(verification_mode="auto"),
+            )
+            == "project_full"
+        )
+        invalid_sample_oracle = replace(
+            project_full_command,
+            verification_mode="sample_optimized",
+        )
+        try:
+            runner._effective_verification_mode(
+                invalid_sample_oracle,
+                argparse.Namespace(verification_mode="auto"),
+            )
+        except ValueError as exc:
+            assert "SAMPLE_ORACLE_TEST_FILE_MISSING" in str(exc)
+        else:
+            raise AssertionError("sample_optimized verification must require a pinned test file")
+        missing_strict_test = replace(strict_oracle, test_location="")
+        try:
+            runner._effective_verification_mode(
+                missing_strict_test,
+                argparse.Namespace(verification_mode="auto"),
+            )
+        except ValueError as exc:
+            assert "STRICT_ORACLE_TEST_FILE_MISSING" in str(exc)
+        else:
+            raise AssertionError("strict Refused Bequest Oracle must require a pinned test file")
         try:
             runner._effective_verification_mode(
                 strict_oracle,

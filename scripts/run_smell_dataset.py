@@ -250,7 +250,11 @@ def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> st
     sample_mode = str(sample.verification_mode or "").strip()
     requested = "local" if cli_mode == "local" else (sample_mode or cli_mode)
     if requested == "auto":
-        requested = "sample_optimized" if sample.test_command.strip() else "project_full"
+        requested = (
+            "sample_optimized"
+            if sample.test_command.strip() and sample.test_location.strip()
+            else "project_full"
+        )
     strict_oracle = bool(
         sample.smell == "refused_bequest"
         and parse_structural_expectation(sample.evidence)
@@ -259,6 +263,16 @@ def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> st
         raise ValueError(
             "STRICT_ORACLE_TEST_COMMAND_MISSING: structurally constrained Refused Bequest "
             f"sample {sample.sample_id} must declare test_command"
+        )
+    if strict_oracle and not sample.test_location.strip():
+        raise ValueError(
+            "STRICT_ORACLE_TEST_FILE_MISSING: structurally constrained Refused Bequest "
+            f"sample {sample.sample_id} must declare test_file"
+        )
+    if requested == "sample_optimized" and not sample.test_location.strip():
+        raise ValueError(
+            "SAMPLE_ORACLE_TEST_FILE_MISSING: sample_optimized verification requires "
+            f"sample {sample.sample_id} to declare test_file"
         )
     if strict_oracle and requested == "local":
         raise ValueError(
