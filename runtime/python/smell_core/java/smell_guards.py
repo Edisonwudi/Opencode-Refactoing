@@ -465,11 +465,7 @@ def _verify_clone_structural_resolution(
     if len(moved) >= 2:
         return {
             "success": False,
-            "message": (
-                "the original clone body was copied or moved to multiple methods instead of centralized. "
-                "Keep the common control flow in exactly one method; for primitive overloads, pass "
-                "typed index lambdas into one core instead of creating one full helper per primitive type."
-            ),
+            "message": "the original clone body was copied or moved to multiple methods instead of centralized.",
             "details": {
                 "structural_resolution": "moved_clone_still_duplicated",
                 "moved_clone_occurrences": moved,
@@ -487,7 +483,7 @@ def _verify_clone_structural_resolution(
             "success": False,
             "message": (
                 "new parallel helpers still duplicate one another; centralize the "
-                "shared behavior in one core and keep wrappers as short typed calls only."
+                "shared behavior and remove superseded wrappers."
             ),
             "details": {
                 "structural_resolution": "parallel_new_helpers_duplicated",

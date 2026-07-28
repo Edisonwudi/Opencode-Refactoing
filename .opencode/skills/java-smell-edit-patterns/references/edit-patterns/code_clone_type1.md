@@ -148,10 +148,6 @@ Route-specific edit steps:
 3. Rewrite overloads as adapters that call the core with converted values.
 4. Refactor only the two reported overloads first. Do not sweep every sibling
    overload merely because it has a similar shape.
-5. Keep exactly one method containing the common loop/null/length control flow.
-   Do not create `boolean` and `short` (or other per-type) helpers that each copy
-   that full control flow. Both target overloads should call the same index-based
-   core directly; only their lambdas or tiny adapters differ by primitive type.
 
 Verification fit delta: The large common body should exist only in the core method.
 
