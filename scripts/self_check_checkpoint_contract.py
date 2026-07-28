@@ -255,6 +255,28 @@ def main() -> int:
     ), structural_pack
     assert "implement or delegate" in structural_pack["recommendations"][0], structural_pack
 
+    invalid_test_evidence_pack = _build_failure_pack({
+        "status": "SAMPLE_TEST_FAILED",
+        "build_test_guard": {
+            "success": False,
+            "details": {
+                "test": {
+                    "success": False,
+                    "status": "test_not_executed",
+                    "returncode": 0,
+                    "failure_highlights": [
+                        "Pinned sample test location does not identify a test class.",
+                    ],
+                },
+            },
+        },
+    }, {})
+    assert invalid_test_evidence_pack["failure_category"] == "SAMPLE_TEST_EVIDENCE_INVALID", (
+        invalid_test_evidence_pack
+    )
+    assert invalid_test_evidence_pack["failure_group"] == "", invalid_test_evidence_pack
+    assert invalid_test_evidence_pack["retryable"] is False, invalid_test_evidence_pack
+
     checkpoint_only_structural_pack = _build_failure_pack({
         "status": "SMELL_GUARD_FAILED",
         "smell_guard": {

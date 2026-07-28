@@ -35,6 +35,17 @@ class Fixture {{
   void consume(int value) {{}}
 }}
 """
+CLONE_WITH_PARAMETERIZED_CAST = f"""\
+class Fixture {{
+  void left() {{ shared(null); }}
+  void right() {{ shared(null); }}
+  void shared(Object raw) {{
+    java.util.List<String> values = (java.util.List<String>) raw;
+    {CLONE_BODY}
+  }}
+  void consume(int value) {{}}
+}}
+"""
 CLONE_AFTER = f"""\
 class Fixture {{
   void left() {{ shared(); }}
@@ -78,6 +89,32 @@ CLONE_PARENT_AFTER = f"""\
 class Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
 class Left extends Parent {{}}
 class Right extends Parent {{}}
+"""
+OVERLOAD_BEFORE = f"""\
+class Fixture {{
+  void work(int[] values) {{ {CLONE_BODY} }}
+  void work(short[] values) {{ {CLONE_BODY} }}
+  void work(byte[] values) {{ consume(values.length); }}
+  void consume(int value) {{}}
+}}
+"""
+OVERLOAD_SCOPED_AFTER = f"""\
+class Fixture {{
+  void work(int[] values) {{ shared(); }}
+  void work(short[] values) {{ shared(); }}
+  void work(byte[] values) {{ consume(values.length); }}
+  void shared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+OVERLOAD_TOO_BROAD_AFTER = f"""\
+class Fixture {{
+  void work(int[] values) {{ shared(); }}
+  void work(short[] values) {{ shared(); }}
+  void work(byte[] values) {{ shared(); }}
+  void shared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
 """
 
 
@@ -156,6 +193,7 @@ def main() -> int:
             CLONE_MUTATION_ONLY,
             CLONE_MOVED_TWICE,
             CLONE_SHARED_WITH_PARALLEL_HELPERS,
+            CLONE_WITH_PARAMETERIZED_CAST,
         ),
     )
     parent_clone = _case(
@@ -170,12 +208,20 @@ def main() -> int:
         "tokens=30; group_size=2",
         "clone_token_count",
     )
+    scoped_overload_clone = _case(
+        "code_clone_type1", OVERLOAD_BEFORE, OVERLOAD_SCOPED_AFTER,
+        "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+        rejected_intermediates=(OVERLOAD_TOO_BROAD_AFTER,),
+    )
     print(
         "checkpoint-relational-adapters-self-check PASS unchanged_pass=0 "
         f"data_clumps={data[0]:g}->{data[1]:g} "
         f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
         f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g} "
-        f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g}"
+        f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g} "
+        f"scoped_overload_clone={scoped_overload_clone[0]:g}->{scoped_overload_clone[1]:g}"
     )
     return 0
 

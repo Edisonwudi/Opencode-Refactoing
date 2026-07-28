@@ -350,6 +350,7 @@ def run_java_clone_guard(
         first,
         second,
         min_tokens=int(guard.get("min_tokens", 80)),
+        expected_group_size=_clone_group_size(_guard_evidence(guard)),
         changed_java_files=context.changed_java_files if context else [],
     )
     if not structural["success"]:
@@ -395,6 +396,7 @@ def _verify_clone_structural_resolution(
     second: Any,
     *,
     min_tokens: int,
+    expected_group_size: int,
     changed_java_files: List[Path],
 ) -> Dict[str, object]:
     baseline = _load_clone_baseline(config, (first, second))
@@ -418,6 +420,42 @@ def _verify_clone_structural_resolution(
         _find_clone_target_method(current_methods, loc, baseline_target)
         for loc, baseline_target in zip((first, second), baseline_targets)
     ]
+
+    scope_expansion = _find_unreported_overload_changes(
+        baseline_methods,
+        baseline_targets,
+        current_methods,
+        expected_group_size=expected_group_size,
+    )
+    if scope_expansion:
+        return {
+            "success": False,
+            "message": (
+                "the dataset reports a two-member overload clone, but additional "
+                "overloads were changed; restore unrelated family members."
+            ),
+            "details": {
+                "structural_resolution": "unreported_overload_scope_expansion",
+                "changed_unreported_overloads": scope_expansion,
+            },
+        }
+
+    new_parameterized_casts = _find_new_parameterized_casts(
+        baseline_methods,
+        current_methods,
+    )
+    if new_parameterized_casts:
+        return {
+            "success": False,
+            "message": (
+                "the refactoring introduced parameterized casts; preserve concrete "
+                "generic types through typed adapters instead."
+            ),
+            "details": {
+                "structural_resolution": "new_parameterized_casts",
+                "parameterized_casts": new_parameterized_casts,
+            },
+        }
 
     moved = _find_moved_clone_occurrences(
         current_methods,
@@ -606,6 +644,88 @@ def _method_identity(method: JavaMethodInfo) -> Tuple[str, str, str]:
     )
 
 
+def _clone_group_size(evidence: str) -> int:
+    match = re.search(r"\bgroup_size=(\d+)\b", str(evidence or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _find_unreported_overload_changes(
+    baseline_methods: List[JavaMethodInfo],
+    baseline_targets: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+    *,
+    expected_group_size: int,
+) -> List[Dict[str, object]]:
+    """Keep a reported two-overload clone repair scoped to that exact pair."""
+    if expected_group_size != 2:
+        return []
+    left, right = baseline_targets
+    if (
+        left.rel_path != right.rel_path
+        or left.class_name != right.class_name
+        or left.method_name != right.method_name
+    ):
+        return []
+    target_identities = {_method_identity(method) for method in baseline_targets}
+    current_by_identity = {
+        _method_identity(method): method
+        for method in current_methods
+    }
+    changed: List[Dict[str, object]] = []
+    for baseline_method in baseline_methods:
+        identity = _method_identity(baseline_method)
+        if identity in target_identities:
+            continue
+        if (
+            baseline_method.rel_path != left.rel_path
+            or baseline_method.class_name != left.class_name
+            or baseline_method.method_name != left.method_name
+        ):
+            continue
+        current_method = current_by_identity.get(identity)
+        if (
+            current_method is not None
+            and tokenize_clone(current_method.body_text) == tokenize_clone(baseline_method.body_text)
+        ):
+            continue
+        changed.append({
+            "file": baseline_method.rel_path,
+            "class": baseline_method.class_name,
+            "method": baseline_method.signature,
+            "change": "removed" if current_method is None else "body_changed",
+        })
+    return changed
+
+
+_PARAMETERIZED_CAST_RE = re.compile(
+    r"\(\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*<[^()\n]+>\s*\)"
+)
+
+
+def _find_new_parameterized_casts(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+) -> List[Dict[str, object]]:
+    baseline_count = sum(
+        len(_PARAMETERIZED_CAST_RE.findall(method.body_text))
+        for method in baseline_methods
+    )
+    current_hits: List[Dict[str, object]] = []
+    for method in current_methods:
+        casts = _PARAMETERIZED_CAST_RE.findall(method.body_text)
+        if not casts:
+            continue
+        current_hits.extend({
+            "file": method.rel_path,
+            "class": method.class_name,
+            "method": method.signature,
+            "cast": " ".join(cast.split()),
+        } for cast in casts)
+    if len(current_hits) <= baseline_count:
+        return []
+    return current_hits[baseline_count:]
+
+
 def _find_parallel_new_helpers(
     baseline_methods: List[JavaMethodInfo],
     current_methods: List[JavaMethodInfo],
@@ -732,7 +852,7 @@ def _proven_shared_calls(
             if method.method_name == call_name
         ]
         owners = {(method.rel_path, method.class_name) for method in definitions}
-        if len(owners) <= 1:
+        if definitions and len(owners) == 1:
             proven.append(call_name)
     return proven
 

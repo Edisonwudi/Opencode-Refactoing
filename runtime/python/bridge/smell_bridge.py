@@ -1001,6 +1001,22 @@ def _classify_failure_pack(
             "Sample-optimized verification requires SMELL_SAMPLE_TEST_COMMAND or --sample-test-command.",
         ]
     if status == "SAMPLE_TEST_FAILED":
+        build_test = payload.get("build_test_guard") or {}
+        details = build_test.get("details") if isinstance(build_test, dict) else {}
+        test = details.get("test") if isinstance(details, dict) else {}
+        test_status = str(test.get("status") or "") if isinstance(test, dict) else ""
+        failure_text = " ".join(
+            str(item)
+            for item in (test.get("failure_highlights") or [])
+        ) if isinstance(test, dict) else ""
+        if (
+            test_status == "test_not_executed"
+            and "Pinned sample test location does not identify a test class" in failure_text
+        ):
+            return "SAMPLE_TEST_EVIDENCE_INVALID", [
+                "The configured test command passed, but the pinned test-file evidence is invalid.",
+                "This dataset/configuration defect cannot be repaired by editing production code.",
+            ]
         return "SAMPLE_TEST_FAILED", [
             "The sample-level test command failed; fix the regression or report the blocker explicitly.",
         ]
