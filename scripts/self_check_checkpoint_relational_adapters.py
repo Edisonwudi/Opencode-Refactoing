@@ -80,6 +80,16 @@ class RightAdapter {{
   void consume(int value) {{}}
 }}
 """
+CLONE_SHARED_WITH_OVERLOADED_HELPERS = f"""\
+class Fixture {{
+  void left() {{ shared(); }}
+  void right() {{ shared(); }}
+  void shared() {{ {CLONE_BODY} }}
+  void leftover(int ignored) {{ int count = 0; for (int i = 0; i < 20; i++) {{ count += i; }} consume(count); }}
+  void leftover(short ignored) {{ int count = 0; for (int i = 0; i < 20; i++) {{ count += i; }} consume(count); }}
+  void consume(int value) {{}}
+}}
+"""
 CLONE_PARENT_BEFORE = f"""\
 class Parent {{}}
 class Left extends Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
@@ -193,6 +203,7 @@ def main() -> int:
             CLONE_MUTATION_ONLY,
             CLONE_MOVED_TWICE,
             CLONE_SHARED_WITH_PARALLEL_HELPERS,
+            CLONE_SHARED_WITH_OVERLOADED_HELPERS,
             CLONE_WITH_PARAMETERIZED_CAST,
         ),
     )

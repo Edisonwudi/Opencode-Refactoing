@@ -753,8 +753,7 @@ def _find_parallel_new_helpers(
 
     duplicated: List[List[Dict[str, object]]] = []
     for methods in groups.values():
-        owners = {(method.rel_path, method.class_name) for method in methods}
-        if len(owners) < 2:
+        if len(methods) < 2:
             continue
         duplicated.append([
             {
@@ -851,8 +850,7 @@ def _proven_shared_calls(
             for method in current_methods
             if method.method_name == call_name
         ]
-        owners = {(method.rel_path, method.class_name) for method in definitions}
-        if definitions and len(owners) == 1:
+        if len(definitions) == 1:
             proven.append(call_name)
     return proven
 
