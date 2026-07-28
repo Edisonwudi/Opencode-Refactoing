@@ -5,6 +5,8 @@ Semantics under test: a real production diff that reduces any valid target
 metric vs baseline is an accepted improvement (PASS, resolution="improved")
 even when the strict detector still reports the smell. Without a diff or
 without metric reduction the old failure semantics must be unchanged.
+Refused Bequest rows with an explicit structural expectation are stricter:
+metric improvement is progress-only and cannot become final acceptance.
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = REPO_ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
+sys.path.insert(0, str(BRIDGE.parent))
+
+from smell_bridge import _requires_strict_smell_resolution  # noqa: E402
 
 
 def _method(index: int, controls: int) -> str:
@@ -54,6 +59,23 @@ def _bridge(project: Path, subcommand: str) -> dict:
 
 
 def main() -> int:
+    assert _requires_strict_smell_resolution(
+        "refused_bequest",
+        "parents=Parent; structural_expectation=capability_split",
+    )
+    assert _requires_strict_smell_resolution(
+        "refused_bequest",
+        "parents=Parent; structural_expectation=rejecting_override_removed",
+    )
+    assert not _requires_strict_smell_resolution(
+        "refused_bequest",
+        "parents=Parent",
+    )
+    assert not _requires_strict_smell_resolution(
+        "god_class",
+        "structural_expectation=capability_split",
+    )
+
     with tempfile.TemporaryDirectory(prefix="improvement-gate-") as tmp:
         root = Path(tmp)
         (root / "Smelly.java").write_text(_class_source(12, 3, 60), encoding="utf-8")

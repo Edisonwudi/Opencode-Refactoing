@@ -883,6 +883,20 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
   }
 
+  const structuralFailure = hooks.classifyFailureForContinue({
+    failure_category: "STRUCTURAL_ROUTE_MISMATCH",
+    verify_status: "SMELL_GUARD_FAILED",
+    highlights: ["CAPABILITY_SPLIT_REQUIRED target=ReadOnlyPacket method=toBytes parent=Packet"],
+    artifact_paths: {},
+  })
+  assertEqual("structural_route_mismatch_repairable", structuralFailure.ok, true, "ok")
+  assertEqual(
+    "structural_route_mismatch_category",
+    structuralFailure.category,
+    "STRUCTURAL_ROUTE_MISMATCH",
+    "category",
+  )
+
   function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED" } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status))
     payload.loop = {
@@ -940,10 +954,19 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("unified_budget_round2", calls.length, 2, "calls")
     assertEqual("unified_budget_value2", rt.peek("s1").continuation, 2, "continuation")
 
+    // The plugin may authorize one cap recovery while keeping the public
+    // continuation value at max. A fresh generation must still dispatch in
+    // every OpenCode surface.
+    record(rt, { continuation: 2, max: 2 })
+    rt.handleIdle("s1")
+    await flush()
+    assertEqual("unified_cap_recovery_round", calls.length, 3, "calls")
+    assertEqual("unified_cap_recovery_value", rt.peek("s1").continuation, 2, "continuation")
+
     record(rt, { decision: "stop", continuation: 2, max: 2 })
     assertEqual("unified_budget_stop_dispatch", rt.handleIdle("s1"), false, "dispatch")
     await flush()
-    assertEqual("unified_budget_stop_calls", calls.length, 2, "calls")
+    assertEqual("unified_budget_stop_calls", calls.length, 3, "calls")
   }
 
   // A generation dispatches once; PASS or malformed output revokes pending.
@@ -1018,6 +1041,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
 function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
   assertCond("command_decision_hook", typeof hooks?.applyCommandLoopDecision === "function", "missing applyCommandLoopDecision")
+  assertCond("command_state_snapshot_hook", typeof hooks?.commandLoopStateSnapshot === "function", "missing commandLoopStateSnapshot")
+  assertCond("command_state_restore_hook", typeof hooks?.restoreCommandLoopState === "function", "missing restoreCommandLoopState")
   const state = {
     policy: {
       task: "task",
@@ -1033,6 +1058,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     },
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -1053,6 +1079,40 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("command_decision_continue", firstPayload.loop.decision, "continue", "decision")
   assertEqual("command_decision_count", firstPayload.loop.continuation, 1, "continuation")
   assertEqual("command_decision_instruction", firstPayload.loop.instruction, "repair narrowly", "instruction")
+  const routeLockedPrompt = hooks.commandPolicyPrompt({
+    ...state.policy,
+    task: [
+      "Project root: /tmp/project",
+      "Smell type: refused_bequest",
+      "Target location: Child.java:method=toBytes|line=10",
+      "Smell evidence: parents=Packet; structural_expectation=capability_split; refactor_path=split_read_from_write",
+    ].join("\n"),
+  })
+  assertCond(
+    "command_prompt_capability_split_route_lock",
+    routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
+      && routeLockedPrompt.includes("A body-only implementation or delegation"),
+    "capability split route lock missing from initial command prompt",
+  )
+  const restoredAfterRestart = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(state)),
+  )
+  assertCond("command_state_restored", Boolean(restoredAfterRestart), "state did not restore")
+  assertEqual("command_state_count_survives_restart", restoredAfterRestart.continuationCount, 1, "continuationCount")
+  assertEqual(
+    "command_state_fingerprint_survives_restart",
+    restoredAfterRestart.lastFailureFingerprint,
+    state.lastFailureFingerprint,
+    "lastFailureFingerprint",
+  )
+  const restartedSecond = { output: JSON.stringify(failure), metadata: {} }
+  hooks.applyCommandLoopDecision(restartedSecond, restoredAfterRestart)
+  assertEqual(
+    "command_state_no_progress_survives_restart",
+    JSON.parse(restartedSecond.output).loop.termination_reason,
+    "NO_PROGRESS",
+    "termination",
+  )
   const second = { output: JSON.stringify(failure), metadata: {} }
   hooks.applyCommandLoopDecision(second, state)
   const secondPayload = JSON.parse(second.output)
@@ -1065,6 +1125,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     policy: state.policy,
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -1086,12 +1147,118 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("improved_no_progress_stop", improvedSecondPayload.loop.termination_reason, "PASS", "termination")
   assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
 
+  const structuralState = {
+    policy: state.policy,
+    startedAt: Date.now(),
+    continuationCount: 0,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const structuralImproved = {
+    ...improved,
+    failure_pack: {
+      failure_category: "STRUCTURAL_ROUTE_MISMATCH",
+      failure_group: "smell",
+      retryable: true,
+    },
+  }
+  const structuralResult = { output: JSON.stringify(structuralImproved), metadata: {} }
+  hooks.applyCommandLoopDecision(structuralResult, structuralState)
+  const structuralPayload = JSON.parse(structuralResult.output)
+  assertEqual("structural_decision_continue", structuralPayload.loop.decision, "continue", "decision")
+  assertCond(
+    "structural_instruction_overrides_metric_hint",
+    structuralPayload.loop.instruction.startsWith("Capability split is mandatory.")
+      && !structuralPayload.loop.instruction.includes("keep going to resolved"),
+    "generic metric continue_hint overrode structural route correction",
+  )
+
   const resolved = { success: true, status: "PASS", resolution: "resolved" }
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
   hooks.applyCommandLoopDecision(resolvedResult, improvedState)
   const resolvedPayload = JSON.parse(resolvedResult.output)
   assertEqual("resolved_decision_stop", resolvedPayload.loop.decision, "stop", "decision")
   assertEqual("resolved_termination", resolvedPayload.loop.termination_reason, "PASS", "termination")
+
+  const capPolicy = {
+    ...state.policy,
+    loop: {
+      ...state.policy.loop,
+      no_progress_limit: 3,
+      allowed_failure_groups: ["smell", "compile", "test"],
+    },
+  }
+  const capState = {
+    policy: capPolicy,
+    startedAt: Date.now(),
+    continuationCount: 2,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const progressingAtCap = {
+    ...failure,
+    checkpoint: { delta: { metric_progress: true } },
+  }
+  const capRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(capRecovery, capState)
+  const capRecoveryPayload = JSON.parse(capRecovery.output)
+  assertEqual("cap_progress_recovers_once", capRecoveryPayload.loop.decision, "continue", "decision")
+  assertEqual("cap_recovery_count_bounded", capRecoveryPayload.loop.continuation, 2, "continuation")
+  assertEqual("cap_recovery_marked", capRecoveryPayload.loop.cap_recovery_used, true, "cap_recovery_used")
+  const restoredCapState = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(capState)),
+  )
+  const restartedCapRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(restartedCapRecovery, restoredCapState)
+  assertEqual(
+    "cap_recovery_survives_restart",
+    JSON.parse(restartedCapRecovery.output).loop.termination_reason,
+    "MAX_CONTINUATIONS_REACHED",
+    "termination",
+  )
+  const capRecoveryAgain = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(capRecoveryAgain, capState)
+  const capRecoveryAgainPayload = JSON.parse(capRecoveryAgain.output)
+  assertEqual("cap_recovery_only_once", capRecoveryAgainPayload.loop.decision, "stop", "decision")
+  assertEqual("cap_recovery_then_max", capRecoveryAgainPayload.loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
+
+  const compileCapState = {
+    ...capState,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const compileAtCap = {
+    success: false,
+    status: "BUILD_FAILED",
+    failure_pack: {
+      failure_category: "BUILD_FAILED",
+      failure_group: "compile",
+      retryable: true,
+      verify_status: "BUILD_FAILED",
+      highlights: ["compile repair remains"],
+    },
+    snapshot: { diff_stat: { stdout: " Foo.java | 2 +-" } },
+  }
+  const compileRecovery = { output: JSON.stringify(compileAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(compileRecovery, compileCapState)
+  assertEqual("compile_diff_recovers_at_cap", JSON.parse(compileRecovery.output).loop.decision, "continue", "decision")
+
+  const noProgressCapState = {
+    ...capState,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+  }
+  const noProgressAtCap = {
+    ...failure,
+    checkpoint: { delta: { metric_progress: false } },
+  }
+  const noCapRecovery = { output: JSON.stringify(noProgressAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(noCapRecovery, noProgressCapState)
+  assertEqual("cap_without_progress_stops", JSON.parse(noCapRecovery.output).loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
   return { passed: true }
 }
 

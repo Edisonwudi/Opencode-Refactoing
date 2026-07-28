@@ -220,6 +220,70 @@ def main() -> int:
     assert len(highlights[0]) <= 190, highlights
     assert highlights[1:3] == feedback, failure_pack
 
+    structural_pack = _build_failure_pack({
+        "status": "SMELL_GUARD_FAILED",
+        "smell_guard": {
+            "success": False,
+            "results": [{
+                "type": "refused_bequest",
+                "success": False,
+                "message": (
+                    "refused_bequest guard: the reported parent capability is still "
+                    "inherited and still exposes the target method."
+                ),
+                "details": {
+                    "structural_expectation": "capability_split",
+                    "capability_profile": {
+                        "ok": True,
+                        "target_class": "example.ReadOnlyPacket",
+                        "method": "toBytes",
+                        "reported_parent": "Packet",
+                        "inherits_reported_parent": True,
+                        "child_declares_target": True,
+                        "parent_declares_target": True,
+                        "capability_split_satisfied": False,
+                    },
+                },
+            }],
+        },
+    }, {})
+    assert structural_pack["failure_category"] == "STRUCTURAL_ROUTE_MISMATCH", structural_pack
+    assert structural_pack["failure_group"] == "smell", structural_pack
+    assert structural_pack["retryable"] is True, structural_pack
+    assert structural_pack["highlights"][0].startswith(
+        "CAPABILITY_SPLIT_REQUIRED target=example.ReadOnlyPacket"
+    ), structural_pack
+    assert "implement or delegate" in structural_pack["recommendations"][0], structural_pack
+
+    checkpoint_only_structural_pack = _build_failure_pack({
+        "status": "SMELL_GUARD_FAILED",
+        "smell_guard": {
+            "success": False,
+            "results": [{
+                "type": "refused_bequest",
+                "success": False,
+                "message": (
+                    "refused_bequest checkpoint contract: production source changed, "
+                    "but no checkpoint objective decreased."
+                ),
+                "details": {
+                    "detector": "checkpoint_contract",
+                    "reason": "NO_STRUCTURAL_PROGRESS",
+                },
+            }],
+        },
+    }, {}, smell="refused_bequest", evidence=(
+        "parents=IPacket; structural_expectation=capability_split; "
+        "refactor_path=split_readable_packets_from_writable_packets"
+    ))
+    assert (
+        checkpoint_only_structural_pack["failure_category"]
+        == "STRUCTURAL_ROUTE_MISMATCH"
+    ), checkpoint_only_structural_pack
+    assert checkpoint_only_structural_pack["failure_group"] == "smell", (
+        checkpoint_only_structural_pack
+    )
+
     print(f"checkpoint-contract-self-check PASS smells={len(EXPECTED)} unchanged_pass=0 strict_decrease=PASS feedback=PASS")
     return 0
 

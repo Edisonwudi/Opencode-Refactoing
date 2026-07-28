@@ -6,6 +6,7 @@ import csv
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -24,7 +25,16 @@ if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
 from smell_core.config import VERIFICATION_MODES  # noqa: E402
+from smell_core.detector_utils import (  # noqa: E402
+    parse_parent_from_evidence,
+    parse_structural_expectation,
+)
+from smell_core.java.semantic_detector import (  # noqa: E402
+    _build_project_model,
+    analyze_refused_bequest_target,
+)
 from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
+from smell_core.location import parse_locations, split_location_descriptors  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
@@ -32,6 +42,7 @@ from smell_core.project_revision import (  # noqa: E402
     load_revisions,
     resolve_revision,
     verify_checkout,
+    verify_test_oracle,
 )
 from normalize_maven_offline_repo import metadata_fingerprint  # noqa: E402
 
@@ -85,6 +96,7 @@ class Sample:
     test_command: str = ""
     verification_mode: str = ""
     canonical_project_root: Path | None = None
+    sibling_revision_audit: tuple[dict[str, str], ...] = ()
 
 
 def _run(
@@ -111,7 +123,7 @@ def _run(
 
 
 def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return _run(["git", *args], project_root)
+    return _run(["git", "-c", "safe.directory=*", *args], project_root)
 
 
 def _prepare_idea_service(project_root: Path, sample_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -171,6 +183,18 @@ def _dataset_evidence(row: dict[str, str | None]) -> str:
     has_class = any(part.strip().lower().startswith("class=") for part in evidence.split(";"))
     if smell == "god_class" and class_name and not has_class:
         return f"{evidence};class={class_name}" if evidence else f"class={class_name}"
+    if smell == "refused_bequest" and str(row.get("group_occurrences") or "").strip():
+        try:
+            members = json.loads(str(row["group_occurrences"]))
+        except (json.JSONDecodeError, TypeError):
+            members = []
+        if isinstance(members, list) and members:
+            arities = [str(item.get("target_parameter_count", "")).strip() for item in members]
+            classes = [str(item.get("target_class", "")).strip() for item in members]
+            if all(arities):
+                evidence += "; target_parameter_counts=" + "|".join(arities)
+            if all(classes):
+                evidence += "; target_classes=" + "|".join(classes)
     return evidence
 
 
@@ -221,11 +245,25 @@ def _filter_samples(samples: list[Sample], args: argparse.Namespace) -> list[Sam
 
 
 def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> str:
-    cli_mode = str(args.verification_mode or "local").strip() or "local"
+    cli_mode = str(args.verification_mode or "auto").strip() or "auto"
     sample_mode = str(sample.verification_mode or "").strip()
     requested = "local" if cli_mode == "local" else (sample_mode or cli_mode)
     if requested == "auto":
         requested = "sample_optimized" if sample.test_command.strip() else "project_full"
+    strict_oracle = bool(
+        sample.smell == "refused_bequest"
+        and parse_structural_expectation(sample.evidence)
+    )
+    if strict_oracle and not sample.test_command.strip():
+        raise ValueError(
+            "STRICT_ORACLE_TEST_COMMAND_MISSING: structurally constrained Refused Bequest "
+            f"sample {sample.sample_id} must declare test_command"
+        )
+    if strict_oracle and requested == "local":
+        raise ValueError(
+            "STRICT_ORACLE_LOCAL_FORBIDDEN: structurally constrained Refused Bequest "
+            f"sample {sample.sample_id} cannot use local verification"
+        )
     if requested not in VERIFICATION_MODES:
         raise ValueError(
             f"Unsupported verification mode '{requested}'. Expected one of: {', '.join(sorted(VERIFICATION_MODES))}."
@@ -288,7 +326,76 @@ def _execution_checkout_run_dir(run_dir: Path) -> Path:
     return Path(tempfile.gettempdir()) / "opencode-refactor-worktrees" / run_dir.name
 
 
-def _prepare_worktree(sample: Sample, run_dir: Path, *, target_commit: str) -> Sample:
+def _declared_sibling_projects(sample: Sample) -> list[str]:
+    raw = str(sample.raw.get("checkout_sibling_projects") or "").strip()
+    return [
+        name.strip()
+        for name in re.split(r"[|,;]", raw)
+        if name.strip()
+    ]
+
+
+def _evidence_values(evidence: str, field: str) -> list[str]:
+    match = re.search(
+        rf"(?:^|;\s*){re.escape(field)}=([^;]+)",
+        str(evidence or ""),
+        flags=re.IGNORECASE,
+    )
+    return [part.strip() for part in match.group(1).split("|")] if match else []
+
+
+def _assert_dataset_test_commit(sample: Sample, project_commit: str) -> None:
+    declared = str(sample.raw.get("test_commit") or "").strip()
+    if declared and declared != project_commit:
+        raise ProjectRevisionError(
+            "TEST_COMMIT_PROJECT_REVISION_MISMATCH",
+            f"dataset test_commit {declared} does not match authoritative project_commit "
+            f"{project_commit} for {sample.project_name}",
+            test_commit=declared,
+            project_commit=project_commit,
+            project_name=sample.project_name,
+        )
+
+
+def _pin_refused_bequest_target_classes(sample: Sample) -> Sample:
+    """Capture pre-refactor class identities so deleted methods cannot drift by line."""
+    if sample.smell != "refused_bequest" or not parse_structural_expectation(sample.evidence):
+        return sample
+    targets = parse_locations(sample.location, sample.project_root)
+    arities = _evidence_values(sample.evidence, "target_parameter_counts")
+    model = _build_project_model(sample.project_root, include_tests=False)
+    target_classes: list[str] = []
+    for index, target in enumerate(targets):
+        arity = int(arities[index]) if len(arities) == len(targets) else None
+        profile = analyze_refused_bequest_target(
+            sample.project_root,
+            target_file=target.file_path,
+            method=target.method,
+            line=target.line,
+            reported_parent=parse_parent_from_evidence(sample.evidence),
+            target_parameter_count=arity,
+            project_model=model,
+        )
+        target_class = str(profile.get("target_class") or "").strip()
+        if not profile.get("ok") or not target_class:
+            raise ProjectRevisionError(
+                "TARGET_CLASS_PIN_FAILED",
+                f"cannot pin pre-refactor target class for {target.raw}",
+                target=target.raw,
+                detector_error=str(profile.get("error") or ""),
+            )
+        target_classes.append(target_class)
+    evidence = sample.evidence + "; target_classes=" + "|".join(target_classes)
+    return replace(sample, evidence=evidence)
+
+
+def _prepare_worktree(
+    sample: Sample,
+    run_dir: Path,
+    *,
+    target_commit: str,
+    revisions: dict[str, dict[str, Any]] | None = None,
+) -> Sample:
     """Create an isolated checkout pinned to ``target_commit``.
 
     ``target_commit`` is REQUIRED: there is no HEAD fallback. Callers (both the real
@@ -300,9 +407,6 @@ def _prepare_worktree(sample: Sample, run_dir: Path, *, target_commit: str) -> S
             "_prepare_worktree requires a non-empty target_commit; HEAD fallback is forbidden"
         )
     canonical_root = sample.project_root.resolve()
-    safe_proc = _run(["git", "config", "--global", "--add", "safe.directory", "*"], canonical_root)
-    if safe_proc.returncode != 0:
-        raise RuntimeError(safe_proc.stderr or safe_proc.stdout or "failed to configure git safe.directory")
 
     worktree = run_dir / "worktrees" / f"sample-{_sanitize(sample.sample_id)}" / canonical_root.name
     if worktree.exists():
@@ -335,10 +439,61 @@ def _prepare_worktree(sample: Sample, run_dir: Path, *, target_commit: str) -> S
 
     _restore_worktree_build_wrappers(canonical_root, worktree)
 
+    sibling_audits: list[dict[str, str]] = []
+    sibling_projects = _declared_sibling_projects(sample)
+    if sibling_projects and revisions is None:
+        raise RuntimeError("sibling project checkout requires the authoritative revisions manifest")
+    for project_name in sibling_projects:
+        sibling_root = canonical_root.parent / project_name
+        if not sibling_root.is_dir():
+            raise ProjectRevisionError(
+                "SIBLING_PROJECT_ROOT_MISSING",
+                f"declared sibling project {project_name} is missing beside {canonical_root}",
+                project_name=project_name,
+                project_root=str(sibling_root),
+            )
+        sibling_revision = resolve_revision(project_name, revisions or {}, "in-memory revisions")
+        assert_commit_present(sibling_root, sibling_revision.project_commit)
+        sibling_checkout = worktree.parent / sibling_root.name
+        if sibling_checkout.exists():
+            shutil.rmtree(sibling_checkout)
+        clone_proc = _git(
+            sibling_root,
+            ["clone", "--shared", "--no-checkout", str(sibling_root), str(sibling_checkout)],
+        )
+        if clone_proc.returncode != 0:
+            raise RuntimeError(
+                clone_proc.stderr
+                or clone_proc.stdout
+                or f"failed to create sibling checkout at {sibling_checkout}"
+            )
+        checkout_proc = _git(
+            sibling_checkout,
+            ["checkout", "--detach", sibling_revision.project_commit],
+        )
+        if checkout_proc.returncode != 0:
+            shutil.rmtree(sibling_checkout, ignore_errors=True)
+            raise RuntimeError(
+                checkout_proc.stderr
+                or checkout_proc.stdout
+                or f"failed to check out sibling {project_name}"
+            )
+        _restore_worktree_build_wrappers(sibling_root, sibling_checkout)
+        sibling_audit = verify_checkout(sibling_checkout, sibling_revision)
+        sibling_audits.append(
+            {
+                "project_name": project_name,
+                "canonical_project_root": str(sibling_root),
+                "execution_project_root": str(sibling_checkout),
+                **sibling_audit,
+            }
+        )
+
     return replace(
         sample,
         project_root=worktree.resolve(),
         canonical_project_root=canonical_root,
+        sibling_revision_audit=tuple(sibling_audits),
         location=_remap_text(sample.location, canonical_root, worktree.resolve()),
         evidence=_remap_text(sample.evidence, canonical_root, worktree.resolve()),
         test_location=_remap_text(sample.test_location, canonical_root, worktree.resolve()),
@@ -554,6 +709,8 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
     """
     verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
     verify_success = bool(verify_payload.get("success")) if isinstance(verify_payload, dict) else False
+    if opencode_returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE:
+        return "PROVIDER_QUOTA_FAILED"
     if opencode_returncode != 0:
         if opencode_returncode == 124 and verify_returncode == 0 and verify_success and verify_status == "PASS":
             return "PASS_AFTER_OPENCODE_TIMEOUT"
@@ -562,6 +719,22 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
 
 
 OPENCODE_SHUTDOWN_GRACE_SECONDS = 60
+OPENCODE_FATAL_PROVIDER_RETURN_CODE = 86
+
+
+def _fatal_provider_error(log_text: str) -> str:
+    """Classify non-retryable provider quota failures found in OpenCode logs."""
+    text = str(log_text or "")
+    lowered = text.casefold()
+    if "token plan 用量上限" in lowered or "已达到 token plan" in lowered:
+        return "MINIMAX_TOKEN_PLAN_EXHAUSTED"
+    if (
+        "insufficient_quota" in lowered
+        or "billing_hard_limit_reached" in lowered
+        or "credit balance is too low" in lowered
+    ):
+        return "PROVIDER_INSUFFICIENT_QUOTA"
+    return ""
 
 
 def _opencode_timeout_seconds(sample_deadline: int) -> int:
@@ -585,6 +758,7 @@ def _task_prompt(
     agent: str,
 ) -> str:
     idea_enabled = agent == "java-refactor-agent-idea"
+    target_count = len(split_location_descriptors(sample.location))
     lines = [
         f"Project root: {sample.project_root}",
         f"Language: {sample.language}",
@@ -602,10 +776,17 @@ def _task_prompt(
     if idea_enabled and args.idea_refactor_cli:
         lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
     lines.append("")
-    lines.append(
-        f"Repair this one {sample.language} smell from the dataset row. "
-        "Preserve behavior. Call smell_verify as the final acceptance gate."
-    )
+    if target_count > 1:
+        lines.append(
+            f"Repair this grouped {sample.language} smell across all {target_count} listed "
+            "target methods in one cohesive refactoring. Partial target removal is not accepted. "
+            "Preserve behavior. Call smell_verify as the final acceptance gate."
+        )
+    else:
+        lines.append(
+            f"Repair this one {sample.language} smell from the dataset row. "
+            "Preserve behavior. Call smell_verify as the final acceptance gate."
+        )
     return "\n".join(lines)
 
 
@@ -723,7 +904,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_status = ""
-    last_termination_reason = ""
+    last_cap_recovery_used = False
+    last_command_loop_state: dict[str, Any] | None = None
     for raw in (events_text or "").splitlines():
         try:
             event = json.loads(raw)
@@ -743,7 +925,10 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             meta_loop = metadata.get("loop")
             if isinstance(meta_loop, dict):
                 last_decision = str(meta_loop.get("decision") or "")
-                last_termination_reason = str(meta_loop.get("termination_reason") or "")
+                last_cap_recovery_used = meta_loop.get("cap_recovery_used") is True
+            command_loop_state = metadata.get("command_loop_state")
+            if isinstance(command_loop_state, dict):
+                last_command_loop_state = command_loop_state
             auto = metadata.get("auto_continuation")
             if isinstance(auto, dict):
                 last_status = str(auto.get("status") or "")
@@ -759,21 +944,16 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
-    if not last_termination_reason and isinstance(loop, dict):
-        last_termination_reason = str(loop.get("termination_reason") or "")
+        last_cap_recovery_used = loop.get("cap_recovery_used") is True
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
-    failure_pack = last_payload.get("failure_pack") if isinstance(last_payload, dict) else None
-    checkpoint = last_payload.get("checkpoint") if isinstance(last_payload, dict) else None
-    delta = checkpoint.get("delta") if isinstance(checkpoint, dict) else None
     return {
         "smell_verify_calls": calls,
         "last_loop_decision": last_decision,
-        "last_termination_reason": last_termination_reason,
         "last_status": last_status,
-        "last_failure_retryable": failure_pack.get("retryable") if isinstance(failure_pack, dict) else None,
-        "last_metric_progress": delta.get("metric_progress") if isinstance(delta, dict) else None,
         "last_output_parsed": last_payload is not None,
+        "last_cap_recovery_used": last_cap_recovery_used,
+        "command_loop_state": last_command_loop_state,
     }
 
 
@@ -787,24 +967,18 @@ def _runner_closure_action(
     """Return the next synchronous runner action for a completed OpenCode turn."""
     if int(trace.get("smell_verify_calls") or 0) == 0:
         return "stop" if reminder_used else "verify_required"
+    # The plugin owns all semantic continuation policy across UI and batch.
+    # This is only a transport safety bound. The extra transport is available
+    # only when the plugin explicitly persisted that its one cap recovery was
+    # consumed; a bare `continue` must never manufacture an extra retry.
+    transport_limit = max_continuations + (
+        1 if trace.get("last_cap_recovery_used") is True else 0
+    )
     if (
         trace.get("last_loop_decision") == "continue"
-        and continuations_dispatched < max_continuations
+        and continuations_dispatched < transport_limit
     ):
         return "continue"
-    # The plugin's in-turn continuation budget and the runner's cross-process
-    # budget protect different boundaries. If the plugin stopped only because
-    # its internal budget was exhausted while the latest retryable checkpoint
-    # still made measurable progress, resume the same session. The runner's
-    # existing max_continuations remains the outer hard cap.
-    if (
-        trace.get("last_loop_decision") == "stop"
-        and trace.get("last_termination_reason") == "MAX_CONTINUATIONS_REACHED"
-        and trace.get("last_failure_retryable") is True
-        and trace.get("last_metric_progress") is True
-        and continuations_dispatched < max_continuations
-    ):
-        return "continue_after_internal_cap"
     return "stop"
 
 
@@ -818,16 +992,10 @@ def _runner_continuation_prompt(action: str, continuation: int, max_continuation
                 "Treat its loop.decision as authoritative and do not modify or weaken tests.",
             ]
         )
-    reason = (
-        "The plugin stopped only because its internal continuation budget was exhausted, "
-        "but the latest retryable checkpoint still made measurable progress."
-        if action == "continue_after_internal_cap"
-        else "The previous smell_verify result requested another corrective iteration."
-    )
     return "\n".join(
         [
             f"[runner-verification-closure continue {continuation}/{max_continuations}]",
-            reason,
+            "The previous smell_verify result requested another corrective iteration.",
             instruction,
             "Continue the same task in this session, then call smell_verify again.",
             "Use the latest failure pack and remaining-occurrence evidence as the repair scope.",
@@ -874,6 +1042,7 @@ def _run_opencode(
     *,
     session_id: str = "",
     continuation_prompt: str = "",
+    command_loop_state: dict[str, Any] | None = None,
     attempt_suffix: str = "",
     hard_timeout_seconds: int | None = None,
 ) -> tuple[int, str]:
@@ -893,6 +1062,12 @@ def _run_opencode(
     # The custom command owns the native in-session loop. Disable the legacy
     # session.idle mechanism so there is exactly one controller.
     env["SMELL_BATCH_RUN"] = "1"
+    if session_id and command_loop_state:
+        env["SMELL_COMMAND_LOOP_STATE_JSON"] = json.dumps(
+            command_loop_state, separators=(",", ":"), sort_keys=True
+        )
+    else:
+        env.pop("SMELL_COMMAND_LOOP_STATE_JSON", None)
     if agent == "java-refactor-agent-idea":
         env["SMELL_IDEA_PREPARED"] = "1"
     env["SMELL_BRIDGE_FILE"] = str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py")
@@ -985,7 +1160,39 @@ def _run_opencode(
             hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
         )
         timeout_code = 0
+        log_scan_offset = 0
+        log_scan_tail = ""
         while proc.poll() is None:
+            try:
+                with log_path.open("r", encoding="utf-8", errors="replace") as log_reader:
+                    log_reader.seek(log_scan_offset)
+                    log_chunk = log_reader.read()
+                    log_scan_offset = log_reader.tell()
+            except OSError:
+                log_chunk = ""
+            provider_failure = _fatal_provider_error(log_scan_tail + log_chunk)
+            log_scan_tail = (log_scan_tail + log_chunk)[-256:]
+            if provider_failure:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=10)
+                timeout_code = OPENCODE_FATAL_PROVIDER_RETURN_CODE
+                provider_failure_path = _attempt_artifact_path(
+                    sample_dir, "provider.failure.json", attempt_suffix
+                )
+                provider_failure_path.write_text(
+                    json.dumps(
+                        {
+                            "failure_category": "PROVIDER_QUOTA_FAILED",
+                            "provider_failure": provider_failure,
+                            "retryable": False,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                break
             if time.monotonic() > deadline:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=10)
@@ -1103,17 +1310,39 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
     try:
         revisions = load_revisions(args.project_revisions)
         rev = resolve_revision(sample.project_name, revisions, args.project_revisions)
+        _assert_dataset_test_commit(sample, rev.project_commit)
         assert_commit_present(canonical_root, rev.project_commit)
         prepared = _prepare_worktree(
-            sample, _execution_checkout_run_dir(run_dir), target_commit=rev.project_commit
+            sample,
+            _execution_checkout_run_dir(run_dir),
+            target_commit=rev.project_commit,
+            revisions=revisions,
         )
+        prepared = _pin_refused_bequest_target_classes(prepared)
         audit = verify_checkout(prepared.project_root, rev)
+        audit["target_class_pins"] = _evidence_values(
+            prepared.evidence,
+            "target_classes",
+        )
+        if prepared.sibling_revision_audit:
+            audit["sibling_checkouts"] = list(prepared.sibling_revision_audit)
+        audit.update(
+            verify_test_oracle(
+                prepared.project_root,
+                prepared.test_location,
+                sample.raw.get("test_oracle_sha256", ""),
+            )
+        )
         row.update({
             "status": "CHECKOUT_OK",
             "execution_project_root": str(prepared.project_root),
             **audit,
         })
         _remove_worktree_checkout(canonical_root, prepared.project_root)
+        for sibling in prepared.sibling_revision_audit:
+            sibling_checkout = str(sibling.get("execution_project_root") or "").strip()
+            if sibling_checkout:
+                shutil.rmtree(sibling_checkout, ignore_errors=True)
     except ProjectRevisionError as exc:
         row.update({
             "status": exc.status,
@@ -1156,21 +1385,41 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     # project-revisions.json (resolved via smell_core.project_revision). There is no
     # HEAD fallback: if the manifest entry / commit / tree cannot be honored, the
     # sample fails fast with an explicit PROJECT_* status.
-    revision_audit: dict[str, str] = {}
+    revision_audit: dict[str, Any] = {}
     revisions_path = getattr(args, "project_revisions", DEFAULT_REVISIONS_PATH)
     try:
         revisions = load_revisions(revisions_path)
         rev = resolve_revision(sample.project_name, revisions, revisions_path)
+        _assert_dataset_test_commit(sample, rev.project_commit)
         assert_commit_present(sample.project_root.resolve(), rev.project_commit)
         execution_sample = (
             _prepare_worktree(
-                sample, _execution_checkout_run_dir(run_dir), target_commit=rev.project_commit
+                sample,
+                _execution_checkout_run_dir(run_dir),
+                target_commit=rev.project_commit,
+                revisions=revisions,
             )
             if args.worktree
             else replace(sample, canonical_project_root=sample.project_root)
         )
         if args.worktree:
             revision_audit = verify_checkout(execution_sample.project_root, rev)
+            if execution_sample.sibling_revision_audit:
+                revision_audit["sibling_checkouts"] = list(
+                    execution_sample.sibling_revision_audit
+                )
+        execution_sample = _pin_refused_bequest_target_classes(execution_sample)
+        revision_audit["target_class_pins"] = _evidence_values(
+            execution_sample.evidence,
+            "target_classes",
+        )
+        revision_audit.update(
+            verify_test_oracle(
+                execution_sample.project_root,
+                execution_sample.test_location,
+                sample.raw.get("test_oracle_sha256", ""),
+            )
+        )
     except ProjectRevisionError as exc:
         # Fail fast: record the deviation and abort this sample without running
         # opencode/verify or touching runtime HEAD.
@@ -1244,6 +1493,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     controller_attempts: list[dict[str, Any]] = []
     session_id = ""
     continuation_prompt = ""
+    command_loop_state: dict[str, Any] | None = None
     continuations_dispatched = 0
     reminders_dispatched = 0
     reminder_used = False
@@ -1263,6 +1513,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             verification_mode,
             session_id=session_id,
             continuation_prompt=continuation_prompt,
+            command_loop_state=command_loop_state,
             attempt_suffix=attempt_suffix,
             hard_timeout_seconds=remaining,
         )
@@ -1282,6 +1533,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 **trace,
             }
         )
+        restored_state = trace.get("command_loop_state")
+        if isinstance(restored_state, dict):
+            command_loop_state = restored_state
         if opencode_returncode != 0 or not session_id:
             break
         action = _runner_closure_action(
@@ -1309,6 +1563,25 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     verify_returncode, verify_payload = _run_verify(
         execution_sample, sample_dir, args, verification_mode
     )
+    try:
+        post_oracle_audit = verify_test_oracle(
+            execution_sample.project_root,
+            execution_sample.test_location,
+            sample.raw.get("test_oracle_sha256", ""),
+        )
+        revision_audit["post_refactor_test_oracle"] = post_oracle_audit
+    except ProjectRevisionError as exc:
+        revision_audit["post_refactor_test_oracle"] = {
+            "test_oracle_alignment": exc.status,
+            **{str(key): str(value) for key, value in exc.extra.items()},
+        }
+        verify_payload = {
+            "success": False,
+            "status": exc.status,
+            "message": exc.message,
+            "prior_verify": verify_payload,
+        }
+        verify_returncode = 1
     if agent == "java-refactor-agent-idea":
         _close_idea_project(execution_sample.project_root, sample_dir, args)
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
@@ -1383,7 +1656,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1800,
         help="Single per-phase time budget in seconds for the command loop and final verify; the runner adds only a 60-second OpenCode shutdown grace.",
     )
-    parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="local")
+    parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="auto")
     parser.add_argument(
         "--agent",
         choices=["smell-refactor-agent", "java-refactor-agent", "java-refactor-agent-idea"],

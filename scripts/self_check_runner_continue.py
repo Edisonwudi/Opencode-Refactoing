@@ -60,6 +60,25 @@ check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "S
 check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
 check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS_AFTER_OPENCODE_TIMEOUT")
 check("opencode_timeout_verify_fail", R._compute_status(124, 0, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+check(
+    "provider_quota_overrides_verify",
+    R._compute_status(R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, 0, make_payload("PASS")),
+    "PROVIDER_QUOTA_FAILED",
+)
+
+print("== fatal provider error ==")
+check(
+    "minimax_token_plan",
+    R._fatal_provider_error("AI_APICallError: 已达到 Token Plan 用量上限：请升级套餐。 (2056)"),
+    "MINIMAX_TOKEN_PLAN_EXHAUSTED",
+)
+check(
+    "generic_insufficient_quota",
+    R._fatal_provider_error('{"error":{"code":"insufficient_quota"}}'),
+    "PROVIDER_INSUFFICIENT_QUOTA",
+)
+check("transient_rate_limit_not_fatal", R._fatal_provider_error("HTTP 429 rate limit"), "")
+check("ordinary_model_error_not_fatal", R._fatal_provider_error("tool call failed"), "")
 
 print("== dataset evidence identity ==")
 god_row = {"smell_type": "god_class", "class": "Configuration", "evidence": "nom=143;wmc=162"}
@@ -105,6 +124,7 @@ check("policy_instruction", resolved.loop.instruction, "Use the pack")
 quoted_argv = parse_command_policy("--loop-max=2 '--loop-instruction=修复最新 failure pack 并保持行为不变' -- task")
 check("policy_instruction_quoted_argv", quoted_argv.loop.instruction, "修复最新 failure pack 并保持行为不变")
 check_true("policy_allows_guard", resolved.loop.allows("SMELL_GUARD_FAILED"))
+check_true("policy_allows_structural_route_mismatch", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"))
 check("policy_blocks_compile", resolved.loop.allows("BUILD_COMPILE_ERROR"), False)
 check("policy_task", resolved.task, "Project root: /tmp/p")
 disabled = parse_command_policy('--loop-max=0 -- Project root: /tmp/p')
@@ -137,13 +157,17 @@ check("non_json_ignored", R._parse_session_id_from_json_events('not json\n{"sess
 check("sid_trimmed", R._parse_session_id_from_json_events('{"sessionID":"  ses_trim  "}'), "ses_trim")
 
 print("== synchronous verification closure ==")
-def verify_event(payload: dict, status: str = "completed") -> str:
+def verify_event(payload: dict, status: str = "completed", metadata: dict | None = None) -> str:
     return json.dumps({
         "type": "tool_use",
         "sessionID": "ses_loop",
         "part": {
             "tool": "smell_verify",
-            "state": {"status": status, "output": json.dumps(payload)},
+            "state": {
+                "status": status,
+                "output": json.dumps(payload),
+                **({"metadata": metadata} if metadata is not None else {}),
+            },
         },
     })
 
@@ -168,10 +192,38 @@ check(
     "continue",
 )
 check(
-    "continue_cap_shared",
+    "bare_continue_has_no_extra_transport",
     R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
     "stop",
 )
+cap_continue_trace = R._verification_trace(verify_event({
+    "status": "SMELL_GUARD_FAILED",
+    "loop": {"decision": "continue", "cap_recovery_used": True},
+}))
+check("trace_cap_recovery", cap_continue_trace["last_cap_recovery_used"], True)
+check(
+    "plugin_cap_recovery_transport",
+    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "continue",
+)
+check(
+    "transport_hard_cap",
+    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=3, max_continuations=2),
+    "stop",
+)
+persisted_state = {
+    "schema_version": 1,
+    "continuation_count": 2,
+    "cap_recovery_used": False,
+}
+state_trace = R._verification_trace(verify_event(
+    {"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}},
+    metadata={
+        "loop": {"decision": "continue", "cap_recovery_used": False},
+        "command_loop_state": persisted_state,
+    },
+))
+check("trace_command_loop_state", state_trace["command_loop_state"], persisted_state)
 pass_trace = R._verification_trace(verify_event({"status": "PASS", "loop": {"decision": "stop"}}))
 check(
     "pass_stops",
@@ -206,17 +258,41 @@ cap_payload = {
     "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
 }
 cap_trace = R._verification_trace(verify_event(cap_payload))
-check("cap_termination_reason", cap_trace["last_termination_reason"], "MAX_CONTINUATIONS_REACHED")
-check("cap_retryable", cap_trace["last_failure_retryable"], True)
-check("cap_metric_progress", cap_trace["last_metric_progress"], True)
 check(
-    "cap_progress_resumes_same_session",
+    "runner_does_not_reinterpret_plugin_stop",
     R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
-    "continue_after_internal_cap",
+    "stop",
 )
+compile_cap_payload = {
+    "status": "BUILD_FAILED",
+    "failure_pack": {"retryable": True},
+    "checkpoint": {"delta": {"metric_progress": False}},
+    "snapshot": {"diff_stat": {"stdout": " Foo.java | 2 +-\n 1 file changed"}},
+    "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
+}
+compile_cap_trace = R._verification_trace(verify_event(compile_cap_payload))
 check(
-    "cap_progress_obeys_outer_budget",
-    R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
+    "runner_does_not_reinterpret_compile_stop",
+    R._runner_closure_action(
+        compile_cap_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=2,
+    ),
+    "stop",
+)
+compile_cap_no_diff = {
+    **compile_cap_payload,
+    "snapshot": {"diff_stat": {"stdout": ""}},
+}
+check(
+    "compile_cap_empty_diff_stops",
+    R._runner_closure_action(
+        R._verification_trace(verify_event(compile_cap_no_diff)),
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=2,
+    ),
     "stop",
 )
 for name, mutation in (
@@ -233,11 +309,6 @@ for name, mutation in (
     )
 check_true("verify_prompt_marker", "verify-required" in R._runner_continuation_prompt("verify_required", 0, 2, "repair"))
 check_true("continue_prompt_marker", "continue 1/2" in R._runner_continuation_prompt("continue", 1, 2, "repair"))
-check_true(
-    "cap_prompt_explains_budget_boundary",
-    "internal continuation budget was exhausted"
-    in R._runner_continuation_prompt("continue_after_internal_cap", 1, 2, "repair"),
-)
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
@@ -326,6 +397,38 @@ check_true("prompt_has_base", "Repair this one java smell" in prompt_plain)
 roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "local"))
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
+
+refused = Sample(
+    sample_id="2",
+    language="java",
+    smell="refused_bequest",
+    project_name="p",
+    project_root=Path("/tmp/p"),
+    location="Child.java:method=reject|line=10",
+    evidence=(
+        "parents=Parent; structural_expectation=capability_split; "
+        "refactor_path=split_read_from_write; refactor_group_id=packet_capabilities"
+    ),
+    raw={},
+)
+refused_prompt = R._task_prompt(refused, args, "project_full", "java-refactor-agent")
+check("runner_prompt_has_no_smell_protocol", "Refused Bequest structural protocol:" in refused_prompt, False)
+refused_skill = (
+    ROOT
+    / ".opencode"
+    / "skills"
+    / "java-smell-edit-patterns"
+    / "references"
+    / "edit-patterns"
+    / "refused_bequest.md"
+).read_text(encoding="utf-8")
+check_true("refused_skill_maps_callers", "every production call site of the target contract" in refused_skill)
+check_true("refused_skill_rejects_relocation", "Never relocate an empty, throwing, null-returning" in refused_skill)
+check_true("refused_skill_uses_group_boundary", "`refactor_group_id`" in refused_skill)
+check_true(
+    "refused_skill_locks_capability_split_route",
+    "Do not implement or delegate the reported rejecting/empty/null-returning method" in refused_skill,
+)
 
 print()
 if failures:

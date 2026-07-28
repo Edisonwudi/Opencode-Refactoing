@@ -256,10 +256,12 @@ class ClassRecord:
     end_line: int
     kind: str
     superclass_name: str = ""
+    interface_names: List[str] = field(default_factory=list)
     modifiers: Set[str] = field(default_factory=set)
     type_parameters: Dict[str, str] = field(default_factory=dict)
     fields: Dict[str, str] = field(default_factory=dict)
     methods: List["MethodRecord"] = field(default_factory=list)
+    declared_method_names: Set[str] = field(default_factory=set)
     bodyless_method_declarations: List[str] = field(default_factory=list)
 
 
@@ -419,6 +421,177 @@ def analyze_feature_envy_target(
         "foreign_by_origin": dict(sorted(stats.foreign_by_origin.items())),
         "ignored_by_type": dict(sorted(stats.ignored_by_type.items())),
         "strict_detector_hit": strict_hit,
+    }
+
+
+def analyze_refused_bequest_target(
+    project_root: Path,
+    *,
+    target_file: Path,
+    method: Optional[str],
+    line: Optional[int],
+    reported_parent: str,
+    target_parameter_count: Optional[int] = None,
+    target_class_name: str = "",
+    project_model: Optional[ProjectModel] = None,
+) -> Dict[str, Any]:
+    """Return the positive hierarchy contract for one Refused Bequest target."""
+    root = project_root.expanduser().resolve()
+    model = project_model or _build_project_model(root, include_tests=False)
+    target_rel = _normalize_rel_path(target_file, root)
+    target_method = _normalize_method(method)
+    parent_name = str(reported_parent or "").strip()
+    if not target_method or not parent_name:
+        return {
+            "ok": False,
+            "error": "target_method_or_parent_missing",
+            "file": target_rel,
+            "method": target_method,
+            "reported_parent": parent_name,
+        }
+
+    file_classes = [
+        item for item in model.classes.values() if _normalize_path(item.file) == target_rel
+    ]
+    method_owners = {
+        item.owner_qualified_name
+        for item in model.methods
+        if _normalize_path(item.file) == target_rel
+        and _normalize_method(item.method_name) == target_method
+    }
+    pinned_class = str(target_class_name or "").strip().lower()
+    candidates = []
+    if pinned_class:
+        candidates = [
+            item
+            for item in file_classes
+            if item.class_name.lower() == pinned_class
+            or item.qualified_name.lower() == pinned_class
+            or item.qualified_name.lower().endswith(f".{pinned_class}")
+        ]
+        if not candidates:
+            return {
+                "ok": False,
+                "error": "pinned_target_class_not_found",
+                "file": target_rel,
+                "method": target_method,
+                "target_class_name": target_class_name,
+                "reported_parent": parent_name,
+            }
+    if not candidates:
+        candidates = (
+            [item for item in file_classes if item.begin_line <= line <= item.end_line]
+            if line is not None
+            else []
+        )
+    if not candidates:
+        candidates = [item for item in file_classes if item.qualified_name in method_owners]
+    if not candidates:
+        candidates = file_classes
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "target_class_not_found",
+            "file": target_rel,
+            "method": target_method,
+            "reported_parent": parent_name,
+        }
+    target_class = min(
+        candidates,
+        key=lambda item: (
+            0 if line is not None and item.begin_line <= line <= item.end_line else 1,
+            abs(item.begin_line - int(line or item.begin_line)),
+            item.end_line - item.begin_line,
+        ),
+    )
+
+    parent_simple = parent_name.rsplit(".", 1)[-1].lower()
+    inherited_names = _all_parent_type_names(model, target_class)
+    inherits_parent = any(
+        name.rsplit(".", 1)[-1].lower() == parent_simple for name in inherited_names
+    )
+    parent_candidates = [
+        item
+        for item in model.classes.values()
+        if item.class_name.lower() == parent_simple
+        or item.qualified_name.lower() == parent_name.lower()
+    ]
+    parent_record = parent_candidates[0] if parent_candidates else None
+    def declares_target(record: Optional[ClassRecord]) -> bool:
+        if record is None:
+            return False
+        if target_parameter_count is None:
+            return target_method in {
+                _normalize_method(name) for name in record.declared_method_names
+            }
+        return any(
+            _normalize_method(item.method_name) == target_method
+            and len(item.parameter_descriptors) == target_parameter_count
+            for item in record.methods
+        )
+
+    child_declares_target = declares_target(target_class)
+    parent_declares_target = declares_target(parent_record)
+    inherited_rejecting_owners: List[str] = []
+    for inherited_name in sorted(inherited_names):
+        inherited_record = model.classes.get(inherited_name)
+        if inherited_record is None:
+            simple_name = inherited_name.rsplit(".", 1)[-1].lower()
+            inherited_record = next(
+                (
+                    item
+                    for item in model.classes.values()
+                    if item.class_name.lower() == simple_name
+                    or item.qualified_name.lower() == inherited_name.lower()
+                ),
+                None,
+            )
+        if inherited_record is None:
+            continue
+        rejecting_target = any(
+            _normalize_method(item.method_name) == target_method
+            and (
+                target_parameter_count is None
+                or len(item.parameter_descriptors) == target_parameter_count
+            )
+            and _is_stub_method(item)
+            for item in inherited_record.methods
+        )
+        if rejecting_target:
+            inherited_rejecting_owners.append(inherited_record.qualified_name)
+    capability_split_satisfied = bool(
+        not child_declares_target
+        and (
+            not inherits_parent
+            or (
+                parent_record
+                and not parent_declares_target
+                and not inherited_rejecting_owners
+            )
+        )
+    )
+    rejecting_override_removed = bool(
+        parent_record
+        and inherits_parent
+        and parent_declares_target
+        and not child_declares_target
+    )
+    return {
+        "ok": True,
+        "file": target_rel,
+        "method": target_method,
+        "target_parameter_count": target_parameter_count,
+        "pinned_target_class": target_class_name,
+        "target_class": target_class.qualified_name,
+        "reported_parent": parent_name,
+        "parent_resolved": parent_record is not None,
+        "inherited_types": sorted(inherited_names),
+        "inherits_reported_parent": inherits_parent,
+        "child_declares_target": child_declares_target,
+        "parent_declares_target": parent_declares_target,
+        "inherited_rejecting_owners": inherited_rejecting_owners,
+        "capability_split_satisfied": capability_split_satisfied,
+        "rejecting_override_removed": rejecting_override_removed,
     }
 
 
@@ -585,6 +758,10 @@ def _collect_class_records(
         end_line=_node_end_line(class_node),
         kind=class_node.type.replace("_declaration", ""),
         superclass_name=_resolve_type_name(file_model, _superclass_text(file_model.source, class_node), classes_by_simple),
+        interface_names=[
+            _resolve_type_name(file_model, item, classes_by_simple)
+            for item in _interface_texts(file_model.source, class_node)
+        ],
         modifiers=_modifiers(file_model.source, class_node),
         type_parameters=_type_parameters(file_model, class_node, classes_by_simple),
         fields={},
@@ -597,6 +774,10 @@ def _collect_class_records(
     if body is None:
         return
     for child in body.children:
+        if child.type in METHOD_NODE_TYPES:
+            method_name = _declared_name(file_model.source, child)
+            if method_name:
+                rec.declared_method_names.add(method_name)
         if child.type in CLASS_NODE_TYPES:
             _collect_class_records(file_model, child, owners + [class_name], classes, classes_by_simple)
 
@@ -1644,6 +1825,20 @@ def _superclass_text(source: bytes, class_node: Node) -> str:
     return ""
 
 
+def _interface_texts(source: bytes, class_node: Node) -> List[str]:
+    container = _first_child(class_node, "super_interfaces") or _first_child(
+        class_node, "extends_interfaces"
+    )
+    if container is None:
+        return []
+    type_list = _first_child(container, "type_list") or container
+    return [
+        _node_text(source, child)
+        for child in type_list.children
+        if child.type in {"type_identifier", "scoped_type_identifier", "generic_type"}
+    ]
+
+
 def _parameter_name(source: bytes, node: Node) -> str:
     name_node = node.child_by_field_name("name")
     if name_node is None:
@@ -1833,6 +2028,31 @@ def _resolve_model_type(model: ProjectModel, type_name: str) -> str:
     simple = type_name.rsplit(".", 1)[-1]
     candidates = model.classes_by_simple.get(simple, [])
     return candidates[0].qualified_name if candidates else type_name
+
+
+def _all_parent_type_names(model: ProjectModel, child: ClassRecord) -> Set[str]:
+    pending = [
+        name for name in [child.superclass_name, *child.interface_names] if name
+    ]
+    parents: Set[str] = set()
+    while pending:
+        name = pending.pop()
+        resolved = _resolve_model_type(model, name)
+        if resolved in parents:
+            continue
+        parents.add(resolved)
+        record = model.classes.get(resolved)
+        if record is None:
+            simple = resolved.rsplit(".", 1)[-1]
+            candidates = model.classes_by_simple.get(simple, [])
+            record = candidates[0] if candidates else None
+        if record is not None:
+            pending.extend(
+                parent
+                for parent in [record.superclass_name, *record.interface_names]
+                if parent
+            )
+    return parents
 
 
 def _is_subtype(model: ProjectModel, child_name: str, parent_name: str) -> bool:

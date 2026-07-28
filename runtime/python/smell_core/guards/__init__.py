@@ -11,6 +11,8 @@ import re
 import hashlib
 import subprocess
 import tempfile
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -271,6 +273,7 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
             }
     if config.defaults.run_tests:
         test_cwd = config.dataset_root if config.test_source == "dataset" else config.cwd
+        test_started_ns = time.time_ns()
         test_result = _run_command_config(
             config.test,
             cwd=test_cwd,
@@ -290,6 +293,23 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
                 **metadata,
                 "details": {"build": build_result, "test": test_result},
             }
+        if config.verification_mode == "sample_optimized":
+            execution = _sample_test_execution_evidence(config, test_started_ns)
+            test_result["execution_evidence"] = execution
+            if not execution["success"]:
+                test_result["success"] = False
+                test_result["status"] = "test_not_executed"
+                test_result["failure_highlights"] = [
+                    str(execution["message"])
+                ]
+                test_result["summary_text"] = str(execution["message"])
+                return {
+                    "type": "build_test",
+                    "success": False,
+                    "message": f"Sample test failed. {execution['message']}",
+                    **metadata,
+                    "details": {"build": build_result, "test": test_result},
+                }
     return {
         "type": "build_test",
         "success": True,
@@ -316,6 +336,59 @@ def _command_hash(command: str) -> str:
     if not text:
         return ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sample_test_execution_evidence(
+    config: ResolvedRunConfig,
+    started_ns: int,
+) -> Dict[str, object]:
+    """Require a fresh JUnit XML report for the pinned sample test class."""
+    test_class = Path(str(config.sample_test_location or "")).stem
+    if not test_class:
+        return {
+            "success": False,
+            "message": "Pinned sample test location does not identify a test class.",
+            "test_class": "",
+            "reports": [],
+            "tests": 0,
+        }
+    reports: List[str] = []
+    executed = 0
+    skipped_total = 0
+    for report in config.project_root.rglob(f"TEST-*{test_class}.xml"):
+        try:
+            if report.stat().st_mtime_ns < started_ns:
+                continue
+            root = ET.parse(report).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        tests_text = str(root.attrib.get("tests") or "").strip()
+        try:
+            tests = int(tests_text)
+        except ValueError:
+            tests = len(root.findall(".//testcase"))
+        try:
+            skipped = int(str(root.attrib.get("skipped") or "0"))
+        except ValueError:
+            skipped = len(root.findall(".//testcase/skipped"))
+        non_skipped = max(tests - skipped, 0)
+        if non_skipped <= 0:
+            continue
+        reports.append(str(report.relative_to(config.project_root)))
+        executed += non_skipped
+        skipped_total += skipped
+    return {
+        "success": executed > 0,
+        "message": (
+            f"Pinned sample test {test_class} executed {executed} test(s)."
+            if executed > 0
+            else f"Pinned sample test {test_class} produced no fresh non-empty JUnit report."
+        ),
+        "test_class": test_class,
+        "reports": sorted(reports),
+        "tests": executed,
+        "skipped": skipped_total,
+    }
 
 
 def _run_long_method_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:

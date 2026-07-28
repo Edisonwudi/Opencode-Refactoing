@@ -6,18 +6,23 @@ a Java-specific detector.
 """
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..analysis import count_meaningful_lines, extract_snippet
+from ..analysis import count_meaningful_lines, extract_snippet, strip_comments
 from ..config import ResolvedRunConfig
 from ..guards.context import GuardRunContext
 from .detector_utils import (
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
+    parse_expected_state_field as _parse_expected_state_field,
     parse_parent_from_evidence as _parse_parent_from_evidence,
+    parse_structural_expectation as _parse_structural_expectation,
+    parse_target_class as _parse_target_class,
+    parse_target_parameter_count as _parse_target_parameter_count,
 )
 from .data_clumps import (
     data_clump_group_from_evidence,
@@ -27,6 +32,7 @@ from .data_clumps import (
 from .semantic_detector import (
     SemanticFinding,
     _build_project_model,
+    analyze_refused_bequest_target,
     find_matching_semantic_finding,
     run_java_semantic_detector,
 )
@@ -418,10 +424,23 @@ def _run_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, objec
     }
 
 
+def _group_evidence_values(evidence: str, field: str) -> List[str]:
+    match = re.search(
+        rf"(?:^|;\s*){re.escape(field)}=([^;]+)",
+        str(evidence or ""),
+        flags=re.IGNORECASE,
+    )
+    return [part.strip() for part in match.group(1).split("|")] if match else []
+
+
 def _run_semantic_guard(
     config: ResolvedRunConfig,
     guard_type: str,
     evidence: str,
+    *,
+    _shared_detection=None,
+    _shared_project_model=None,
+    _group_member: bool = False,
 ) -> Dict[str, object]:
     """Run a Java semantic guard (feature_envy / data_clumps / refused_bequest / dead_code).
 
@@ -437,17 +456,80 @@ def _run_semantic_guard(
             "message": f"{guard_type} guard only supports Java detector-backed validation.",
             "details": {"detector": "python_semantic_detector", "language": config.language},
         }
-    target = config.locations[0]
-    if not target.file_path.exists() or target.file_path.suffix != ".java":
+    invalid_targets = [
+        target
+        for target in config.locations
+        if not target.file_path.exists() or target.file_path.suffix != ".java"
+    ]
+    if invalid_targets:
         return {
             "type": guard_type,
             "success": False,
-            "message": f"{guard_type} guard: target file not found or not a .java file: {target.file_path}",
-            "details": {"detector": "python_semantic_detector", "file": str(target.file_path)},
+            "message": (
+                f"{guard_type} guard: target file not found or not a .java file: "
+                f"{invalid_targets[0].file_path}"
+            ),
+            "details": {
+                "detector": "python_semantic_detector",
+                "file": str(invalid_targets[0].file_path),
+            },
         }
     if guard_type == "data_clumps":
         return _run_data_clumps_group_guard(config, guard_type, evidence)
-    detection = run_java_semantic_detector(config.project_root)
+    if guard_type == "refused_bequest" and len(config.locations) > 1 and not _group_member:
+        detection = run_java_semantic_detector(config.project_root)
+        if not detection.ok:
+            return {
+                "type": guard_type,
+                "success": False,
+                "message": f"{guard_type} guard: semantic detector unavailable: {detection.error}",
+                "details": {"detector": "python_semantic_detector", "error": detection.error},
+            }
+        project_model = _build_project_model(config.project_root, include_tests=False)
+        group_arities = _group_evidence_values(evidence, "target_parameter_counts")
+        group_classes = _group_evidence_values(evidence, "target_classes")
+        member_results = []
+        for index, target in enumerate(config.locations):
+            member_config = copy.copy(config)
+            member_config.locations = [target]
+            member_evidence = evidence
+            if len(group_arities) == len(config.locations):
+                member_evidence += f"; target_parameter_count={group_arities[index]}"
+            if len(group_classes) == len(config.locations):
+                member_evidence += f"; target_class={group_classes[index]}"
+            member_results.append(
+                _run_semantic_guard(
+                    member_config,
+                    guard_type,
+                    member_evidence,
+                    _shared_detection=detection,
+                    _shared_project_model=project_model,
+                    _group_member=True,
+                )
+            )
+        failed_members = [item for item in member_results if not item.get("success")]
+        first_failure = (
+            f" First unresolved target: {failed_members[0].get('message', 'unknown failure')}"
+            if failed_members
+            else ""
+        )
+        return {
+            "type": guard_type,
+            "success": not failed_members,
+            "message": (
+                f"refused_bequest group guard: {len(member_results) - len(failed_members)}/"
+                f"{len(member_results)} target methods satisfy the structural contract."
+                f"{first_failure}"
+            ),
+            "details": {
+                "detector": "python_semantic_detector",
+                "target_count": len(member_results),
+                "failure_count": len(failed_members),
+                "member_results": member_results,
+            },
+        }
+    target = config.locations[0]
+    detection = _shared_detection or run_java_semantic_detector(config.project_root)
     if not detection.ok:
         return {
             "type": guard_type,
@@ -480,7 +562,122 @@ def _run_semantic_guard(
                 "evidence": match.evidence,
             },
         }
-    if guard_type == "refused_bequest" and _requires_unsupported_throw_removal(evidence):
+    structural_target_removed = False
+    if guard_type == "refused_bequest":
+        structural_expectation = _parse_structural_expectation(evidence)
+        if structural_expectation:
+            if structural_expectation == "state_getter":
+                expected_state_field = _parse_expected_state_field(evidence)
+                if not expected_state_field:
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: state_getter requires "
+                            "expected_state_field evidence."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                        },
+                    }
+                if not _target_method_returns_expected_state(
+                    config,
+                    target,
+                    expected_state_field,
+                ):
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: state getter must directly return "
+                            f"the declared backing field {expected_state_field!r}."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "expected_state_field": expected_state_field,
+                        },
+                    }
+            elif structural_expectation not in {
+                "capability_split",
+                "rejecting_override_removed",
+            }:
+                return {
+                    "type": guard_type,
+                    "success": False,
+                    "message": (
+                        "refused_bequest guard: unsupported structural expectation "
+                        f"{structural_expectation!r}."
+                    ),
+                    "details": {
+                        "detector": "python_semantic_detector",
+                        "structural_expectation": structural_expectation,
+                    },
+                }
+            else:
+                profile = analyze_refused_bequest_target(
+                    config.project_root,
+                    target_file=target.file_path,
+                    method=target.method,
+                    line=target.line,
+                    reported_parent=_parse_parent_from_evidence(evidence),
+                    target_parameter_count=_parse_target_parameter_count(evidence),
+                    target_class_name=_parse_target_class(evidence),
+                    project_model=_shared_project_model,
+                )
+                if not profile.get("ok"):
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": (
+                            "refused_bequest guard: capability-split profile could not "
+                            f"be resolved: {profile.get('error', 'unknown error')}."
+                        ),
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "capability_profile": profile,
+                        },
+                    }
+                expectation_satisfied = (
+                    profile.get("capability_split_satisfied")
+                    if structural_expectation == "capability_split"
+                    else profile.get("rejecting_override_removed")
+                )
+                if not expectation_satisfied:
+                    if structural_expectation == "rejecting_override_removed":
+                        failure_message = (
+                            "refused_bequest guard: the rejecting child override is still "
+                            "declared, or the reported safe parent method cannot be resolved."
+                        )
+                    elif profile.get("inherited_rejecting_owners"):
+                        failure_message = (
+                            "refused_bequest guard: the rejected capability was relocated "
+                            "to an inherited ancestor instead of being split. Rejecting "
+                            f"ancestor(s): {', '.join(profile['inherited_rejecting_owners'])}."
+                        )
+                    else:
+                        failure_message = (
+                            "refused_bequest guard: the reported parent capability is "
+                            "still inherited and still exposes the target method."
+                        )
+                    return {
+                        "type": guard_type,
+                        "success": False,
+                        "message": failure_message,
+                        "details": {
+                            "detector": "python_semantic_detector",
+                            "structural_expectation": structural_expectation,
+                            "capability_profile": profile,
+                        },
+                    }
+                structural_target_removed = True
+    if (
+        guard_type == "refused_bequest"
+        and not structural_target_removed
+        and _requires_unsupported_throw_removal(evidence)
+    ):
         unsupported_throw = _target_method_unsupported_throw(config, target)
         if unsupported_throw:
             return {
@@ -499,7 +696,11 @@ def _run_semantic_guard(
                     "explicit_unsupported_throw": True,
                 },
             }
-    if guard_type == "refused_bequest" and _requires_empty_override_removal(evidence):
+    if (
+        guard_type == "refused_bequest"
+        and not structural_target_removed
+        and _requires_empty_override_removal(evidence)
+    ):
         empty_override = _target_method_empty_override(config, target)
         if empty_override:
             return {
@@ -998,6 +1199,27 @@ def _target_method_empty_override(config: ResolvedRunConfig, target) -> bool:
     if snippet is None:
         return False
     return count_meaningful_lines(snippet.body_text, config.language) == 0
+
+
+def _target_method_returns_expected_state(
+    config: ResolvedRunConfig,
+    target,
+    expected_state_field: str,
+) -> bool:
+    try:
+        snippet = extract_snippet(target, config.language)
+    except Exception:
+        return False
+    if snippet is None:
+        return False
+    body = strip_comments(snippet.body_text, config.language).strip()
+    field = re.escape(expected_state_field)
+    return bool(
+        re.fullmatch(
+            rf"\{{?\s*return\s+(?:this\.)?{field}\s*;\s*\}}?",
+            body,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

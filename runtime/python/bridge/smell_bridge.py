@@ -34,6 +34,7 @@ from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
 from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
 from smell_core.guards import GuardRunContext, god_class_relative_reduction, run_build_test_guard, run_smell_guards  # noqa: E402
 from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
+from smell_core.detector_utils import parse_structural_expectation  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
     IdeaRefactorPreflightError,
     IdeaRefactorPreflightOptions,
@@ -130,6 +131,14 @@ def _resolve(args: argparse.Namespace):
 def _is_idea_backed(language: str) -> bool:
     support = get_language(language)
     return bool(support and support.idea_backed)
+
+
+def _requires_strict_smell_resolution(smell: str, evidence: str) -> bool:
+    """Return whether metric improvement is progress-only, never final acceptance."""
+    return bool(
+        smell == "refused_bequest"
+        and parse_structural_expectation(evidence)
+    )
 
 
 def _location_payload(resolved) -> list[dict[str, Any]]:
@@ -426,7 +435,20 @@ def _god_class_min_reduction(resolved) -> float:
 
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
-    if args.skip_build_test and os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1":
+    evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
+    strict_resolution_required = _requires_strict_smell_resolution(
+        resolved.smell,
+        evidence,
+    )
+    build_test_required = bool(
+        os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
+        or strict_resolution_required
+    )
+    if build_test_required and (
+        args.skip_build_test
+        or not args.run_build_test
+        or resolved.verification_mode == "local"
+    ):
         full_payload = {
             "success": False,
             "status": "BUILD_TEST_REQUIRED",
@@ -441,7 +463,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         }
         artifact_dir = _verify_artifact_dir(args, resolved.project_root)
         artifacts = _write_verify_artifacts(artifact_dir, full_payload)
-        failure_pack = _build_failure_pack(full_payload, artifacts)
+        failure_pack = _build_failure_pack(
+            full_payload,
+            artifacts,
+            smell=resolved.smell,
+            evidence=evidence,
+        )
         full_payload["failure_pack"] = failure_pack
         artifacts["verify_full"] = _write_json_artifact(artifact_dir / "verify.full.json", full_payload)
         return {
@@ -453,7 +480,6 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             "artifacts": artifacts,
             "failure_pack": failure_pack,
         }
-    evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
     guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
@@ -472,23 +498,33 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     # lines would otherwise pass both the guard and this gate.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
         improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
+    accepted_improvement_pass = improvement_pass and not strict_resolution_required
     build_test_result = None
     if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(resolved)
     snapshot = _snapshot_project(resolved.project_root) if args.snapshot else None
-    success = (not failed_smell or improvement_pass) and (
+    success = (not failed_smell or accepted_improvement_pass) and (
         build_test_result is None or bool(build_test_result.get("success"))
     )
     resolution = ""
     if success:
         resolution = "resolved" if not failed_smell else "improved"
+    elif improvement_pass and (
+        build_test_result is None or bool(build_test_result.get("success"))
+    ):
+        resolution = "improved"
     continue_hint = ""
     if resolution == "improved":
         remaining = [str(item.get("message") or "") for item in failed_smell if item.get("message")]
+        progress_disposition = (
+            "Progress recorded but not accepted as final"
+            if strict_resolution_required
+            else "Progress accepted"
+        )
         continue_hint = (
-            "Progress accepted (resolution=improved): the checkpoint confirms a real "
-            "production diff with metric reduction vs baseline. The detector still "
-            "reports the smell, so keep refactoring toward resolution=resolved. "
+            f"{progress_disposition} (resolution=improved): the checkpoint confirms a real "
+            "production diff with metric reduction vs baseline. The detector or structural "
+            "guard still reports the smell, so keep refactoring toward resolution=resolved. "
             "Remaining detector signals: "
             + " | ".join(remaining[:3])
             + " Best partial progress is already saved; do not undo these metric "
@@ -533,7 +569,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     artifacts = _write_verify_artifacts(artifact_dir, full_payload)
     failure_pack = None
     if not success:
-        failure_pack = _build_failure_pack(full_payload, artifacts)
+        failure_pack = _build_failure_pack(
+            full_payload,
+            artifacts,
+            smell=resolved.smell,
+            evidence=evidence,
+        )
         full_payload["failure_pack"] = failure_pack
         artifacts["verify_full"] = _write_json_artifact(artifact_dir / "verify.full.json", full_payload)
     payload = {
@@ -914,7 +955,34 @@ def _looks_like_dependency_resolution_failure(text: str) -> bool:
     )
 
 
-def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tuple[str, list[str]]:
+def _capability_split_failure(payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the failed positive capability contract, when present."""
+    if not isinstance(payload, dict):
+        return None
+    smell_guard = payload.get("smell_guard")
+    if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
+        return None
+    for result in smell_guard.get("results") or []:
+        if not isinstance(result, dict) or result.get("success") is not False:
+            continue
+        details = result.get("details")
+        if not isinstance(details, dict) or details.get("structural_expectation") != "capability_split":
+            continue
+        profile = details.get("capability_profile")
+        if not isinstance(profile, dict) or profile.get("ok") is not True:
+            continue
+        if profile.get("capability_split_satisfied") is not True:
+            return profile
+    return None
+
+
+def _classify_failure_pack(
+    payload: Optional[dict[str, Any]],
+    text: str,
+    *,
+    smell: str = "",
+    evidence: str = "",
+) -> tuple[str, list[str]]:
     if payload is None:
         return "UNKNOWN_VERIFY_FAILURE", ["No verify artifact or inline verify payload was available."]
     status = str(payload.get("status") or "").strip()
@@ -932,6 +1000,15 @@ def _classify_failure_pack(payload: Optional[dict[str, Any]], text: str) -> tupl
         ]
     smell_guard = payload.get("smell_guard") or {}
     if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+        capability_split_required = bool(
+            smell == "refused_bequest"
+            and parse_structural_expectation(evidence) == "capability_split"
+        )
+        if _capability_split_failure(payload) or capability_split_required:
+            return "STRUCTURAL_ROUTE_MISMATCH", [
+                "The required capability split is still incomplete. Do not implement or delegate the reported method as the final repair.",
+                "Split the parent capability, migrate real implementers and production callers to narrow types, and remove the unsupported operation from the refusing type's inherited contract.",
+            ]
         return "SMELL_GUARD_FAILED", ["Smell guard did not pass; continue the refactoring rather than repairing tests."]
     build_test = payload.get("build_test_guard") or {}
     if isinstance(build_test, dict):
@@ -977,6 +1054,18 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
     if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
         return []
     highlights: list[str] = []
+    profile = _capability_split_failure(payload)
+    max_highlights = 2 if profile else 1
+    if profile:
+        target = str(profile.get("target_class") or "?")
+        method = str(profile.get("method") or "?")
+        parent = str(profile.get("reported_parent") or "?")
+        highlights.append(
+            "CAPABILITY_SPLIT_REQUIRED "
+            f"target={target} method={method} parent={parent}; "
+            "implementing the method body is not accepted; split the parent capability "
+            "and migrate implementers and callers."
+        )
     for result in smell_guard.get("results") or []:
         if not isinstance(result, dict) or result.get("success") is not False:
             continue
@@ -990,15 +1079,29 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
             tail = max(1, available - head - 5)
             message = f"{message[:head]} ... {message[-tail:]}"
         highlights.append(prefix + message)
-        if len(highlights) >= 1:
+        if len(highlights) >= max_highlights:
             break
-    return highlights
+    return [
+        item if len(item) <= limit else item[: max(1, limit - 3)].rstrip() + "..."
+        for item in highlights
+    ]
 
 
-def _build_failure_pack(payload: Optional[dict[str, Any]], artifact_paths: dict[str, str]) -> dict[str, Any]:
+def _build_failure_pack(
+    payload: Optional[dict[str, Any]],
+    artifact_paths: dict[str, str],
+    *,
+    smell: str = "",
+    evidence: str = "",
+) -> dict[str, Any]:
     paths = _artifact_paths_from_verify_payload(payload, artifact_paths)
     bundle = _failure_text_bundle(payload, paths)
-    category, recommendations = _classify_failure_pack(payload, bundle)
+    category, recommendations = _classify_failure_pack(
+        payload,
+        bundle,
+        smell=smell,
+        evidence=evidence,
+    )
     failure_group = REPAIRABLE_CATEGORY_GROUPS.get(category, "")
     patterns = [
         "DependencyResolutionException",

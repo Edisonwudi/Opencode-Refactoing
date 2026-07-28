@@ -41,6 +41,7 @@ from smell_core.project_revision import (  # noqa: E402
     load_revisions,
     resolve_revision,
     verify_checkout,
+    verify_test_oracle,
 )
 from run_smell_dataset import (  # noqa: E402
     Sample as RunnerSample,
@@ -66,6 +67,7 @@ class Sample:
     test_command: str
     target_method: str
     legacy_test_commit: str = ""
+    test_oracle_sha256: str = ""
 
     @property
     def key(self) -> str:
@@ -162,6 +164,7 @@ def load_samples(
                     test_command=str(row.get("test_command") or "").strip(),
                     target_method=target_method(row.get("group_occurrences")),
                     legacy_test_commit=str(row.get("test_commit") or "").strip(),
+                    test_oracle_sha256=str(row.get("test_oracle_sha256") or "").strip(),
                 )
                 if projects and sample.project_name not in projects:
                     continue
@@ -662,6 +665,13 @@ def execute_single_plan(
         ).hexdigest()
         with isolated_worktree(sample, checkout_id, target_commit=rev.project_commit) as (isolated, _canonical):
             revision_audit = verify_checkout(Path(isolated.project_path), rev)
+            revision_audit.update(
+                verify_test_oracle(
+                    Path(isolated.project_path),
+                    sample.test_file,
+                    sample.test_oracle_sha256,
+                )
+            )
             resolved = copy.deepcopy(
                 resolve(
                     isolated,
@@ -924,6 +934,13 @@ def main() -> int:
                 with isolated_worktree(sample, checkout_id, target_commit=project_commit) as (isolated, _canonical):
                     # Verify actual commit + tree against the manifest via the shared module.
                     revision_audit = verify_checkout(Path(isolated.project_path), rev)
+                    revision_audit.update(
+                        verify_test_oracle(
+                            Path(isolated.project_path),
+                            sample.test_file,
+                            sample.test_oracle_sha256,
+                        )
+                    )
                     actual_commit = revision_audit.get("actual_commit", "")
                     resolved = copy.deepcopy(
                         resolve(

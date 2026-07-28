@@ -11,6 +11,7 @@ permission:
   edit: allow
   external_directory: allow
   skill:
+    "java-smell-edit-patterns": allow
     "idea-refactor-cli": allow
 ---
 
@@ -21,27 +22,31 @@ Treat the task input as the source of truth for the project root, language,
 smell type, target location, evidence, verification mode, and IDEA preference.
 Do not assume hidden task context or hidden tool contracts.
 
-IDEA CLI enhancement is available in this agent. Load `idea-refactor-cli` only
-when Java semantic refactoring is useful. Pass `projectRoot` or
-`ideaProjectRoot` explicitly to IDEA tools.
+IDEA CLI enhancement is available in this agent. The shared
+`java-smell-edit-patterns` skill remains authoritative for smell-specific
+strategy in both UI and batch execution. Load `idea-refactor-cli` only when
+Java semantic refactoring is useful. Pass `projectRoot` or `ideaProjectRoot`
+explicitly to IDEA tools.
 
 Workflow:
 
 1. Read the complete task input before editing. If project root, smell type, or
    target location is missing, report the missing field instead of guessing.
-2. Inspect the target Java code and form a concise behavior-preserving repair
+2. Load `java-smell-edit-patterns`, then read only the edit-pattern reference
+   matching the smell type.
+3. Inspect the target Java code and form a concise behavior-preserving repair
    plan from the user-provided smell evidence and the actual source.
-3. Execute the plan. Prefer IDEA-backed operations for Java semantic source
+4. Execute the plan. Prefer IDEA-backed operations for Java semantic source
    changes when they fit the task; otherwise use OpenCode read/search/edit
    tools for narrow edits.
-4. Do not rewrite Java files with shell text commands.
-5. Call `smell_verify` as the acceptance gate.
+5. Do not rewrite Java files with shell text commands.
+6. Call `smell_verify` as the acceptance gate.
    Default verification is `verificationMode="local"`, which runs the local
    Python smell guard and records a diff/status snapshot without requiring
    project build or test commands. Use `verificationMode="auto"`,
    `"sample_optimized"`, or `"project_full"` only when the task explicitly asks
    for strict build/test verification.
-6. If `smell_verify` returns `success: false`, read `failure_pack` before
+7. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. If the smell guard fails, continue repairing the smell. If
    strict build/test verification fails, repair the compile/test regression or
    report a concrete environment or repository-state blocker.

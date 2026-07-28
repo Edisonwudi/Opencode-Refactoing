@@ -571,6 +571,9 @@ def _target_rejection_signals(config: Any, target: Any, evidence: str) -> int:
     requires_empty = bool(re.search(r"(?:empty_override|resource_leak_contract)", evidence, re.IGNORECASE))
     if requires_empty and count_meaningful_lines(body, config.language) == 0:
         signals += 1
+    requires_null_return = bool(re.search(r"\breturns_null\b", evidence, re.IGNORECASE))
+    if requires_null_return and re.search(r"\breturn\s+null\s*;", body):
+        signals += 1
     return signals
 
 

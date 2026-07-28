@@ -1,0 +1,15 @@
+project_name,location,detector_score,disposition,reason
+commons-collections,src/main/java/org/apache/commons/collections4/bag/UnmodifiableBag.java,0.746,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/collection/UnmodifiableBoundedCollection.java,0.728,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/collection/UnmodifiableCollection.java,0.786,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/list/UnmodifiableList.java,0.702,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/multiset/UnmodifiableMultiSet.java,0.725,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/queue/UnmodifiableQueue.java,0.810,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+commons-collections,src/main/java/org/apache/commons/collections4/set/UnmodifiableSet.java,0.769,REJECT_INTENTIONAL_CONTRACT,unmodifiable wrapper must reject mutation
+tika,tika-core/src/main/java/org/apache/tika/sax/xpath/NodeMatcher.java,0.938,REJECT_VALID_SPECIALIZATION,node matcher intentionally accepts every node category
+tika,tika-encoding-detectors/tika-encoding-detector-icu4j/src/main/java/org/apache/tika/parser/txt/CharsetRecog_sbcs.java:CharsetRecog_8859_8_I_he,0.850,REJECT_VALID_SPECIALIZATION,charset recognizer overrides define a concrete encoding
+tika,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-microsoft-module/src/main/java/org/apache/tika/parser/microsoft/ooxml/XWPFListManager.java:EmptyListManager,1.000,REJECT_NULL_OBJECT,empty singleton intentionally returns empty list numbers
+tika,tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-microsoft-module/src/main/java/org/apache/tika/parser/microsoft/ooxml/xwpf/XWPFNumberingShim.java:EmptyNumberingShim,0.783,REJECT_NULL_OBJECT,empty singleton intentionally reports missing numbering
+guava,guava-tests/test/com/google/common/reflect/TypeVisitorTest.java,1.000,REJECT_TEST_CODE,detector finding is a test fixture
+guava,guava/src/com/google/common/collect/ImmutableRangeSet.java,0.761,REJECT_INTENTIONAL_CONTRACT,immutable collection must reject mutation
+Mindustry-v154.3,tests/src/test/java/MindustryServerControlCoverageBoost_ESTest.java,0.875,REJECT_TEST_CODE,detector finding is a test fixture

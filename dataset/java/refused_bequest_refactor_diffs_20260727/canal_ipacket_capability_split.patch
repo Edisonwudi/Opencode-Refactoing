@@ -1,0 +1,675 @@
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/HeaderPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/HeaderPacket.java
+index 0326c9ef..9459b92b 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/HeaderPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/HeaderPacket.java
+@@ -20,7 +20,7 @@ import com.alibaba.otter.canal.common.utils.CanalToStringStyle;
+  * 
+  * @author fujohnwang
+  */
+-public class HeaderPacket implements IPacket {
++public class HeaderPacket implements ReadablePacket, WritablePacket {
+ 
+     /**
+      * this field indicates the packet length that follows the header, with
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/IPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/IPacket.java
+index b823d96e..f5233a96 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/IPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/IPacket.java
+@@ -1,30 +1,10 @@
+ package com.alibaba.otter.canal.parse.driver.mysql.packets;
+ 
+-import java.io.IOException;
+-
+ /**
+- * Top Abstraction for network packet.<br>
+- * it exposes 2 behaviors for sub-class implementation which will be used to
+- * marshal data into bytes before sending and to un-marshal data from data after
+- * receiving.<br>
++ * Top-level marker for network packets.
+  * 
+  * @author fujohnwang
+  * @see 1.0
+  */
+ public interface IPacket {
+-
+-    /**
+-     * un-marshal raw bytes into {@link IPacket} state for application usage.<br>
+-     * 
+-     * @param data, the raw byte data received from networking
+-     */
+-    void fromBytes(byte[] data) throws IOException;
+-
+-    /**
+-     * marshal the {@link IPacket} state into raw bytes for sending out to
+-     * network.<br>
+-     * 
+-     * @return the bytes that's collected from {@link IPacket} state
+-     */
+-    byte[] toBytes() throws IOException;
+ }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/ReadablePacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/ReadablePacket.java
+new file mode 100644
+index 00000000..ff3bfbe5
+--- /dev/null
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/ReadablePacket.java
+@@ -0,0 +1,9 @@
++package com.alibaba.otter.canal.parse.driver.mysql.packets;
++
++import java.io.IOException;
++
++/** Packet capability for unmarshalling received bytes. */
++public interface ReadablePacket extends IPacket {
++
++    void fromBytes(byte[] data) throws IOException;
++}
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/WritablePacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/WritablePacket.java
+new file mode 100644
+index 00000000..3d2d4488
+--- /dev/null
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/WritablePacket.java
+@@ -0,0 +1,9 @@
++package com.alibaba.otter.canal.parse.driver.mysql.packets;
++
++import java.io.IOException;
++
++/** Packet capability for marshalling bytes to send. */
++public interface WritablePacket extends IPacket {
++
++    byte[] toBytes() throws IOException;
++}
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/AuthSwitchResponsePacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/AuthSwitchResponsePacket.java
+index 5bf22374..a3240aa5 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/AuthSwitchResponsePacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/AuthSwitchResponsePacket.java
+@@ -4,14 +4,12 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ 
+-public class AuthSwitchResponsePacket extends CommandPacket {
++public class AuthSwitchResponsePacket extends CommandPacket implements WritablePacket {
+ 
+     public byte[] authData;
+ 
+-    public void fromBytes(byte[] data) {
+-    }
+-
+     public byte[] toBytes() throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+         out.write(authData);
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpCommandPacket.java
+index f0fba11a..b98d5c2e 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpCommandPacket.java
+@@ -6,6 +6,7 @@ import java.io.IOException;
+ import org.apache.commons.lang.StringUtils;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+@@ -14,7 +15,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+  * @author fujohnwang
+  * @since 1.0
+  */
+-public class BinlogDumpCommandPacket extends CommandPacket {
++public class BinlogDumpCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     /** BINLOG_DUMP options */
+     public static final int BINLOG_DUMP_NON_BLOCK           = 1;
+@@ -27,10 +28,6 @@ public class BinlogDumpCommandPacket extends CommandPacket {
+         setCommand((byte) 0x12);
+     }
+ 
+-    public void fromBytes(byte[] data) {
+-        // bypass
+-    }
+-
+     /**
+      * <pre>
+      * Bytes                        Name
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpGTIDCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpGTIDCommandPacket.java
+index ef9526b1..bc9bfd0c 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpGTIDCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/BinlogDumpGTIDCommandPacket.java
+@@ -5,13 +5,14 @@ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+  * Created by hiwjd on 2018/4/24. hiwjd0@gmail.com
+  * https://dev.mysql.com/doc/internals/en/com-binlog-dump-gtid.html
+  */
+-public class BinlogDumpGTIDCommandPacket extends CommandPacket {
++public class BinlogDumpGTIDCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     public static final int BINLOG_DUMP_NON_BLOCK   = 0x01;
+     public static final int BINLOG_THROUGH_POSITION = 0x02;
+@@ -24,10 +25,6 @@ public class BinlogDumpGTIDCommandPacket extends CommandPacket {
+         setCommand((byte) 0x1e);
+     }
+ 
+-    @Override
+-    public void fromBytes(byte[] data) throws IOException {
+-    }
+-
+     @Override
+     public byte[] toBytes() throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/ClientAuthenticationPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/ClientAuthenticationPacket.java
+index 1750b255..633d1587 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/ClientAuthenticationPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/ClientAuthenticationPacket.java
+@@ -8,11 +8,12 @@ import org.apache.commons.lang.StringUtils;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.Capability;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.MSC;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.MySQLPasswordEncrypter;
+ 
+-public class ClientAuthenticationPacket extends PacketWithHeaderPacket {
++public class ClientAuthenticationPacket extends PacketWithHeaderPacket implements WritablePacket {
+ 
+     private int    clientCapability = Capability.CLIENT_LONG_PASSWORD | Capability.CLIENT_LONG_FLAG
+                                       | Capability.CLIENT_PROTOCOL_41 | Capability.CLIENT_INTERACTIVE
+@@ -26,10 +27,6 @@ public class ClientAuthenticationPacket extends PacketWithHeaderPacket {
+     private byte[] scrumbleBuff;
+     private byte[] authPluginName;
+ 
+-    public void fromBytes(byte[] data) {
+-        // bypass since nowhere to use.
+-    }
+-
+     /**
+      * <pre>
+      * VERSION 4.1
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QueryCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QueryCommandPacket.java
+index 74ff3a63..acb43aea 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QueryCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QueryCommandPacket.java
+@@ -4,8 +4,9 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ 
+-public class QueryCommandPacket extends CommandPacket {
++public class QueryCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     private String queryString;
+ 
+@@ -13,9 +14,6 @@ public class QueryCommandPacket extends CommandPacket {
+         setCommand((byte) 0x03);
+     }
+ 
+-    public void fromBytes(byte[] data) throws IOException {
+-    }
+-
+     public byte[] toBytes() throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+         out.write(getCommand());
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QuitCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QuitCommandPacket.java
+index dfd51de0..eae96b73 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QuitCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/QuitCommandPacket.java
+@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ 
+ /**
+  * quit cmd
+@@ -11,17 +12,12 @@ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
+  * @author agapple 2016年3月1日 下午8:33:02
+  * @since 1.0.22
+  */
+-public class QuitCommandPacket extends CommandPacket {
++public class QuitCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     public QuitCommandPacket(){
+         setCommand((byte) 0x01);
+     }
+ 
+-    @Override
+-    public void fromBytes(byte[] data) throws IOException {
+-
+-    }
+-
+     @Override
+     public byte[] toBytes() throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/RegisterSlaveCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/RegisterSlaveCommandPacket.java
+index c11a1fe0..a3b343ad 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/RegisterSlaveCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/RegisterSlaveCommandPacket.java
+@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+@@ -12,7 +13,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+  * @author zhibinliu
+  * @since 1.0.24
+  */
+-public class RegisterSlaveCommandPacket extends CommandPacket {
++public class RegisterSlaveCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     public String reportHost;
+     public int    reportPort;
+@@ -24,10 +25,6 @@ public class RegisterSlaveCommandPacket extends CommandPacket {
+         setCommand((byte) 0x15);
+     }
+ 
+-    public void fromBytes(byte[] data) {
+-        // bypass
+-    }
+-
+     public static byte[] toLH(int n) {
+         byte[] b = new byte[4];
+         b[0] = (byte) (n & 0xff);
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SemiAckCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SemiAckCommandPacket.java
+index 8041aecf..aaf26108 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SemiAckCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SemiAckCommandPacket.java
+@@ -6,6 +6,7 @@ import java.io.IOException;
+ import org.apache.commons.lang.StringUtils;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+@@ -13,7 +14,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+  * 
+  * @author amos_chen
+  */
+-public class SemiAckCommandPacket extends CommandPacket {
++public class SemiAckCommandPacket extends CommandPacket implements WritablePacket {
+ 
+     public long   binlogPosition;
+     public String binlogFileName;
+@@ -22,10 +23,6 @@ public class SemiAckCommandPacket extends CommandPacket {
+ 
+     }
+ 
+-    @Override
+-    public void fromBytes(byte[] data) throws IOException {
+-    }
+-
+     /**
+      * <pre>
+      * Bytes                        Name
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SslRequestCommandPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SslRequestCommandPacket.java
+index 5e8b4fdf..9123ef00 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SslRequestCommandPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/client/SslRequestCommandPacket.java
+@@ -4,14 +4,14 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.Capability;
+-import com.alibaba.otter.canal.parse.driver.mysql.packets.IPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+  * @author 枭博
+  * @date 2024/05/14
+  */
+-public class SslRequestCommandPacket implements IPacket {
++public class SslRequestCommandPacket implements WritablePacket {
+ 
+     private final int serverCharsetNumber;
+ 
+@@ -19,11 +19,6 @@ public class SslRequestCommandPacket implements IPacket {
+         this.serverCharsetNumber = serverCharsetNumber;
+     }
+ 
+-    @Override
+-    public void fromBytes(byte[] data) throws IOException {
+-        throw new UnsupportedOperationException();
+-    }
+-
+     @Override
+     public byte[] toBytes() throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestMoreData.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestMoreData.java
+index 347f26dc..ca08469a 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestMoreData.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestMoreData.java
+@@ -1,11 +1,10 @@
+ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ 
+-import java.io.IOException;
+-
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+-public class AuthSwitchRequestMoreData extends CommandPacket {
++public class AuthSwitchRequestMoreData extends CommandPacket implements ReadablePacket {
+ 
+     public int    status;
+     public byte[] authData;
+@@ -18,8 +17,4 @@ public class AuthSwitchRequestMoreData extends CommandPacket {
+         authData = ByteHelper.readNullTerminatedBytes(data, index);
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+ }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestPacket.java
+index 3cc7de97..9db92c64 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/AuthSwitchRequestPacket.java
+@@ -1,11 +1,10 @@
+ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ 
+-import java.io.IOException;
+-
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+-public class AuthSwitchRequestPacket extends CommandPacket {
++public class AuthSwitchRequestPacket extends CommandPacket implements ReadablePacket {
+ 
+     public int    status;
+     public String authName;
+@@ -22,8 +21,4 @@ public class AuthSwitchRequestPacket extends CommandPacket {
+         authData = ByteHelper.readNullTerminatedBytes(data, index);
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+ }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/DataPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/DataPacket.java
+index 424295a3..92b9bdcb 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/DataPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/DataPacket.java
+@@ -1,17 +1,6 @@
+ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ 
+-import java.io.IOException;
+-
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.CommandPacket;
+ 
+ public class DataPacket extends CommandPacket {
+-
+-    public void fromBytes(byte[] data) {
+-
+-    }
+-
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+ }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/EOFPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/EOFPacket.java
+index 6b200c2e..cf78420f 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/EOFPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/EOFPacket.java
+@@ -4,9 +4,11 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+-public class EOFPacket extends PacketWithHeaderPacket {
++public class EOFPacket extends PacketWithHeaderPacket implements ReadablePacket, WritablePacket {
+ 
+     public byte fieldCount;
+     public int  warningCount;
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ErrorPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ErrorPacket.java
+index a9dfc778..120ee52f 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ErrorPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ErrorPacket.java
+@@ -3,9 +3,10 @@ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+-public class ErrorPacket extends PacketWithHeaderPacket {
++public class ErrorPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     public byte   fieldCount;
+     public int    errorNumber;
+@@ -45,10 +46,6 @@ public class ErrorPacket extends PacketWithHeaderPacket {
+         // end read
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+     @Override
+     public String toString() {
+         return "ErrorPacket [errorNumber=" + errorNumber + ", fieldCount=" + fieldCount + ", message=" + message
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/FieldPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/FieldPacket.java
+index 56014413..0b06d385 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/FieldPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/FieldPacket.java
+@@ -3,10 +3,11 @@ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.LengthCodedStringReader;
+ 
+-public class FieldPacket extends PacketWithHeaderPacket {
++public class FieldPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     private String catalog;
+     private String db;
+@@ -82,10 +83,6 @@ public class FieldPacket extends PacketWithHeaderPacket {
+         }
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+     public String getCatalog() {
+         return catalog;
+     }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/HandshakeInitializationPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/HandshakeInitializationPacket.java
+index 488490ff..a0c2eb8f 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/HandshakeInitializationPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/HandshakeInitializationPacket.java
+@@ -5,6 +5,7 @@ import java.io.IOException;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.Capability;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.HeaderPacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.MSC;
+ 
+@@ -14,7 +15,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.MSC;
+  * @author fujohnwang
+  * @since 1.0
+  */
+-public class HandshakeInitializationPacket extends PacketWithHeaderPacket {
++public class HandshakeInitializationPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     public byte   protocolVersion = MSC.DEFAULT_PROTOCOL_VERSION;
+     public String serverVersion;
+@@ -104,11 +105,4 @@ public class HandshakeInitializationPacket extends PacketWithHeaderPacket {
+         }
+     }
+ 
+-    /**
+-     * Bypass implementing it, 'cause nowhere to use it.
+-     */
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+ }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/OKPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/OKPacket.java
+index fcd3173d..e1b66bd6 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/OKPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/OKPacket.java
+@@ -4,6 +4,7 @@ import java.io.IOException;
+ import java.util.Arrays;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+@@ -11,7 +12,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+  * 
+  * @author fujohnwang
+  */
+-public class OKPacket extends PacketWithHeaderPacket {
++public class OKPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     public byte   fieldCount;
+     public byte[] affectedRows;
+@@ -57,10 +58,6 @@ public class OKPacket extends PacketWithHeaderPacket {
+         // end read
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+     public byte getFieldCount() {
+         return fieldCount;
+     }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/Reply323Packet.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/Reply323Packet.java
+index 2a1b5f7c..b8efd74c 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/Reply323Packet.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/Reply323Packet.java
+@@ -4,16 +4,13 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+-public class Reply323Packet extends PacketWithHeaderPacket {
++public class Reply323Packet extends PacketWithHeaderPacket implements WritablePacket {
+ 
+     public byte[] seed;
+ 
+-    public void fromBytes(byte[] data) throws IOException {
+-
+-    }
+-
+     public byte[] toBytes() throws IOException {
+         if (seed == null) {
+             return new byte[] { (byte) 0 };
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ResultSetHeaderPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ResultSetHeaderPacket.java
+index b6cdc9a7..f2bc2e9d 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ResultSetHeaderPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/ResultSetHeaderPacket.java
+@@ -3,6 +3,7 @@ package com.alibaba.otter.canal.parse.driver.mysql.packets.server;
+ import java.io.IOException;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+ 
+ /**
+@@ -25,7 +26,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.utils.ByteHelper;
+  * 
+  * @author fujohnwang
+  */
+-public class ResultSetHeaderPacket extends PacketWithHeaderPacket {
++public class ResultSetHeaderPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     private long columnCount;
+     private long extra;
+@@ -40,10 +41,6 @@ public class ResultSetHeaderPacket extends PacketWithHeaderPacket {
+         }
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+     public long getColumnCount() {
+         return columnCount;
+     }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/RowDataPacket.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/RowDataPacket.java
+index c1aa5539..38ac29e9 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/RowDataPacket.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/packets/server/RowDataPacket.java
+@@ -5,9 +5,10 @@ import java.util.ArrayList;
+ import java.util.List;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.utils.LengthCodedStringReader;
+ 
+-public class RowDataPacket extends PacketWithHeaderPacket {
++public class RowDataPacket extends PacketWithHeaderPacket implements ReadablePacket {
+ 
+     private List<String> columns = new ArrayList<>();
+ 
+@@ -19,10 +20,6 @@ public class RowDataPacket extends PacketWithHeaderPacket {
+         } while (reader.getIndex() < data.length);
+     }
+ 
+-    public byte[] toBytes() throws IOException {
+-        return null;
+-    }
+-
+     public void setColumns(List<String> columns) {
+         this.columns = columns;
+     }
+diff --git a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/utils/ChannelBufferHelper.java b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/utils/ChannelBufferHelper.java
+index 2232bef0..5bda4fb0 100644
+--- a/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/utils/ChannelBufferHelper.java
++++ b/driver/src/main/java/com/alibaba/otter/canal/parse/driver/mysql/utils/ChannelBufferHelper.java
+@@ -8,8 +8,9 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.HeaderPacket;
+-import com.alibaba.otter.canal.parse.driver.mysql.packets.IPacket;
+ import com.alibaba.otter.canal.parse.driver.mysql.packets.PacketWithHeaderPacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.ReadablePacket;
++import com.alibaba.otter.canal.parse.driver.mysql.packets.WritablePacket;
+ 
+ public class ChannelBufferHelper {
+ 
+@@ -23,8 +24,8 @@ public class ChannelBufferHelper {
+         return header;
+     }
+ 
+-    public final PacketWithHeaderPacket assembleBodyPacketWithHeader(ChannelBuffer buffer, HeaderPacket header,
+-                                                                     PacketWithHeaderPacket body) throws IOException {
++    public final <T extends PacketWithHeaderPacket & ReadablePacket> T assembleBodyPacketWithHeader(
++        ChannelBuffer buffer, HeaderPacket header, T body) throws IOException {
+         if (body.getHeader() == null) {
+             body.setHeader(header);
+         }
+@@ -54,7 +55,7 @@ public class ChannelBufferHelper {
+         return ChannelBuffers.wrappedBuffer(header.toBytes());
+     }
+ 
+-    public final ChannelBuffer buildChannelBufferFromCommandPacket(IPacket packet) throws IOException {
++    public final ChannelBuffer buildChannelBufferFromCommandPacket(WritablePacket packet) throws IOException {
+         byte[] bodyBytes = packet.toBytes();
+         ChannelBuffer header = createHeader(bodyBytes.length, (byte) 0);
+         return ChannelBuffers.wrappedBuffer(header, ChannelBuffers.wrappedBuffer(bodyBytes));

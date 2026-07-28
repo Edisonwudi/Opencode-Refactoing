@@ -72,3 +72,43 @@ def parse_parent_from_evidence(evidence: str) -> str:
         return ""
     value = re.split(r"[|,]", match.group(1), maxsplit=1)[0]
     return value.strip().lower()
+
+
+def parse_structural_expectation(evidence: str) -> str:
+    """Extract an explicit structural acceptance contract from dataset evidence."""
+    match = re.search(
+        r"(?:^|;\s*)structural_expectation=([^;]+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip().lower() if match else ""
+
+
+def parse_expected_state_field(evidence: str) -> str:
+    """Extract the backing field required by a ``state_getter`` contract."""
+    match = re.search(
+        r"(?:^|;\s*)expected_state_field=([A-Za-z_$][A-Za-z0-9_$]*)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def parse_target_parameter_count(evidence: str) -> Optional[int]:
+    """Extract a pinned target-method arity used to distinguish Java overloads."""
+    matches = re.findall(
+        r"(?:^|;\s*)target_parameter_count=(\d+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return int(matches[-1]) if matches else None
+
+
+def parse_target_class(evidence: str) -> str:
+    """Extract a pinned target class; the final field overrides group defaults."""
+    matches = re.findall(
+        r"(?:^|;\s*)target_class=([^;]+)",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    return matches[-1].strip() if matches else ""

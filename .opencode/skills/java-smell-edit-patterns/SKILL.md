@@ -29,6 +29,9 @@ After reading the complete task input and identifying the smell type:
    operation shape is unclear.
 5. Use the `Verification fit` section only to avoid routes that cannot satisfy
    `smell_verify`; do not make detector-only edits.
+6. For `refused_bequest` evidence with a structural expectation, follow the
+   hierarchy migration protocol in `refused_bequest.md` before choosing a route.
+   This protocol applies equally to interactive UI and batch execution.
 
 ## OpenCode Edit Contract
 

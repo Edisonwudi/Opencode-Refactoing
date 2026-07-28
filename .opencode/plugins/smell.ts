@@ -35,9 +35,13 @@ type CommandLoopState = {
   policy: CommandPolicy
   startedAt: number
   continuationCount: number
+  capRecoveryUsed: boolean
   noProgressCount: number
   lastFailureFingerprint: string
 }
+
+const COMMAND_LOOP_STATE_VERSION = 1
+const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
 
 const pluginFile = fileURLToPath(import.meta.url)
 const pluginRoot = path.resolve(path.dirname(pluginFile), "..", "..")
@@ -198,6 +202,7 @@ const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
 // timeout / unknown failures are never continued.
 const REPAIRABLE_CATEGORIES = new Set([
   "SMELL_GUARD_FAILED",
+  "STRUCTURAL_ROUTE_MISMATCH",
   "BUILD_COMPILE_ERROR",
   "TEST_BEHAVIOR_REGRESSION",
   "TEST_REFLECTION_ENTRY_STALE",
@@ -1237,6 +1242,21 @@ function commandPolicyPrompt(policy: CommandPolicy): string {
     "When loop.decision is stop, stop and report loop.termination_reason. Never modify or weaken tests.",
   ]
   const smell = String(taskField(policy.task, "Smell type") || "")
+  const evidence = String(taskField(policy.task, "Smell evidence") || "")
+  if (
+    smell === "refused_bequest"
+    && /(?:^|;)\s*structural_expectation\s*=\s*capability_split(?:\s*;|$)/i.test(evidence)
+  ) {
+    lines.push(
+      "",
+      "Mandatory Refused Bequest route lock:",
+      "- required_route: capability_split",
+      "- A body-only implementation or delegation of the reported method cannot pass, even when build and behavior tests pass.",
+      "- Before the first edit, inspect the parent contract, relevant sibling implementers, and production callers.",
+      "- Split the parent into narrow supported capabilities, migrate implementers and callers, and remove the unsupported operation from the refusing type's inherited contract.",
+      "- Do not relocate the rejecting/empty/null behavior to an ancestor, interface default, adapter, or compatibility shim.",
+    )
+  }
   if (checkpointSmells.has(smell)) {
     lines.push(
       "",
@@ -1272,9 +1292,101 @@ function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
     policy,
     startedAt: Date.now(),
     continuationCount: 0,
+    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
+}
+
+function commandLoopStateSnapshot(state: CommandLoopState): Record<string, unknown> {
+  return {
+    schema_version: COMMAND_LOOP_STATE_VERSION,
+    policy: {
+      ...state.policy,
+      // The original task can contain a large group manifest. It is not used
+      // after command initialization, so do not duplicate it in every tool
+      // event or runner handoff.
+      task: "Continue the current smell refactoring task.",
+    },
+    started_at: state.startedAt,
+    continuation_count: state.continuationCount,
+    cap_recovery_used: state.capRecoveryUsed,
+    no_progress_count: state.noProgressCount,
+    last_failure_fingerprint: state.lastFailureFingerprint,
+  }
+}
+
+function restoreCommandLoopState(raw: string | undefined): CommandLoopState | undefined {
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (parsed.schema_version !== COMMAND_LOOP_STATE_VERSION) return undefined
+    const policy = parsed.policy as CommandPolicy | undefined
+    const loop = policy?.loop
+    if (
+      !policy
+      || !["local", "auto", "sample_optimized", "project_full"].includes(policy.verification_mode)
+      || !loop
+      || !["off", "verify-failure"].includes(loop.mode)
+      || !Number.isInteger(loop.max_continuations)
+      || loop.max_continuations < 0
+      || loop.max_continuations > 5
+      || !Number.isInteger(loop.no_progress_limit)
+      || loop.no_progress_limit < 0
+      || !Array.isArray(loop.allowed_failure_groups)
+      || !loop.allowed_failure_groups.every((item) => typeof item === "string")
+      || typeof loop.instruction !== "string"
+      || !Number.isFinite(loop.sample_deadline_seconds)
+      || loop.sample_deadline_seconds <= 0
+    ) return undefined
+    const startedAt = Number(parsed.started_at)
+    const continuationCount = Number(parsed.continuation_count)
+    const noProgressCount = Number(parsed.no_progress_count)
+    if (
+      !Number.isFinite(startedAt)
+      || !Number.isInteger(continuationCount)
+      || continuationCount < 0
+      || continuationCount > loop.max_continuations
+      || !Number.isInteger(noProgressCount)
+      || noProgressCount < 0
+    ) return undefined
+    return {
+      policy,
+      startedAt,
+      continuationCount,
+      capRecoveryUsed: parsed.cap_recovery_used === true,
+      noProgressCount,
+      lastFailureFingerprint:
+        typeof parsed.last_failure_fingerprint === "string"
+          ? parsed.last_failure_fingerprint
+          : "",
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function hasActionableProgressAtCap(payload: Record<string, unknown>, failureGroup: string): boolean {
+  const checkpoint = payload.checkpoint && typeof payload.checkpoint === "object" && !Array.isArray(payload.checkpoint)
+    ? payload.checkpoint as Record<string, unknown>
+    : undefined
+  const delta = checkpoint?.delta && typeof checkpoint.delta === "object" && !Array.isArray(checkpoint.delta)
+    ? checkpoint.delta as Record<string, unknown>
+    : undefined
+  if (delta?.metric_progress === true) {
+    return true
+  }
+  if (failureGroup !== "compile" && failureGroup !== "test") {
+    return false
+  }
+  const snapshot = payload.snapshot && typeof payload.snapshot === "object" && !Array.isArray(payload.snapshot)
+    ? payload.snapshot as Record<string, unknown>
+    : undefined
+  const diffStat = snapshot?.diff_stat && typeof snapshot.diff_stat === "object" && !Array.isArray(snapshot.diff_stat)
+    ? snapshot.diff_stat as Record<string, unknown>
+    : undefined
+  return delta?.has_production_diff === true
+    || (typeof diffStat?.stdout === "string" && diffStat.stdout.trim().length > 0)
 }
 
 function failureFingerprint(payload: Record<string, unknown>): string {
@@ -1362,7 +1474,22 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
       terminationReason = improvedOnly ? "PASS" : "NO_PROGRESS"
     } else if (state.continuationCount >= state.policy.loop.max_continuations) {
-      terminationReason = improvedOnly ? "PASS" : "MAX_CONTINUATIONS_REACHED"
+      if (
+        !improvedOnly
+        && retryable
+        && !state.capRecoveryUsed
+        && hasActionableProgressAtCap(payload, group)
+      ) {
+        // One final, bounded repair is part of the shared command policy so
+        // TUI/Web/serve/attach and batch runs receive identical behavior.
+        // Keep the public continuation count at the configured maximum; the
+        // separate flag prevents a second recovery.
+        state.capRecoveryUsed = true
+        decision = "continue"
+        terminationReason = ""
+      } else {
+        terminationReason = improvedOnly ? "PASS" : "MAX_CONTINUATIONS_REACHED"
+      }
     } else {
       state.continuationCount += 1
       decision = "continue"
@@ -1375,6 +1502,7 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     termination_reason: terminationReason,
     continuation: state.continuationCount,
     max_continuations: state.policy.loop.max_continuations,
+    cap_recovery_used: state.capRecoveryUsed,
     remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
     no_progress_count: state.noProgressCount,
     no_progress_limit: state.policy.loop.no_progress_limit,
@@ -1383,9 +1511,11 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     failure_category: category,
     failure_group: group,
     instruction: decision === "continue"
-      ? (improvedOnly && typeof payload.continue_hint === "string" && payload.continue_hint
-          ? payload.continue_hint
-          : state.policy.loop.instruction)
+      ? (category === "STRUCTURAL_ROUTE_MISMATCH"
+          ? "Capability split is mandatory. Revert or replace any body-only implementation of the reported method; split the parent capability, migrate real implementers and production callers to narrow types, remove the unsupported inherited operation, then call smell_verify again. Do not modify or weaken tests."
+          : improvedOnly && typeof payload.continue_hint === "string" && payload.continue_hint
+            ? payload.continue_hint
+            : state.policy.loop.instruction)
       : "",
   }
   payload.loop = loop
@@ -1437,7 +1567,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         let commandState = commandLoopStates.get(sessionID)
         if (!commandState && sessionID) {
           const requestedMode = String(resolved.verificationMode || "local") as CommandPolicy["verification_mode"]
-          commandState = newCommandLoopState(defaultCommandPolicy(requestedMode))
+          commandState = restoreCommandLoopState(process.env[COMMAND_LOOP_STATE_ENV])
+            || newCommandLoopState(defaultCommandPolicy(requestedMode))
           commandLoopStates.set(sessionID, commandState)
         }
         if (commandState) {
@@ -1448,6 +1579,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
         if (commandState) {
           applyCommandLoopDecision(normalized, commandState)
+          normalized.metadata.command_loop_state = toJsonSafe(commandLoopStateSnapshot(commandState))
         }
         // Consume the authoritative loop decision and arm same-session
         // continuation. This path is identical for TUI, run, serve, web,
@@ -1773,6 +1905,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   commandPolicyPrompt,
   defaultCommandPolicy,
   newCommandLoopState,
+  commandLoopStateSnapshot,
+  restoreCommandLoopState,
   failureFingerprint,
   applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,
