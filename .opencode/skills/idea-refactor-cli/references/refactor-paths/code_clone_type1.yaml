@@ -222,3 +222,4 @@ code_clone_type1:
       - "Keep the first cohesive edit to the two reported overloads. Broaden the family only when compilation or the structural Oracle proves the pair cannot be centralized independently."
       - "Do not use java.lang.reflect.Array plus a Class<?> discriminator or type-switch for primitive access. Capture the concrete arrays in an index callback/predicate instead."
       - "After Oracle feedback, inspect the complete production diff and remove superseded wrappers, duplicate adapters, and unused imports before final verification."
+      - "Keep the common null/length/loop control flow in exactly one core method. Do not create one full helper per primitive type; both target overloads should call the same index-based core directly, with only their lambdas or tiny adapters differing."
