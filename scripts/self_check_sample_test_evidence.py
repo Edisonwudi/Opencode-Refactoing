@@ -59,9 +59,26 @@ def main() -> int:
             ),
         )
         missing = _sample_test_execution_evidence(missing_config, started_ns)
-        assert missing["success"] is False, missing
+        assert missing["success"] is True, missing
         assert missing["missing_test_classes"] == ["MissingBehaviorTest"]
-        print("  ok   one missing declared class fails closed")
+        assert missing["executed_test_classes"] == ["FirstBehaviorTest"]
+        print("  ok   support file without a report is recorded")
+
+        all_missing_config = SimpleNamespace(
+            project_root=root,
+            sample_test_location=(
+                "src/test/java/example/MissingBehaviorTest.java;"
+                "src/test/java/example/OtherMissingBehaviorTest.java"
+            ),
+        )
+        all_missing = _sample_test_execution_evidence(all_missing_config, started_ns)
+        assert all_missing["success"] is False, all_missing
+        assert all_missing["executed_test_classes"] == []
+        assert all_missing["missing_test_classes"] == [
+            "MissingBehaviorTest",
+            "OtherMissingBehaviorTest",
+        ]
+        print("  ok   no declared class executed fails closed")
 
         skipped_started_ns = time.time_ns()
         _write_report(root, "SkippedBehaviorTest", 1, skipped=1)

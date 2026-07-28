@@ -355,6 +355,7 @@ def _sample_test_execution_evidence(
             "test_class": "",
             "test_classes": [],
             "classes": [],
+            "executed_test_classes": [],
             "missing_test_classes": [],
             "reports": [],
             "tests": 0,
@@ -401,6 +402,11 @@ def _sample_test_execution_evidence(
         for item in classes
         if not bool(item["success"])
     ]
+    executed_classes = [
+        str(item["test_class"])
+        for item in classes
+        if bool(item["success"])
+    ]
     reports = sorted(
         str(report)
         for item in classes
@@ -408,19 +414,26 @@ def _sample_test_execution_evidence(
     )
     executed = sum(int(item["tests"]) for item in classes)
     skipped_total = sum(int(item["skipped"]) for item in classes)
-    success = not missing and executed > 0
+    success = executed > 0
     return {
         "success": success,
         "message": (
             f"Pinned sample tests executed {executed} test(s) across "
-            f"{len(test_classes)} declared class(es)."
+            f"{len(executed_classes)} declared class(es)"
+            + (
+                f"; no fresh report for {', '.join(missing)}."
+                if missing
+                else "."
+            )
             if success
-            else "Pinned sample test evidence is missing for declared class(es): "
+            else "Pinned sample test evidence contains no fresh non-empty report "
+            "for declared class(es): "
             + ", ".join(missing)
         ),
         "test_class": test_classes[0] if len(test_classes) == 1 else "",
         "test_classes": test_classes,
         "classes": classes,
+        "executed_test_classes": executed_classes,
         "missing_test_classes": missing,
         "reports": reports,
         "tests": executed,

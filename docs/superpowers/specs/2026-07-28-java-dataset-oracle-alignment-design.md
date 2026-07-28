@@ -84,11 +84,13 @@ The build/test guard derives one test class name from every declared Java test
 file. After running the dataset test command, it searches for fresh JUnit XML
 reports for each declared class.
 
-Success requires:
-
-- at least one fresh matching report for every declared test class;
-- at least one non-skipped test across those reports;
-- no declared class with zero executed tests.
+Success requires at least one fresh matching report for a declared test class
+and at least one non-skipped test across the matching reports. Some historical
+`test_file` values include support harnesses that compile with the test suite
+but do not contain executable test cases; those files remain existence-checked
+and are reported as declarations without execution evidence rather than
+causing a false failure. If no declared class produces a fresh non-empty
+report, verification fails closed.
 
 The evidence payload records per-class report paths and executed/skipped
 counts, while preserving the aggregate fields used by existing consumers.
