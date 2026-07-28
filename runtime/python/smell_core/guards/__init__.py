@@ -342,50 +342,87 @@ def _sample_test_execution_evidence(
     config: ResolvedRunConfig,
     started_ns: int,
 ) -> Dict[str, object]:
-    """Require a fresh JUnit XML report for the pinned sample test class."""
-    test_class = Path(str(config.sample_test_location or "")).stem
-    if not test_class:
+    """Require fresh JUnit XML evidence for every declared sample test class."""
+    test_classes = [
+        Path(part.strip()).stem
+        for part in str(config.sample_test_location or "").split(";")
+        if part.strip() and Path(part.strip()).stem
+    ]
+    if not test_classes:
         return {
             "success": False,
             "message": "Pinned sample test location does not identify a test class.",
             "test_class": "",
+            "test_classes": [],
+            "classes": [],
+            "missing_test_classes": [],
             "reports": [],
             "tests": 0,
+            "skipped": 0,
         }
-    reports: List[str] = []
-    executed = 0
-    skipped_total = 0
-    for report in config.project_root.rglob(f"TEST-*{test_class}.xml"):
-        try:
-            if report.stat().st_mtime_ns < started_ns:
+    classes: List[Dict[str, object]] = []
+    for test_class in test_classes:
+        class_reports: List[str] = []
+        class_executed = 0
+        class_skipped = 0
+        for report in config.project_root.rglob(f"TEST-*{test_class}.xml"):
+            try:
+                if report.stat().st_mtime_ns < started_ns:
+                    continue
+                root = ET.parse(report).getroot()
+            except (OSError, ET.ParseError):
                 continue
-            root = ET.parse(report).getroot()
-        except (OSError, ET.ParseError):
-            continue
-        tests_text = str(root.attrib.get("tests") or "").strip()
-        try:
-            tests = int(tests_text)
-        except ValueError:
-            tests = len(root.findall(".//testcase"))
-        try:
-            skipped = int(str(root.attrib.get("skipped") or "0"))
-        except ValueError:
-            skipped = len(root.findall(".//testcase/skipped"))
-        non_skipped = max(tests - skipped, 0)
-        if non_skipped <= 0:
-            continue
-        reports.append(str(report.relative_to(config.project_root)))
-        executed += non_skipped
-        skipped_total += skipped
+            tests_text = str(root.attrib.get("tests") or "").strip()
+            try:
+                tests = int(tests_text)
+            except ValueError:
+                tests = len(root.findall(".//testcase"))
+            try:
+                skipped = int(str(root.attrib.get("skipped") or "0"))
+            except ValueError:
+                skipped = len(root.findall(".//testcase/skipped"))
+            non_skipped = max(tests - skipped, 0)
+            if non_skipped <= 0:
+                continue
+            class_reports.append(str(report.relative_to(config.project_root)))
+            class_executed += non_skipped
+            class_skipped += skipped
+        classes.append(
+            {
+                "test_class": test_class,
+                "success": class_executed > 0,
+                "reports": sorted(class_reports),
+                "tests": class_executed,
+                "skipped": class_skipped,
+            }
+        )
+    missing = [
+        str(item["test_class"])
+        for item in classes
+        if not bool(item["success"])
+    ]
+    reports = sorted(
+        str(report)
+        for item in classes
+        for report in item["reports"]  # type: ignore[union-attr]
+    )
+    executed = sum(int(item["tests"]) for item in classes)
+    skipped_total = sum(int(item["skipped"]) for item in classes)
+    success = not missing and executed > 0
     return {
-        "success": executed > 0,
+        "success": success,
         "message": (
-            f"Pinned sample test {test_class} executed {executed} test(s)."
-            if executed > 0
-            else f"Pinned sample test {test_class} produced no fresh non-empty JUnit report."
+            f"Pinned sample tests executed {executed} test(s) across "
+            f"{len(test_classes)} declared class(es)."
+            if success
+            else "Pinned sample test evidence is missing for declared class(es): "
+            + ", ".join(missing)
         ),
-        "test_class": test_class,
-        "reports": sorted(reports),
+        "test_class": test_classes[0] if len(test_classes) == 1 else "",
+        "test_classes": test_classes,
+        "classes": classes,
+        "missing_test_classes": missing,
+        "reports": reports,
         "tests": executed,
         "skipped": skipped_total,
     }

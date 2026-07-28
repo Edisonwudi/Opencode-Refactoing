@@ -37,6 +37,7 @@ from smell_core.guards import run_build_test_guard  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
+    audit_test_commit,
     assert_commit_present,
     load_revisions,
     resolve_revision,
@@ -751,17 +752,6 @@ def execute_single_plan(
 
 
 
-def _legacy_status(sample: "Sample", canonical_root: Path, legacy: str) -> str:
-    if not legacy:
-        return "LEGACY_EMPTY"
-    rc = subprocess.run(
-        ["git", "-c", "safe.directory=*", "-C", str(canonical_root),
-         "cat-file", "-e", f"{legacy}^{{commit}}"],
-        capture_output=True,
-    ).returncode
-    return "LEGACY_PRESENT" if rc == 0 else "LEGACY_MISSING"
-
-
 def main() -> int:
     args = parse_args()
     started = time.time()
@@ -886,7 +876,6 @@ def main() -> int:
         checkout_id = hashlib.sha256(f"{sample.key}\0{sample.test_command}".encode("utf-8")).hexdigest()
         canonical_root = Path(sample.project_path).resolve()
         legacy = sample.legacy_test_commit
-        legacy_status = _legacy_status(sample, canonical_root, legacy)
 
         # Resolve the authoritative project_commit via the shared module (no HEAD fallback).
         revision_audit: dict[str, str] = {}
@@ -895,9 +884,17 @@ def main() -> int:
             rev = resolve_revision(sample.project_name, revisions, args.project_revisions)
             assert_commit_present(canonical_root, rev.project_commit)
             project_commit = rev.project_commit
+            provenance_audit = audit_test_commit(
+                canonical_root,
+                legacy,
+                project_commit,
+            )
+            revision_audit.update(provenance_audit)
+            legacy_status = provenance_audit["test_commit_provenance"]
         except ProjectRevisionError as exc:
             commit_error = exc.status
             project_commit = ""
+            legacy_status = "NOT_AUDITED"
             revision_audit = {
                 "requested_project_commit": "",
                 "actual_commit": "",
@@ -907,7 +904,11 @@ def main() -> int:
                 "project_revisions_path": args.project_revisions,
             }
         # strict policy: a non-empty legacy test_commit that is missing must fail explicitly.
-        if not commit_error and args.commit_policy == "strict" and legacy and legacy_status == "LEGACY_MISSING":
+        if (
+            not commit_error
+            and args.commit_policy == "strict"
+            and legacy_status == "MISSING_FROM_REPOSITORY"
+        ):
             commit_error = "TEST_COMMIT_MISSING"
 
         print(

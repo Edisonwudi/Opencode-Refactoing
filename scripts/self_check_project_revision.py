@@ -13,7 +13,11 @@ RUNTIME_PYTHON = ROOT / "runtime" / "python"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.project_revision import ProjectRevisionError, verify_test_oracle  # noqa: E402
+from smell_core.project_revision import (  # noqa: E402
+    ProjectRevisionError,
+    audit_test_commit,
+    verify_test_oracle,
+)
 
 
 def _run(repo: Path, *args: str) -> None:
@@ -69,16 +73,72 @@ def main() -> int:
         skipped = verify_test_oracle(repo, "", "")
         assert skipped["test_oracle_alignment"] == "NOT_DECLARED"
         print("  ok   undeclared oracle")
-        _expect_error(
-            "TEST_ORACLE_SCHEMA_INVALID",
-            lambda: verify_test_oracle(repo, "src/ExampleTest.java", ""),
-        )
-        print("  ok   file without oracle hash")
+        unhashed = verify_test_oracle(repo, "src/ExampleTest.java", "")
+        assert unhashed["test_oracle_alignment"] == "PRESENT_UNHASHED"
+        assert unhashed["test_files"] == ["src/ExampleTest.java"]
+        print("  ok   legacy file without oracle hash")
         _expect_error(
             "TEST_ORACLE_SCHEMA_INVALID",
             lambda: verify_test_oracle(repo, "", expected),
         )
         print("  ok   oracle hash without file")
+
+        second_file = repo / "src" / "SecondTest.java"
+        second_file.write_text("class SecondTest {}\n", encoding="utf-8")
+        _run(repo, "add", ".")
+        _run(repo, "commit", "-qm", "second fixture")
+        second_expected = hashlib.sha256(second_file.read_bytes()).hexdigest()
+        multi = verify_test_oracle(
+            repo,
+            "src/ExampleTest.java;src/SecondTest.java",
+            f"{expected};{second_expected}",
+        )
+        assert multi["test_oracle_alignment"] == "ALIGNED"
+        assert multi["test_files"] == [
+            "src/ExampleTest.java",
+            "src/SecondTest.java",
+        ]
+        assert multi["actual_test_oracle_sha256s"] == [
+            expected,
+            second_expected,
+        ]
+        print("  ok   aligned multi-file oracle")
+
+        _expect_error(
+            "TEST_ORACLE_SCHEMA_INVALID",
+            lambda: verify_test_oracle(
+                repo,
+                "src/ExampleTest.java;src/SecondTest.java",
+                expected,
+            ),
+        )
+        print("  ok   multi-file oracle hash count")
+
+        commits = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--reverse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        project_commit = commits[-1]
+        provenance_commit = commits[0]
+        mismatch = audit_test_commit(repo, provenance_commit, project_commit)
+        assert mismatch["test_commit_provenance"] == "PRESENT_IN_REPOSITORY"
+        assert mismatch["test_commit"] == provenance_commit
+        assert mismatch["project_commit"] == project_commit
+        print("  ok   mismatched but present test provenance")
+
+        matching = audit_test_commit(repo, project_commit, project_commit)
+        assert matching["test_commit_provenance"] == "MATCHES_PROJECT_COMMIT"
+        print("  ok   matching test provenance")
+
+        undeclared = audit_test_commit(repo, "", project_commit)
+        assert undeclared["test_commit_provenance"] == "NOT_DECLARED"
+        print("  ok   undeclared test provenance")
+
+        missing = audit_test_commit(repo, "f" * 40, project_commit)
+        assert missing["test_commit_provenance"] == "MISSING_FROM_REPOSITORY"
+        print("  ok   missing test provenance")
 
     print("project revision self-check: PASS")
     return 0

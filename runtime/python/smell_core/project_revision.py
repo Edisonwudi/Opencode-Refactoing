@@ -190,62 +190,124 @@ def verify_test_oracle(
     checkout: Path,
     test_file: str,
     expected_sha256: str,
-) -> dict[str, str]:
-    """Verify an optional immutable test file against its dataset content hash.
+) -> dict[str, object]:
+    """Verify declared test files and any optional immutable content hashes.
 
     The project manifest remains the sole checkout authority.  This check only
-    proves that the pinned tree contains the same test oracle that the dataset
-    was curated against, avoiding a second per-sample revision path.  The file
-    and hash form one declaration: either both are absent or both are required.
+    proves that the pinned tree contains the declared test evidence. Historical
+    datasets may omit hashes; curated immutable Oracles declare one hash per
+    semicolon-separated test file in the same order.
     """
     test_file = str(test_file or "").strip()
     expected_sha256 = str(expected_sha256 or "").strip().lower()
-    if bool(test_file) != bool(expected_sha256):
+    test_files = _split_declaration(test_file)
+    expected_hashes = _split_declaration(expected_sha256)
+    if not test_files and expected_hashes:
         raise ProjectRevisionError(
             "TEST_ORACLE_SCHEMA_INVALID",
-            "test_file and test_oracle_sha256 must be declared together",
+            "test_oracle_sha256 cannot be declared without test_file",
             test_file=test_file,
             expected_test_oracle_sha256=expected_sha256,
         )
-    if not test_file:
+    if not test_files:
         return {
             "test_oracle_alignment": "NOT_DECLARED",
             "test_file": "",
             "expected_test_oracle_sha256": "",
             "actual_test_oracle_sha256": "",
+            "test_files": [],
+            "expected_test_oracle_sha256s": [],
+            "actual_test_oracle_sha256s": [],
         }
-    if len(expected_sha256) != 64 or any(
-        char not in "0123456789abcdef" for char in expected_sha256
-    ):
+    if expected_hashes and len(expected_hashes) != len(test_files):
         raise ProjectRevisionError(
             "TEST_ORACLE_SCHEMA_INVALID",
-            "test_oracle_sha256 must be a 64-character SHA256",
+            "test_file and test_oracle_sha256 must contain the same number of entries",
             test_file=test_file,
             expected_test_oracle_sha256=expected_sha256,
         )
-    path = checkout / test_file
-    if not path.is_file():
-        raise ProjectRevisionError(
-            "TEST_ORACLE_FILE_MISSING",
-            f"declared test oracle is missing from pinned checkout: {test_file}",
-            test_file=test_file,
-            expected_test_oracle_sha256=expected_sha256,
-        )
-    actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ProjectRevisionError(
-            "TEST_ORACLE_MISMATCH",
-            f"test oracle hash mismatch for {test_file}: "
-            f"actual {actual_sha256} != expected {expected_sha256}",
-            test_file=test_file,
-            expected_test_oracle_sha256=expected_sha256,
-            actual_test_oracle_sha256=actual_sha256,
-        )
+    for expected_hash in expected_hashes:
+        if len(expected_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_hash
+        ):
+            raise ProjectRevisionError(
+                "TEST_ORACLE_SCHEMA_INVALID",
+                "every test_oracle_sha256 entry must be a 64-character SHA256",
+                test_file=test_file,
+                expected_test_oracle_sha256=expected_sha256,
+            )
+
+    actual_hashes: list[str] = []
+    for index, declared_file in enumerate(test_files):
+        relative = Path(declared_file)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ProjectRevisionError(
+                "TEST_ORACLE_SCHEMA_INVALID",
+                f"declared test oracle must stay inside the pinned checkout: {declared_file}",
+                test_file=declared_file,
+                expected_test_oracle_sha256=(
+                    expected_hashes[index] if expected_hashes else ""
+                ),
+            )
+        path = checkout / relative
+        if not path.is_file():
+            raise ProjectRevisionError(
+                "TEST_ORACLE_FILE_MISSING",
+                f"declared test oracle is missing from pinned checkout: {declared_file}",
+                test_file=declared_file,
+                expected_test_oracle_sha256=(
+                    expected_hashes[index] if expected_hashes else ""
+                ),
+            )
+        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        actual_hashes.append(actual_hash)
+        if expected_hashes and actual_hash != expected_hashes[index]:
+            raise ProjectRevisionError(
+                "TEST_ORACLE_MISMATCH",
+                f"test oracle hash mismatch for {declared_file}: "
+                f"actual {actual_hash} != expected {expected_hashes[index]}",
+                test_file=declared_file,
+                expected_test_oracle_sha256=expected_hashes[index],
+                actual_test_oracle_sha256=actual_hash,
+            )
+
+    aligned = bool(expected_hashes)
     return {
-        "test_oracle_alignment": "ALIGNED",
+        "test_oracle_alignment": "ALIGNED" if aligned else "PRESENT_UNHASHED",
         "test_file": test_file,
         "expected_test_oracle_sha256": expected_sha256,
-        "actual_test_oracle_sha256": actual_sha256,
+        "actual_test_oracle_sha256": (
+            ";".join(actual_hashes) if aligned else ""
+        ),
+        "test_files": test_files,
+        "expected_test_oracle_sha256s": expected_hashes,
+        "actual_test_oracle_sha256s": actual_hashes,
+    }
+
+
+def _split_declaration(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(";") if part.strip()]
+
+
+def audit_test_commit(
+    repo: Path,
+    test_commit: str,
+    project_commit: str,
+) -> dict[str, str]:
+    """Audit legacy test provenance without changing checkout authority."""
+    declared = str(test_commit or "").strip()
+    authoritative = str(project_commit or "").strip()
+    if not declared:
+        status = "NOT_DECLARED"
+    elif declared == authoritative:
+        status = "MATCHES_PROJECT_COMMIT"
+    else:
+        proc = _git(repo, ["cat-file", "-e", f"{declared}^{{commit}}"])
+        status = "PRESENT_IN_REPOSITORY" if proc.returncode == 0 else "MISSING_FROM_REPOSITORY"
+    return {
+        "test_commit_provenance": status,
+        "test_commit": declared,
+        "project_commit": authoritative,
     }
 
 

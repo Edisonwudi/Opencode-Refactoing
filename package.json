@@ -24,7 +24,7 @@
     "check:checkpoint-semantic": "python3 scripts/self_check_checkpoint_semantic_adapters.py",
     "check:checkpoint-remaining": "python3 scripts/self_check_checkpoint_remaining_adapters.py",
     "check:runner-closure": "python3 scripts/self_check_runner_continue.py",
-    "check:project-revision": "python3 scripts/self_check_project_revision.py",
+    "check:project-revision": "python3 scripts/self_check_project_revision.py && python3 scripts/self_check_sample_test_evidence.py",
     "check:clone-contract": "bash scripts/self_check_clone_contract.sh",
     "check:mounted-source": "bash scripts/self_check_mounted_source_contract.sh",
     "check:multilanguage-runner": "python3 scripts/self_check_multilanguage_runner.py && python3 scripts/self_check_nonjava_checkpoint.py",

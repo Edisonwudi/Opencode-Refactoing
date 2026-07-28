@@ -38,6 +38,7 @@ from smell_core.location import parse_locations, split_location_descriptors  # n
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
+    audit_test_commit,
     assert_commit_present,
     load_revisions,
     resolve_revision,
@@ -342,19 +343,6 @@ def _evidence_values(evidence: str, field: str) -> list[str]:
         flags=re.IGNORECASE,
     )
     return [part.strip() for part in match.group(1).split("|")] if match else []
-
-
-def _assert_dataset_test_commit(sample: Sample, project_commit: str) -> None:
-    declared = str(sample.raw.get("test_commit") or "").strip()
-    if declared and declared != project_commit:
-        raise ProjectRevisionError(
-            "TEST_COMMIT_PROJECT_REVISION_MISMATCH",
-            f"dataset test_commit {declared} does not match authoritative project_commit "
-            f"{project_commit} for {sample.project_name}",
-            test_commit=declared,
-            project_commit=project_commit,
-            project_name=sample.project_name,
-        )
 
 
 def _pin_refused_bequest_target_classes(sample: Sample) -> Sample:
@@ -1310,7 +1298,6 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
     try:
         revisions = load_revisions(args.project_revisions)
         rev = resolve_revision(sample.project_name, revisions, args.project_revisions)
-        _assert_dataset_test_commit(sample, rev.project_commit)
         assert_commit_present(canonical_root, rev.project_commit)
         prepared = _prepare_worktree(
             sample,
@@ -1320,6 +1307,13 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
         )
         prepared = _pin_refused_bequest_target_classes(prepared)
         audit = verify_checkout(prepared.project_root, rev)
+        audit.update(
+            audit_test_commit(
+                canonical_root,
+                sample.raw.get("test_commit", ""),
+                rev.project_commit,
+            )
+        )
         audit["target_class_pins"] = _evidence_values(
             prepared.evidence,
             "target_classes",
@@ -1390,7 +1384,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     try:
         revisions = load_revisions(revisions_path)
         rev = resolve_revision(sample.project_name, revisions, revisions_path)
-        _assert_dataset_test_commit(sample, rev.project_commit)
         assert_commit_present(sample.project_root.resolve(), rev.project_commit)
         execution_sample = (
             _prepare_worktree(
@@ -1409,6 +1402,13 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                     execution_sample.sibling_revision_audit
                 )
         execution_sample = _pin_refused_bequest_target_classes(execution_sample)
+        revision_audit.update(
+            audit_test_commit(
+                sample.project_root.resolve(),
+                sample.raw.get("test_commit", ""),
+                rev.project_commit,
+            )
+        )
         revision_audit["target_class_pins"] = _evidence_values(
             execution_sample.evidence,
             "target_classes",
