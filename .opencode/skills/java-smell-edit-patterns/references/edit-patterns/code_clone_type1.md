@@ -121,7 +121,9 @@ Route-specific edit steps:
 
 1. Compare overloads and isolate the type-specific conversion points.
 2. Create a private core method for the shared algorithm, using small typed adapters
-   when the overload value types differ.
+   when the overload value types differ. For primitive arrays, pass lengths plus an
+   index callback that captures each concrete array; keep array access in the typed
+   caller instead of inspecting array types in the core.
 3. Rewrite overloads as adapters that call the core with converted values.
 
 Verification fit delta: The large common body should exist only in the core method.
