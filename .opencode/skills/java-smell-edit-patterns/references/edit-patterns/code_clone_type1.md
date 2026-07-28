@@ -8,39 +8,21 @@ or shared core.
 
 ## Common verification fit
 
-- Before editing, name one structural route and the shared symbol that will own the
-  duplicated behavior.
-- The original pair should no longer contain two large identical blocks, and both
-  targets must resolve through that one owner: a shared callee, owner delegation, or
-  inherited parent implementation.
-- Search the changed production files for the original block. It may remain once in
-  the shared owner, but must not reappear in two private helpers or in a parent plus
-  a leftover child override.
-- Compile immediately after the first cohesive structural edit, then run
-  `smell_verify`. Repair the exact compiler diagnostic before attempting another
-  route.
-- Keep the first edit scoped to the reported clone pair. Broaden an overload family
-  only when compilation or the structural Oracle proves that the pair cannot be
-  centralized independently.
-- Before final verification, inspect the complete production diff and delete
-  superseded helpers, wrappers, imports, or duplicated adapters left by an earlier
-  attempt.
+- Prefer the smallest production diff that gives both reported clone sites one shared
+  implementation owner.
+- Choose one fitting route, edit only the reported pair, and call `smell_verify`
+  before broadening the change.
+- The final pair must share a callee, delegate to an existing owner, or inherit one
+  parent implementation while preserving behavior and public signatures.
 
 ## Common avoid
 
-- Changing literals, operators, statement order, or only one clone side merely to
-  break exact-token equality.
-- Moving the two blocks into separate helpers, even if the reported target methods
-  become short.
 - Leaving both clone blocks intact after adding a helper.
 - Creating a new abstraction when an existing owner or parent is the intended
   normalization point.
-- Using unchecked casts to force `List<A>` and `List<B>` through one helper, or
-  routing primitive overloads through an incompatible object/generic functional
-  interface.
-- Replacing typed primitive access with `java.lang.reflect.Array`, a `Class<?>`
-  discriminator, and a type-switch. That trades a local clone for slower, less
-  readable runtime dispatch.
+- Changing literals or operators only to evade clone detection.
+- Expanding to unrelated overloads or using unchecked casts when a small typed
+  adapter can preserve the reported pair's API.
 
 ## Routes
 
@@ -77,9 +59,7 @@ Route-specific edit steps:
 
 1. Confirm both clone methods are sibling overrides with the same parent contract.
 2. Add the common implementation to the parent with the narrowest usable visibility.
-3. Delete child overrides and any shadowing duplicate state that now belongs to the
-   parent.
-4. Compile-check constructors and every `final` field assignment after the move.
+3. Delete child overrides that now inherit the parent behavior.
 
 Verification fit delta: The clone disappears because the duplicated child bodies no longer exist.
 
@@ -99,9 +79,7 @@ Route-specific edit steps:
 1. Pick the closest existing utility or package-local helper location shared by both
    callers.
 2. Move the common block into a helper with explicit inputs and outputs.
-3. Preserve each caller's concrete generic type. Prefer typed adapters or a
-   caller-supplied projection over unchecked casts.
-4. Replace both clone blocks and update imports or visibility.
+3. Replace both clone blocks and update imports or visibility.
 
 Verification fit delta: Both clone sites should call the same helper rather than retain parallel bodies.
 
@@ -140,14 +118,9 @@ Source operation shape: `idea_edit`. See [`operation-translations.md`](operation
 Route-specific edit steps:
 
 1. Compare overloads and isolate the type-specific conversion points.
-2. Create a private core method for the shared control flow. For primitive
-   overloads, pass an index callback/predicate that closes over the concrete arrays,
-   or keep thin typed adapters; do not box values into an incompatible generic
-   interface. The shared core may own bounds, null, and loop control, while the
-   callback performs the concrete typed comparison.
+2. Create a private core method for the shared algorithm, using small typed adapters
+   when the overload value types differ.
 3. Rewrite overloads as adapters that call the core with converted values.
-4. Refactor only the two reported overloads first. Do not sweep every sibling
-   overload merely because it has a similar shape.
 
 Verification fit delta: The large common body should exist only in the core method.
 
