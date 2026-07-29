@@ -21,6 +21,8 @@ class ContractEvaluation:
     metric_progress: bool
     reason: str
     objective_delta: dict[str, dict[str, float]]
+    semantic_contract_preserved: bool
+    semantic_contract_delta: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -29,6 +31,8 @@ class ContractEvaluation:
             "metric_progress": self.metric_progress,
             "reason": self.reason,
             "objectives": self.objective_delta,
+            "semantic_contract_preserved": self.semantic_contract_preserved,
+            "semantic_contract": self.semantic_contract_delta,
         }
 
 
@@ -66,10 +70,13 @@ def evaluate_checkpoint_contract(
     # the strict guard, which verifies the original signature is gone.
     absence_goal = smell in ("dead_code", "mysterious_name")
     target_unlocated = current.get("target_missing") is True and not absence_goal
+    semantic_contract = _semantic_contract_delta(baseline, current, smell=smell)
+    semantic_contract_preserved = not bool(semantic_contract.get("regressions"))
     progress = bool(
         has_production_diff
         and available
         and not target_unlocated
+        and semantic_contract_preserved
         and any(item["absolute_reduction"] > 0 for item in deltas.values())
     )
     if not has_production_diff:
@@ -78,11 +85,20 @@ def evaluate_checkpoint_contract(
         reason = "BASELINE_METRIC_UNAVAILABLE"
     elif target_unlocated:
         reason = "TARGET_NOT_LOCATED"
+    elif not semantic_contract_preserved:
+        reason = "SEMANTIC_CONTRACT_REGRESSION"
     elif not progress:
         reason = "NO_STRUCTURAL_PROGRESS"
     else:
         reason = "METRIC_PROGRESS"
-    return ContractEvaluation(available, progress, reason, deltas)
+    return ContractEvaluation(
+        available,
+        progress,
+        reason,
+        deltas,
+        semantic_contract_preserved,
+        semantic_contract,
+    )
 
 
 def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -102,6 +118,10 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
         "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
+        "SEMANTIC_CONTRACT_REGRESSION": (
+            "the refactoring removed or narrowed unrelated public/protected API "
+            "from the target type"
+        ),
     }
     return {
         "type": smell,
@@ -133,6 +153,20 @@ def checkpoint_feedback_highlights(checkpoint: Mapping[str, Any] | None) -> list
     highlights = [
         f"CHECKPOINT reason={reason} production_diff={production_diff} metric_progress={progress}"
     ]
+    semantic_contract = delta.get("semantic_contract")
+    if isinstance(semantic_contract, Mapping):
+        regressions = semantic_contract.get("regressions")
+        if isinstance(regressions, list) and regressions:
+            highlights.append(
+                "CHECKPOINT_CONTRACT "
+                + "; ".join(str(item) for item in regressions[:4])
+            )
+        review_signals = semantic_contract.get("review_signals")
+        if isinstance(review_signals, list) and review_signals:
+            highlights.append(
+                "CHECKPOINT_CONTRACT_REVIEW "
+                + "; ".join(str(item) for item in review_signals[:4])
+            )
     objectives = delta.get("objectives")
     if not isinstance(objectives, Mapping):
         return highlights
@@ -241,3 +275,104 @@ def _numeric_objectives(value: Any) -> dict[str, float]:
             continue
         result[str(name)] = float(raw)
     return result
+
+
+def _semantic_contract_delta(
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    smell: str,
+) -> dict[str, Any]:
+    """Compare route-independent semantic contracts captured by adapters.
+
+    Refused Bequest may legitimately change the superclass, declaration owner,
+    and capability topology.  The comparison therefore ignores ownership and
+    hard-checks API declared by the target itself and records inherited API
+    removal for review. Inherited removal cannot be a universal hard failure:
+    shedding an unwanted inherited capability is the purpose of this smell.
+    No project, class, method, or sample name is encoded in this policy.
+    """
+    if smell != "refused_bequest":
+        return {"applicable": False, "regressions": []}
+    before = baseline.get("contract_snapshot")
+    after = current.get("contract_snapshot")
+    if not isinstance(before, Mapping) or not before.get("ok"):
+        return {
+            "applicable": False,
+            "regressions": [],
+            "reason": "baseline_contract_unavailable",
+        }
+    if not isinstance(after, Mapping) or not after.get("ok"):
+        return {
+            "applicable": True,
+            "regressions": ["target_contract_unavailable_after_edit"],
+            "before_class": before.get("class"),
+            "after_class": after.get("class") if isinstance(after, Mapping) else "",
+        }
+
+    before_methods = _api_entries(before.get("visible_non_target_methods"))
+    after_methods = _api_entries(after.get("visible_non_target_methods"))
+    before_constructors = _api_entries(before.get("declared_visible_constructors"))
+    after_constructors = _api_entries(after.get("declared_visible_constructors"))
+    regressions: list[str] = []
+    missing_methods = sorted(set(before_methods).difference(after_methods))
+    missing_constructors = sorted(set(before_constructors).difference(after_constructors))
+    review_signals: list[str] = []
+    for key in missing_methods:
+        if before_methods[key].get("declared_on_target") is True:
+            regressions.append(f"missing_declared_method:{key}")
+        else:
+            review_signals.append(f"missing_inherited_method:{key}")
+    for key in missing_constructors:
+        regressions.append(f"missing_constructor:{key}")
+    for key in sorted(set(before_methods).intersection(after_methods)):
+        if (
+            _visibility_rank(after_methods[key].get("visibility"))
+            < _visibility_rank(before_methods[key].get("visibility"))
+        ):
+            signal = (
+                f"{key}:{before_methods[key].get('visibility')}"
+                f"->{after_methods[key].get('visibility')}"
+            )
+            if before_methods[key].get("declared_on_target") is True:
+                regressions.append(f"narrowed_declared_method:{signal}")
+            else:
+                review_signals.append(f"narrowed_inherited_method:{signal}")
+    for key in sorted(set(before_constructors).intersection(after_constructors)):
+        if (
+            _visibility_rank(after_constructors[key].get("visibility"))
+            < _visibility_rank(before_constructors[key].get("visibility"))
+        ):
+            regressions.append(
+                "narrowed_constructor:"
+                f"{key}:{before_constructors[key].get('visibility')}"
+                f"->{after_constructors[key].get('visibility')}"
+            )
+    return {
+        "applicable": True,
+        "before_class": before.get("class"),
+        "after_class": after.get("class"),
+        "superclass_changed": before.get("direct_superclass") != after.get("direct_superclass"),
+        "missing_methods": missing_methods,
+        "missing_constructors": missing_constructors,
+        "regressions": regressions,
+        "review_signals": review_signals,
+        "policy": before.get("comparison_policy") or {},
+    }
+
+
+def _api_entries(value: Any) -> dict[str, Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return {}
+    entries: dict[str, Mapping[str, Any]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("api_key") or "").strip()
+        if key:
+            entries[key] = item
+    return entries
+
+
+def _visibility_rank(value: Any) -> int:
+    return {"protected": 1, "public": 2}.get(str(value or ""), 0)

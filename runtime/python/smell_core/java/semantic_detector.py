@@ -856,6 +856,12 @@ def build_refused_bequest_impact_map(
                 }
             )
             ancestor_name = ancestor.superclass_name
+    target_contract = _refused_bequest_target_contract(
+        model,
+        target_record,
+        target_method=target_method,
+        target_parameter_count=arity,
+    )
     return {
         "ok": True,
         "structural_expectation": "capability_split",
@@ -870,6 +876,7 @@ def build_refused_bequest_impact_map(
         "implementers": implementers,
         "production_call_sites": call_sites,
         "inherited_surface_at_risk": inherited_surface,
+        "target_contract": target_contract,
         "excluded_unrelated_same_name_calls": excluded_same_name_calls,
         "unresolved_receiver_call_sites": sum(
             1 for item in call_sites if item.get("receiver_resolution") == "unresolved"
@@ -889,6 +896,118 @@ def build_refused_bequest_impact_map(
             "Treat unresolved receiver sites as required manual review; do not declare "
             "the migration complete while one remains unexamined."
         ),
+    }
+
+
+def _refused_bequest_target_contract(
+    model: ProjectModel,
+    target: Optional[ClassRecord],
+    *,
+    target_method: str,
+    target_parameter_count: Optional[int],
+) -> Dict[str, Any]:
+    """Describe the target type's externally visible non-target contract.
+
+    The snapshot is deliberately independent of a particular project or
+    refactoring route.  It records what callers can observe on the refusing
+    type before an inheritance migration, regardless of which ancestor owns
+    each method.  A later checkpoint can therefore distinguish a legitimate
+    capability split from silently dropping unrelated inherited API.
+    """
+    if target is None:
+        return {"ok": False, "error": "target_class_not_found"}
+
+    def is_reported_target(method: MethodRecord) -> bool:
+        return bool(
+            _normalize_method(method.method_name) == target_method
+            and (
+                target_parameter_count is None
+                or len(method.parameter_descriptors) == target_parameter_count
+            )
+        )
+
+    def visibility(method: MethodRecord) -> str:
+        if "public" in method.modifiers:
+            return "public"
+        if "protected" in method.modifiers:
+            return "protected"
+        return "package"
+
+    def api_key(method: MethodRecord) -> str:
+        parameter_types = ",".join(_erase_type(item) for item in method.parameter_types)
+        return f"{method.method_name}({parameter_types})"
+
+    # Walk the target before its ancestors so an override represents the
+    # effective method. Interfaces and more distant ancestors are included
+    # through the semantic model's transitive parent resolver.
+    owners: List[ClassRecord] = [target]
+    inherited_names = sorted(_all_parent_type_names(model, target))
+    owners.extend(
+        model.classes[name]
+        for name in inherited_names
+        if name in model.classes and name != target.qualified_name
+    )
+    effective: Dict[str, Dict[str, Any]] = {}
+    for owner in owners:
+        for method in owner.methods:
+            if method.is_constructor or is_reported_target(method):
+                continue
+            method_visibility = visibility(method)
+            if method_visibility not in {"public", "protected"}:
+                continue
+            key = api_key(method)
+            candidate = {
+                "api_key": key,
+                "signature": method.method_signature,
+                "return_type": _erase_type(method.return_type),
+                "visibility": method_visibility,
+                "owner": owner.qualified_name,
+                "declared_on_target": owner.qualified_name == target.qualified_name,
+            }
+            previous = effective.get(key)
+            if previous is None:
+                effective[key] = candidate
+            elif previous["visibility"] == "protected" and method_visibility == "public":
+                # A public declaration remains public even when traversal order
+                # encounters a narrower inherited declaration first.
+                effective[key] = candidate
+
+    constructors = []
+    for method in target.methods:
+        if not method.is_constructor:
+            continue
+        method_visibility = visibility(method)
+        if method_visibility not in {"public", "protected"}:
+            continue
+        constructors.append(
+            {
+                "api_key": api_key(method),
+                "signature": method.method_signature,
+                "visibility": method_visibility,
+            }
+        )
+    return {
+        "ok": True,
+        "class": target.qualified_name,
+        "kind": target.kind,
+        "direct_superclass": target.superclass_name,
+        "interfaces": sorted(target.interface_names),
+        "visible_non_target_methods": [
+            effective[key] for key in sorted(effective)
+        ],
+        "declared_visible_constructors": sorted(
+            constructors,
+            key=lambda item: str(item["api_key"]),
+        ),
+        "comparison_policy": {
+            "hard_scope": (
+                "target_declared_public_or_protected_non_target_methods_and_constructors"
+            ),
+            "review_scope": "inherited_public_or_protected_non_target_methods",
+            "allows_owner_migration": True,
+            "allows_superclass_change": True,
+            "ignores_reported_rejected_capability": True,
+        },
     }
 
 

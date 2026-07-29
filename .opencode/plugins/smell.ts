@@ -1290,7 +1290,9 @@ function capabilityPlanPrompt(payload: Record<string, unknown>): string {
     "",
     "Use this as a closure worklist before the first edit. Inspect every declaration, implementer,",
     "production call site, and inherited_surface_at_risk entry. If changing a superclass, preserve",
-    "or explicitly migrate its non-target state and API. Manually resolve every receiver marked",
+    "or explicitly migrate its non-target state and API. Treat target_contract as the compatibility",
+    "inventory: preserve target-declared non-target API and constructors; justify inherited API removal",
+    "from production usage rather than assuming every inherited method is unwanted. Manually resolve every receiver marked",
     "unresolved; do not skip it.",
   ].join("\n")
 }

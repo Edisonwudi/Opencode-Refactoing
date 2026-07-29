@@ -83,6 +83,11 @@ For a structural route, finish one coherent migration batch before the first
 4. Before replacing or removing a superclass, inspect `inherited_surface_at_risk`.
    Preserve or explicitly migrate every non-target state field and method that the target
    or its callers rely on; a compiling target that silently loses parent API is incomplete.
+   Treat `target_contract.visible_non_target_methods` and
+   `target_contract.declared_visible_constructors` as the route-independent compatibility
+   inventory. Preserve target-declared entries and constructors. For inherited entries,
+   distinguish unwanted inherited capabilities from API that production callers still use;
+   never remove a used entry merely to keep the hierarchy split small.
 5. Before verification, search the whole production tree for the old contract and target
    signature. Confirm that real implementers retain the capability and refusing types do
    not receive a default, placeholder, duplicate declaration, or unchecked-cast escape
@@ -91,6 +96,14 @@ For a structural route, finish one coherent migration batch before the first
    closure worklist. Search for every occurrence of the unresolved or inaccessible symbol,
    repair all related sites in one pass, and only then verify again. Do not spend one
    continuation fixing one occurrence at a time.
+
+The checkpoint verifier compares that compatibility inventory before and after the edit.
+Target-declared API and constructors are hard compatibility requirements; removed inherited
+API is surfaced for diff review because shedding an unwanted inherited capability can itself
+be the intended repair. The verifier does not require a particular class hierarchy: narrow
+interfaces, intermediate abstract classes, and composition/delegation remain valid when they
+remove the refused capability, retain explicit contracts for real implementers, and preserve
+the visible API that remains part of the target's behavior.
 
 ## Common avoid
 

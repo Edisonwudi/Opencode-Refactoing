@@ -30,9 +30,15 @@ from .mysterious_name import (
 )
 from .java.ast_ncss import run_ast_ncss
 from .java.data_clumps import data_clump_occurrence_threshold, detect_data_clump_occurrences
-from .java.detector_utils import parse_parent_from_evidence
+from .java.detector_utils import (
+    parse_parent_from_evidence,
+    parse_structural_expectation,
+    parse_target_class,
+    parse_target_parameter_count,
+)
 from .java.semantic_detector import (
     analyze_feature_envy_target,
+    build_refused_bequest_impact_map,
     find_matching_semantic_finding,
     run_java_semantic_detector,
 )
@@ -537,7 +543,32 @@ def _god_class(config: Any, evidence: str) -> dict[str, Any]:
 
 
 def _refused_bequest(config: Any, evidence: str) -> dict[str, Any]:
-    return _semantic_finding(config, "refused_bequest", evidence)
+    snapshot = _semantic_finding(config, "refused_bequest", evidence)
+    if (
+        config.language != "java"
+        or parse_structural_expectation(evidence) != "capability_split"
+        or not config.locations
+    ):
+        return snapshot
+    target = _target(config)
+    impact_map = build_refused_bequest_impact_map(
+        config.project_root,
+        target_file=target.file_path,
+        method=target.method,
+        line=target.line,
+        reported_parent=parse_parent_from_evidence(evidence),
+        target_parameter_count=parse_target_parameter_count(evidence),
+        target_class_name=parse_target_class(evidence) or str(target.class_name or ""),
+    )
+    snapshot["contract_snapshot"] = (
+        impact_map.get("target_contract")
+        if impact_map.get("ok")
+        else {
+            "ok": False,
+            "error": impact_map.get("error", "capability_impact_map_unavailable"),
+        }
+    )
+    return snapshot
 
 
 def _integer_metrics(evidence: str, names: tuple[str, ...]) -> dict[str, int]:

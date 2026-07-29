@@ -18,7 +18,7 @@ abstract class Page {
 
     abstract void setChild(Page child);
 
-    int pageId() {
+    protected int pageId() {
         return pageId;
     }
 }
@@ -106,6 +106,17 @@ def main() -> int:
         item["signature"].startswith("pageId(")
         for item in inherited_surface[0]["non_target_methods"]
     ), inherited_surface
+    contract = payload["target_contract"]
+    assert contract["ok"] is True, contract
+    assert contract["direct_superclass"].endswith("Page"), contract
+    assert any(
+        item["api_key"].startswith("pageId(")
+        for item in contract["visible_non_target_methods"]
+    ), contract
+    assert all(
+        not item["api_key"].startswith("setChild(")
+        for item in contract["visible_non_target_methods"]
+    ), contract
     print("refused bequest plan self-check: PASS")
     return 0
 
