@@ -75,6 +75,8 @@ code_clone_type1:
     notes:
       - "After pull-up, remove every child duplicate and shadowing duplicate state. Compile-check constructors and final-field assignment before verification."
       - "A parent implementation plus one leftover child copy is still a clone and must not be accepted."
+      - "Trace intermediate superclasses before deciding there is no shared parent; one target may inherit the common owner through an unchanged middle class."
+      - "For duplicated constructor initialization, move shared state initialization to the real parent constructor and make both child constructors delegate with super(...)."
   - id: different-parent-shared-helper-clone
     when: "the clones live under different parent branches with no good superclass target, so the shared behavior should move to an external helper"
     before: |
@@ -162,6 +164,8 @@ code_clone_type1:
     notes:
       - "Use this path when source inspection proves an existing owner already provides the duplicated behavior. Do not create a second helper just to satisfy the clone smell."
       - "Dependency injection, constructors, and test fixtures may need narrow direct_edit follow-up because IDEA structural insertion does not know framework wiring."
+      - "Do not add nullable injection and retain the original clone as a fallback. Establish one reliable owner route and remove the superseded body."
+      - "Do not widen a private or protected method to public solely to make delegation convenient; preserve the public API and use the narrowest valid owner/helper visibility."
   - id: type-variant-shared-core-clone
     when: "the clones are same-class overloads that differ mainly by primitive or narrow value type, so keep the public overload API and extract only a private shared core with type-specific adapters"
     before: |
@@ -221,4 +225,5 @@ code_clone_type1:
       - "For primitive variants, use an index predicate/comparator or typed adapter that compiles for every overload; do not force boolean, short, or other primitives through an incompatible generic functional interface."
       - "Keep the first cohesive edit to the two reported overloads. Broaden the family only when compilation or the structural Oracle proves the pair cannot be centralized independently."
       - "Do not use java.lang.reflect.Array plus a Class<?> discriminator or type-switch for primitive access. Capture the concrete arrays in an index callback/predicate instead."
+      - "Do not use Object plus instanceof/casts as a primitive array dispatcher, or IntFunction<Object/boxed primitive> in a per-element loop. Prefer IntPredicate or a primitive-specific decision adapter that does not box each element."
       - "After Oracle feedback, inspect the complete production diff and remove superseded wrappers, duplicate adapters, and unused imports before final verification."

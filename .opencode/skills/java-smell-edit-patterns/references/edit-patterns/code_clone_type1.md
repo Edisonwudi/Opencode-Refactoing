@@ -25,6 +25,12 @@ or shared core.
 - Changing literals or operators only to evade clone detection.
 - Expanding to unrelated overloads or using unchecked casts when a small typed
   adapter can preserve the reported pair's API.
+- Adding a nullable owner dependency and retaining the original clone as a
+  fallback. Either establish one reliable owner route and delete the superseded
+  body, or choose a different topology.
+- Widening a production method from private/protected to public only to make
+  delegation convenient. Prefer an existing owner, inheritance, or the narrowest
+  package-visible helper that preserves the public API.
 
 ## Routes
 
@@ -59,7 +65,8 @@ Source operation shape: `pullUp:method`. See [`operation-translations.md`](opera
 
 Route-specific edit steps:
 
-1. Confirm both clone methods are sibling overrides with the same parent contract.
+1. Confirm both clone methods share the same parent contract. Follow intermediate
+   parent classes as needed; siblings do not have to name the common owner directly.
 2. Add the common implementation to the parent with the narrowest usable visibility.
 3. Delete child overrides that now inherit the parent behavior.
 
@@ -106,6 +113,8 @@ Route-specific edit steps:
 Verification fit delta: The non-owner target should no longer duplicate owner logic.
 
 Avoid: Do not create a parallel helper when the domain owner already exists.
+Do not keep the old body behind a null check, feature flag, exception catch, or
+other fallback after adding the owner call; that preserves the smell.
 
 ### `type-variant-shared-core-clone`
 
@@ -128,3 +137,6 @@ Verification fit delta: The large common body should exist only in the core meth
 
 Avoid: Do not collapse public overloads if callers rely on their narrow types, and
 do not replace typed array access with reflection or an `Object` type dispatcher.
+Do not use `IntFunction<Object>` or boxed primitive wrappers for a per-element hot
+loop. Prefer `IntPredicate`, a primitive comparator, or another adapter whose
+callback returns the final decision/value without boxing each array element.

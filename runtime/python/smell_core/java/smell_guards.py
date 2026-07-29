@@ -477,6 +477,40 @@ def _verify_clone_structural_resolution(
             },
         }
 
+    new_primitive_dispatch_adapters = _find_new_primitive_dispatch_adapters(
+        baseline_methods,
+        current_methods,
+    )
+    if new_primitive_dispatch_adapters:
+        return {
+            "success": False,
+            "message": (
+                "the refactoring introduced an Object/type-switch or boxing adapter "
+                "for primitive variants; keep primitive access typed."
+            ),
+            "details": {
+                "structural_resolution": "new_primitive_dispatch_adapter",
+                "primitive_dispatch_adapters": new_primitive_dispatch_adapters,
+            },
+        }
+
+    retained_clone_fallbacks = _find_retained_clone_fallbacks(
+        baseline_targets,
+        current_targets,
+    )
+    if retained_clone_fallbacks:
+        return {
+            "success": False,
+            "message": (
+                "a target delegates to a shared owner but still retains the original "
+                "clone body as a fallback; remove the superseded implementation."
+            ),
+            "details": {
+                "structural_resolution": "delegating_fallback_retains_clone",
+                "retained_clone_fallbacks": retained_clone_fallbacks,
+            },
+        }
+
     moved = _find_moved_clone_occurrences(
         baseline_methods,
         current_methods,
@@ -589,6 +623,25 @@ def _clone_relevant_files(
             path = config.project_root / path
         if path.exists() and path.suffix == ".java":
             files[str(path.resolve())] = path.resolve()
+    unresolved_parents: set[str] = set()
+    for _ in range(16):
+        classes, _ = load_project_model(config.project_root, list(files.values()))
+        known_classes = {item.class_name for item in classes}
+        unresolved_parents = {
+            item.parent_name
+            for item in classes
+            if item.parent_name and item.parent_name not in known_classes
+        }
+        added = False
+        for parent_name in sorted(unresolved_parents):
+            for candidate in config.project_root.rglob(f"{parent_name}.java"):
+                resolved = candidate.resolve()
+                key = str(resolved)
+                if key not in files:
+                    files[key] = resolved
+                    added = True
+        if not added:
+            break
     return list(files.values())
 
 
@@ -761,6 +814,92 @@ _REFLECTIVE_ARRAY_CALL_RE = re.compile(
     r"Array\s*\.\s*(?:get|set|getLength)\s*\("
 )
 
+_PRIMITIVE_ARRAY_TYPE_SWITCH_RE = re.compile(
+    r"\binstanceof\s+(?:boolean|byte|char|short|int|long|float|double)\s*\[\s*\]"
+)
+_PRIMITIVE_ARRAY_CAST_RE = re.compile(
+    r"\(\s*(?:boolean|byte|char|short|int|long|float|double)\s*\[\s*\]\s*\)"
+)
+_BOXING_INDEX_ADAPTER_RE = re.compile(
+    r"\b(?:java\s*\.\s*util\s*\.\s*function\s*\.\s*)?IntFunction\s*<\s*"
+    r"(?:Object|Boolean|Byte|Character|Short|Integer|Long|Float|Double)\s*>"
+)
+
+
+def _find_new_primitive_dispatch_adapters(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+) -> List[Dict[str, object]]:
+    """Reject new primitive paths that erase type or box each indexed value."""
+    def hits(method: JavaMethodInfo) -> List[str]:
+        text = f"{method.signature}\n{method.body_text}"
+        reasons = []
+        if (
+            re.search(r"\bObject\b", method.signature)
+            and (
+                _PRIMITIVE_ARRAY_TYPE_SWITCH_RE.search(method.body_text)
+                or _PRIMITIVE_ARRAY_CAST_RE.search(method.body_text)
+            )
+        ):
+            reasons.append("object_primitive_array_type_switch")
+        if _BOXING_INDEX_ADAPTER_RE.search(text):
+            reasons.append("boxing_int_function")
+        return reasons
+
+    baseline_hits = set()
+    for method in baseline_methods:
+        for reason in hits(method):
+            baseline_hits.add((*_method_identity(method), reason))
+    introduced = []
+    for method in current_methods:
+        for reason in hits(method):
+            identity = (*_method_identity(method), reason)
+            if identity in baseline_hits:
+                continue
+            introduced.append({
+                "file": method.rel_path,
+                "class": method.class_name,
+                "method": method.signature,
+                "reason": reason,
+            })
+    return introduced
+
+
+def _find_retained_clone_fallbacks(
+    baseline_targets: List[JavaMethodInfo],
+    current_targets: List[Optional[JavaMethodInfo]],
+) -> List[Dict[str, object]]:
+    """Detect a new delegation wrapped around an otherwise retained clone body."""
+    retained = []
+    for baseline_target, current_target in zip(baseline_targets, current_targets):
+        if current_target is None:
+            continue
+        baseline_tokens = tokenize_clone(baseline_target.body_text)
+        current_tokens = tokenize_clone(current_target.body_text)
+        if len(baseline_tokens) < 20 or current_tokens == baseline_tokens:
+            continue
+        baseline_core = (
+            baseline_tokens[1:-1]
+            if len(baseline_tokens) >= 2
+            and baseline_tokens[0] == "{"
+            and baseline_tokens[-1] == "}"
+            else baseline_tokens
+        )
+        if _contains_token_subsequence(current_tokens, baseline_core):
+            retained.append({
+                "file": current_target.rel_path,
+                "class": current_target.class_name,
+                "method": current_target.signature,
+            })
+    return retained
+
+
+def _contains_token_subsequence(tokens: List[str], candidate: List[str]) -> bool:
+    if not candidate or len(candidate) > len(tokens):
+        return False
+    width = len(candidate)
+    return any(tokens[index:index + width] == candidate for index in range(len(tokens) - width + 1))
+
 
 def _find_new_reflective_array_calls(
     baseline_methods: List[JavaMethodInfo],
@@ -837,13 +976,30 @@ def _shared_clone_route_proof(
     left, right = current_targets
     baseline_common = _method_calls(baseline_targets[0]) & _method_calls(baseline_targets[1])
     if left is not None and right is not None:
-        current_common = _method_calls(left) & _method_calls(right)
+        left_calls = _method_calls(left)
+        right_calls = _method_calls(right)
+        current_common = left_calls & right_calls
         introduced_common = _proven_shared_calls(
             current_common - baseline_common,
             current_methods,
         )
         if introduced_common:
             return {"proven": True, "route": "shared_callee", "shared_calls": introduced_common}
+        if (
+            "super" in current_common
+            and "super" not in baseline_common
+            and _share_parent_constructor(
+                left,
+                right,
+                current_classes,
+                current_methods,
+            )
+        ):
+            return {
+                "proven": True,
+                "route": "shared_parent_constructor_delegation",
+                "shared_calls": ["super"],
+            }
         left_new_calls = _method_calls(left) - _method_calls(baseline_targets[0])
         right_new_calls = _method_calls(right) - _method_calls(baseline_targets[1])
         one_hop_common = _proven_one_hop_shared_calls(
@@ -934,17 +1090,16 @@ def _shared_clone_route_proof(
         )
         if baseline_class is None or current_class is None or not current_class.parent_name:
             continue
-        parent_method = next(
-            (
-                method for method in current_methods
-                if method.class_name == current_class.parent_name
-                and _normalize_method(method.method_name) == _normalize_method(baseline_target.method_name)
-                and len(method.parameter_names) == len(baseline_target.parameter_names)
-            ),
-            None,
+        inherited_method, inheritance_path = _find_inherited_method(
+            current_class,
+            baseline_target,
+            current_classes,
+            current_methods,
         )
-        if parent_method is not None:
-            inherited.append(f"{current_class.class_name}->{current_class.parent_name}.{parent_method.signature}")
+        if inherited_method is not None:
+            inherited.append(
+                f"{'->'.join(inheritance_path)}.{inherited_method.signature}"
+            )
     missing_count = sum(target is None for target in current_targets)
     if missing_count and len(inherited) == missing_count:
         return {"proven": True, "route": "shared_parent_inheritance", "shared_calls": inherited}
@@ -955,6 +1110,59 @@ def _shared_clone_route_proof(
         "current_left_calls": sorted(_method_calls(left)),
         "current_right_calls": sorted(_method_calls(right)),
     }
+
+
+def _find_inherited_method(
+    current_class: JavaClassInfo,
+    baseline_target: JavaMethodInfo,
+    current_classes: List[JavaClassInfo],
+    current_methods: List[JavaMethodInfo],
+) -> Tuple[Optional[JavaMethodInfo], List[str]]:
+    classes_by_name = {item.class_name: item for item in current_classes}
+    path = [current_class.class_name]
+    parent_name = current_class.parent_name
+    visited = set(path)
+    while parent_name and parent_name not in visited:
+        visited.add(parent_name)
+        path.append(parent_name)
+        parent_method = next(
+            (
+                method for method in current_methods
+                if method.class_name == parent_name
+                and _normalize_method(method.method_name) == _normalize_method(baseline_target.method_name)
+                and len(method.parameter_names) == len(baseline_target.parameter_names)
+            ),
+            None,
+        )
+        if parent_method is not None:
+            return parent_method, path
+        parent_class = classes_by_name.get(parent_name)
+        parent_name = parent_class.parent_name if parent_class else None
+    return None, path
+
+
+def _share_parent_constructor(
+    left: JavaMethodInfo,
+    right: JavaMethodInfo,
+    current_classes: List[JavaClassInfo],
+    current_methods: List[JavaMethodInfo],
+) -> bool:
+    classes_by_name = {item.class_name: item for item in current_classes}
+    left_class = classes_by_name.get(left.class_name)
+    right_class = classes_by_name.get(right.class_name)
+    if (
+        left_class is None
+        or right_class is None
+        or not left_class.parent_name
+        or left_class.parent_name != right_class.parent_name
+    ):
+        return False
+    parent_name = left_class.parent_name
+    return any(
+        method.class_name == parent_name
+        and _normalize_method(method.method_name) == _normalize_method(parent_name)
+        for method in current_methods
+    )
 
 
 def _proven_qualified_owner_calls(

@@ -57,6 +57,35 @@ class Fixture {{
   void consume(int value) {{}}
 }}
 """
+CLONE_WITH_OBJECT_PRIMITIVE_DISPATCH = f"""\
+class Fixture {{
+  void left() {{ shared(new boolean[0]); }}
+  void right() {{ shared(new short[0]); }}
+  void shared(Object values) {{
+    if (values instanceof boolean[]) {{ consume(((boolean[]) values).length); }}
+    else if (values instanceof short[]) {{ consume(((short[]) values).length); }}
+    {CLONE_BODY}
+  }}
+  void consume(int value) {{}}
+}}
+"""
+CLONE_WITH_BOXING_INDEX_ADAPTER = f"""\
+class Fixture {{
+  void left() {{ shared(i -> Integer.valueOf(i)); }}
+  void right() {{ shared(i -> Integer.valueOf(i)); }}
+  void shared(java.util.function.IntFunction<Integer> getter) {{ getter.apply(0); {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+CLONE_WITH_DELEGATING_FALLBACK = f"""\
+class Fixture {{
+  boolean ready;
+  void left() {{ if (ready) {{ shared(); return; }} {CLONE_BODY} }}
+  void right() {{ shared(); }}
+  void shared() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
 CLONE_AFTER = f"""\
 class Fixture {{
   void left() {{ shared(); }}
@@ -110,6 +139,65 @@ CLONE_PARENT_AFTER = f"""\
 class Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
 class Left extends Parent {{}}
 class Right extends Parent {{}}
+"""
+CLONE_TRANSITIVE_PARENT_BEFORE = f"""\
+class Parent {{}}
+class Middle extends Parent {{}}
+class Left extends Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+class Right extends Middle {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+"""
+CLONE_TRANSITIVE_PARENT_AFTER = f"""\
+class Parent {{ void work() {{ {CLONE_BODY} }} void consume(int value) {{}} }}
+class Middle extends Parent {{}}
+class Left extends Parent {{}}
+class Right extends Middle {{}}
+"""
+CLONE_PARENT_CONSTRUCTOR_BEFORE = """\
+class Parent {
+  Parent() {}
+}
+class Left extends Parent {
+  int below;
+  int above;
+  boolean between;
+  Left(int below, int above, boolean between) {
+    this.below = below;
+    this.above = above;
+    this.between = between;
+  }
+}
+class Right extends Parent {
+  int below;
+  int above;
+  boolean between;
+  Right(int below, int above, boolean between) {
+    this.below = below;
+    this.above = above;
+    this.between = between;
+  }
+}
+"""
+CLONE_PARENT_CONSTRUCTOR_AFTER = """\
+class Parent {
+  int below;
+  int above;
+  boolean between;
+  Parent(int below, int above, boolean between) {
+    this.below = below;
+    this.above = above;
+    this.between = between;
+  }
+}
+class Left extends Parent {
+  Left(int below, int above, boolean between) {
+    super(below, above, between);
+  }
+}
+class Right extends Parent {
+  Right(int below, int above, boolean between) {
+    super(below, above, between);
+  }
+}
 """
 OWNER_CLONE_BEFORE = f"""\
 class Left {{
@@ -263,6 +351,55 @@ def _case(
         return before_value, after_value
 
 
+def _transitive_parent_multifile_case() -> tuple[float, float]:
+    before = {
+        "Parent.java": "class Parent {}\n",
+        "Middle.java": "class Middle extends Parent {}\n",
+        "Left.java": (
+            f"class Left extends Parent {{ void work() {{ {CLONE_BODY} }} "
+            "void consume(int value) {} }\n"
+        ),
+        "Right.java": (
+            f"class Right extends Middle {{ void work() {{ {CLONE_BODY} }} "
+            "void consume(int value) {} }\n"
+        ),
+    }
+    after = {
+        "Parent.java": (
+            f"class Parent {{ void work() {{ {CLONE_BODY} }} "
+            "void consume(int value) {} }\n"
+        ),
+        "Left.java": "class Left extends Parent {}\n",
+        "Right.java": "class Right extends Middle {}\n",
+    }
+    with tempfile.TemporaryDirectory(prefix="checkpoint-code-clone-transitive-") as temp_dir:
+        project = Path(temp_dir)
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "runtime" / "python")}
+        for name, content in before.items():
+            (project / name).write_text(content, encoding="utf-8")
+        for command in (["git", "init", "-q"], ["git", "add", "."]):
+            result = _run(command, project, env)
+            if result.returncode:
+                raise AssertionError(result.stderr)
+        result = _run([
+            "git", "-c", "user.name=checkpoint-self-check", "-c",
+            "user.email=checkpoint@example.invalid", "commit", "-qm", "baseline",
+        ], project, env)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        location = "Left.java:method=work|line=1 <-> Right.java:method=work|line=1"
+        evidence = "tokens=30; group_size=2"
+        baseline = _bridge(project, env, "capture-baseline", "code_clone_type1", location, evidence)
+        before_value = float(baseline["metrics"]["objectives"]["clone_token_count"])
+        for name, content in after.items():
+            (project / name).write_text(content, encoding="utf-8")
+        repaired = _bridge(project, env, "verify", "code_clone_type1", location, evidence)
+        if repaired.get("status") != "PASS":
+            raise AssertionError(f"multifile transitive parent did not pass: {repaired}")
+        after_value = float(repaired["checkpoint"]["delta"]["objectives"]["clone_token_count"]["after"])
+        return before_value, after_value
+
+
 def main() -> int:
     data = _case(
         "data_clumps", DATA_BEFORE, DATA_AFTER,
@@ -282,11 +419,27 @@ def main() -> int:
             CLONE_SHARED_WITH_OVERLOADED_HELPERS,
             CLONE_WITH_PARAMETERIZED_CAST,
             CLONE_WITH_REFLECTIVE_ARRAY_DISPATCH,
+            CLONE_WITH_OBJECT_PRIMITIVE_DISPATCH,
+            CLONE_WITH_BOXING_INDEX_ADAPTER,
+            CLONE_WITH_DELEGATING_FALLBACK,
         ),
     )
     parent_clone = _case(
         "code_clone_type1", CLONE_PARENT_BEFORE, CLONE_PARENT_AFTER,
         "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+    )
+    transitive_parent_clone = _case(
+        "code_clone_type1", CLONE_TRANSITIVE_PARENT_BEFORE, CLONE_TRANSITIVE_PARENT_AFTER,
+        "Fixture.java:method=work|line=3 <-> Fixture.java:method=work|line=4",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+    )
+    transitive_parent_multifile_clone = _transitive_parent_multifile_case()
+    parent_constructor_clone = _case(
+        "code_clone_type1", CLONE_PARENT_CONSTRUCTOR_BEFORE, CLONE_PARENT_CONSTRUCTOR_AFTER,
+        "Fixture.java:method=Left|line=8 <-> Fixture.java:method=Right|line=18",
         "tokens=30; group_size=2",
         "clone_token_count",
     )
@@ -326,6 +479,9 @@ def main() -> int:
         f"data_clumps={data[0]:g}->{data[1]:g} "
         f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
         f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g} "
+        f"transitive_parent_clone={transitive_parent_clone[0]:g}->{transitive_parent_clone[1]:g} "
+        f"transitive_parent_multifile_clone={transitive_parent_multifile_clone[0]:g}->{transitive_parent_multifile_clone[1]:g} "
+        f"parent_constructor_clone={parent_constructor_clone[0]:g}->{parent_constructor_clone[1]:g} "
         f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g} "
         f"qualified_owner_clone={qualified_owner_clone[0]:g}->{qualified_owner_clone[1]:g} "
         f"removed_target_clone={removed_target_clone[0]:g}->{removed_target_clone[1]:g} "
