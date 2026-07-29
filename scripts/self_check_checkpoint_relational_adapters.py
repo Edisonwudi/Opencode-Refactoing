@@ -354,7 +354,11 @@ def _case(
 def _transitive_parent_multifile_case() -> tuple[float, float]:
     before = {
         "Parent.java": "class Parent {}\n",
-        "Middle.java": "class Middle extends Parent {}\n",
+        "Middle.java": (
+            "class Middle extends Parent { "
+            "Object existing(Object raw) { return (java.util.List<String>) raw; } "
+            "}\n"
+        ),
         "Left.java": (
             f"class Left extends Parent {{ void work() {{ {CLONE_BODY} }} "
             "void consume(int value) {} }\n"

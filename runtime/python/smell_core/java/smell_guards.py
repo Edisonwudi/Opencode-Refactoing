@@ -411,6 +411,12 @@ def _verify_clone_structural_resolution(
         }
     baseline_classes, baseline_methods, baseline_targets = baseline
     relevant_files = _clone_relevant_files(config, (first, second), changed_java_files)
+    baseline_classes, baseline_methods = _extend_clone_baseline_scope(
+        config,
+        baseline_classes,
+        baseline_methods,
+        relevant_files,
+    )
     try:
         current_classes, current_methods = load_project_model(config.project_root, relevant_files)
     except Exception as exc:
@@ -643,6 +649,38 @@ def _clone_relevant_files(
         if not added:
             break
     return list(files.values())
+
+
+def _extend_clone_baseline_scope(
+    config: ResolvedRunConfig,
+    baseline_classes: List[JavaClassInfo],
+    baseline_methods: List[JavaMethodInfo],
+    relevant_files: List[Path],
+) -> Tuple[List[JavaClassInfo], List[JavaMethodInfo]]:
+    """Load HEAD versions of added context files so relational checks stay symmetric."""
+    classes = list(baseline_classes)
+    methods = list(baseline_methods)
+    loaded_paths = {_normalize_path(item.rel_path) for item in classes}
+    for file_path in relevant_files:
+        try:
+            rel_path = file_path.resolve().relative_to(config.project_root.resolve()).as_posix()
+        except ValueError:
+            continue
+        if _normalize_path(rel_path) in loaded_paths:
+            continue
+        result = subprocess.run(
+            ["git", "-C", str(config.project_root), "show", f"HEAD:{rel_path}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            continue
+        parsed_classes, parsed_methods = load_java_source_model(file_path, rel_path, result.stdout)
+        classes.extend(parsed_classes)
+        methods.extend(parsed_methods)
+        loaded_paths.add(_normalize_path(rel_path))
+    return classes, methods
 
 
 def _find_clone_target_method(
