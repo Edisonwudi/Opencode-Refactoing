@@ -620,6 +620,8 @@ def _verify_status(
             test = details.get("test") or {}
             if test.get("status") == "missing":
                 return "SAMPLE_TEST_SPEC_MISSING"
+            if test.get("status") == "test_not_executed" and test.get("returncode") == 0:
+                return "SAMPLE_TEST_EVIDENCE_MISSING"
             if test.get("success") is False:
                 return "SAMPLE_TEST_FAILED"
         details = build_test_result.get("details") or {}
@@ -999,6 +1001,16 @@ def _classify_failure_pack(
     if status == "SAMPLE_TEST_SPEC_MISSING":
         return "SAMPLE_TEST_SPEC_MISSING", [
             "Sample-optimized verification requires SMELL_SAMPLE_TEST_COMMAND or --sample-test-command.",
+        ]
+    if status == "SAMPLE_TEST_EVIDENCE_MISSING":
+        smell_guard = payload.get("smell_guard") or {}
+        if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+            return "SMELL_GUARD_FAILED", [
+                "Smell guard did not pass; continue the refactoring rather than repairing tests."
+            ]
+        return "SAMPLE_TEST_EVIDENCE_MISSING", [
+            "The sample test command exited successfully, but no fresh structured test report was retained.",
+            "Treat this as a verification configuration problem; do not repair production code or weaken tests.",
         ]
     if status == "SAMPLE_TEST_FAILED":
         smell_guard = payload.get("smell_guard") or {}

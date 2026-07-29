@@ -17,7 +17,7 @@ from smell_core.checkpoint_contract import (  # noqa: E402
     evaluate_checkpoint_contract,
 )
 from smell_core.checkpoints import _partial_checkpoint_rank  # noqa: E402
-from smell_bridge import _build_failure_pack  # noqa: E402
+from smell_bridge import _build_failure_pack, _verify_status  # noqa: E402
 
 
 EXPECTED = {
@@ -37,6 +37,39 @@ EXPECTED = {
 
 def main() -> int:
     assert CHECKPOINT_SMELLS == EXPECTED, CHECKPOINT_SMELLS
+
+    evidence_missing_build_test = {
+        "success": False,
+        "verification_mode": "sample_optimized",
+        "details": {
+            "build": {"success": True, "returncode": 0},
+            "test": {
+                "success": False,
+                "status": "test_not_executed",
+                "returncode": 0,
+            },
+        },
+    }
+    assert _verify_status(
+        False,
+        {"success": True},
+        evidence_missing_build_test,
+    ) == "SAMPLE_TEST_EVIDENCE_MISSING"
+    assert _verify_status(
+        False,
+        {"success": True},
+        {
+            **evidence_missing_build_test,
+            "details": {
+                **evidence_missing_build_test["details"],
+                "test": {
+                    "success": False,
+                    "status": "failed",
+                    "returncode": 1,
+                },
+            },
+        },
+    ) == "SAMPLE_TEST_FAILED"
     baseline = {"ok": True, "objectives": {"primary": 10, "secondary": 3}}
 
     unchanged = evaluate_checkpoint_contract(baseline, baseline, has_production_diff=False)
