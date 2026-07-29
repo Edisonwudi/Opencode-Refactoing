@@ -15,6 +15,12 @@ or shared core.
   constructor.
 - Choose one fitting route, edit only the reported pair, and call `smell_verify`
   before broadening the change.
+- Before pulling behavior or state into a parent, inspect every direct and
+  transitive non-target child. Keep child-owned fields and overrides in place
+  when moving them would change unrelated descendants, reflection/serialization
+  shape, framework wiring, or lifecycle side-effect order. In that case, put a
+  narrow parameterized helper in the shared parent or package and let both
+  original owners call it at the same point in their existing sequence.
 - The final pair must share a callee, delegate to an existing owner, or inherit one
   parent implementation while preserving behavior and public signatures.
 - The smell Oracle proves clone removal and convergence only. Architecture and
@@ -35,6 +41,9 @@ or shared core.
 - Widening a production method from private/protected to public only to make
   delegation convenient. Prefer an existing owner, inheritance, or the narrowest
   package-visible helper that preserves the public API.
+- Treating a test that observes declared fields, cleanup order, lazy allocation,
+  logging, or exception behavior as an infrastructure blocker. Preserve the
+  observable contract and choose a less invasive shared-helper topology.
 
 ## Routes
 
@@ -71,8 +80,16 @@ Route-specific edit steps:
 
 1. Confirm both clone methods share the same parent contract. Follow intermediate
    parent classes as needed; siblings do not have to name the common owner directly.
-2. Add the common implementation to the parent with the narrowest usable visibility.
-3. Delete child overrides that now inherit the parent behavior.
+2. Inspect non-target descendants and field/lifecycle contracts. Pull up the
+   implementation only when the behavior and required state genuinely belong to
+   every affected child.
+3. Add the common implementation to the parent with the narrowest usable visibility.
+4. Delete child overrides that now inherit the parent behavior.
+
+If child-owned state or lifecycle ordering must remain local, do not move those
+fields into the parent. Add a protected helper that accepts the required state,
+call it from both existing overrides at the original point, and keep the
+surrounding `super` call order unchanged.
 
 For constructor clones, move the shared fields and initialization to the common
 parent constructor, then delegate from both child constructors with `super(...)`.
@@ -80,7 +97,9 @@ Do not edit neighboring ordinary methods merely because they also look similar.
 
 Verification fit delta: The clone disappears because the duplicated child bodies no longer exist.
 
-Avoid: Do not introduce a helper if inheritance already provides the correct owner.
+Avoid: Do not force a pull-up merely because a common parent exists. A parent
+helper is preferable when the full behavior or state is not universal across
+the hierarchy.
 
 ### `different-parent-shared-helper-clone`
 

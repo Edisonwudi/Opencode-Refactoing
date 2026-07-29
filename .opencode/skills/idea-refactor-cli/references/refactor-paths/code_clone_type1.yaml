@@ -77,6 +77,8 @@ code_clone_type1:
       - "A parent implementation plus one leftover child copy is still a clone and must not be accepted."
       - "Trace intermediate superclasses before deciding there is no shared parent; one target may inherit the common owner through an unchanged middle class."
       - "For duplicated constructor initialization, move shared state initialization to the real parent constructor and make both child constructors delegate with super(...)."
+      - "Before moving behavior or fields, inspect every direct and transitive non-target child. Do not pull up state when that changes unrelated descendants, reflection or serialization shape, framework wiring, or lifecycle side-effect order."
+      - "When child-owned fields or ordering must remain local, keep both overrides and fields in place, add one protected parameterized helper to the parent, call it at the original point in each override, and preserve the surrounding super-call order."
   - id: different-parent-shared-helper-clone
     when: "the clones live under different parent branches with no good superclass target, so the shared behavior should move to an external helper"
     before: |
