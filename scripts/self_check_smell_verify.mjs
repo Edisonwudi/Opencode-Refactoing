@@ -1278,12 +1278,6 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
     Object.assign(process.env, cleanSmellIdentityEnv(process.env), { SMELL_ARTIFACT_ROOT: artifactRoot })
     try {
       const plugin = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
-      const smellPlan = plugin?.tool?.smell_plan
-      if (!smellPlan || typeof smellPlan.execute !== "function") {
-        throw new SelfCheckError("plan_tool_lookup", "smell_plan tool was not registered with an execute function.", {
-          toolKeys: plugin?.tool && typeof plugin.tool === "object" ? Object.keys(plugin.tool) : [],
-        })
-      }
       const smellVerify = plugin?.tool?.smell_verify
       if (!smellVerify || typeof smellVerify.execute !== "function") {
         throw new SelfCheckError("tool_lookup", "smell_verify tool was not registered with an execute function.", {

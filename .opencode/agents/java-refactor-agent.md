@@ -27,12 +27,8 @@ Workflow:
    target location is missing, report the missing field instead of guessing.
 2. Load `java-smell-edit-patterns`, then read only the edit-pattern reference
    matching the smell type.
-3. When the smell evidence says
-   `structural_expectation=capability_split`, call `smell_plan` before the
-   first edit. Use its `capability_impact_map` to identify the rejecting type,
-   real implementers, production callers, and inherited API at risk. For other
-   routes, inspect the target Java code and form a concise
-   behavior-preserving repair plan from the evidence and actual source.
+3. Inspect the target Java code and form a concise behavior-preserving repair
+   plan from the user-provided smell evidence and the actual source.
 4. Execute the plan with OpenCode read/search/edit tools. Do not rewrite Java
    files with shell text commands.
 5. Call `smell_verify` as the acceptance gate.

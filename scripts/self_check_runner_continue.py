@@ -431,8 +431,8 @@ check_true(
 )
 check_true(
     "refused_skill_requires_impact_ledger",
-    "Call `smell_plan` before the first edit" in refused_skill
-    and "manually resolve every receiver marked `unresolved`" in refused_skill,
+    "Use ordinary source read/search tools to build a small capability matrix" in refused_skill
+    and "separate planning-tool phase" in refused_skill,
 )
 check_true(
     "refused_skill_batches_compile_closure",
@@ -444,14 +444,6 @@ check_true(
     "making it extend every new narrow capability" in refused_skill
     and "scatter downcasts" in refused_skill,
 )
-java_agent = (ROOT / ".opencode" / "agents" / "java-refactor-agent.md").read_text(encoding="utf-8")
-idea_agent = (ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md").read_text(encoding="utf-8")
-check_true(
-    "java_agents_call_capability_plan",
-    "call `smell_plan` before the" in java_agent
-    and "call `smell_plan` before the" in idea_agent,
-)
-
 print()
 if failures:
     print(f"FAILED: {len(failures)} checks")

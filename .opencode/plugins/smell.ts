@@ -1614,27 +1614,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       },
     })
 
-  const planTool = tool({
-    description:
-      "Build a read-only refactoring plan context. Capability-split Refused Bequest results include contract declarations, implementers, and production call sites.",
-    args: {
-      ...commonShape,
-    },
-    async execute(args) {
-      const resolved = withBatchDefaults(args)
-      const bridgeArgs = [
-        "build-plan-context",
-        ...commonArgs(resolved),
-        "--no-idea-preflight",
-        "--no-idea-open",
-      ]
-      return normalizeToolResult("Smell refactoring plan", await runBridge(worktree, bridgeArgs))
-    },
-  })
-
   return {
     tool: {
-      smell_plan: planTool,
       smell_verify: verifyTool("Smell verification"),
 
       idea_refactor_locate: tool({

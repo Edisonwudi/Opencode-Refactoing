@@ -71,10 +71,11 @@ For a structural route, form one coherent closure plan before editing, then use
 `smell_verify` early enough to catch a wrong ownership model before broad caller
 rewrites:
 
-1. Call `smell_plan` before the first edit and read its generated
-   `capability_impact_map`. Use its
-   contract declarations, concrete implementers, and production call sites as the
-   impact ledger; manually resolve every receiver marked `unresolved`.
+1. Use ordinary source read/search tools to build a small capability matrix:
+   identify the rejecting type, the parent contract declaration, concrete types
+   with real implementations, production call sites, and inherited non-target
+   state or API at risk. Keep this as the closure worklist; do not introduce a
+   separate planning-tool phase.
 2. Prefer an existing narrow capability or concrete subtype. If a new capability is
    necessary, declare it with usable visibility before changing implementations or callers
    to reference it.
