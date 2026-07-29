@@ -123,6 +123,17 @@ runs/<run-name>/samples/<sample>/
 git pull    # agent 源码即最新版;镜像无需任何操作
 ```
 
+Java 环境镜像的唯一构建入口是
+`docker/java-refactor-delivery/Dockerfile.mounted-source`。该 Dockerfile
+只允许固化 IDE、项目快照、dataset、离线仓库、Node/OpenCode 依赖及版本清单；
+Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在运行时
+从 `/agent-src` 只读装配。`npm run check:mounted-source` 会阻断重新复制这些源码
+或绕过挂载入口的 Dockerfile 改动。
+
+只有以下环境契约变化才重建镜像：IDE/工具链、项目快照、dataset、离线依赖，
+或 `package-lock.json` / `.opencode/package-lock.json`。其余 Agent 逻辑更新只
+同步仓库；实验结果同时记录 Git commit 与环境镜像 ID，避免把两种版本混为一谈。
+
 只有环境本身（IDE、依赖缓存、dataset）变化才需要重新交付镜像（回到 1.2)。
 
 ### 1.10 非 Java 语言（python / c / cpp）

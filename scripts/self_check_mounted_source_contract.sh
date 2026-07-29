@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 entrypoint="$repo_root/docker/mounted-source/entrypoint.sh"
+dockerfile="$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mounted-source-contract.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -31,5 +32,19 @@ status=$?
 set -e
 [[ "$status" == "78" ]] || { echo "Expected dependency mismatch exit 78, got $status" >&2; exit 1; }
 grep -q 'AGENT_DEPENDENCY_MISMATCH: package-lock.json' "$tmp/mismatch.stderr"
+
+grep -q '^FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source$' "$dockerfile"
+grep -q '^FROM ${BASE_ENV_IMAGE}$' "$dockerfile"
+grep -q 'COPY docker/mounted-source/entrypoint.sh /usr/local/bin/run-mounted-opencode-agent' "$dockerfile"
+grep -q 'org.opencontainers.refactor.agent-source-mode="mounted-readonly"' "$dockerfile"
+grep -q 'test ! -e /opt/opencode-refactor' "$dockerfile"
+if grep -Eq '^COPY (\.opencode|runtime/python|scripts|docker/java-refactor-delivery/entrypoint\.sh)' "$dockerfile"; then
+  echo "Environment image must not copy Agent source" >&2
+  exit 1
+fi
+if grep -Fqx 'ENTRYPOINT ["/usr/local/bin/run-java-refactor-delivery"]' "$dockerfile"; then
+  echo "Environment image must enter through the mounted-source contract" >&2
+  exit 1
+fi
 
 echo "Mounted source contract self-check passed"

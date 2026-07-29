@@ -35,18 +35,27 @@ def check_dataset_snapshot_contract() -> None:
         root
         / "docker"
         / "java-refactor-delivery"
-        / "Dockerfile.r7.3.18-main-refused-bequest"
+        / "Dockerfile.mounted-source"
     ).read_text(encoding="utf-8")
-    cleanup = "RUN rm -rf /opt/dataset/java/delivery_schema"
+    cleanup = "/opt/dataset/java/delivery_schema"
     snapshot_copy = (
         "COPY dataset/java/delivery_schema/ /opt/dataset/java/delivery_schema/"
     )
     assert cleanup in dockerfile
     assert snapshot_copy in dockerfile
     assert dockerfile.index(cleanup) < dockerfile.index(snapshot_copy)
-    assert dockerfile.startswith("ARG BASE_IMAGE=")
-    assert "FROM ${BASE_IMAGE}" in dockerfile
-    assert "org.opencontainers.refactor.base-image=" in dockerfile
+    assert dockerfile.startswith("ARG BASE_ENV_IMAGE=")
+    assert "FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source" in dockerfile
+    assert "FROM ${BASE_ENV_IMAGE}" in dockerfile
+    assert "org.opencontainers.refactor.base-environment-image=" in dockerfile
+    assert 'org.opencontainers.refactor.agent-source-mode="mounted-readonly"' in dockerfile
+    assert "COPY .opencode/" not in dockerfile
+    assert "COPY runtime/python/" not in dockerfile
+    assert "COPY scripts/" not in dockerfile
+    assert (
+        'ENTRYPOINT ["/usr/local/bin/run-mounted-opencode-agent"]'
+        in dockerfile
+    )
     assert f"ARG REFUSED_BEQUEST_CSV_SHA256={refused_sha256}" in dockerfile
     assert "org.opencontainers.refactor.dataset-snapshot=" in dockerfile
     assert "org.opencontainers.refactor.refused-bequest-csv-sha256=" in dockerfile

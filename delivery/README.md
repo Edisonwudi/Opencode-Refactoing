@@ -9,9 +9,9 @@
 | C | `opencode-smell-c-refactor-env:0.1.1-amd64-delivery-20260720` | `smell-refactor-env-c.tar.gz` | 0.98 GB | `7dfc05fe4188d2894c70b4dd3e64767b97987244820f01715d5e613e6fc109dc` |
 | C++ | `opencode-smell-cpp-refactor-env:0.1.1-amd64-delivery-20260720` | `smell-refactor-env-cpp.tar.gz` | 1.8 GB | `e02f716b70954cbda3320d3c9f9dc640ea81fcd3808583a7b2f2224ed3649a99` |
 
-## 当前 Java refused_bequest 候选镜像（2026-07-30）
+## Java refused_bequest 环境候选（2026-07-30）
 
-Edison 本地候选镜像：
+Edison 上已完成离线依赖验收的历史候选镜像：
 
 - tag：`opencode-java-refactor-delivery:0.1.3-r7.3.19-rb-capability-closure-v1-canal-oracle-fix-csv-aligned-v1`
 - image ID：`sha256:80de97ec2b0dbafbc99dfe2d52e3aa047c9a867be82fa766145ead4a55e1ea51`
@@ -29,9 +29,14 @@ Edison 本地候选镜像：
 Dockerfile 重建时还会校验唯一 CSV 文件名和内容 sha256，避免 Docker `COPY`
 保留旧文件而形成混合快照。
 
-这是 Edison 上的已验收候选镜像，还不是上方 2026-07-20 的压缩包交付物。
-本次验收只覆盖最终 30 条 refused-bequest；依赖审计脚本通过只读挂载运行，
-按当前仓库重建后才会被烤入镜像。
+该 tag 是恢复挂载式架构前生成的依赖来源，只用于提取已验收的项目、IDE 和
+离线依赖，不再作为正式运行入口。当前 Dockerfile 的最终层以干净环境镜像为
+基础，只从该候选复制 `/opt/buildenv`、`/opt/projects`、Node/OpenCode 依赖与
+项目版本清单；不会复制 Agent prompt、plugin、Python runtime 或 runner。
+
+正式运行必须把当前仓库只读挂载到 `/agent-src`。因此 Agent、skill、plugin、
+checkpoint 或 runner 更新只需同步 Git 工作树，不重建镜像；仅当 IDE、项目
+快照、dataset、离线依赖或两个 lockfile 变化时才需要重建环境镜像。
 
 ## 使用
 

@@ -1,0 +1,74 @@
+ARG BASE_ENV_IMAGE=opencode-java-refactor-env:0.1.0-mounted-source-godclass-bounded-3a10c8ad
+ARG DEPENDENCY_SOURCE_IMAGE=opencode-java-refactor-delivery:0.1.3-r7.3.19-rb-capability-closure-v1-canal-oracle-fix-csv-aligned-v1
+
+FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source
+FROM ${BASE_ENV_IMAGE}
+
+ARG BASE_ENV_IMAGE
+ARG DEPENDENCY_SOURCE_IMAGE
+ARG DEPENDENCY_SOURCE_IMAGE_ID
+ARG DELIVERY_IMAGE_TAG=opencode-java-refactor-env:0.1.1-rb-certified-mounted-source-v1
+ARG DATASET_SNAPSHOT=main-20260730
+ARG REFUSED_BEQUEST_CSV_SHA256=1d86919e64a3be4a25a67ff8cf6191312a0e04c6424fd6df029e8759272ee7ae
+ARG AGENT_ROOT_LOCK_SHA256=992323e7f0e071a1515731f3a7aa4508e2baae3f04cc57e1ff8b3a172bbad997
+ARG AGENT_OPENCODE_LOCK_SHA256=d01e3b8cf1713dcf8dd22ae9b435b39d26b709cf16d65d7ffd24e02588a5271b
+
+USER root
+
+RUN rm -rf \
+      /opt/buildenv \
+      /opt/projects \
+      /opt/opencode-runtime \
+      /opt/opencode-refactor \
+      /opt/dataset/java/delivery_schema \
+  && install -d -m 0755 \
+      /opt/dataset/java/delivery_schema \
+      /opt/opencode-runtime
+
+# Reuse the already certified project/offline-dependency closure, but copy only
+# environment artifacts. Agent prompts, plugins, Python runtime and runner
+# scripts are deliberately excluded from the final image.
+COPY --from=dependency_source /opt/buildenv/ /opt/buildenv/
+COPY --from=dependency_source /opt/projects/ /opt/projects/
+COPY --from=dependency_source /opt/opencode-refactor/node_modules/ \
+  /opt/opencode-runtime/node_modules/
+COPY --from=dependency_source /opt/opencode-refactor/.opencode/node_modules/ \
+  /opt/opencode-runtime/opencode-node_modules/
+COPY --from=dependency_source /opt/opencode-refactor/project-revisions.json \
+  /opt/opencode-runtime/project-revisions.json
+COPY --from=dependency_source /opt/opencode-refactor/runtime/python/smell_core/defaults/projects.java.docker.yaml \
+  /opt/opencode-runtime/projects.docker.yaml
+
+COPY dataset/java/delivery_schema/ /opt/dataset/java/delivery_schema/
+COPY docker/mounted-source/entrypoint.sh /usr/local/bin/run-mounted-opencode-agent
+
+RUN test "$(find /opt/dataset/java/delivery_schema -maxdepth 1 -type f \
+        -name 'refused_bequest*.csv' -printf '%f\n')" = "refused_bequest.csv" \
+  && echo "${REFUSED_BEQUEST_CSV_SHA256}  /opt/dataset/java/delivery_schema/refused_bequest.csv" \
+      | sha256sum -c - \
+  && test -d /opt/opencode-runtime/node_modules \
+  && test -d /opt/opencode-runtime/opencode-node_modules \
+  && test -f /opt/opencode-runtime/project-revisions.json \
+  && test -f /opt/opencode-runtime/projects.docker.yaml \
+  && test ! -e /opt/opencode-refactor \
+  && chmod 0755 /usr/local/bin/run-mounted-opencode-agent
+
+ENV OPENCODE_AGENT_SOURCE=/agent-src \
+    OPENCODE_AGENT_ROOT=/opt/opencode-refactor \
+    OPENCODE_RUNTIME_DEPS=/opt/opencode-runtime \
+    AGENT_SOURCE_REQUIRE_READONLY=1 \
+    AGENT_ROOT_LOCK_SHA256=${AGENT_ROOT_LOCK_SHA256} \
+    AGENT_OPENCODE_LOCK_SHA256=${AGENT_OPENCODE_LOCK_SHA256}
+
+LABEL org.opencontainers.refactor.base-environment-image="${BASE_ENV_IMAGE}" \
+      org.opencontainers.refactor.dependency-source-image="${DEPENDENCY_SOURCE_IMAGE}" \
+      org.opencontainers.refactor.dependency-source-image-id="${DEPENDENCY_SOURCE_IMAGE_ID}" \
+      org.opencontainers.refactor.delivery-image="${DELIVERY_IMAGE_TAG}" \
+      org.opencontainers.refactor.agent-source-mode="mounted-readonly" \
+      org.opencontainers.refactor.agent-root-lock-sha256="${AGENT_ROOT_LOCK_SHA256}" \
+      org.opencontainers.refactor.agent-opencode-lock-sha256="${AGENT_OPENCODE_LOCK_SHA256}" \
+      org.opencontainers.refactor.dataset-snapshot="${DATASET_SNAPSHOT}" \
+      org.opencontainers.refactor.refused-bequest-csv-sha256="${REFUSED_BEQUEST_CSV_SHA256}" \
+      org.opencontainers.refactor.refused-bequest="capability-contract-v1"
+
+ENTRYPOINT ["/usr/local/bin/run-mounted-opencode-agent"]

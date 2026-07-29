@@ -21,10 +21,17 @@ done
 for forbidden in \
   delta_patch \
   docker/java-refactor-delivery/Dockerfile \
+  docker/java-refactor-delivery/Dockerfile.r7-maven-fix \
+  docker/java-refactor-delivery/Dockerfile.r7.3.18-main-refused-bequest \
   docker/java-refactor-environment \
   runtime/python/smell_core/defaults/projects.java.docker.yaml; do
   [[ ! -e "$repo_root/$forbidden" ]] || { echo "Obsolete environment build content remains: $forbidden" >&2; exit 1; }
 done
+
+[[ -f "$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source" ]] || {
+  echo "Missing canonical mounted-source environment Dockerfile" >&2
+  exit 1
+}
 
 bash -n "$repo_root/docker/java-refactor-delivery/entrypoint.sh"
 bash -n "$repo_root/docker/mounted-source/entrypoint.sh"
