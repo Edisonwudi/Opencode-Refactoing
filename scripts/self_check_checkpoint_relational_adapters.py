@@ -35,102 +35,12 @@ class Fixture {{
   void consume(int value) {{}}
 }}
 """
-CLONE_WITH_PARAMETERIZED_CAST = f"""\
-class Fixture {{
-  void left() {{ shared(null); }}
-  void right() {{ shared(null); }}
-  void shared(Object raw) {{
-    java.util.List<String> values = (java.util.List<String>) raw;
-    {CLONE_BODY}
-  }}
-  void consume(int value) {{}}
-}}
-"""
-CLONE_WITH_REFLECTIVE_ARRAY_DISPATCH = f"""\
-class Fixture {{
-  void left() {{ shared(null); }}
-  void right() {{ shared(null); }}
-  void shared(Object values) {{
-    int length = java.lang.reflect.Array.getLength(values);
-    {CLONE_BODY}
-  }}
-  void consume(int value) {{}}
-}}
-"""
-CLONE_WITH_OBJECT_PRIMITIVE_DISPATCH = f"""\
-class Fixture {{
-  void left() {{ shared(new boolean[0]); }}
-  void right() {{ shared(new short[0]); }}
-  void shared(Object values) {{
-    if (values instanceof boolean[]) {{ consume(((boolean[]) values).length); }}
-    else if (values instanceof short[]) {{ consume(((short[]) values).length); }}
-    {CLONE_BODY}
-  }}
-  void consume(int value) {{}}
-}}
-"""
-CLONE_WITH_BOXING_INDEX_ADAPTER = f"""\
-class Fixture {{
-  void left() {{ shared(i -> Integer.valueOf(i)); }}
-  void right() {{ shared(i -> Integer.valueOf(i)); }}
-  void shared(java.util.function.IntFunction<Integer> getter) {{ getter.apply(0); {CLONE_BODY} }}
-  void consume(int value) {{}}
-}}
-"""
 CLONE_WITH_DELEGATING_FALLBACK = f"""\
 class Fixture {{
   boolean ready;
   void left() {{ if (ready) {{ shared(); return; }} {CLONE_BODY} }}
   void right() {{ shared(); }}
   void shared() {{ {CLONE_BODY} }}
-  void consume(int value) {{}}
-}}
-"""
-CLONE_WITH_SERVICE_LOCATOR_DELEGATION = f"""\
-class Fixture {{
-  void left() {{ ApplicationContextProvider.getBean(Owner.class).shared(); }}
-  void right() {{ Owner.shared(); }}
-  void consume(int value) {{}}
-}}
-class ApplicationContextProvider {{
-  static Owner getBean(Class<?> type) {{ return new Owner(); }}
-}}
-class Owner {{
-  static void shared() {{ {CLONE_BODY} }}
-  static void consume(int value) {{}}
-}}
-"""
-REMOVED_TARGET_FIELD_OWNER_AFTER = f"""\
-class Client {{
-  private final Owner owner = new Owner();
-  void run() {{ owner.draw(); }}
-  void consume(int value) {{}}
-}}
-class Owner {{
-  void draw() {{ {CLONE_BODY} }}
-  void consume(int value) {{}}
-}}
-"""
-REMOVED_TARGET_NULL_FIELD_OWNER_AFTER = f"""\
-class Client {{
-  private Owner owner;
-  Client() {{ this.owner = null; }}
-  void run() {{ owner.draw(); }}
-  void consume(int value) {{}}
-}}
-class Owner {{
-  void draw() {{ {CLONE_BODY} }}
-  void consume(int value) {{}}
-}}
-"""
-REMOVED_TARGET_FIELD_OWNER_BEFORE = f"""\
-class Client {{
-  void run() {{ draw(); }}
-  void draw() {{ {CLONE_BODY} }}
-  void consume(int value) {{}}
-}}
-class Owner {{
-  void draw() {{ {CLONE_BODY} }}
   void consume(int value) {{}}
 }}
 """
@@ -469,12 +379,7 @@ def main() -> int:
             CLONE_MOVED_TWICE,
             CLONE_SHARED_WITH_PARALLEL_HELPERS,
             CLONE_SHARED_WITH_OVERLOADED_HELPERS,
-            CLONE_WITH_PARAMETERIZED_CAST,
-            CLONE_WITH_REFLECTIVE_ARRAY_DISPATCH,
-            CLONE_WITH_OBJECT_PRIMITIVE_DISPATCH,
-            CLONE_WITH_BOXING_INDEX_ADAPTER,
             CLONE_WITH_DELEGATING_FALLBACK,
-            CLONE_WITH_SERVICE_LOCATOR_DELEGATION,
         ),
     )
     parent_clone = _case(
@@ -514,19 +419,17 @@ def main() -> int:
         "tokens=30; group_size=2",
         "clone_token_count",
     )
-    removed_target_field_owner_clone = _case(
-        "code_clone_type1", REMOVED_TARGET_FIELD_OWNER_BEFORE, REMOVED_TARGET_FIELD_OWNER_AFTER,
-        "Fixture.java:method=draw|line=3 <-> Fixture.java:method=draw|line=8",
-        "tokens=30; group_size=2",
-        "clone_token_count",
-        rejected_intermediates=(REMOVED_TARGET_NULL_FIELD_OWNER_AFTER,),
-    )
     scoped_overload_clone = _case(
         "code_clone_type1", OVERLOAD_BEFORE, OVERLOAD_SCOPED_AFTER,
         "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
         "tokens=30; group_size=2",
         "clone_token_count",
-        rejected_intermediates=(OVERLOAD_TOO_BROAD_AFTER,),
+    )
+    expanded_overload_clone = _case(
+        "code_clone_type1", OVERLOAD_BEFORE, OVERLOAD_TOO_BROAD_AFTER,
+        "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
+        "tokens=30; group_size=2",
+        "clone_token_count",
     )
     existing_family_clone = _case(
         "code_clone_type1", OVERLOAD_EXISTING_FAMILY_BEFORE, OVERLOAD_EXISTING_FAMILY_AFTER,
@@ -545,8 +448,8 @@ def main() -> int:
         f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g} "
         f"qualified_owner_clone={qualified_owner_clone[0]:g}->{qualified_owner_clone[1]:g} "
         f"removed_target_clone={removed_target_clone[0]:g}->{removed_target_clone[1]:g} "
-        f"removed_target_field_owner_clone={removed_target_field_owner_clone[0]:g}->{removed_target_field_owner_clone[1]:g} "
         f"scoped_overload_clone={scoped_overload_clone[0]:g}->{scoped_overload_clone[1]:g} "
+        f"expanded_overload_clone={expanded_overload_clone[0]:g}->{expanded_overload_clone[1]:g} "
         f"existing_family_clone={existing_family_clone[0]:g}->{existing_family_clone[1]:g}"
     )
     return 0

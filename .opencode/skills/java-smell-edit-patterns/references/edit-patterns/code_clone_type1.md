@@ -17,6 +17,9 @@ or shared core.
   before broadening the change.
 - The final pair must share a callee, delegate to an existing owner, or inherit one
   parent implementation while preserving behavior and public signatures.
+- The smell Oracle proves clone removal and convergence only. Architecture and
+  implementation-quality concerns belong to existing project checks and final diff
+  review; they must not be turned into sample-specific smell-guard vetoes.
 
 ## Common avoid
 
@@ -26,20 +29,12 @@ or shared core.
 - Creating a new abstraction when an existing owner or parent is the intended
   normalization point.
 - Changing literals or operators only to evade clone detection.
-- Expanding to unrelated overloads or using unchecked casts when a small typed
-  adapter can preserve the reported pair's API.
 - Adding a nullable owner dependency and retaining the original clone as a
   fallback. Either establish one reliable owner route and delete the superseded
   body, or choose a different topology.
 - Widening a production method from private/protected to public only to make
   delegation convenient. Prefer an existing owner, inheritance, or the narrowest
   package-visible helper that preserves the public API.
-- Replacing explicit dependency injection with a global application-context or
-  service-locator lookup. Follow the project's established constructor/field
-  injection and update construction sites narrowly when required.
-- Keeping a compatibility constructor that assigns the new owner dependency to
-  `null`, even if a setter may inject it later. Make the dependency required and
-  update construction sites or fixtures mechanically.
 
 ## Routes
 
@@ -121,10 +116,9 @@ Route-specific edit steps:
 
 1. Identify the clone side or nearby service that already owns the behavior.
 2. Expose or reuse a narrow owner method for the duplicated operation.
-3. Inject the owner using the project's established required constructor/field
-   pattern and replace the non-owner clone with a call to that owner.
-4. Update affected construction sites and test fixtures; do not keep an overload
-   that initializes the owner to `null`.
+3. Reuse the project's established wiring pattern and replace the non-owner clone
+   with a call to that owner.
+4. Update affected construction sites and test fixtures as required.
 
 Verification fit delta: The non-owner target should no longer duplicate owner logic.
 
@@ -151,8 +145,5 @@ Route-specific edit steps:
 
 Verification fit delta: The large common body should exist only in the core method.
 
-Avoid: Do not collapse public overloads if callers rely on their narrow types, and
-do not replace typed array access with reflection or an `Object` type dispatcher.
-Do not use `IntFunction<Object>` or boxed primitive wrappers for a per-element hot
-loop. Prefer `IntPredicate`, a primitive comparator, or another adapter whose
-callback returns the final decision/value without boxing each array element.
+Avoid: Do not collapse public overloads if callers rely on their narrow types.
+Prefer the project's existing typed abstractions when they are available.

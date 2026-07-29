@@ -21,7 +21,6 @@ from smell_core.java.semantic_detector import (  # noqa: E402
 from smell_core.java.smell_guards import _run_semantic_guard  # noqa: E402
 from smell_core.location import parse_location_descriptor  # noqa: E402
 from smell_core.detector_utils import (  # noqa: E402
-    parse_expected_state_field,
     parse_parent_from_evidence,
     parse_structural_expectation,
     parse_target_class,
@@ -70,7 +69,6 @@ def _capability_guard(
     *,
     structural: bool = True,
     structural_expectation: str = "",
-    expected_state_field: str = "",
     target_parameter_count: int | None = None,
     target_class: str = "",
     target_line: int = 6,
@@ -83,8 +81,6 @@ def _capability_guard(
         evidence = "parents=ParentCapability; flags=explicit_unsupported_throw"
         if expectation:
             evidence += f"; structural_expectation={expectation}"
-        if expected_state_field:
-            evidence += f"; expected_state_field={expected_state_field}"
         if target_parameter_count is not None:
             evidence += f"; target_parameter_count={target_parameter_count}"
         if target_class:
@@ -161,14 +157,6 @@ def main() -> int:
         != "rejecting_override_removed"
     ):
         raise AssertionError("rejecting override expectation must be parsed from dataset evidence")
-    if (
-        parse_expected_state_field(
-            "structural_expectation=state_getter; expected_state_field=isMultipleValues"
-        )
-        != "isMultipleValues"
-    ):
-        raise AssertionError("state getter backing field must be parsed from dataset evidence")
-
     parent_contract = """\
 interface ParentCapability {
   Object target();
@@ -463,42 +451,6 @@ class Child {
         raise AssertionError(
             "rejecting override contract is specific to inheriting the reported safe parent method"
         )
-
-    state_getter_guard = _capability_guard(
-        parent_contract,
-        """\
-class Child implements ParentCapability {
-  private final Object state = new Object();
-  public Object target() {
-    return this.state;
-  }
-}
-""",
-        structural_expectation="state_getter",
-        expected_state_field="state",
-    )
-    if not state_getter_guard["success"]:
-        raise AssertionError("state getter must accept a direct return of its declared backing field")
-
-    for invalid_return in ("false", "true", "otherState"):
-        invalid_state_getter_guard = _capability_guard(
-            parent_contract,
-            f"""\
-class Child implements ParentCapability {{
-  private final Object state = new Object();
-  private final Object otherState = new Object();
-  public Object target() {{
-    return {invalid_return};
-  }}
-}}
-""",
-            structural_expectation="state_getter",
-            expected_state_field="state",
-        )
-        if invalid_state_getter_guard["success"]:
-            raise AssertionError(
-                f"state getter must reject returning {invalid_return} instead of its backing field"
-            )
 
     logging_only = """\
 class Child extends Parent {

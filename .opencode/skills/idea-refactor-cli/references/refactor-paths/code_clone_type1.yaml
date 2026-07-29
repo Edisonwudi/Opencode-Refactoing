@@ -124,7 +124,7 @@ code_clone_type1:
     source: { project: commons-lang-3.20.0, class: ContextedException / ContextedRuntimeException / ExceptionUtils, verified: "2026-05-09" }
     notes:
       - "Both callers must resolve through the same helper. Two same-shaped private helpers only move the clone."
-      - "Keep concrete generic types at each caller; use typed adapters or projections rather than unchecked List casts."
+      - "Prefer existing project abstractions and preserve caller contracts."
   - id: existing-owner-delegation-clone
     when: "one clone target already has a semantically owned implementation in a dedicated service, utility, or domain owner, so the other clone should delegate to that owner instead of creating a new helper"
     before: |
@@ -165,8 +165,7 @@ code_clone_type1:
       - "Use this path when source inspection proves an existing owner already provides the duplicated behavior. Do not create a second helper just to satisfy the clone smell."
       - "Dependency injection, constructors, and test fixtures may need narrow direct_edit follow-up because IDEA structural insertion does not know framework wiring."
       - "Do not add nullable injection and retain the original clone as a fallback. Establish one reliable owner route and remove the superseded body."
-      - "Use the project's established constructor or field injection. Do not replace explicit wiring with ApplicationContextProvider/getBean or another global service locator."
-      - "Make a newly required owner dependency non-null and update construction sites or fixtures. Do not preserve a compatibility constructor that assigns the dependency to null."
+      - "Use the project's established wiring pattern and update affected construction sites or fixtures."
       - "Do not widen a private or protected method to public solely to make delegation convenient; preserve the public API and use the narrowest valid owner/helper visibility."
   - id: type-variant-shared-core-clone
     when: "the clones are same-class overloads that differ mainly by primitive or narrow value type, so keep the public overload API and extract only a private shared core with type-specific adapters"
@@ -226,6 +225,4 @@ code_clone_type1:
       - "Do not replace primitive overloads with a broad Object/generic API or a helper that makes call sites uglier; keep type-specific wrappers and share only the loop/control core."
       - "For primitive variants, use an index predicate/comparator or typed adapter that compiles for every overload; do not force boolean, short, or other primitives through an incompatible generic functional interface."
       - "Keep the first cohesive edit to the two reported overloads. Broaden the family only when compilation or the structural Oracle proves the pair cannot be centralized independently."
-      - "Do not use java.lang.reflect.Array plus a Class<?> discriminator or type-switch for primitive access. Capture the concrete arrays in an index callback/predicate instead."
-      - "Do not use Object plus instanceof/casts as a primitive array dispatcher, or IntFunction<Object/boxed primitive> in a per-element loop. Prefer IntPredicate or a primitive-specific decision adapter that does not box each element."
       - "After Oracle feedback, inspect the complete production diff and remove superseded wrappers, duplicate adapters, and unused imports before final verification."

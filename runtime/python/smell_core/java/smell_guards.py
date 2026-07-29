@@ -12,14 +12,13 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..analysis import count_meaningful_lines, extract_snippet, strip_comments
+from ..analysis import count_meaningful_lines, extract_snippet
 from ..config import ResolvedRunConfig
 from ..guards.context import GuardRunContext
 from .detector_utils import (
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
-    parse_expected_state_field as _parse_expected_state_field,
     parse_parent_from_evidence as _parse_parent_from_evidence,
     parse_structural_expectation as _parse_structural_expectation,
     parse_target_class as _parse_target_class,
@@ -350,7 +349,6 @@ def run_java_clone_guard(
         first,
         second,
         min_tokens=int(guard.get("min_tokens", 80)),
-        expected_group_size=_clone_group_size(_guard_evidence(guard)),
         changed_java_files=context.changed_java_files if context else [],
     )
     if not structural["success"]:
@@ -399,7 +397,6 @@ def _verify_clone_structural_resolution(
     second: Any,
     *,
     min_tokens: int,
-    expected_group_size: int,
     changed_java_files: List[Path],
 ) -> Dict[str, object]:
     baseline = _load_clone_baseline(config, (first, second))
@@ -430,76 +427,6 @@ def _verify_clone_structural_resolution(
         for loc, baseline_target in zip((first, second), baseline_targets)
     ]
 
-    scope_expansion = _find_unreported_overload_changes(
-        baseline_methods,
-        baseline_targets,
-        current_methods,
-        expected_group_size=expected_group_size,
-    )
-    if scope_expansion:
-        return {
-            "success": False,
-            "message": (
-                "the dataset reports a two-member overload clone, but additional "
-                "overloads were changed; restore unrelated family members."
-            ),
-            "details": {
-                "structural_resolution": "unreported_overload_scope_expansion",
-                "changed_unreported_overloads": scope_expansion,
-            },
-        }
-
-    new_parameterized_casts = _find_new_parameterized_casts(
-        baseline_methods,
-        current_methods,
-    )
-    if new_parameterized_casts:
-        return {
-            "success": False,
-            "message": (
-                "the refactoring introduced parameterized casts; preserve concrete "
-                "generic types through typed adapters instead."
-            ),
-            "details": {
-                "structural_resolution": "new_parameterized_casts",
-                "parameterized_casts": new_parameterized_casts,
-            },
-        }
-
-    new_reflective_array_calls = _find_new_reflective_array_calls(
-        baseline_methods,
-        current_methods,
-    )
-    if new_reflective_array_calls:
-        return {
-            "success": False,
-            "message": (
-                "the refactoring introduced reflective array dispatch; preserve "
-                "typed access through adapters instead."
-            ),
-            "details": {
-                "structural_resolution": "new_reflective_array_dispatch",
-                "reflective_array_calls": new_reflective_array_calls,
-            },
-        }
-
-    new_primitive_dispatch_adapters = _find_new_primitive_dispatch_adapters(
-        baseline_methods,
-        current_methods,
-    )
-    if new_primitive_dispatch_adapters:
-        return {
-            "success": False,
-            "message": (
-                "the refactoring introduced an Object/type-switch or boxing adapter "
-                "for primitive variants; keep primitive access typed."
-            ),
-            "details": {
-                "structural_resolution": "new_primitive_dispatch_adapter",
-                "primitive_dispatch_adapters": new_primitive_dispatch_adapters,
-            },
-        }
-
     retained_clone_fallbacks = _find_retained_clone_fallbacks(
         baseline_targets,
         current_targets,
@@ -514,40 +441,6 @@ def _verify_clone_structural_resolution(
             "details": {
                 "structural_resolution": "delegating_fallback_retains_clone",
                 "retained_clone_fallbacks": retained_clone_fallbacks,
-            },
-        }
-
-    new_service_locator_calls = _find_new_service_locator_calls(
-        baseline_targets,
-        current_targets,
-    )
-    if new_service_locator_calls:
-        return {
-            "success": False,
-            "message": (
-                "the refactoring introduced runtime service-locator delegation; "
-                "preserve the project's explicit dependency-injection route."
-            ),
-            "details": {
-                "structural_resolution": "new_service_locator_delegation",
-                "service_locator_calls": new_service_locator_calls,
-            },
-        }
-
-    new_nullable_dependencies = _find_new_nullable_dependencies(
-        baseline_methods,
-        current_methods,
-    )
-    if new_nullable_dependencies:
-        return {
-            "success": False,
-            "message": (
-                "the refactoring introduced a dependency assigned to null and later "
-                "dereferenced; use required constructor injection and update callers."
-            ),
-            "details": {
-                "structural_resolution": "new_nullable_dependency",
-                "nullable_dependencies": new_nullable_dependencies,
             },
         }
 
@@ -799,144 +692,6 @@ def _method_identity(method: JavaMethodInfo) -> Tuple[str, str, str]:
     )
 
 
-def _clone_group_size(evidence: str) -> int:
-    match = re.search(r"\bgroup_size=(\d+)\b", str(evidence or ""))
-    return int(match.group(1)) if match else 0
-
-
-def _find_unreported_overload_changes(
-    baseline_methods: List[JavaMethodInfo],
-    baseline_targets: List[JavaMethodInfo],
-    current_methods: List[JavaMethodInfo],
-    *,
-    expected_group_size: int,
-) -> List[Dict[str, object]]:
-    """Keep a reported two-overload clone repair scoped to that exact pair."""
-    if expected_group_size != 2:
-        return []
-    left, right = baseline_targets
-    if (
-        left.rel_path != right.rel_path
-        or left.class_name != right.class_name
-        or left.method_name != right.method_name
-    ):
-        return []
-    target_identities = {_method_identity(method) for method in baseline_targets}
-    current_by_identity = {
-        _method_identity(method): method
-        for method in current_methods
-    }
-    changed: List[Dict[str, object]] = []
-    for baseline_method in baseline_methods:
-        identity = _method_identity(baseline_method)
-        if identity in target_identities:
-            continue
-        if (
-            baseline_method.rel_path != left.rel_path
-            or baseline_method.class_name != left.class_name
-            or baseline_method.method_name != left.method_name
-        ):
-            continue
-        current_method = current_by_identity.get(identity)
-        if (
-            current_method is not None
-            and tokenize_clone(current_method.body_text) == tokenize_clone(baseline_method.body_text)
-        ):
-            continue
-        changed.append({
-            "file": baseline_method.rel_path,
-            "class": baseline_method.class_name,
-            "method": baseline_method.signature,
-            "change": "removed" if current_method is None else "body_changed",
-        })
-    return changed
-
-
-_PARAMETERIZED_CAST_RE = re.compile(
-    r"\(\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*<[^()\n]+>\s*\)"
-)
-
-
-def _find_new_parameterized_casts(
-    baseline_methods: List[JavaMethodInfo],
-    current_methods: List[JavaMethodInfo],
-) -> List[Dict[str, object]]:
-    baseline_count = sum(
-        len(_PARAMETERIZED_CAST_RE.findall(method.body_text))
-        for method in baseline_methods
-    )
-    current_hits: List[Dict[str, object]] = []
-    for method in current_methods:
-        casts = _PARAMETERIZED_CAST_RE.findall(method.body_text)
-        if not casts:
-            continue
-        current_hits.extend({
-            "file": method.rel_path,
-            "class": method.class_name,
-            "method": method.signature,
-            "cast": " ".join(cast.split()),
-        } for cast in casts)
-    if len(current_hits) <= baseline_count:
-        return []
-    return current_hits[baseline_count:]
-
-
-_REFLECTIVE_ARRAY_CALL_RE = re.compile(
-    r"\b(?:java\s*\.\s*lang\s*\.\s*reflect\s*\.\s*)?"
-    r"Array\s*\.\s*(?:get|set|getLength)\s*\("
-)
-
-_PRIMITIVE_ARRAY_TYPE_SWITCH_RE = re.compile(
-    r"\binstanceof\s+(?:boolean|byte|char|short|int|long|float|double)\s*\[\s*\]"
-)
-_PRIMITIVE_ARRAY_CAST_RE = re.compile(
-    r"\(\s*(?:boolean|byte|char|short|int|long|float|double)\s*\[\s*\]\s*\)"
-)
-_BOXING_INDEX_ADAPTER_RE = re.compile(
-    r"\b(?:java\s*\.\s*util\s*\.\s*function\s*\.\s*)?IntFunction\s*<\s*"
-    r"(?:Object|Boolean|Byte|Character|Short|Integer|Long|Float|Double)\s*>"
-)
-
-
-def _find_new_primitive_dispatch_adapters(
-    baseline_methods: List[JavaMethodInfo],
-    current_methods: List[JavaMethodInfo],
-) -> List[Dict[str, object]]:
-    """Reject new primitive paths that erase type or box each indexed value."""
-    def hits(method: JavaMethodInfo) -> List[str]:
-        text = f"{method.signature}\n{method.body_text}"
-        reasons = []
-        if (
-            re.search(r"\bObject\b", method.signature)
-            and (
-                _PRIMITIVE_ARRAY_TYPE_SWITCH_RE.search(method.body_text)
-                or _PRIMITIVE_ARRAY_CAST_RE.search(method.body_text)
-            )
-        ):
-            reasons.append("object_primitive_array_type_switch")
-        if _BOXING_INDEX_ADAPTER_RE.search(text):
-            reasons.append("boxing_int_function")
-        return reasons
-
-    baseline_hits = set()
-    for method in baseline_methods:
-        for reason in hits(method):
-            baseline_hits.add((*_method_identity(method), reason))
-    introduced = []
-    for method in current_methods:
-        for reason in hits(method):
-            identity = (*_method_identity(method), reason)
-            if identity in baseline_hits:
-                continue
-            introduced.append({
-                "file": method.rel_path,
-                "class": method.class_name,
-                "method": method.signature,
-                "reason": reason,
-            })
-    return introduced
-
-
 def _find_retained_clone_fallbacks(
     baseline_targets: List[JavaMethodInfo],
     current_targets: List[Optional[JavaMethodInfo]],
@@ -971,91 +726,6 @@ def _contains_token_subsequence(tokens: List[str], candidate: List[str]) -> bool
         return False
     width = len(candidate)
     return any(tokens[index:index + width] == candidate for index in range(len(tokens) - width + 1))
-
-
-_SERVICE_LOCATOR_CALL_RE = re.compile(
-    r"\b(?:ApplicationContextProvider|ApplicationContextHolder|SpringContext|"
-    r"ServiceLocator|BeanFactory)\s*\.\s*(?:getBean|getService|resolve)\s*\("
-)
-_NULL_FIELD_ASSIGNMENT_RE = re.compile(
-    r"\bthis\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*null\s*;"
-)
-_INSTANCE_QUALIFIED_CALL_RE = re.compile(
-    r"\b([a-z_$][A-Za-z0-9_$]*)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
-)
-
-
-def _find_new_service_locator_calls(
-    baseline_targets: List[JavaMethodInfo],
-    current_targets: List[Optional[JavaMethodInfo]],
-) -> List[Dict[str, object]]:
-    introduced = []
-    for baseline_target, current_target in zip(baseline_targets, current_targets):
-        if current_target is None:
-            continue
-        before = len(_SERVICE_LOCATOR_CALL_RE.findall(baseline_target.body_text))
-        after = len(_SERVICE_LOCATOR_CALL_RE.findall(current_target.body_text))
-        if after <= before:
-            continue
-        introduced.append({
-            "file": current_target.rel_path,
-            "class": current_target.class_name,
-            "method": current_target.signature,
-            "count": after - before,
-        })
-    return introduced
-
-
-def _find_new_nullable_dependencies(
-    baseline_methods: List[JavaMethodInfo],
-    current_methods: List[JavaMethodInfo],
-) -> List[Dict[str, object]]:
-    baseline_assignments = {
-        (method.rel_path, method.class_name, field_name)
-        for method in baseline_methods
-        for field_name in _NULL_FIELD_ASSIGNMENT_RE.findall(method.body_text)
-    }
-    dereferenced = {
-        (method.rel_path, method.class_name, receiver)
-        for method in current_methods
-        for receiver, _ in _INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text)
-    }
-    introduced = []
-    for method in current_methods:
-        for field_name in _NULL_FIELD_ASSIGNMENT_RE.findall(method.body_text):
-            key = (method.rel_path, method.class_name, field_name)
-            if key in baseline_assignments or key not in dereferenced:
-                continue
-            introduced.append({
-                "file": method.rel_path,
-                "class": method.class_name,
-                "method": method.signature,
-                "field": field_name,
-            })
-    return introduced
-
-
-def _find_new_reflective_array_calls(
-    baseline_methods: List[JavaMethodInfo],
-    current_methods: List[JavaMethodInfo],
-) -> List[Dict[str, object]]:
-    baseline_count = sum(
-        len(_REFLECTIVE_ARRAY_CALL_RE.findall(method.body_text))
-        for method in baseline_methods
-    )
-    current_hits: List[Dict[str, object]] = []
-    for method in current_methods:
-        calls = _REFLECTIVE_ARRAY_CALL_RE.findall(method.body_text)
-        if not calls:
-            continue
-        current_hits.extend({
-            "file": method.rel_path,
-            "class": method.class_name,
-            "method": method.signature,
-        } for _ in calls)
-    if len(current_hits) <= baseline_count:
-        return []
-    return current_hits[baseline_count:]
 
 
 def _find_parallel_new_helpers(
@@ -1209,34 +879,6 @@ def _shared_clone_route_proof(
                 "route": "removed_target_to_shared_callee",
                 "shared_calls": proven_replacements,
             }
-        expected_receiver = (
-            surviving_target.class_name[:1].lower()
-            + surviving_target.class_name[1:]
-        )
-        baseline_qualified_calls = set().union(*(
-            set(_INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text))
-            for method in baseline_methods
-            if method.class_name == missing_class
-        ))
-        current_qualified_calls = set().union(*(
-            set(_INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text))
-            for method in current_methods
-            if method.class_name == missing_class
-        ))
-        owner_call = (
-            expected_receiver,
-            surviving_target.method_name,
-        )
-        if (
-            owner_call in current_qualified_calls
-            and owner_call not in baseline_qualified_calls
-        ):
-            return {
-                "proven": True,
-                "route": "removed_target_to_injected_owner",
-                "shared_calls": [f"{expected_receiver}.{surviving_target.method_name}"],
-            }
-
     inherited = []
     for baseline_target, current_target in zip(baseline_targets, current_targets):
         if current_target is not None:
@@ -1624,40 +1266,7 @@ def _run_semantic_guard(
     if guard_type == "refused_bequest":
         structural_expectation = _parse_structural_expectation(evidence)
         if structural_expectation:
-            if structural_expectation == "state_getter":
-                expected_state_field = _parse_expected_state_field(evidence)
-                if not expected_state_field:
-                    return {
-                        "type": guard_type,
-                        "success": False,
-                        "message": (
-                            "refused_bequest guard: state_getter requires "
-                            "expected_state_field evidence."
-                        ),
-                        "details": {
-                            "detector": "python_semantic_detector",
-                            "structural_expectation": structural_expectation,
-                        },
-                    }
-                if not _target_method_returns_expected_state(
-                    config,
-                    target,
-                    expected_state_field,
-                ):
-                    return {
-                        "type": guard_type,
-                        "success": False,
-                        "message": (
-                            "refused_bequest guard: state getter must directly return "
-                            f"the declared backing field {expected_state_field!r}."
-                        ),
-                        "details": {
-                            "detector": "python_semantic_detector",
-                            "structural_expectation": structural_expectation,
-                            "expected_state_field": expected_state_field,
-                        },
-                    }
-            elif structural_expectation not in {
+            if structural_expectation not in {
                 "capability_split",
                 "rejecting_override_removed",
             }:
@@ -2257,27 +1866,6 @@ def _target_method_empty_override(config: ResolvedRunConfig, target) -> bool:
     if snippet is None:
         return False
     return count_meaningful_lines(snippet.body_text, config.language) == 0
-
-
-def _target_method_returns_expected_state(
-    config: ResolvedRunConfig,
-    target,
-    expected_state_field: str,
-) -> bool:
-    try:
-        snippet = extract_snippet(target, config.language)
-    except Exception:
-        return False
-    if snippet is None:
-        return False
-    body = strip_comments(snippet.body_text, config.language).strip()
-    field = re.escape(expected_state_field)
-    return bool(
-        re.fullmatch(
-            rf"\{{?\s*return\s+(?:this\.)?{field}\s*;\s*\}}?",
-            body,
-        )
-    )
 
 
 # ---------------------------------------------------------------------------

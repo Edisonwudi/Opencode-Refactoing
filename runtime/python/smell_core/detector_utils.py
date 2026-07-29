@@ -84,16 +84,6 @@ def parse_structural_expectation(evidence: str) -> str:
     return match.group(1).strip().lower() if match else ""
 
 
-def parse_expected_state_field(evidence: str) -> str:
-    """Extract the backing field required by a ``state_getter`` contract."""
-    match = re.search(
-        r"(?:^|;\s*)expected_state_field=([A-Za-z_$][A-Za-z0-9_$]*)",
-        evidence,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).strip() if match else ""
-
-
 def parse_target_parameter_count(evidence: str) -> Optional[int]:
     """Extract a pinned target-method arity used to distinguish Java overloads."""
     matches = re.findall(
