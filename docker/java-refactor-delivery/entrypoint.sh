@@ -90,6 +90,17 @@ if [[ "${1:-}" == "baseline-check" ]]; then
     "$@"
 fi
 
+if [[ "${1:-}" == "dependency-audit" ]]; then
+  shift
+  mkdir -p "$RUNS_ROOT"
+  if [[ "$(id -u)" == "0" && "$RUN_AS_USER" != "root" ]]; then
+    chown -R "$RUN_AS_USER:$RUN_AS_USER" "$RUNS_ROOT"
+    exec runuser -u "$RUN_AS_USER" -- \
+      python3 /opt/opencode-refactor/scripts/audit_java_image_dependencies.py "$@"
+  fi
+  exec python3 /opt/opencode-refactor/scripts/audit_java_image_dependencies.py "$@"
+fi
+
 if [[ "$MODEL_EGRESS_ONLY" != "1" ]]; then
   echo "MODEL_EGRESS_ONLY must remain enabled for this delivery image." >&2
   exit 64

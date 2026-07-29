@@ -15,6 +15,7 @@
     "check:bridge": "python3 -m py_compile runtime/python/bridge/smell_bridge.py",
     "check:plugin": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node .opencode/plugins/smell.ts",
     "check:maven-offline-repo": "python3 scripts/self_check_maven_offline_repo.py",
+    "check:image-dependencies": "python3 scripts/self_check_java_image_dependencies.py",
     "check:feature-envy-checkpoint": "python3 scripts/self_check_feature_envy_checkpoint.py",
     "check:checkpoint-contract": "python3 scripts/self_check_checkpoint_contract.py",
     "check:checkpoint-nonutf8": "python3 scripts/self_check_checkpoint_nonutf8_patch.py",
@@ -29,6 +30,6 @@
     "check:mounted-source": "bash scripts/self_check_mounted_source_contract.sh",
     "check:multilanguage-runner": "python3 scripts/self_check_multilanguage_runner.py && python3 scripts/self_check_nonjava_checkpoint.py",
     "check:self": "node scripts/self_check_smell_verify.mjs",
-    "check": "npm run check:bridge && npm run check:plugin && npm run check:maven-offline-repo && npm run check:checkpoint-contract && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:checkpoint-syntactic && npm run check:feature-envy-checkpoint && npm run check:checkpoint-relational && npm run check:checkpoint-semantic && npm run check:checkpoint-remaining && npm run check:runner-closure && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner"
+    "check": "npm run check:bridge && npm run check:plugin && npm run check:maven-offline-repo && npm run check:image-dependencies && npm run check:checkpoint-contract && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:checkpoint-syntactic && npm run check:feature-envy-checkpoint && npm run check:checkpoint-relational && npm run check:checkpoint-semantic && npm run check:checkpoint-remaining && npm run check:runner-closure && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner"
   }
 }

@@ -4,8 +4,13 @@ ARG SOURCE_IMAGE_TAG=opencode-java-refactor-delivery:0.1.3-r7.3.17-rb-loop-state
 ARG SOURCE_IMAGE_ID
 ARG DELIVERY_IMAGE_TAG=opencode-java-refactor-delivery:0.1.3-r7.3.18-main-refused-bequest-v1
 ARG MAIN_COMMIT
+ARG DATASET_SNAPSHOT=main-20260730
+ARG REFUSED_BEQUEST_CSV_SHA256=1d86919e64a3be4a25a67ff8cf6191312a0e04c6424fd6df029e8759272ee7ae
 
 USER root
+
+RUN rm -rf /opt/dataset/java/delivery_schema \
+  && install -d -m 0755 /opt/dataset/java/delivery_schema
 
 COPY .opencode/ /opt/opencode-refactor/.opencode/
 COPY runtime/python/ /opt/opencode-refactor/runtime/python/
@@ -14,7 +19,12 @@ COPY dataset/java/delivery_schema/ /opt/dataset/java/delivery_schema/
 COPY docker/java-refactor-delivery/entrypoint.sh \
   /usr/local/bin/run-java-refactor-delivery
 
-RUN chmod 0755 \
+RUN test "$(find /opt/dataset/java/delivery_schema -maxdepth 1 -type f \
+        -name 'refused_bequest*.csv' -printf '%f\n')" = "refused_bequest.csv" \
+  && echo "${REFUSED_BEQUEST_CSV_SHA256}  /opt/dataset/java/delivery_schema/refused_bequest.csv" \
+      | sha256sum -c - \
+  && chmod 0755 \
+      /opt/opencode-refactor/scripts/audit_java_image_dependencies.py \
       /opt/opencode-refactor/scripts/normalize_maven_offline_repo.py \
       /opt/opencode-refactor/scripts/run_smell_dataset.py \
       /opt/opencode-refactor/scripts/self_check_java_baselines.py \
@@ -38,6 +48,8 @@ LABEL org.opencontainers.refactor.source-image="${SOURCE_IMAGE_TAG}" \
       org.opencontainers.refactor.source-image-id="${SOURCE_IMAGE_ID}" \
       org.opencontainers.refactor.delivery-image="${DELIVERY_IMAGE_TAG}" \
       org.opencontainers.refactor.main-commit="${MAIN_COMMIT}" \
+      org.opencontainers.refactor.dataset-snapshot="${DATASET_SNAPSHOT}" \
+      org.opencontainers.refactor.refused-bequest-csv-sha256="${REFUSED_BEQUEST_CSV_SHA256}" \
       org.opencontainers.refactor.refused-bequest="capability-contract-v1"
 
 ENTRYPOINT ["/usr/local/bin/run-java-refactor-delivery"]
