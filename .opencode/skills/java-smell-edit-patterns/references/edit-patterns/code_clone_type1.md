@@ -36,6 +36,14 @@ or shared core.
 - The smell Oracle proves clone removal and convergence only. Architecture and
   implementation-quality concerns belong to existing project checks and final diff
   review; they must not be turned into sample-specific smell-guard vetoes.
+- Treat overload and override dispatch as behavior. If the original loop calls a
+  primitive overload or an overridable hook, reflection such as `Array.get`
+  produces boxed `Object` values and may select a different method. Keep the typed
+  call in each thin wrapper and share only the iteration/control flow, typically
+  through an index callback.
+- Preserve every side effect in the extracted block, including logging, interrupt
+  handling, metrics, and state-write order. Pass an existing logger or narrow
+  callback into the helper when it owns the shared catch path.
 
 ## Common avoid
 
@@ -243,6 +251,9 @@ Route-specific edit steps:
 4. If the targets are in different packages, use the helper's fully qualified
    package/import in both callers and compile immediately. Never delete or move
    the helper while call sites still reference it.
+5. Compare the extracted helper against the original block statement by statement.
+   Preserve warning/error logging and state-write order, not only return values and
+   thrown exception types.
 
 For duplicated state predicates in different inheritance branches, prefer a
 shared query helper that returns the result:
@@ -263,6 +274,11 @@ protected void updateEnabledState() {
 The two one-line wrappers are valid because the behavior has one implementation
 owner. Do not conclude that different inheritance branches make the clone
 unrefactorable when a parameterized query or command helper preserves behavior.
+
+Use the narrowest visibility that reaches both callers. A same-package helper
+should normally be package-private; make it public only when callers are in
+different packages and no existing shared owner is available. Utility classes
+should be `final` with a private constructor and no unused imports.
 
 Verification fit delta: Both clone sites should call the same helper rather than retain parallel bodies.
 
@@ -311,6 +327,29 @@ Route-specific edit steps:
 4. Confirm there is exactly one algorithm-bearing core. Two overloaded helpers
    with identical bodies are still a clone; replace them with one Object/reflection,
    indexed predicate, comparator, or other type-neutral core as appropriate.
+
+When the loop invokes primitive overloads or overridable hooks, prefer an indexed
+core so the wrapper retains the original statically typed call:
+
+```java
+private void forEachIndex(int length, IntConsumer action) {
+    for (int i = 0; i < length; i++) {
+        action.accept(i);
+    }
+}
+
+void append(boolean[] values) {
+    forEachIndex(values.length, i -> appendDetail(values[i]));
+}
+
+void append(short[] values) {
+    forEachIndex(values.length, i -> appendDetail(values[i]));
+}
+```
+
+Do not replace `appendDetail(boolean)` or `appendDetail(short)` with
+`appendDetail(Array.get(...))`: boxing changes overload selection and can bypass
+subclass overrides even when focused tests remain green.
 
 Verification fit delta: The large common body should exist only in the core method.
 
