@@ -1,5 +1,7 @@
-FROM opencode-java-refactor-delivery:0.1.3-r7.3.17-rb-loop-state-v1
+ARG BASE_IMAGE=opencode-java-refactor-delivery:0.1.3-r7.3.17-rb-loop-state-v1
+FROM ${BASE_IMAGE}
 
+ARG BASE_IMAGE
 ARG SOURCE_IMAGE_TAG=opencode-java-refactor-delivery:0.1.3-r7.3.17-rb-loop-state-v1
 ARG SOURCE_IMAGE_ID
 ARG DELIVERY_IMAGE_TAG=opencode-java-refactor-delivery:0.1.3-r7.3.18-main-refused-bequest-v1
@@ -46,6 +48,7 @@ RUN test "$(find /opt/dataset/java/delivery_schema -maxdepth 1 -type f \
 
 LABEL org.opencontainers.refactor.source-image="${SOURCE_IMAGE_TAG}" \
       org.opencontainers.refactor.source-image-id="${SOURCE_IMAGE_ID}" \
+      org.opencontainers.refactor.base-image="${BASE_IMAGE}" \
       org.opencontainers.refactor.delivery-image="${DELIVERY_IMAGE_TAG}" \
       org.opencontainers.refactor.main-commit="${MAIN_COMMIT}" \
       org.opencontainers.refactor.dataset-snapshot="${DATASET_SNAPSHOT}" \

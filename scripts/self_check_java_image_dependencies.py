@@ -44,6 +44,9 @@ def check_dataset_snapshot_contract() -> None:
     assert cleanup in dockerfile
     assert snapshot_copy in dockerfile
     assert dockerfile.index(cleanup) < dockerfile.index(snapshot_copy)
+    assert dockerfile.startswith("ARG BASE_IMAGE=")
+    assert "FROM ${BASE_IMAGE}" in dockerfile
+    assert "org.opencontainers.refactor.base-image=" in dockerfile
     assert f"ARG REFUSED_BEQUEST_CSV_SHA256={refused_sha256}" in dockerfile
     assert "org.opencontainers.refactor.dataset-snapshot=" in dockerfile
     assert "org.opencontainers.refactor.refused-bequest-csv-sha256=" in dockerfile
