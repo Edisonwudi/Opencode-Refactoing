@@ -100,6 +100,40 @@ class Owner {{
   static void consume(int value) {{}}
 }}
 """
+REMOVED_TARGET_FIELD_OWNER_AFTER = f"""\
+class Client {{
+  private final Owner owner = new Owner();
+  void run() {{ owner.draw(); }}
+  void consume(int value) {{}}
+}}
+class Owner {{
+  void draw() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+REMOVED_TARGET_NULL_FIELD_OWNER_AFTER = f"""\
+class Client {{
+  private Owner owner;
+  Client() {{ this.owner = null; }}
+  void run() {{ owner.draw(); }}
+  void consume(int value) {{}}
+}}
+class Owner {{
+  void draw() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+REMOVED_TARGET_FIELD_OWNER_BEFORE = f"""\
+class Client {{
+  void run() {{ draw(); }}
+  void draw() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+class Owner {{
+  void draw() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
 CLONE_AFTER = f"""\
 class Fixture {{
   void left() {{ shared(); }}
@@ -480,6 +514,13 @@ def main() -> int:
         "tokens=30; group_size=2",
         "clone_token_count",
     )
+    removed_target_field_owner_clone = _case(
+        "code_clone_type1", REMOVED_TARGET_FIELD_OWNER_BEFORE, REMOVED_TARGET_FIELD_OWNER_AFTER,
+        "Fixture.java:method=draw|line=3 <-> Fixture.java:method=draw|line=8",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+        rejected_intermediates=(REMOVED_TARGET_NULL_FIELD_OWNER_AFTER,),
+    )
     scoped_overload_clone = _case(
         "code_clone_type1", OVERLOAD_BEFORE, OVERLOAD_SCOPED_AFTER,
         "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
@@ -504,6 +545,7 @@ def main() -> int:
         f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g} "
         f"qualified_owner_clone={qualified_owner_clone[0]:g}->{qualified_owner_clone[1]:g} "
         f"removed_target_clone={removed_target_clone[0]:g}->{removed_target_clone[1]:g} "
+        f"removed_target_field_owner_clone={removed_target_field_owner_clone[0]:g}->{removed_target_field_owner_clone[1]:g} "
         f"scoped_overload_clone={scoped_overload_clone[0]:g}->{scoped_overload_clone[1]:g} "
         f"existing_family_clone={existing_family_clone[0]:g}->{existing_family_clone[1]:g}"
     )

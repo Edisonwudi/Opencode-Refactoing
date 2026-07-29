@@ -37,6 +37,9 @@ or shared core.
 - Replacing explicit dependency injection with a global application-context or
   service-locator lookup. Follow the project's established constructor/field
   injection and update construction sites narrowly when required.
+- Keeping a compatibility constructor that assigns the new owner dependency to
+  `null`, even if a setter may inject it later. Make the dependency required and
+  update construction sites or fixtures mechanically.
 
 ## Routes
 
@@ -118,7 +121,10 @@ Route-specific edit steps:
 
 1. Identify the clone side or nearby service that already owns the behavior.
 2. Expose or reuse a narrow owner method for the duplicated operation.
-3. Replace the non-owner clone with a call to that owner.
+3. Inject the owner using the project's established required constructor/field
+   pattern and replace the non-owner clone with a call to that owner.
+4. Update affected construction sites and test fixtures; do not keep an overload
+   that initializes the owner to `null`.
 
 Verification fit delta: The non-owner target should no longer duplicate owner logic.
 

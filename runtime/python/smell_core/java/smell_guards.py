@@ -534,6 +534,23 @@ def _verify_clone_structural_resolution(
             },
         }
 
+    new_nullable_dependencies = _find_new_nullable_dependencies(
+        baseline_methods,
+        current_methods,
+    )
+    if new_nullable_dependencies:
+        return {
+            "success": False,
+            "message": (
+                "the refactoring introduced a dependency assigned to null and later "
+                "dereferenced; use required constructor injection and update callers."
+            ),
+            "details": {
+                "structural_resolution": "new_nullable_dependency",
+                "nullable_dependencies": new_nullable_dependencies,
+            },
+        }
+
     moved = _find_moved_clone_occurrences(
         baseline_methods,
         current_methods,
@@ -960,6 +977,12 @@ _SERVICE_LOCATOR_CALL_RE = re.compile(
     r"\b(?:ApplicationContextProvider|ApplicationContextHolder|SpringContext|"
     r"ServiceLocator|BeanFactory)\s*\.\s*(?:getBean|getService|resolve)\s*\("
 )
+_NULL_FIELD_ASSIGNMENT_RE = re.compile(
+    r"\bthis\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*null\s*;"
+)
+_INSTANCE_QUALIFIED_CALL_RE = re.compile(
+    r"\b([a-z_$][A-Za-z0-9_$]*)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
 
 
 def _find_new_service_locator_calls(
@@ -980,6 +1003,35 @@ def _find_new_service_locator_calls(
             "method": current_target.signature,
             "count": after - before,
         })
+    return introduced
+
+
+def _find_new_nullable_dependencies(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+) -> List[Dict[str, object]]:
+    baseline_assignments = {
+        (method.rel_path, method.class_name, field_name)
+        for method in baseline_methods
+        for field_name in _NULL_FIELD_ASSIGNMENT_RE.findall(method.body_text)
+    }
+    dereferenced = {
+        (method.rel_path, method.class_name, receiver)
+        for method in current_methods
+        for receiver, _ in _INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text)
+    }
+    introduced = []
+    for method in current_methods:
+        for field_name in _NULL_FIELD_ASSIGNMENT_RE.findall(method.body_text):
+            key = (method.rel_path, method.class_name, field_name)
+            if key in baseline_assignments or key not in dereferenced:
+                continue
+            introduced.append({
+                "file": method.rel_path,
+                "class": method.class_name,
+                "method": method.signature,
+                "field": field_name,
+            })
     return introduced
 
 
@@ -1156,6 +1208,33 @@ def _shared_clone_route_proof(
                 "proven": True,
                 "route": "removed_target_to_shared_callee",
                 "shared_calls": proven_replacements,
+            }
+        expected_receiver = (
+            surviving_target.class_name[:1].lower()
+            + surviving_target.class_name[1:]
+        )
+        baseline_qualified_calls = set().union(*(
+            set(_INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text))
+            for method in baseline_methods
+            if method.class_name == missing_class
+        ))
+        current_qualified_calls = set().union(*(
+            set(_INSTANCE_QUALIFIED_CALL_RE.findall(method.body_text))
+            for method in current_methods
+            if method.class_name == missing_class
+        ))
+        owner_call = (
+            expected_receiver,
+            surviving_target.method_name,
+        )
+        if (
+            owner_call in current_qualified_calls
+            and owner_call not in baseline_qualified_calls
+        ):
+            return {
+                "proven": True,
+                "route": "removed_target_to_injected_owner",
+                "shared_calls": [f"{expected_receiver}.{surviving_target.method_name}"],
             }
 
     inherited = []
