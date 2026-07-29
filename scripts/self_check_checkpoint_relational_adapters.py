@@ -86,6 +86,20 @@ class Fixture {{
   void consume(int value) {{}}
 }}
 """
+CLONE_WITH_SERVICE_LOCATOR_DELEGATION = f"""\
+class Fixture {{
+  void left() {{ ApplicationContextProvider.getBean(Owner.class).shared(); }}
+  void right() {{ Owner.shared(); }}
+  void consume(int value) {{}}
+}}
+class ApplicationContextProvider {{
+  static Owner getBean(Class<?> type) {{ return new Owner(); }}
+}}
+class Owner {{
+  static void shared() {{ {CLONE_BODY} }}
+  static void consume(int value) {{}}
+}}
+"""
 CLONE_AFTER = f"""\
 class Fixture {{
   void left() {{ shared(); }}
@@ -426,6 +440,7 @@ def main() -> int:
             CLONE_WITH_OBJECT_PRIMITIVE_DISPATCH,
             CLONE_WITH_BOXING_INDEX_ADAPTER,
             CLONE_WITH_DELEGATING_FALLBACK,
+            CLONE_WITH_SERVICE_LOCATOR_DELEGATION,
         ),
     )
     parent_clone = _case(

@@ -165,6 +165,7 @@ code_clone_type1:
       - "Use this path when source inspection proves an existing owner already provides the duplicated behavior. Do not create a second helper just to satisfy the clone smell."
       - "Dependency injection, constructors, and test fixtures may need narrow direct_edit follow-up because IDEA structural insertion does not know framework wiring."
       - "Do not add nullable injection and retain the original clone as a fallback. Establish one reliable owner route and remove the superseded body."
+      - "Use the project's established constructor or field injection. Do not replace explicit wiring with ApplicationContextProvider/getBean or another global service locator."
       - "Do not widen a private or protected method to public solely to make delegation convenient; preserve the public API and use the narrowest valid owner/helper visibility."
   - id: type-variant-shared-core-clone
     when: "the clones are same-class overloads that differ mainly by primitive or narrow value type, so keep the public overload API and extract only a private shared core with type-specific adapters"

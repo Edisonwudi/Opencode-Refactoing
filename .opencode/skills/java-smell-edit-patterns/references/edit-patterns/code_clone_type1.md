@@ -10,6 +10,9 @@ or shared core.
 
 - Prefer the smallest production diff that gives both reported clone sites one shared
   implementation owner.
+- Resolve the exact methods or constructors containing both line anchors before
+  editing. Do not refactor a nearby similar method when the labeled target is a
+  constructor.
 - Choose one fitting route, edit only the reported pair, and call `smell_verify`
   before broadening the change.
 - The final pair must share a callee, delegate to an existing owner, or inherit one
@@ -31,6 +34,9 @@ or shared core.
 - Widening a production method from private/protected to public only to make
   delegation convenient. Prefer an existing owner, inheritance, or the narrowest
   package-visible helper that preserves the public API.
+- Replacing explicit dependency injection with a global application-context or
+  service-locator lookup. Follow the project's established constructor/field
+  injection and update construction sites narrowly when required.
 
 ## Routes
 
@@ -69,6 +75,10 @@ Route-specific edit steps:
    parent classes as needed; siblings do not have to name the common owner directly.
 2. Add the common implementation to the parent with the narrowest usable visibility.
 3. Delete child overrides that now inherit the parent behavior.
+
+For constructor clones, move the shared fields and initialization to the common
+parent constructor, then delegate from both child constructors with `super(...)`.
+Do not edit neighboring ordinary methods merely because they also look similar.
 
 Verification fit delta: The clone disappears because the duplicated child bodies no longer exist.
 

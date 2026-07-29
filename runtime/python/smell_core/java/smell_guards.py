@@ -517,6 +517,23 @@ def _verify_clone_structural_resolution(
             },
         }
 
+    new_service_locator_calls = _find_new_service_locator_calls(
+        baseline_targets,
+        current_targets,
+    )
+    if new_service_locator_calls:
+        return {
+            "success": False,
+            "message": (
+                "the refactoring introduced runtime service-locator delegation; "
+                "preserve the project's explicit dependency-injection route."
+            ),
+            "details": {
+                "structural_resolution": "new_service_locator_delegation",
+                "service_locator_calls": new_service_locator_calls,
+            },
+        }
+
     moved = _find_moved_clone_occurrences(
         baseline_methods,
         current_methods,
@@ -937,6 +954,33 @@ def _contains_token_subsequence(tokens: List[str], candidate: List[str]) -> bool
         return False
     width = len(candidate)
     return any(tokens[index:index + width] == candidate for index in range(len(tokens) - width + 1))
+
+
+_SERVICE_LOCATOR_CALL_RE = re.compile(
+    r"\b(?:ApplicationContextProvider|ApplicationContextHolder|SpringContext|"
+    r"ServiceLocator|BeanFactory)\s*\.\s*(?:getBean|getService|resolve)\s*\("
+)
+
+
+def _find_new_service_locator_calls(
+    baseline_targets: List[JavaMethodInfo],
+    current_targets: List[Optional[JavaMethodInfo]],
+) -> List[Dict[str, object]]:
+    introduced = []
+    for baseline_target, current_target in zip(baseline_targets, current_targets):
+        if current_target is None:
+            continue
+        before = len(_SERVICE_LOCATOR_CALL_RE.findall(baseline_target.body_text))
+        after = len(_SERVICE_LOCATOR_CALL_RE.findall(current_target.body_text))
+        if after <= before:
+            continue
+        introduced.append({
+            "file": current_target.rel_path,
+            "class": current_target.class_name,
+            "method": current_target.signature,
+            "count": after - before,
+        })
+    return introduced
 
 
 def _find_new_reflective_array_calls(
