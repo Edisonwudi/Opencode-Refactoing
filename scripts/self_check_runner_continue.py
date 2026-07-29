@@ -431,13 +431,25 @@ check_true(
 )
 check_true(
     "refused_skill_requires_impact_ledger",
-    "generated `capability_impact_map` before the first edit" in refused_skill
+    "Call `smell_plan` before the first edit" in refused_skill
     and "manually resolve every receiver marked `unresolved`" in refused_skill,
 )
 check_true(
     "refused_skill_batches_compile_closure",
     "complete diagnostic set into one" in refused_skill
     and "repair all related sites in one pass" in refused_skill,
+)
+check_true(
+    "refused_skill_avoids_broad_alias_and_downcasts",
+    "making it extend every new narrow capability" in refused_skill
+    and "scatter downcasts" in refused_skill,
+)
+java_agent = (ROOT / ".opencode" / "agents" / "java-refactor-agent.md").read_text(encoding="utf-8")
+idea_agent = (ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md").read_text(encoding="utf-8")
+check_true(
+    "java_agents_call_capability_plan",
+    "call `smell_plan` before the" in java_agent
+    and "call `smell_plan` before the" in idea_agent,
 )
 
 print()

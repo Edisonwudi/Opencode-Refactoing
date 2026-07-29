@@ -67,11 +67,12 @@ Apply this protocol whenever evidence supplies `structural_expectation`, especia
 
 ## Capability migration closure
 
-For a structural route, finish one coherent migration batch before the first
-`smell_verify` instead of alternating between body-level edits and verification:
+For a structural route, form one coherent closure plan before editing, then use
+`smell_verify` early enough to catch a wrong ownership model before broad caller
+rewrites:
 
-1. Read the command's generated `capability_impact_map` before the first edit. When
-   working outside the command flow, call `smell_plan` to obtain the same map. Use its
+1. Call `smell_plan` before the first edit and read its generated
+   `capability_impact_map`. Use its
    contract declarations, concrete implementers, and production call sites as the
    impact ledger; manually resolve every receiver marked `unresolved`.
 2. Prefer an existing narrow capability or concrete subtype. If a new capability is
@@ -88,11 +89,18 @@ For a structural route, finish one coherent migration batch before the first
    inventory. Preserve target-declared entries and constructors. For inherited entries,
    distinguish unwanted inherited capabilities from API that production callers still use;
    never remove a used entry merely to keep the hierarchy split small.
-5. Before verification, search the whole production tree for the old contract and target
-   signature. Confirm that real implementers retain the capability and refusing types do
-   not receive a default, placeholder, duplicate declaration, or unchecked-cast escape
-   hatch.
-6. If `smell_verify` reports compilation errors, turn the complete diagnostic set into one
+5. Do not preserve the broad contract by making it extend every new narrow capability:
+   that leaves refusing types exposed to the same operation. Do not make a private
+   concrete subtype public or scatter downcasts to that implementation across callers.
+   Prefer a narrow capability type that real implementers explicitly implement and that
+   callers can name without knowing the concrete subtype.
+6. After changing the capability declaration and one representative implementer/caller
+   path, call `smell_verify`. A compile failure is an impact-ledger update, not a reason
+   to restore the broad capability or add casts. Before final verification, search the
+   whole production tree for the old contract and target signature. Confirm that real
+   implementers retain the capability and refusing types do not receive a default,
+   placeholder, duplicate declaration, or unchecked-cast escape hatch.
+7. If `smell_verify` reports compilation errors, turn the complete diagnostic set into one
    closure worklist. Search for every occurrence of the unresolved or inaccessible symbol,
    repair all related sites in one pass, and only then verify again. Do not spend one
    continuation fixing one occurrence at a time.
