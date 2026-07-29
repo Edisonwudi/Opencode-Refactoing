@@ -5,6 +5,7 @@
 # - same-file-exact-clone
 # - shared-parent-pull-up-clone
 # - child-owned-lifecycle-helper-clone
+# - child-owned-identity-sentinel-helper-clone
 # - different-parent-shared-helper-clone
 # - existing-owner-delegation-clone
 # - type-variant-shared-core-clone
@@ -134,6 +135,48 @@ code_clone_type1:
       - "Choose this route before shared-parent-pull-up-clone when child-declared state, reflection, serialization, framework wiring, or lifecycle order is observable."
       - "A no-progress result means the original blocks were not replaced. Do not respond by moving the child fields; replace each duplicated block with the shared call."
       - "Keep logging, exception handling, and the position of super.stop() equivalent to the original methods."
+  - id: child-owned-identity-sentinel-helper-clone
+    when: "two methods duplicate an identity-sentinel unwrap/check, and each original owner declares its own sentinel instance"
+    before: |
+      /* FirstChild.java */
+      private final Position nullPosition = new Position() {};
+      public Position getPosition(Key key) {
+          Position value = super.getPosition(key);
+          if (value == nullPosition) {
+              return null;
+          }
+          return value;
+      }
+
+      /* SecondChild.java has its own nullPosition instance and the same unwrap. */
+    actions:
+      - op: idea_edit
+        argument_contract: "Add exactly one helper to a shared parent or package owner. It must accept both the retrieved value and the caller's existing sentinel, compare them with ==, and must not declare a sentinel field."
+        cli_steps:
+          - idea_edit(file="<shared-parent-or-helper.java>", oldString=<unique exact insertion block>, newString=<same block plus unwrapSentinel(value, ownerSentinel)>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "Keep each sentinel field in its original child. Replace only the multi-line unwrap block with unwrapSentinel(super.getPosition(key), nullPosition)."
+        cli_steps:
+          - idea_edit(file="<first-child.java>", oldString=<exact unwrap block>, newString=<shared helper call>, replaceAll=false)
+          - idea_edit(file="<second-child.java>", oldString=<exact unwrap block>, newString=<shared helper call>, replaceAll=false)
+    after: |
+      /* Shared parent or helper */
+      protected static <T> T unwrapSentinel(T value, T ownerSentinel) {
+          return value == ownerSentinel ? null : value;
+      }
+
+      /* FirstChild.java */
+      private final Position nullPosition = new Position() {}; // remains here
+      public Position getPosition(Key key) {
+          return unwrapSentinel(super.getPosition(key), nullPosition);
+      }
+
+      /* SecondChild.java keeps its distinct sentinel and uses the same helper. */
+    source: { project: synthetic-refactor-paths, class: Parent / FirstChild / SecondChild, verified: "synthetic" }
+    notes:
+      - "This is the default route when identity is observed with == or tests/reflection expect the sentinel to remain declared in each child."
+      - "Do not add a parent sentinel, shared singleton sentinel, or virtual sentinel accessor. Pass the original child-owned object explicitly."
+      - "The short wrappers are valid shared-callee delegates and preserve each owner's identity semantics."
   - id: different-parent-shared-helper-clone
     when: "the clones live under different parent branches with no good superclass target, so the shared behavior should move to an external helper"
     before: |

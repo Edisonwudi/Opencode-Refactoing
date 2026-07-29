@@ -171,6 +171,60 @@ Avoid: Do not convert this route into `shared-parent-pull-up-clone` after a
 no-progress result. A no-progress result means both original clone blocks still
 exist; replace those blocks with the helper call rather than moving fields.
 
+### `child-owned-identity-sentinel-helper-clone`
+
+When: two methods duplicate an identity-sentinel unwrap/check, and each original
+owner declares its own sentinel instance
+
+Direct edit target: Keep every sentinel declared in its original class and move
+only the comparison algorithm to one parameterized helper.
+
+Generic shape:
+
+```java
+abstract class Parent {
+    protected static <T> T unwrapSentinel(T value, T ownerSentinel) {
+        return value == ownerSentinel ? null : value;
+    }
+}
+
+final class FirstChild extends Parent {
+    private final Position nullPosition = new Position() {}; // remains here
+
+    @Override
+    public Position getPosition(Key key) {
+        return unwrapSentinel(super.getPosition(key), nullPosition);
+    }
+}
+
+final class SecondChild extends Parent {
+    private final Position nullPosition = new Position() {}; // remains here
+
+    @Override
+    public Position getPosition(Key key) {
+        return unwrapSentinel(super.getPosition(key), nullPosition);
+    }
+}
+```
+
+The two short wrappers preserve dynamic ownership of each sentinel while the
+identity comparison has one implementation owner. This is the default route when
+tests, reflection, serialization, or other code observe the child declaration.
+
+Route-specific edit steps:
+
+1. Locate every declaration and use of each sentinel. Do not delete, rename, or
+   relocate those fields.
+2. Add exactly one helper receiving both the retrieved value and the current
+   owner's sentinel.
+3. Replace each original multi-line unwrap block with one helper call.
+4. Run the focused behavior tests that insert or retrieve the sentinel and confirm
+   it is still converted using `==`.
+
+Avoid: Do not introduce a parent sentinel, a shared singleton sentinel, or a
+virtual sentinel accessor merely to enable the extraction. Those alternatives
+change object identity or class shape. Pass the original object explicitly.
+
 ### `different-parent-shared-helper-clone`
 
 When: the clones live under different parent branches with no good superclass target, so the
