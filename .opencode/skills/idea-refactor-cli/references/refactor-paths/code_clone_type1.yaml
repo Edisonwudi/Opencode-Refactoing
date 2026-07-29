@@ -4,6 +4,7 @@
 # Entry ids:
 # - same-file-exact-clone
 # - shared-parent-pull-up-clone
+# - child-owned-lifecycle-helper-clone
 # - different-parent-shared-helper-clone
 # - existing-owner-delegation-clone
 # - type-variant-shared-core-clone
@@ -79,6 +80,59 @@ code_clone_type1:
       - "For duplicated constructor initialization, move shared state initialization to the real parent constructor and make both child constructors delegate with super(...)."
       - "Before moving behavior or fields, inspect every direct and transitive non-target child. Do not pull up state when that changes unrelated descendants, reflection or serialization shape, framework wiring, or lifecycle side-effect order."
       - "When child-owned fields or ordering must remain local, keep both overrides and fields in place, add one protected parameterized helper to the parent, call it at the original point in each override, and preserve the surrounding super-call order."
+      - "If both children already declare same-named resource fields, do not remove or relocate those declarations. Select child-owned-lifecycle-helper-clone instead of completing a field pull-up."
+  - id: child-owned-lifecycle-helper-clone
+    when: "sibling lifecycle methods duplicate resource cleanup or setup, but each child owns the fields and must retain declaration shape and super-call order"
+    before: |
+      /* FirstChild.java */
+      protected Connection connection;
+      protected Cache cache;
+      public void stop() {
+          if (connection != null) {
+              connection.disconnect();
+          }
+          if (cache != null) {
+              cache.clear();
+          }
+          super.stop();
+      }
+
+      /* SecondChild.java declares the same field names and cleanup sequence. */
+    actions:
+      - op: idea_edit
+        argument_contract: "Add one protected parameterized lifecycle helper to the closest shared parent. The helper receives the child-owned resources; it must not introduce or move resource fields."
+        cli_steps:
+          - idea_edit(file="<shared-parent.java>", oldString=<unique exact insertion block>, newString=<same block plus one protected helper accepting the resources>, replaceAll=false)
+      - op: idea_edit
+        argument_contract: "In each target child, preserve the field declarations and the surrounding lifecycle method. Replace only the duplicated block with a call to the shared helper at the same position."
+        cli_steps:
+          - idea_edit(file="<first-child.java>", oldString=<exact duplicated block>, newString=<shared helper call>, replaceAll=false)
+          - idea_edit(file="<second-child.java>", oldString=<exact duplicated block>, newString=<shared helper call>, replaceAll=false)
+    after: |
+      /* SharedParent.java */
+      protected final void cleanupResources(Connection connection, Cache cache) {
+          if (connection != null) {
+              connection.disconnect();
+          }
+          if (cache != null) {
+              cache.clear();
+          }
+      }
+
+      /* FirstChild.java */
+      protected Connection connection; // declaration remains in this child
+      protected Cache cache;            // declaration remains in this child
+      public void stop() {
+          cleanupResources(connection, cache);
+          super.stop();                 // original order is preserved
+      }
+
+      /* SecondChild.java uses the same helper and retains its own fields. */
+    source: { project: synthetic-refactor-paths, class: SharedParent / FirstChild / SecondChild, verified: "synthetic" }
+    notes:
+      - "Choose this route before shared-parent-pull-up-clone when child-declared state, reflection, serialization, framework wiring, or lifecycle order is observable."
+      - "A no-progress result means the original blocks were not replaced. Do not respond by moving the child fields; replace each duplicated block with the shared call."
+      - "Keep logging, exception handling, and the position of super.stop() equivalent to the original methods."
   - id: different-parent-shared-helper-clone
     when: "the clones live under different parent branches with no good superclass target, so the shared behavior should move to an external helper"
     before: |

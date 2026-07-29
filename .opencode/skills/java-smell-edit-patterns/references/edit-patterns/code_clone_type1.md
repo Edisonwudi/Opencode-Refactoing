@@ -21,6 +21,11 @@ or shared core.
   shape, framework wiring, or lifecycle side-effect order. In that case, put a
   narrow parameterized helper in the shared parent or package and let both
   original owners call it at the same point in their existing sequence.
+- If both target children already declare same-named resource fields, treat
+  declaration ownership as part of the existing class contract. Do not remove,
+  shadow, or relocate those fields merely to make a parent method compile.
+  Extract the duplicated operations into one helper that accepts the child-owned
+  resources as parameters.
 - The final pair must share a callee, delegate to an existing owner, or inherit one
   parent implementation while preserving behavior and public signatures.
 - The smell Oracle proves clone removal and convergence only. Architecture and
@@ -100,6 +105,66 @@ Verification fit delta: The clone disappears because the duplicated child bodies
 Avoid: Do not force a pull-up merely because a common parent exists. A parent
 helper is preferable when the full behavior or state is not universal across
 the hierarchy.
+
+### `child-owned-lifecycle-helper-clone`
+
+When: sibling lifecycle methods duplicate cleanup or setup logic, but each child
+owns the resource fields and must retain its declaration shape and surrounding
+lifecycle order
+
+Direct edit target: Keep each child field and override, extract one parameterized
+helper to the closest shared parent or package helper, and replace only the
+duplicated block with a call.
+
+Source operation shape: `idea_edit`. See
+[`operation-translations.md`](operation-translations.md) for reusable mechanics.
+
+Generic shape:
+
+```java
+abstract class Parent {
+    protected final void cleanupResources(Connection connection, Cache cache) {
+        if (connection != null) {
+            connection.disconnect();
+        }
+        if (cache != null) {
+            cache.clear();
+        }
+    }
+}
+
+final class FirstChild extends Parent {
+    protected Connection connection; // remains declared here
+    protected Cache cache;            // remains declared here
+
+    @Override
+    public void stop() {
+        cleanupResources(connection, cache);
+        super.stop(); // remains in its original position
+    }
+}
+```
+
+Apply the same call in the other target child. The two short delegating wrappers
+are acceptable: the duplicated algorithm now has one implementation owner, while
+the child-specific state and lifecycle contract remain intact.
+
+Route-specific edit steps:
+
+1. Inspect both complete lifecycle methods, their declared fields, all assignments,
+   and the position of `super` calls.
+2. Add one helper with explicit resource parameters and the narrowest shared
+   visibility.
+3. Replace only the duplicated operations in each child with the shared call.
+4. Confirm the child fields are still declared in their original classes and the
+   `super` call and exception/logging order have not moved.
+
+Verification fit delta: The original multi-statement clone is replaced by calls
+to one implementation; no state is pulled into the parent.
+
+Avoid: Do not convert this route into `shared-parent-pull-up-clone` after a
+no-progress result. A no-progress result means both original clone blocks still
+exist; replace those blocks with the helper call rather than moving fields.
 
 ### `different-parent-shared-helper-clone`
 
