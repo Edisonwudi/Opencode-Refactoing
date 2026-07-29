@@ -45,6 +45,7 @@ from .syntactic_detector import (
     find_matching_syntactic_finding,
     load_java_source_model,
     load_project_model,
+    mask_comments_and_strings,
     parse_mysterious_evidence,
     run_java_syntactic_detector,
     tokenize_clone,
@@ -384,6 +385,14 @@ def run_java_clone_guard(
 _CALL_RE = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(")
 _QUALIFIED_CALL_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9_$]*)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
+_INSTANCE_CALL_RE = re.compile(
+    r"\b([a-z_$][A-Za-z0-9_$]*)\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
+_DECLARED_REFERENCE_RE = re.compile(
+    r"\b((?:[a-z_$][A-Za-z0-9_$]*\.)*[A-Z_$][A-Za-z0-9_$]*"
+    r"(?:\s*<[^;={}()]+>)?(?:\s*\[\])*)"
+    r"\s+([a-z_$][A-Za-z0-9_$]*)\s*(?=[;=,)])"
 )
 _NON_DELEGATION_CALLS = {
     "if", "for", "while", "switch", "catch", "synchronized", "try",
@@ -868,6 +877,18 @@ def _shared_clone_route_proof(
         missing_index = missing_indexes[0]
         surviving_index = 1 - missing_index
         surviving_target = current_targets[surviving_index]
+        owner_delegation = _proven_removed_target_owner_delegation(
+            baseline_methods,
+            current_methods,
+            baseline_targets[missing_index],
+            surviving_target,
+        )
+        if owner_delegation:
+            return {
+                "proven": True,
+                "route": "removed_target_to_existing_owner",
+                "shared_calls": owner_delegation,
+            }
         missing_class = baseline_targets[missing_index].class_name
         baseline_class_calls = set().union(*(
             _method_calls(method)
@@ -927,6 +948,130 @@ def _shared_clone_route_proof(
         "current_left_calls": sorted(_method_calls(left)),
         "current_right_calls": sorted(_method_calls(right)),
     }
+
+
+def _proven_removed_target_owner_delegation(
+    baseline_methods: List[JavaMethodInfo],
+    current_methods: List[JavaMethodInfo],
+    missing_target: JavaMethodInfo,
+    surviving_target: Optional[JavaMethodInfo],
+) -> List[str]:
+    """Prove that callers of a deleted clone target were retargeted to its peer owner."""
+    if surviving_target is None:
+        return []
+    owner_methods = [
+        method
+        for method in current_methods
+        if method.class_name == surviving_target.class_name
+        and method.method_name == surviving_target.method_name
+    ]
+    if not any(_method_identity(method) == _method_identity(surviving_target) for method in owner_methods):
+        return []
+
+    baseline_by_identity = {
+        _method_identity(method): method
+        for method in baseline_methods
+    }
+    current_callers = [
+        method
+        for method in current_methods
+        if method.class_name == missing_target.class_name
+        and _normalize_path(method.rel_path) == _normalize_path(missing_target.rel_path)
+    ]
+    if not current_callers:
+        return []
+    try:
+        current_source = current_callers[0].file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    receiver_types = _declared_reference_types(current_source)
+    target_arity = len(surviving_target.parameter_names)
+    same_arity_owner_methods = [
+        method
+        for method in owner_methods
+        if len(method.parameter_names) == target_arity
+    ]
+    overload_is_resolved = (
+        len(owner_methods) == 1
+        or (
+            len(same_arity_owner_methods) == 1
+            and _method_identity(same_arity_owner_methods[0]) == _method_identity(surviving_target)
+        )
+    )
+    if not overload_is_resolved:
+        return []
+
+    proven: set[str] = set()
+    for current_caller in current_callers:
+        baseline_caller = baseline_by_identity.get(_method_identity(current_caller))
+        if (
+            baseline_caller is None
+            or missing_target.method_name not in _method_calls(baseline_caller)
+        ):
+            continue
+        baseline_instance_calls = set(_instance_calls(baseline_caller.body_text))
+        for receiver, call_name, arity in _instance_calls(current_caller.body_text):
+            if (
+                call_name != surviving_target.method_name
+                or arity != target_arity
+                or (receiver, call_name, arity) in baseline_instance_calls
+                or surviving_target.class_name not in receiver_types.get(receiver, set())
+            ):
+                continue
+            proven.add(f"{surviving_target.class_name}.{call_name}")
+    return sorted(proven)
+
+
+def _declared_reference_types(source: str) -> Dict[str, set[str]]:
+    masked = mask_comments_and_strings(source)
+    declared: Dict[str, set[str]] = {}
+    for raw_type, name in _DECLARED_REFERENCE_RE.findall(masked):
+        simple_type = re.sub(r"<.*>", "", raw_type).replace("[]", "").strip().split(".")[-1]
+        if simple_type:
+            declared.setdefault(name, set()).add(simple_type)
+    return declared
+
+
+def _instance_calls(body_text: str) -> List[Tuple[str, str, int]]:
+    masked = mask_comments_and_strings(body_text)
+    calls: List[Tuple[str, str, int]] = []
+    for match in _INSTANCE_CALL_RE.finditer(masked):
+        arity = _call_argument_count(masked, match.end() - 1)
+        if arity is not None:
+            calls.append((match.group(1), match.group(2), arity))
+    return calls
+
+
+def _call_argument_count(text: str, open_paren: int) -> Optional[int]:
+    depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    commas = 0
+    has_argument = False
+    for index in range(open_paren + 1, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+            has_argument = True
+        elif char == ")":
+            if depth == 0:
+                return commas + 1 if has_argument else 0
+            depth -= 1
+        elif char == "[":
+            bracket_depth += 1
+            has_argument = True
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif char == "{":
+            brace_depth += 1
+            has_argument = True
+        elif char == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif char == "," and depth == 0 and bracket_depth == 0 and brace_depth == 0:
+            commas += 1
+        elif not char.isspace():
+            has_argument = True
+    return None
 
 
 def _find_inherited_method(

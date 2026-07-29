@@ -208,6 +208,29 @@ class Owner {{
   static void consume(int value) {{}}
 }}
 """
+REMOVED_TARGET_INSTANCE_OWNER_AFTER = f"""\
+class Left {{
+  private final Owner owner = new Owner();
+  void run() {{ owner.right(); }}
+  void consume(int value) {{}}
+}}
+class Owner {{
+  void right() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
+REMOVED_TARGET_UNRELATED_CALL_AFTER = f"""\
+class Left {{
+  private final Owner owner = new Owner();
+  void run() {{}}
+  void observe() {{ owner.right(); }}
+  void consume(int value) {{}}
+}}
+class Owner {{
+  void right() {{ {CLONE_BODY} }}
+  void consume(int value) {{}}
+}}
+"""
 OVERLOAD_BEFORE = f"""\
 class Fixture {{
   void work(int[] values) {{ {CLONE_BODY} }}
@@ -477,6 +500,13 @@ def main() -> int:
         "tokens=30; group_size=2",
         "clone_token_count",
     )
+    removed_target_instance_owner_clone = _case(
+        "code_clone_type1", REMOVED_TARGET_BEFORE, REMOVED_TARGET_INSTANCE_OWNER_AFTER,
+        "Fixture.java:method=left|line=3 <-> Fixture.java:method=right|line=7",
+        "tokens=30; group_size=2",
+        "clone_token_count",
+        rejected_intermediates=(REMOVED_TARGET_UNRELATED_CALL_AFTER,),
+    )
     scoped_overload_clone = _case(
         "code_clone_type1", OVERLOAD_BEFORE, OVERLOAD_SCOPED_AFTER,
         "Fixture.java:method=work|line=2 <-> Fixture.java:method=work|line=3",
@@ -506,6 +536,7 @@ def main() -> int:
         f"typed_adapter_clone={typed_adapter_clone[0]:g}->{typed_adapter_clone[1]:g} "
         f"qualified_owner_clone={qualified_owner_clone[0]:g}->{qualified_owner_clone[1]:g} "
         f"removed_target_clone={removed_target_clone[0]:g}->{removed_target_clone[1]:g} "
+        f"removed_target_instance_owner_clone={removed_target_instance_owner_clone[0]:g}->{removed_target_instance_owner_clone[1]:g} "
         f"scoped_overload_clone={scoped_overload_clone[0]:g}->{scoped_overload_clone[1]:g} "
         f"expanded_overload_clone={expanded_overload_clone[0]:g}->{expanded_overload_clone[1]:g} "
         f"existing_family_clone={existing_family_clone[0]:g}->{existing_family_clone[1]:g} "
