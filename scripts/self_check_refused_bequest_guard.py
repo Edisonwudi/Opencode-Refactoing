@@ -243,6 +243,32 @@ class Child implements ParentCapability {
     if moved_to_parent_guard["success"]:
         raise AssertionError("guard must reject moving rejection into a parent default method")
 
+    moved_to_generic_descendant_guard = _capability_guard(
+        """\
+interface ParentCapability {
+  Object supported();
+}
+""",
+        """\
+abstract class Child<T> implements ParentCapability {
+  public Object supported() {
+    return new Object();
+  }
+}
+class Descendant<T> extends Child<T> {
+  public Object target() {
+    return null;
+  }
+}
+""",
+        target_class="Child",
+        target_line=5,
+    )
+    if moved_to_generic_descendant_guard["success"]:
+        raise AssertionError("guard must reject moving a placeholder into a generic descendant")
+    if "descendant placeholder" not in moved_to_generic_descendant_guard["message"]:
+        raise AssertionError(moved_to_generic_descendant_guard)
+
     moved_to_intermediate_parent_guard = _capability_guard(
         parent_contract,
         """\
@@ -322,6 +348,65 @@ class Child {
     if parent_removed_guard["success"]:
         raise AssertionError(
             "guard must reject removing only the parent while retaining the rejected method"
+        )
+
+    orphaned_real_implementer = _capability_guard(
+        parent_contract,
+        """\
+interface ReadableCapability {
+  void read();
+}
+abstract class SharedBase implements ReadableCapability {
+}
+class Child extends SharedBase {
+  public void read() {}
+}
+class RealWriter extends SharedBase {
+  public void read() {}
+  public Object target() {
+    return new Object();
+  }
+}
+""",
+        target_class="Child",
+        target_line=8,
+    )
+    if orphaned_real_implementer["success"]:
+        raise AssertionError(
+            "capability split must reject real sibling implementations left without "
+            "an explicit narrow capability contract"
+        )
+    if "explicit capability contract" not in orphaned_real_implementer["message"]:
+        raise AssertionError(orphaned_real_implementer)
+
+    migrated_real_implementer = _capability_guard(
+        parent_contract,
+        """\
+interface ReadableCapability {
+  void read();
+}
+interface WritableCapability {
+  Object target();
+}
+abstract class SharedBase implements ReadableCapability {
+}
+class Child extends SharedBase {
+  public void read() {}
+}
+class RealWriter extends SharedBase implements WritableCapability {
+  public void read() {}
+  public Object target() {
+    return new Object();
+  }
+}
+""",
+        target_class="Child",
+        target_line=11,
+    )
+    if not migrated_real_implementer["success"]:
+        raise AssertionError(
+            "capability split must accept real sibling implementations migrated to "
+            "an explicit narrow capability contract"
         )
 
     overloaded_target_removed = _capability_guard(

@@ -3,6 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .detector_utils import (
+    parse_parent_from_evidence,
+    parse_structural_expectation,
+    parse_target_class,
+    parse_target_parameter_count,
+)
+from .java.semantic_detector import build_refused_bequest_impact_map
+
 
 _SMELL_BLOCKERS = {
     "long_method": ["invalid extractable selection", "extraction would only move complexity sideways"],
@@ -252,7 +260,7 @@ def build_direct_edit_policy() -> dict[str, Any]:
 
 def build_plan_context_payload(*, resolved: Any, context_payload: dict[str, Any], route_payload: dict[str, Any]) -> dict[str, Any]:
     locations = context_payload.get("locations") or []
-    return {
+    payload = {
         "success": True,
         "project_root": str(resolved.project_root),
         "roots": context_payload.get("roots") or {},
@@ -284,6 +292,42 @@ def build_plan_context_payload(*, resolved: Any, context_payload: dict[str, Any]
         "smell_guide": route_payload.get("guide") or "",
         "direct_edit_policy": build_direct_edit_policy(),
     }
+    capability_impact_map = _capability_impact_map(resolved, locations)
+    if capability_impact_map is not None:
+        payload["capability_impact_map"] = capability_impact_map
+    return payload
+
+
+def _capability_impact_map(
+    resolved: Any,
+    locations: list[Any],
+) -> dict[str, Any] | None:
+    if resolved.language != "java" or resolved.smell != "refused_bequest":
+        return None
+    evidence = ""
+    for guard in resolved.profile.guards:
+        candidate = str(guard.get("evidence") or "")
+        if candidate:
+            evidence = candidate
+            break
+    if parse_structural_expectation(evidence) != "capability_split":
+        return None
+    target = next((item for item in locations if isinstance(item, dict)), None)
+    if target is None:
+        return {
+            "ok": False,
+            "error": "target_location_missing",
+            "structural_expectation": "capability_split",
+        }
+    return build_refused_bequest_impact_map(
+        resolved.project_root,
+        target_file=resolved.project_root / str(target.get("project_path") or ""),
+        method=target.get("method"),
+        line=target.get("line"),
+        reported_parent=parse_parent_from_evidence(evidence),
+        target_parameter_count=parse_target_parameter_count(evidence),
+        target_class_name=parse_target_class(evidence),
+    )
 
 
 def build_repair_context_payload(*, context_payload: dict[str, Any], route_payload: dict[str, Any]) -> dict[str, Any]:

@@ -65,6 +65,33 @@ Apply this protocol whenever evidence supplies `structural_expectation`, especia
    casts, or compatibility shims unless existing callers make them necessary and behavior
    verification covers them.
 
+## Capability migration closure
+
+For a structural route, finish one coherent migration batch before the first
+`smell_verify` instead of alternating between body-level edits and verification:
+
+1. Read the command's generated `capability_impact_map` before the first edit. When
+   working outside the command flow, call `smell_plan` to obtain the same map. Use its
+   contract declarations, concrete implementers, and production call sites as the
+   impact ledger; manually resolve every receiver marked `unresolved`.
+2. Prefer an existing narrow capability or concrete subtype. If a new capability is
+   necessary, declare it with usable visibility before changing implementations or callers
+   to reference it.
+3. Apply changes in dependency order: capability declaration, real implementers,
+   production types and callers, then removal of the rejected operation from refusing
+   types.
+4. Before replacing or removing a superclass, inspect `inherited_surface_at_risk`.
+   Preserve or explicitly migrate every non-target state field and method that the target
+   or its callers rely on; a compiling target that silently loses parent API is incomplete.
+5. Before verification, search the whole production tree for the old contract and target
+   signature. Confirm that real implementers retain the capability and refusing types do
+   not receive a default, placeholder, duplicate declaration, or unchecked-cast escape
+   hatch.
+6. If `smell_verify` reports compilation errors, turn the complete diagnostic set into one
+   closure worklist. Search for every occurrence of the unresolved or inaccessible symbol,
+   repair all related sites in one pass, and only then verify again. Do not spend one
+   continuation fixing one occurrence at a time.
+
 ## Common avoid
 
 - Hiding refused behavior behind a rename.

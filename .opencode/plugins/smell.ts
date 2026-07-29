@@ -1272,6 +1272,29 @@ function commandPolicyPrompt(policy: CommandPolicy): string {
   return lines.join("\n")
 }
 
+function capabilityPlanPrompt(payload: Record<string, unknown>): string {
+  const impactMap = payload.capability_impact_map
+  if (!impactMap || typeof impactMap !== "object" || Array.isArray(impactMap)) {
+    throw new Error("CAPABILITY_PLAN_FAILED: build-plan-context returned no capability_impact_map")
+  }
+  const impact = impactMap as Record<string, unknown>
+  if (impact.ok !== true) {
+    throw new Error(
+      `CAPABILITY_PLAN_FAILED: ${String(impact.error || "capability impact map could not be resolved")}`,
+    )
+  }
+  return [
+    "",
+    "Pre-edit capability impact map (generated from the production semantic model):",
+    safeJsonStringify(impact),
+    "",
+    "Use this as a closure worklist before the first edit. Inspect every declaration, implementer,",
+    "production call site, and inherited_surface_at_risk entry. If changing a superclass, preserve",
+    "or explicitly migrate its non-target state and API. Manually resolve every receiver marked",
+    "unresolved; do not skip it.",
+  ].join("\n")
+}
+
 function defaultCommandPolicy(
   verificationMode: CommandPolicy["verification_mode"] = "local",
 ): CommandPolicy {
@@ -1614,8 +1637,27 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       },
     })
 
+  const planTool = tool({
+    description:
+      "Build a read-only refactoring plan context. Capability-split Refused Bequest results include contract declarations, implementers, and production call sites.",
+    args: {
+      ...commonShape,
+    },
+    async execute(args) {
+      const resolved = withBatchDefaults(args)
+      const bridgeArgs = [
+        "build-plan-context",
+        ...commonArgs(resolved),
+        "--no-idea-preflight",
+        "--no-idea-open",
+      ]
+      return normalizeToolResult("Smell refactoring plan", await runBridge(worktree, bridgeArgs))
+    },
+  })
+
   return {
     tool: {
+      smell_plan: planTool,
       smell_verify: verifyTool("Smell verification"),
 
       idea_refactor_locate: tool({
@@ -1812,6 +1854,37 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       const result = await runBridge(worktree, ["resolve-command", "--arguments", input.arguments])
       const policy = parseCommandPolicyResult(result)
       const identity = commandTaskIdentity(policy.task)
+      let capabilityPlan = ""
+      if (
+        identity.smell === "refused_bequest"
+        && /(?:^|;)\s*structural_expectation\s*=\s*capability_split(?:\s*;|$)/i.test(
+          String(identity.smellEvidence || ""),
+        )
+      ) {
+        if (!identity.projectRoot || !identity.location) {
+          throw new Error("CAPABILITY_PLAN_FAILED: command task identity is incomplete")
+        }
+        const planResult = await runBridge(worktree, [
+          "build-plan-context",
+          ...commonArgs({
+            projectRoot: String(identity.projectRoot),
+            projectOverrideRoot: identity.projectOverrideRoot,
+            language: identity.language,
+            smell: String(identity.smell),
+            location: String(identity.location),
+            smellEvidence: identity.smellEvidence,
+          }),
+          "--no-idea-preflight",
+          "--no-idea-open",
+        ])
+        const planPayload = planResult.json as Record<string, unknown> | null
+        if (planResult.exitCode !== 0 || !planPayload || planPayload.success !== true) {
+          throw new Error(
+            `CAPABILITY_PLAN_FAILED: ${truncateText(planResult.stderr || planResult.stdout)}`,
+          )
+        }
+        capabilityPlan = capabilityPlanPrompt(planPayload)
+      }
       if (identity.smell && checkpointSmells.has(identity.smell)) {
         if (!identity.projectRoot || !identity.location) {
           throw new Error("CHECKPOINT_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
@@ -1848,7 +1921,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         maxContinuations: policy.loop.max_continuations,
         instruction: policy.loop.instruction,
       })
-      output.parts = [{ type: "text", text: commandPolicyPrompt(policy) }] as typeof output.parts
+      output.parts = [
+        { type: "text", text: commandPolicyPrompt(policy) + capabilityPlan },
+      ] as typeof output.parts
     },
 
     event: async ({ event }) => {

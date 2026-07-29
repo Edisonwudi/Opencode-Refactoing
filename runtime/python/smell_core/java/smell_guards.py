@@ -1483,6 +1483,20 @@ def _run_semantic_guard(
                             "to an inherited ancestor instead of being split. Rejecting "
                             f"ancestor(s): {', '.join(profile['inherited_rejecting_owners'])}."
                         )
+                    elif profile.get("descendant_rejecting_owners"):
+                        failure_message = (
+                            "refused_bequest guard: the rejected capability was relocated "
+                            "to a descendant placeholder instead of being split. Rejecting "
+                            f"descendant(s): {', '.join(profile['descendant_rejecting_owners'])}."
+                        )
+                    elif profile.get("orphaned_real_implementers"):
+                        failure_message = (
+                            "refused_bequest guard: real implementers lost an explicit "
+                            "capability contract during the split. Migrate them to a "
+                            "narrow capability type instead of leaving incidental methods. "
+                            "Orphaned implementer(s): "
+                            f"{', '.join(profile['orphaned_real_implementers'])}."
+                        )
                     else:
                         failure_message = (
                             "refused_bequest guard: the reported parent capability is "

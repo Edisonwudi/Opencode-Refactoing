@@ -429,6 +429,16 @@ check_true(
     "refused_skill_locks_capability_split_route",
     "Do not implement or delegate the reported rejecting/empty/null-returning method" in refused_skill,
 )
+check_true(
+    "refused_skill_requires_impact_ledger",
+    "generated `capability_impact_map` before the first edit" in refused_skill
+    and "manually resolve every receiver marked `unresolved`" in refused_skill,
+)
+check_true(
+    "refused_skill_batches_compile_closure",
+    "complete diagnostic set into one" in refused_skill
+    and "repair all related sites in one pass" in refused_skill,
+)
 
 print()
 if failures:

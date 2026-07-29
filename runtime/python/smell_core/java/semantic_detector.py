@@ -517,18 +517,31 @@ def analyze_refused_bequest_target(
         or item.qualified_name.lower() == parent_name.lower()
     ]
     parent_record = parent_candidates[0] if parent_candidates else None
+
     def declares_target(record: Optional[ClassRecord]) -> bool:
         if record is None:
             return False
-        if target_parameter_count is None:
-            return target_method in {
-                _normalize_method(name) for name in record.declared_method_names
-            }
-        return any(
+        body_method_match = any(
             _normalize_method(item.method_name) == target_method
-            and len(item.parameter_descriptors) == target_parameter_count
+            and (
+                target_parameter_count is None
+                or len(item.parameter_descriptors) == target_parameter_count
+            )
             for item in record.methods
         )
+        bodyless_match = any(
+            re.search(
+                rf"\b{re.escape(target_method)}\s*\(",
+                declaration,
+                flags=re.IGNORECASE,
+            )
+            and (
+                target_parameter_count is None
+                or _declaration_parameter_count(declaration) == target_parameter_count
+            )
+            for declaration in record.bodyless_method_declarations
+        )
+        return body_method_match or bodyless_match
 
     child_declares_target = declares_target(target_class)
     parent_declares_target = declares_target(parent_record)
@@ -559,8 +572,55 @@ def analyze_refused_bequest_target(
         )
         if rejecting_target:
             inherited_rejecting_owners.append(inherited_record.qualified_name)
+    descendant_rejecting_owners: List[str] = []
+    for candidate in model.classes.values():
+        if candidate.qualified_name == target_class.qualified_name:
+            continue
+        if target_class.qualified_name not in _all_parent_type_names(model, candidate):
+            continue
+        rejecting_target = any(
+            _normalize_method(item.method_name) == target_method
+            and (
+                target_parameter_count is None
+                or len(item.parameter_descriptors) == target_parameter_count
+            )
+            and _is_stub_method(item)
+            for item in candidate.methods
+        )
+        if rejecting_target:
+            descendant_rejecting_owners.append(candidate.qualified_name)
+    orphaned_real_implementers: List[str] = []
+    family_root = model.classes.get(target_class.superclass_name)
+    if family_root is not None:
+        for candidate in model.classes.values():
+            if candidate.qualified_name == target_class.qualified_name:
+                continue
+            if (
+                candidate.qualified_name != family_root.qualified_name
+                and family_root.qualified_name not in _all_parent_type_names(model, candidate)
+            ):
+                continue
+            declares_real_target = any(
+                _normalize_method(item.method_name) == target_method
+                and (
+                    target_parameter_count is None
+                    or len(item.parameter_descriptors) == target_parameter_count
+                )
+                and not _is_stub_method(item)
+                for item in candidate.methods
+            )
+            if not declares_real_target:
+                continue
+            inherited_contract = any(
+                declares_target(model.classes.get(inherited_name))
+                for inherited_name in _all_parent_type_names(model, candidate)
+            )
+            if not inherited_contract:
+                orphaned_real_implementers.append(candidate.qualified_name)
     capability_split_satisfied = bool(
         not child_declares_target
+        and not descendant_rejecting_owners
+        and not orphaned_real_implementers
         and (
             not inherits_parent
             or (
@@ -590,9 +650,419 @@ def analyze_refused_bequest_target(
         "child_declares_target": child_declares_target,
         "parent_declares_target": parent_declares_target,
         "inherited_rejecting_owners": inherited_rejecting_owners,
+        "descendant_rejecting_owners": sorted(descendant_rejecting_owners),
+        "orphaned_real_implementers": sorted(orphaned_real_implementers),
         "capability_split_satisfied": capability_split_satisfied,
         "rejecting_override_removed": rejecting_override_removed,
     }
+
+
+def build_refused_bequest_impact_map(
+    project_root: Path,
+    *,
+    target_file: Path,
+    method: Optional[str],
+    line: Optional[int],
+    reported_parent: str,
+    target_parameter_count: Optional[int] = None,
+    target_class_name: str = "",
+) -> Dict[str, Any]:
+    """Build a read-only capability migration worklist from the semantic model.
+
+    This deliberately reports declarations and production call sites instead of
+    proposing sample-specific edits.  It gives a refactoring agent the closure
+    boundary it must inspect before changing an inheritance contract.
+    """
+    root = project_root.expanduser().resolve()
+    model = _build_project_model(root, include_tests=False)
+    profile = analyze_refused_bequest_target(
+        root,
+        target_file=target_file,
+        method=method,
+        line=line,
+        reported_parent=reported_parent,
+        target_parameter_count=target_parameter_count,
+        target_class_name=target_class_name,
+        project_model=model,
+    )
+    if not profile.get("ok"):
+        return {
+            "ok": False,
+            "error": profile.get("error", "capability_profile_unavailable"),
+            "profile": profile,
+        }
+
+    target_method = _normalize_method(method)
+    arity = target_parameter_count
+    parent_name = str(reported_parent or "").strip()
+    parent_simple = parent_name.rsplit(".", 1)[-1].lower()
+    target_qualified = str(profile.get("target_class") or "")
+
+    def method_matches(item: MethodRecord) -> bool:
+        return bool(
+            _normalize_method(item.method_name) == target_method
+            and (arity is None or len(item.parameter_descriptors) == arity)
+        )
+
+    def class_matches_parent(item: ClassRecord) -> bool:
+        return bool(
+            item.class_name.lower() == parent_simple
+            or item.qualified_name.lower() == parent_name.lower()
+        )
+
+    parent_record = next(
+        (item for item in model.classes.values() if class_matches_parent(item)),
+        None,
+    )
+    related_classes = [
+        item
+        for item in model.classes.values()
+        if class_matches_parent(item)
+        or any(
+            inherited.rsplit(".", 1)[-1].lower() == parent_simple
+            for inherited in _all_parent_type_names(model, item)
+        )
+    ]
+    if target_qualified and all(item.qualified_name != target_qualified for item in related_classes):
+        target_record = model.classes.get(target_qualified)
+        if target_record is not None:
+            related_classes.append(target_record)
+
+    contract_declarations: List[Dict[str, Any]] = []
+    declaration_owners: List[ClassRecord] = []
+    if parent_record is not None:
+        declaration_owners.append(parent_record)
+        for inherited_name in sorted(_all_parent_type_names(model, parent_record)):
+            inherited_record = model.classes.get(inherited_name)
+            if inherited_record is not None:
+                declaration_owners.append(inherited_record)
+    seen_declarations: Set[Tuple[str, int, str]] = set()
+    for owner in declaration_owners:
+        for item in owner.methods:
+            if not method_matches(item):
+                continue
+            key = (item.file, item.begin_line, item.method_signature)
+            if key in seen_declarations:
+                continue
+            seen_declarations.add(key)
+            contract_declarations.append(_impact_method_payload(item))
+        file_model = next(
+            (item for item in model.files if item.rel_path == owner.file),
+            None,
+        )
+        for declaration in owner.bodyless_method_declarations:
+            if not re.search(
+                rf"\b{re.escape(target_method)}\s*\(",
+                declaration,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            if arity is not None and _declaration_parameter_count(declaration) != arity:
+                continue
+            line = 0
+            if file_model is not None:
+                offset = file_model.source.find(declaration.encode("utf-8"))
+                if offset >= 0:
+                    line = file_model.source[:offset].count(b"\n") + 1
+            contract_declarations.append(
+                {
+                    "owner": owner.qualified_name,
+                    "file": owner.file,
+                    "line": line,
+                    "signature": declaration.strip(),
+                    "modifiers": sorted(owner.modifiers),
+                    "body_kind": "abstract_or_bodyless",
+                }
+            )
+
+    implementers: List[Dict[str, Any]] = []
+    for item in sorted(related_classes, key=lambda record: record.qualified_name):
+        declarations = [method for method in item.methods if method_matches(method)]
+        has_bodyless_declaration = any(
+            re.search(
+                rf"\b{re.escape(target_method)}\s*\(",
+                declaration,
+                flags=re.IGNORECASE,
+            )
+            and (arity is None or _declaration_parameter_count(declaration) == arity)
+            for declaration in item.bodyless_method_declarations
+        )
+        if item.qualified_name == getattr(parent_record, "qualified_name", ""):
+            role = "contract_owner"
+        elif declarations:
+            has_real = any(method.body is None or not _is_stub_method(method) for method in declarations)
+            role = "real_implementer" if has_real else "rejecting_or_stub_implementer"
+        elif has_bodyless_declaration:
+            role = "abstract_contract_declaration"
+        else:
+            role = "inherits_without_declaration"
+        if item.qualified_name == target_qualified:
+            role = f"refusing_target:{role}"
+        implementers.append(
+            {
+                "class": item.qualified_name,
+                "kind": item.kind,
+                "file": item.file,
+                "line": item.begin_line,
+                "modifiers": sorted(item.modifiers),
+                "role": role,
+                "declared_target_methods": [
+                    _impact_method_payload(method) for method in declarations
+                ],
+            }
+        )
+
+    call_sites, excluded_same_name_calls = _target_method_call_sites(
+        model,
+        target_method=target_method,
+        parent_name=parent_name,
+        related_classes=related_classes,
+    )
+    target_record = model.classes.get(target_qualified)
+    inherited_surface: List[Dict[str, Any]] = []
+    if target_record is not None:
+        seen_ancestors: Set[str] = set()
+        ancestor_name = target_record.superclass_name
+        while ancestor_name and ancestor_name not in seen_ancestors:
+            seen_ancestors.add(ancestor_name)
+            ancestor = model.classes.get(ancestor_name)
+            if ancestor is None:
+                break
+            inherited_methods = [
+                _impact_method_payload(item)
+                for item in ancestor.methods
+                if not item.is_constructor
+                and "private" not in item.modifiers
+                and not method_matches(item)
+            ]
+            inherited_surface.append(
+                {
+                    "owner": ancestor.qualified_name,
+                    "file": ancestor.file,
+                    "state_fields": [
+                        {"name": name, "type": type_name}
+                        for name, type_name in sorted(ancestor.fields.items())
+                    ],
+                    "non_target_methods": inherited_methods,
+                    "bodyless_non_target_methods": [
+                        declaration.strip()
+                        for declaration in ancestor.bodyless_method_declarations
+                        if not re.search(
+                            rf"\b{re.escape(target_method)}\s*\(",
+                            declaration,
+                            flags=re.IGNORECASE,
+                        )
+                    ],
+                }
+            )
+            ancestor_name = ancestor.superclass_name
+    return {
+        "ok": True,
+        "structural_expectation": "capability_split",
+        "target": {
+            "class": target_qualified,
+            "file": profile.get("file"),
+            "method": target_method,
+            "parameter_count": arity,
+            "reported_parent": parent_name,
+        },
+        "contract_declarations": contract_declarations,
+        "implementers": implementers,
+        "production_call_sites": call_sites,
+        "inherited_surface_at_risk": inherited_surface,
+        "excluded_unrelated_same_name_calls": excluded_same_name_calls,
+        "unresolved_receiver_call_sites": sum(
+            1 for item in call_sites if item.get("receiver_resolution") == "unresolved"
+        ),
+        "dependency_order": [
+            "reuse_or_declare_narrow_capability_with_usable_visibility",
+            "migrate_real_implementers",
+            "migrate_production_declarations_and_callers",
+            "preserve_or_explicitly_migrate_inherited_non_target_state_and_api",
+            "remove_rejected_operation_from_refusing_types",
+            "search_production_tree_for_old_contract_and_target_signature",
+        ],
+        "completion_contract": (
+            "Inspect every listed declaration, implementer, and production call site. "
+            "If changing a superclass, preserve or deliberately migrate every listed "
+            "inherited non-target field and method used by the target or its callers. "
+            "Treat unresolved receiver sites as required manual review; do not declare "
+            "the migration complete while one remains unexamined."
+        ),
+    }
+
+
+def _impact_method_payload(method: MethodRecord) -> Dict[str, Any]:
+    if method.body is None:
+        body_kind = "abstract_or_bodyless"
+    elif _is_stub_method(method):
+        body_kind = "rejecting_or_stub"
+    else:
+        body_kind = "real_behavior"
+    return {
+        "owner": method.owner_qualified_name,
+        "file": method.file,
+        "line": method.begin_line,
+        "signature": method.method_signature,
+        "modifiers": sorted(method.modifiers),
+        "body_kind": body_kind,
+    }
+
+
+def _declaration_parameter_count(declaration: str) -> int:
+    match = re.search(r"\((.*)\)", declaration, flags=re.DOTALL)
+    if not match or not match.group(1).strip():
+        return 0
+    return len([item for item in match.group(1).split(",") if item.strip()])
+
+
+def _target_method_call_sites(
+    model: ProjectModel,
+    *,
+    target_method: str,
+    parent_name: str,
+    related_classes: Sequence[ClassRecord],
+) -> Tuple[List[Dict[str, Any]], int]:
+    related_names = {
+        name
+        for item in related_classes
+        for name in (item.qualified_name, item.class_name)
+    }
+    related_simple = {name.rsplit(".", 1)[-1] for name in related_names}
+    parent_simple = parent_name.rsplit(".", 1)[-1]
+    related_simple.add(parent_simple)
+    call_sites: List[Dict[str, Any]] = []
+    excluded_same_name_calls = 0
+    related_files = {item.file for item in related_classes}
+    related_qualified = {item.qualified_name for item in related_classes}
+
+    for file_model in model.files:
+        for node in _iter_nodes(file_model.root):
+            if node.type not in {"method_invocation", "method_reference"}:
+                continue
+            if _normalize_method(_method_usage_name(file_model.source, node)) != target_method:
+                continue
+            call_line = _node_start_line(node)
+            owner_method = next(
+                (
+                    item
+                    for item in model.methods
+                    if item.file == file_model.rel_path
+                    and item.begin_line <= call_line <= item.end_line
+                ),
+                None,
+            )
+            receiver_node = node.child_by_field_name("object")
+            receiver = _node_text(file_model.source, receiver_node).strip()
+            static_type, resolution = _receiver_static_type(
+                model,
+                owner_method,
+                receiver,
+            )
+            static_simple = _erase_type(static_type).rsplit(".", 1)[-1]
+            exposes_contract: Optional[bool]
+            if resolution == "unresolved":
+                exposes_contract = None
+            else:
+                exposes_contract = static_simple in related_simple
+            owner_is_related = bool(
+                owner_method is not None
+                and owner_method.owner_qualified_name in related_qualified
+            )
+            if exposes_contract is not True and not (
+                resolution == "unresolved"
+                and (owner_is_related or file_model.rel_path in related_files)
+            ):
+                excluded_same_name_calls += 1
+                continue
+            call_sites.append(
+                {
+                    "file": file_model.rel_path,
+                    "line": call_line,
+                    "enclosing_method": (
+                        owner_method.method_signature if owner_method is not None else ""
+                    ),
+                    "receiver": receiver or "<implicit-this>",
+                    "static_receiver_type": static_type,
+                    "receiver_resolution": resolution,
+                    "exposes_reported_contract": exposes_contract,
+                    "expression": _node_text(file_model.source, node).strip(),
+                }
+            )
+    return (
+        sorted(call_sites, key=lambda item: (str(item["file"]), int(item["line"]))),
+        excluded_same_name_calls,
+    )
+
+
+def _receiver_static_type(
+    model: ProjectModel,
+    owner_method: Optional[MethodRecord],
+    receiver: str,
+) -> Tuple[str, str]:
+    if owner_method is None:
+        return "", "unresolved"
+    owner = model.classes.get(owner_method.owner_qualified_name)
+    if not receiver or receiver == "this":
+        return owner_method.owner_qualified_name, "owner_type"
+    if receiver == "super":
+        return (owner.superclass_name if owner is not None else ""), (
+            "super_type" if owner is not None and owner.superclass_name else "unresolved"
+        )
+    cast_match = re.match(
+        r"^\(+\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:<[^>]+>)?)\s*\)",
+        receiver,
+    )
+    if cast_match:
+        return cast_match.group(1), "explicit_cast"
+    this_field_match = re.fullmatch(r"this\.([A-Za-z_$][\w$]*)", receiver)
+    if this_field_match and owner is not None:
+        field_name = this_field_match.group(1)
+        if field_name in owner.fields:
+            return owner.fields[field_name], "field"
+    invocation_match = re.fullmatch(
+        r"(?:(.+)\.)?([A-Za-z_$][\w$]*)\s*\([^()]*\)",
+        receiver,
+        flags=re.DOTALL,
+    )
+    if invocation_match:
+        base_expression = str(invocation_match.group(1) or "").strip()
+        invoked_name = invocation_match.group(2)
+        if base_expression:
+            base_type, _ = _receiver_static_type(model, owner_method, base_expression)
+            base_record = _class_record_for_type(model, base_type)
+        else:
+            base_record = owner
+        if base_record is not None:
+            candidates = [
+                item
+                for item in base_record.methods
+                if item.method_name == invoked_name and item.return_type
+            ]
+            if candidates:
+                return candidates[0].return_type, "method_return"
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", receiver):
+        if receiver in owner_method.local_variables:
+            return owner_method.local_variables[receiver], "local_variable"
+        if receiver in owner_method.parameters:
+            return owner_method.parameters[receiver], "parameter"
+        if owner is not None and receiver in owner.fields:
+            return owner.fields[receiver], "field"
+        if receiver in model.classes_by_simple:
+            return receiver, "type_name"
+    return "", "unresolved"
+
+
+def _class_record_for_type(
+    model: ProjectModel,
+    type_name: str,
+) -> Optional[ClassRecord]:
+    erased = _erase_type(type_name)
+    if erased in model.classes:
+        return model.classes[erased]
+    simple = erased.rsplit(".", 1)[-1]
+    candidates = model.classes_by_simple.get(simple, [])
+    return candidates[0] if candidates else None
 
 
 def find_matching_semantic_finding(
@@ -2023,11 +2493,12 @@ def _looks_like_type_name(value: str, model: ProjectModel) -> bool:
 
 
 def _resolve_model_type(model: ProjectModel, type_name: str) -> str:
-    if type_name in model.classes:
-        return type_name
-    simple = type_name.rsplit(".", 1)[-1]
+    erased = _erase_type(type_name)
+    if erased in model.classes:
+        return erased
+    simple = erased.rsplit(".", 1)[-1]
     candidates = model.classes_by_simple.get(simple, [])
-    return candidates[0].qualified_name if candidates else type_name
+    return candidates[0].qualified_name if candidates else erased
 
 
 def _all_parent_type_names(model: ProjectModel, child: ClassRecord) -> Set[str]:
