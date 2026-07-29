@@ -81,6 +81,7 @@ code_clone_type1:
       - "Before moving behavior or fields, inspect every direct and transitive non-target child. Do not pull up state when that changes unrelated descendants, reflection or serialization shape, framework wiring, or lifecycle side-effect order."
       - "When child-owned fields or ordering must remain local, keep both overrides and fields in place, add one protected parameterized helper to the parent, call it at the original point in each override, and preserve the surrounding super-call order."
       - "If both children already declare same-named resource fields, do not remove or relocate those declarations. Select child-owned-lifecycle-helper-clone instead of completing a field pull-up."
+      - "Identity-bearing child sentinels and locks are child-owned state too. If code uses ==, keep each original object declaration and pass it into a shared helper; moving it to the parent changes identity semantics."
   - id: child-owned-lifecycle-helper-clone
     when: "sibling lifecycle methods duplicate resource cleanup or setup, but each child owns the fields and must retain declaration shape and super-call order"
     before: |
@@ -181,6 +182,8 @@ code_clone_type1:
     notes:
       - "Both callers must resolve through the same helper. Two same-shaped private helpers only move the clone."
       - "Prefer existing project abstractions and preserve caller contracts."
+      - "For targets in different packages, put the helper in an actually shared package, add explicit imports or qualified references in both callers, and compile before further edits. Do not remove the helper while references remain."
+      - "For duplicated state predicates across unrelated hierarchies, use one shared query such as ViewState.isEnabled(view), and keep each existing override as a one-line setEnabled(sharedQuery(getView())) delegate. Short delegating wrappers are an accepted shared implementation."
   - id: existing-owner-delegation-clone
     when: "one clone target already has a semantically owned implementation in a dedicated service, utility, or domain owner, so the other clone should delegate to that owner instead of creating a new helper"
     before: |
@@ -280,5 +283,6 @@ code_clone_type1:
       - "Use this path for overload families where the public signatures are part of the API and should remain stable."
       - "Do not replace primitive overloads with a broad Object/generic API or a helper that makes call sites uglier; keep type-specific wrappers and share only the loop/control core."
       - "For primitive variants, use an index predicate/comparator or typed adapter that compiles for every overload; do not force boolean, short, or other primitives through an incompatible generic functional interface."
+      - "Do not create two overloaded helpers with identical algorithm bodies. There must be one type-neutral core; use Object/reflection, an indexed predicate, a comparator, or another existing type-neutral abstraction when necessary."
       - "Keep the first cohesive edit to the two reported overloads. Broaden the family only when compilation or the structural Oracle proves the pair cannot be centralized independently."
       - "After Oracle feedback, inspect the complete production diff and remove superseded wrappers, duplicate adapters, and unused imports before final verification."

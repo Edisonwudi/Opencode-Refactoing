@@ -8,10 +8,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
+sys.path.insert(0, str(ROOT / "runtime" / "python"))
+
+from smell_core.java.smell_guards import _find_clone_target_method
+from smell_core.java.syntactic_detector import load_java_source_model
 
 DATA_BEFORE = """\
 class A { void target(boolean confReq, int maxTokSize, int qop) {} }
@@ -249,6 +254,30 @@ class Fixture {{
 }}
 """
 
+OVERLOAD_LINE_SHIFT_BEFORE = """\
+class Fixture {
+  void work(int[] values) { consume(values.length); }
+  void work(short[] values) { consume(values.length); }
+  void work(byte[] values) { consume(values.length); }
+  void consume(int value) {}
+}
+"""
+OVERLOAD_LINE_SHIFT_AFTER = """\
+class Fixture {
+  void work(int[] values) { shared(values); }
+  void helperInsertedBeforeSecondTarget() {
+    consume(1);
+    consume(2);
+    consume(3);
+    consume(4);
+  }
+  void work(short[] values) { shared(values); }
+  void work(byte[] values) { consume(values.length); }
+  void shared(Object values) {}
+  void consume(int value) {}
+}
+"""
+
 
 def _run(args: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=str(cwd), env=env, text=True, capture_output=True, check=False)
@@ -362,7 +391,36 @@ def _transitive_parent_multifile_case() -> tuple[float, float]:
         return before_value, after_value
 
 
+def _line_shifted_overload_identity_case() -> str:
+    with tempfile.TemporaryDirectory(prefix="checkpoint-code-clone-overload-identity-") as temp_dir:
+        source = Path(temp_dir) / "Fixture.java"
+        _, baseline_methods = load_java_source_model(
+            source,
+            "Fixture.java",
+            OVERLOAD_LINE_SHIFT_BEFORE,
+        )
+        _, current_methods = load_java_source_model(
+            source,
+            "Fixture.java",
+            OVERLOAD_LINE_SHIFT_AFTER,
+        )
+        location = SimpleNamespace(
+            project_path="Fixture.java",
+            method="work",
+            line=3,
+            start_line=None,
+        )
+        baseline_target = _find_clone_target_method(baseline_methods, location, None)
+        if baseline_target is None or "short[]" not in baseline_target.signature:
+            raise AssertionError(f"baseline overload did not resolve to short[]: {baseline_target}")
+        current_target = _find_clone_target_method(current_methods, location, baseline_target)
+        if current_target is None or "short[]" not in current_target.signature:
+            raise AssertionError(f"shifted overload did not retain short[] identity: {current_target}")
+        return "PASS"
+
+
 def main() -> int:
+    line_shifted_overload_identity = _line_shifted_overload_identity_case()
     data = _case(
         "data_clumps", DATA_BEFORE, DATA_AFTER,
         "Fixture.java:method=target|line=1",
@@ -450,7 +508,8 @@ def main() -> int:
         f"removed_target_clone={removed_target_clone[0]:g}->{removed_target_clone[1]:g} "
         f"scoped_overload_clone={scoped_overload_clone[0]:g}->{scoped_overload_clone[1]:g} "
         f"expanded_overload_clone={expanded_overload_clone[0]:g}->{expanded_overload_clone[1]:g} "
-        f"existing_family_clone={existing_family_clone[0]:g}->{existing_family_clone[1]:g}"
+        f"existing_family_clone={existing_family_clone[0]:g}->{existing_family_clone[1]:g} "
+        f"line_shifted_overload_identity={line_shifted_overload_identity}"
     )
     return 0
 

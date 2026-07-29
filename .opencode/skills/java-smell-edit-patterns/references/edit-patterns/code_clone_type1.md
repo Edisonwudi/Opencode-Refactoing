@@ -26,6 +26,11 @@ or shared core.
   shadow, or relocate those fields merely to make a parent method compile.
   Extract the duplicated operations into one helper that accepts the child-owned
   resources as parameters.
+- Apply the same rule to identity-bearing sentinels, locks, listeners, caches, and
+  lifecycle handles. If the original code compares a child-owned object with
+  `==`, moving that object to a parent changes identity semantics. Keep one
+  sentinel per original owner and pass both the observed value and that owner's
+  sentinel to the shared helper.
 - The final pair must share a callee, delegate to an existing owner, or inherit one
   parent implementation while preserving behavior and public signatures.
 - The smell Oracle proves clone removal and convergence only. Architecture and
@@ -181,6 +186,29 @@ Route-specific edit steps:
    callers.
 2. Move the common block into a helper with explicit inputs and outputs.
 3. Replace both clone blocks and update imports or visibility.
+4. If the targets are in different packages, use the helper's fully qualified
+   package/import in both callers and compile immediately. Never delete or move
+   the helper while call sites still reference it.
+
+For duplicated state predicates in different inheritance branches, prefer a
+shared query helper that returns the result:
+
+```java
+final class ViewState {
+    static boolean isEnabled(View view) {
+        return view != null && view.isEnabled();
+    }
+}
+
+// Each existing override remains in its own hierarchy.
+protected void updateEnabledState() {
+    setEnabled(ViewState.isEnabled(getView()));
+}
+```
+
+The two one-line wrappers are valid because the behavior has one implementation
+owner. Do not conclude that different inheritance branches make the clone
+unrefactorable when a parameterized query or command helper preserves behavior.
 
 Verification fit delta: Both clone sites should call the same helper rather than retain parallel bodies.
 
@@ -226,6 +254,9 @@ Route-specific edit steps:
 2. Create a private core method for the shared algorithm, using small typed adapters
    when the overload value types differ.
 3. Rewrite overloads as adapters that call the core with converted values.
+4. Confirm there is exactly one algorithm-bearing core. Two overloaded helpers
+   with identical bodies are still a clone; replace them with one Object/reflection,
+   indexed predicate, comparator, or other type-neutral core as appropriate.
 
 Verification fit delta: The large common body should exist only in the core method.
 

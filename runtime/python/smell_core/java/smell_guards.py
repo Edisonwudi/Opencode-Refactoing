@@ -632,12 +632,26 @@ def _find_clone_target_method(
         if not same_class:
             return None
         candidates = same_class
-        same_arity = [
+        baseline_parameter_types = tuple(
+            token.split(":", 1)[0]
+            for token in baseline_target.parameter_tokens
+        )
+        same_parameter_types = [
             method for method in candidates
-            if len(method.parameter_names) == len(baseline_target.parameter_names)
+            if tuple(
+                token.split(":", 1)[0]
+                for token in method.parameter_tokens
+            ) == baseline_parameter_types
         ]
-        if same_arity:
-            candidates = same_arity
+        if same_parameter_types:
+            candidates = same_parameter_types
+        else:
+            same_arity = [
+                method for method in candidates
+                if len(method.parameter_names) == len(baseline_target.parameter_names)
+            ]
+            if same_arity:
+                candidates = same_arity
     line = int(location.line or location.start_line or 0)
     if line:
         return min(candidates, key=lambda method: abs(method.begin_line - line))
