@@ -21,11 +21,12 @@ class Collaborator {
   void d() {}
 }
 class Subject {
-  void target(Collaborator receiver) {
-    receiver.a();
-    receiver.b();
-    receiver.c();
-    receiver.d();
+  static final Collaborator RECEIVER = new Collaborator();
+  void target() {
+    RECEIVER.a();
+    RECEIVER.b();
+    RECEIVER.c();
+    RECEIVER.d();
   }
 }
 """
@@ -42,10 +43,11 @@ class Collaborator {
   }
 }
 class Subject {
-  void target(Collaborator receiver) {
-    receiver.a();
-    receiver.doWork();
-    receiver.d();
+  static final Collaborator RECEIVER = new Collaborator();
+  void target() {
+    RECEIVER.a();
+    RECEIVER.doWork();
+    RECEIVER.d();
   }
 }
 """
@@ -56,7 +58,7 @@ def _run(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Completed
 
 
 def _bridge(root: Path, env: dict[str, str], command: str) -> dict[str, object]:
-    location = "Fixture.java:method=target|line=8"
+    location = "Fixture.java:method=target|line=9"
     args = [
         sys.executable,
         str(BRIDGE),

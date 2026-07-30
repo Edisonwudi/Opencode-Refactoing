@@ -63,6 +63,26 @@ class Fixture {
 """
 PARAMS_BEFORE = "class Fixture {\n  void target(int a, int b, int c, int d, int e, int f) {}\n}\n"
 PARAMS_AFTER = "class Fixture {\n  void target(int a, int b, int c, int d, int e) {}\n}\n"
+INTERFACE_PARAMS_BEFORE = (
+    "interface Fixture {\n"
+    "  void target(int a, int b, int c, int d, int e, int f);\n"
+    "}\n"
+)
+INTERFACE_PARAMS_AFTER = (
+    "interface Fixture {\n"
+    "  void target(int a, int b, int c, int d, int e);\n"
+    "}\n"
+)
+ANNOTATED_PARAMS_BEFORE = """\
+class Fixture {
+  @Remote(variants = Variant.both, unreliable = true)
+  void target(int a, int b, int c, int d, int e, int f) {}
+}
+"""
+ANNOTATED_PARAMS_AFTER = ANNOTATED_PARAMS_BEFORE.replace(
+    ", int e, int f",
+    ", int e",
+)
 
 
 def _case(smell: str, before: str, after: str, objective: str) -> tuple[float, float]:
@@ -104,6 +124,18 @@ def main() -> int:
         "long_method": _case("long_method", _long_method_source(65), _long_method_source(2), "ast_ncss"),
         "nested_complexity": _case("nested_complexity", NESTED_BEFORE, NESTED_AFTER, "cognitive_complexity"),
         "long_parameter_list": _case("long_parameter_list", PARAMS_BEFORE, PARAMS_AFTER, "parameter_count"),
+        "long_parameter_list_interface": _case(
+            "long_parameter_list",
+            INTERFACE_PARAMS_BEFORE,
+            INTERFACE_PARAMS_AFTER,
+            "parameter_count",
+        ),
+        "long_parameter_list_annotated": _case(
+            "long_parameter_list",
+            ANNOTATED_PARAMS_BEFORE,
+            ANNOTATED_PARAMS_AFTER,
+            "parameter_count",
+        ),
     }
     rendered = " ".join(f"{name}={before:g}->{after:g}" for name, (before, after) in results.items())
     print(f"checkpoint-syntactic-adapters-self-check PASS unchanged_pass=0 {rendered}")

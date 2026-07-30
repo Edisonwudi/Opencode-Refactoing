@@ -10,6 +10,7 @@ from .analysis import (
     count_parameters,
     estimate_complexity,
     extract_class_text,
+    extract_function_signature,
     extract_pair_snippets,
     extract_snippet,
     method_basename,
@@ -191,6 +192,34 @@ def _nested_complexity(config: Any, evidence: str) -> dict[str, Any]:
 
 
 def _long_parameter_list(config: Any, evidence: str) -> dict[str, Any]:
+    if config.language == "java":
+        target = _target(config)
+        if not target.file_path.is_file():
+            return {
+                "ok": True,
+                "detector": "tree_sitter_java_declaration",
+                "objectives": {"parameter_count": 0},
+                "target_missing": True,
+            }
+        signature = extract_function_signature(target, "java")
+        if signature is None:
+            return {
+                "ok": True,
+                "detector": "tree_sitter_java_declaration",
+                "objectives": {"parameter_count": 0},
+                "target_missing": True,
+            }
+        return {
+            "ok": True,
+            "detector": "tree_sitter_java_declaration",
+            "objectives": {
+                "parameter_count": len(signature.parameter_fingerprints),
+            },
+            "target_missing": False,
+            "target_method": signature.name,
+            "target_start_line": signature.start_line,
+            "target_signature": signature.signature_text,
+        }
     return _matching_syntactic(config, "long_parameter_list", {"long_parameter_list": -1}, evidence)
 
 

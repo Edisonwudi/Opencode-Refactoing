@@ -97,6 +97,58 @@ check(
     R._dataset_evidence({"smell_type": "feature_envy", "class": "Configuration", "evidence": "far=8"}),
     "far=8",
 )
+check(
+    "dataset_method_anchor_promoted",
+    R._dataset_location(
+        {
+            "smell_type": "long_parameter_list",
+            "location": "src/Foo.java:42",
+            "group_occurrences": json.dumps(
+                {
+                    "file": "src/Foo.java",
+                    "class": "Foo",
+                    "method": "target",
+                    "begin_line": "42",
+                }
+            ),
+        }
+    ),
+    "src/Foo.java:method=target|line=42",
+)
+check(
+    "explicit_method_anchor_preserved",
+    R._dataset_location(
+        {
+            "smell_type": "long_parameter_list",
+            "location": "src/Foo.java:method=target|line=42",
+            "group_occurrences": json.dumps(
+                {
+                    "file": "src/Foo.java",
+                    "method": "other",
+                    "begin_line": "7",
+                }
+            ),
+        }
+    ),
+    "src/Foo.java:method=target|line=42",
+)
+check(
+    "non_lpl_method_anchor_unchanged",
+    R._dataset_location(
+        {
+            "smell_type": "mysterious_name",
+            "location": "src/Foo.java:42",
+            "group_occurrences": json.dumps(
+                {
+                    "file": "src/Foo.java",
+                    "method": 'SyntheticOwner("value")',
+                    "begin_line": "42",
+                }
+            ),
+        }
+    ),
+    "src/Foo.java:42",
+)
 
 print("== single time budget ==")
 check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)

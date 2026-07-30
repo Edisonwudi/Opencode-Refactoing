@@ -379,7 +379,12 @@ def analyze_feature_envy_target(
             "line": line,
         }
     target = min(candidates, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
-    stats = _member_access_stats(model, target, feature_envy_semantics=True)
+    stats = _member_access_stats(
+        model,
+        target,
+        feature_envy_semantics=True,
+        prefer_environment_symbols=True,
+    )
     dominant_type, dominant_count = _dominant_access(stats.foreign_by_type)
     expected_simple = _erase_type(expected_receiver_type).rsplit(".", 1)[-1].strip()
     expected_count = 0
@@ -1768,6 +1773,7 @@ def _member_access_stats(
     method: MethodRecord,
     *,
     feature_envy_semantics: bool = False,
+    prefer_environment_symbols: bool = False,
 ) -> MemberAccessStats:
     stats = MemberAccessStats()
     if method.body is None:
@@ -1796,6 +1802,7 @@ def _member_access_stats(
             owner,
             owner_method_returns,
             receiver_expr,
+            prefer_environment_symbols=prefer_environment_symbols,
         )
         if receiver_info is None:
             stats.unresolved += 1
@@ -1890,6 +1897,8 @@ def _receiver_info_for_expression(
     owner: Optional[ClassRecord],
     owner_method_returns: Dict[str, str],
     expression: str,
+    *,
+    prefer_environment_symbols: bool = False,
 ) -> Optional[ReceiverInfo]:
     text = str(expression or "").strip()
     if not text:
@@ -1905,6 +1914,8 @@ def _receiver_info_for_expression(
     root = _root_receiver(text)
     if not root or root in {"this", "super"}:
         return None
+    if prefer_environment_symbols and root in env:
+        return env[root]
     if _looks_like_type_name(root, model):
         return None
     if root in env:

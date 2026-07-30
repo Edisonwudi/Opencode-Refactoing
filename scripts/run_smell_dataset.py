@@ -202,6 +202,39 @@ def _dataset_evidence(row: dict[str, str | None]) -> str:
     return evidence
 
 
+def _dataset_location(row: dict[str, str | None]) -> str:
+    """Promote the reviewed LPL method anchor into the runtime location."""
+    location = str(row.get("location") or "").strip()
+    if ":method=" in location or ":class=" in location:
+        return location
+    if str(row.get("smell_type") or "").strip() != "long_parameter_list":
+        return location
+    raw_occurrences = str(row.get("group_occurrences") or "").strip()
+    if not raw_occurrences:
+        return location
+    try:
+        occurrence = json.loads(raw_occurrences)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("long_parameter_list group_occurrences is not valid JSON") from exc
+    if not isinstance(occurrence, dict):
+        raise ValueError("long_parameter_list group_occurrences must be a JSON object")
+    method = str(occurrence.get("method") or "").strip()
+    file_name = str(occurrence.get("file") or "").strip()
+    begin_line = str(occurrence.get("begin_line") or "").strip()
+    if not method or not file_name:
+        raise ValueError("long_parameter_list group_occurrences must declare file and method")
+    location_file = location.rsplit(":", 1)[0].strip()
+    if location_file != file_name:
+        raise ValueError(
+            "group_occurrences file does not match location: "
+            f"{file_name!r} != {location_file!r}"
+        )
+    if begin_line and not begin_line.isdigit():
+        raise ValueError(f"group_occurrences begin_line is not numeric: {begin_line!r}")
+    line_suffix = f"|line={begin_line}" if begin_line else ""
+    return f"{file_name}:method={method}{line_suffix}"
+
+
 def _load_samples(dataset: Path) -> list[Sample]:
     with dataset.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -219,7 +252,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     smell=str(row["smell_type"]),
                     project_name=str(row["project_name"]),
                     project_root=Path(row["project_path"]).expanduser().resolve(),
-                    location=str(row["location"]),
+                    location=_dataset_location(row),
                     evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
                     test_location=str(row.get("test_location") or row.get("test_file") or ""),
