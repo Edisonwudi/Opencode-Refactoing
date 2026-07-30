@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 from audit_java_image_dependencies import (
     _collect_text,
     classify_dependency_failure,
+    parse_args,
     summarize_results,
 )
 
@@ -45,10 +47,21 @@ def check_dataset_snapshot_contract() -> None:
     assert snapshot_copy in dockerfile
     assert dockerfile.index(cleanup) < dockerfile.index(snapshot_copy)
     assert dockerfile.startswith("ARG BASE_ENV_IMAGE=")
+    assert (
+        dockerfile.splitlines()[0]
+        == "ARG BASE_ENV_IMAGE=opencode-smell-opencode:0.1.0-amd64"
+    )
     assert "FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source" in dockerfile
+    assert "FROM ${DEPENDENCY_CLOSURE_IMAGE} AS dependency_closure" in dockerfile
     assert "FROM ${BASE_ENV_IMAGE}" in dockerfile
     assert "org.opencontainers.refactor.base-environment-image=" in dockerfile
     assert 'org.opencontainers.refactor.agent-source-mode="mounted-readonly"' in dockerfile
+    assert 'org.opencontainers.refactor.idea-support="absent"' in dockerfile
+    assert (
+        "COPY --from=dependency_closure /opt/buildenv/ /opt/buildenv/"
+        in dockerfile
+    )
+    assert "COPY --from=dependency_source /opt/projects/ /opt/projects/" in dockerfile
     assert "COPY .opencode/" not in dockerfile
     assert "COPY runtime/python/" not in dockerfile
     assert "COPY scripts/" not in dockerfile
@@ -68,14 +81,25 @@ def check_dataset_snapshot_contract() -> None:
     assert refused_manifest["path"] == str(refused_csv.relative_to(root))
     assert refused_manifest["row_count"] == 30
     assert refused_manifest["sha256"] == refused_sha256
+    assert manifest["schema_version"] == 2
     acceptance = manifest["acceptance"]
-    assert acceptance["fresh_container_rounds"] == 2
-    assert acceptance["sample_count"] == 30
-    assert acceptance["unique_plan_count"] == 4
-    assert acceptance["pass_results"] == 8
-    assert acceptance["confirmed_missing_count"] == 0
-    assert acceptance["resolution_failure_count"] == 0
-    assert acceptance["semantic_plan_comparison"] == "PASS"
+    assert acceptance["sample_count"] == 751
+    assert acceptance["project_count"] == 13
+    assert acceptance["unique_plan_count"] == 409
+    assert acceptance["completed_plan_count"] == 409
+    assert acceptance["category_counts"] == {"PASS": 409}
+    assert acceptance["dependency_failure_count"] == 0
+    assert acceptance["missing_plan_count"] == 0
+    assert acceptance["selection_mismatch_count"] == 0
+    assert acceptance["network"] == "none"
+    assert (
+        acceptance["isolation"]
+        == "one_fresh_container_per_unique_execution_plan"
+    )
+    assert manifest["image"]["source_mode"] == "mounted-readonly"
+    assert manifest["image"]["idea_support"] == "absent"
+    assert manifest["static_integrity"]["errors"] == 0
+    assert manifest["static_integrity"]["maven_last_updated_files"] == 0
 
 
 def check_orchestration() -> None:
@@ -178,8 +202,24 @@ def check_orchestration() -> None:
         assert (output / "plans" / "plan-missing" / "build.log").is_file()
 
 
+def check_mounted_source_defaults() -> None:
+    previous = os.environ.get("PROJECT_REVISIONS")
+    os.environ["PROJECT_REVISIONS"] = "/opt/opencode-runtime/project-revisions.json"
+    try:
+        assert (
+            parse_args(["--list-only"]).project_revisions
+            == "/opt/opencode-runtime/project-revisions.json"
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("PROJECT_REVISIONS", None)
+        else:
+            os.environ["PROJECT_REVISIONS"] = previous
+
+
 def main() -> int:
     check_dataset_snapshot_contract()
+    check_mounted_source_defaults()
     passed = classify_dependency_failure(
         {"first_pass": True},
         "Downloaded org.example:present:1.0.0 before the image was frozen.",
@@ -221,6 +261,17 @@ def main() -> int:
     )
     assert uncertain["category"] == "DEPENDENCY_RESOLUTION_FAILED"
     assert uncertain["confidence"] == "medium"
+
+    toolchain = classify_dependency_failure(
+        {"first_pass": False, "status": "build_failed", "build_success": False},
+        (
+            "Failed to execute goal org.mvnsearch:toolchains-maven-plugin:4.5.0:toolchain: "
+            "Misconfigured toolchains. Non-existing JDK home configuration at "
+            "/root/.m2/jdks/jdk-26.0.1+8"
+        ),
+    )
+    assert toolchain["category"] == "BUILD_TOOLCHAIN_MISSING"
+    assert toolchain["confidence"] == "high"
 
     assertion = classify_dependency_failure(
         {

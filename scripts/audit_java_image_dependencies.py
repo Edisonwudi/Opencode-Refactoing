@@ -43,6 +43,13 @@ RESOLUTION_FAILURE_PATTERNS = (
     re.compile(r"dependencyresolutionexception", re.IGNORECASE),
     re.compile(r"plugin .+ was not found in any of the following sources", re.IGNORECASE),
 )
+TOOLCHAIN_MISSING_PATTERNS = (
+    re.compile(r"misconfigured toolchains", re.IGNORECASE),
+    re.compile(r"non-existing JDK home configuration", re.IGNORECASE),
+    re.compile(r"cannot find matching toolchain", re.IGNORECASE),
+    re.compile(r"no matching toolchains found", re.IGNORECASE),
+    re.compile(r"toolchain.+(?:jdk|java).+(?:missing|not found|does not exist)", re.IGNORECASE),
+)
 COORDINATE_PATTERN = re.compile(
     r"(?<![\w/])"
     r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:[A-Za-z0-9_.+-]+"
@@ -67,7 +74,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--projects", default="")
     parser.add_argument(
         "--project-revisions",
-        default="/opt/opencode-refactor/project-revisions.json",
+        default=os.environ.get(
+            "PROJECT_REVISIONS", "/opt/opencode-refactor/project-revisions.json"
+        ),
     )
     parser.add_argument("--project", action="append", default=[])
     parser.add_argument("--smell", action="append", default=[])
@@ -196,6 +205,7 @@ def classify_dependency_failure(
     coordinates = sorted(set(COORDINATE_PATTERN.findall(text)))[:20]
     offline_evidence = _matching_evidence(text, OFFLINE_MISSING_PATTERNS)
     resolution_evidence = _matching_evidence(text, RESOLUTION_FAILURE_PATTERNS)
+    toolchain_evidence = _matching_evidence(text, TOOLCHAIN_MISSING_PATTERNS)
 
     infrastructure_statuses = {
         "audit_worker_failed",
@@ -220,6 +230,10 @@ def classify_dependency_failure(
             line for line in resolution_evidence if line not in set(offline_evidence)
         ]
         evidence = evidence[:8]
+    elif toolchain_evidence:
+        category = "BUILD_TOOLCHAIN_MISSING"
+        confidence = "high"
+        evidence = toolchain_evidence
     elif resolution_evidence:
         category = "DEPENDENCY_RESOLUTION_FAILED"
         confidence = "medium"
@@ -237,7 +251,10 @@ def classify_dependency_failure(
         confidence = "medium"
         evidence = []
 
-    if category not in {"OFFLINE_DEPENDENCY_MISSING", "DEPENDENCY_RESOLUTION_FAILED"}:
+    if category not in {
+        "OFFLINE_DEPENDENCY_MISSING",
+        "DEPENDENCY_RESOLUTION_FAILED",
+    }:
         coordinates = []
     return {
         "category": category,
@@ -371,14 +388,18 @@ def summarize_results(
         counts[category] = counts.get(category, 0) + 1
     confirmed_missing_count = counts.get("OFFLINE_DEPENDENCY_MISSING", 0)
     resolution_failure_count = counts.get("DEPENDENCY_RESOLUTION_FAILED", 0)
+    toolchain_missing_count = counts.get("BUILD_TOOLCHAIN_MISSING", 0)
     return {
         "success": len(results) == len(plans) and counts.get("PASS", 0) == len(plans),
         "plan_count": len(plans),
         "completed_plan_count": len(results),
         "confirmed_missing_count": confirmed_missing_count,
         "resolution_failure_count": resolution_failure_count,
+        "toolchain_missing_count": toolchain_missing_count,
         "dependency_related_failure_count": (
-            confirmed_missing_count + resolution_failure_count
+            confirmed_missing_count
+            + resolution_failure_count
+            + toolchain_missing_count
         ),
         "category_counts": dict(sorted(counts.items())),
         "results": sorted(results, key=lambda item: str(item.get("execution_id", ""))),

@@ -1,33 +1,24 @@
 {
   "acceptance": {
-    "confirmed_missing_count": 0,
-    "execution_ids": {
-      "Canal": "a07a9d2c0945885c7ee6bd7cfdf2918b962e620baed814321b689cec2ad13ee1",
-      "H2": "7ae5cc5bee143a7e34c55777a36a9ff86fdc529216ecacad28a432d43c1b0133",
-      "JHotDraw": "0ab4e3f32b7e051e21df35e3f7c9442095b54c41d28b136cf2b2b525790f7992",
-      "Mindustry": "2ba93db6ef3b7c5ebae59c1de83144f3e431961d677e47697dfd682532ddc7ad"
+    "category_counts": {
+      "PASS": 409
     },
-    "fresh_container_rounds": 2,
+    "completed_plan_count": 409,
+    "dependency_failure_count": 0,
+    "isolation": "one_fresh_container_per_unique_execution_plan",
+    "missing_plan_count": 0,
     "network": "none",
-    "pass_results": 8,
-    "resolution_failure_count": 0,
-    "rounds": [
-      {
-        "elapsed_seconds": 85.295,
-        "execution_plan_manifest_sha256": "0ff06b3e3fbc7037d42f28241dce2bd880e42e659887837d4eadc8054487a41e",
-        "name": "round1"
-      },
-      {
-        "elapsed_seconds": 85.739,
-        "execution_plan_manifest_sha256": "7cc8594388556c921a96e479f66355fb7c41751eac408ba08b2a2c167919f12f",
-        "name": "round2"
-      }
-    ],
-    "sample_count": 30,
-    "semantic_plan_comparison": "PASS",
-    "unique_plan_count": 4
+    "project_count": 13,
+    "sample_count": 751,
+    "selection_mismatch_count": 0,
+    "unique_plan_count": 409
   },
   "accepted_at": "2026-07-30",
+  "archive": {
+    "bytes": 6151372449,
+    "path": "smell-refactor-env-java.tar.gz",
+    "sha256": "d08d9e2c87507da7ac51d6d74763494b20ef71d16da0eae8d15728a53b1a2c95"
+  },
   "dataset": {
     "refused_bequest": {
       "path": "dataset/java/delivery_schema/refused_bequest.csv",
@@ -37,17 +28,29 @@
     "snapshot": "main-20260730",
     "source": "dataset/java/delivery_schema"
   },
-  "image": {
-    "base_image_id": "sha256:6750ffad9e3faa9290f0e47570b2906e5be515dc4fb87e2f4fc060f57bc3fefa",
-    "base_tag": "opencode-java-refactor-delivery:0.1.3-r7.3.19-rb-capability-closure-v1-canal-oracle-fix",
-    "image_id": "sha256:80de97ec2b0dbafbc99dfe2d52e3aa047c9a867be82fa766145ead4a55e1ea51",
-    "platform": "linux/amd64",
-    "tag": "opencode-java-refactor-delivery:0.1.3-r7.3.19-rb-capability-closure-v1-canal-oracle-fix-csv-aligned-v1"
+  "derby_matrix": {
+    "jdk17_first": "PASS",
+    "jdk17_repeat": "PASS",
+    "jdk21": "PASS",
+    "network": "none"
   },
-  "limitations": [
-    "Acceptance covers the final 30-row refused_bequest dataset, not every Java smell dataset.",
-    "The dependency-audit script was bind-mounted for this acceptance run; rebuild from the current repository to bake it into the image."
-  ],
-  "schema_version": 1,
+  "image": {
+    "dependency_closure_image_id": "sha256:aab34c8c9d1674ec062b1118906a401e4487ce5f7b8559bb060cd96f0f82cc40",
+    "dependency_source_image_id": "sha256:b687059dc04df30d8f5f224feb3d4a88371b878e7bd4e86f4c75687db7294430",
+    "idea_support": "absent",
+    "image_id": "sha256:64a7803b682d677afd237d9267144501ea65c502341382380ed1ade017735205",
+    "platform": "linux/amd64",
+    "source_mode": "mounted-readonly",
+    "tag": "opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2"
+  },
+  "schema_version": 2,
+  "static_integrity": {
+    "archives_checked": 5141,
+    "errors": 0,
+    "maven_last_updated_files": 0,
+    "maven_marker_entries": 4189,
+    "maven_marker_files": 1364,
+    "warnings": 1
+  },
   "status": "accepted-local-edison"
 }

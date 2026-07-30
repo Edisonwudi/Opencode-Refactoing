@@ -34,10 +34,19 @@ set -e
 grep -q 'AGENT_DEPENDENCY_MISMATCH: package-lock.json' "$tmp/mismatch.stderr"
 
 grep -q '^FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source$' "$dockerfile"
+grep -q '^FROM ${DEPENDENCY_CLOSURE_IMAGE} AS dependency_closure$' "$dockerfile"
 grep -q '^FROM ${BASE_ENV_IMAGE}$' "$dockerfile"
+grep -q '^ARG BASE_ENV_IMAGE=opencode-smell-opencode:0.1.0-amd64$' "$dockerfile"
 grep -q 'COPY docker/mounted-source/entrypoint.sh /usr/local/bin/run-mounted-opencode-agent' "$dockerfile"
 grep -q 'org.opencontainers.refactor.agent-source-mode="mounted-readonly"' "$dockerfile"
+grep -q 'org.opencontainers.refactor.idea-support="absent"' "$dockerfile"
+grep -q 'SMELL_PROJECTS=/opt/opencode-runtime/projects.docker.yaml' "$dockerfile"
+grep -q 'COPY --from=dependency_source /etc/gitconfig /etc/gitconfig' "$dockerfile"
+grep -q 'COPY --from=dependency_closure /opt/buildenv/ /opt/buildenv/' "$dockerfile"
+grep -q 'COPY --from=dependency_source /opt/projects/ /opt/projects/' "$dockerfile"
 grep -q 'test ! -e /opt/opencode-refactor' "$dockerfile"
+grep -q 'test ! -e /opt/idea' "$dockerfile"
+grep -q 'test ! -e /opt/idea-refactoring' "$dockerfile"
 if grep -Eq '^COPY (\.opencode|runtime/python|scripts|docker/java-refactor-delivery/entrypoint\.sh)' "$dockerfile"; then
   echo "Environment image must not copy Agent source" >&2
   exit 1
