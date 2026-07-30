@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 entrypoint="$repo_root/docker/mounted-source/entrypoint.sh"
+delivery_entrypoint="$repo_root/docker/java-refactor-delivery/entrypoint.sh"
 dockerfile="$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mounted-source-contract.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
@@ -55,5 +56,13 @@ if grep -Fqx 'ENTRYPOINT ["/usr/local/bin/run-java-refactor-delivery"]' "$docker
   echo "Environment image must enter through the mounted-source contract" >&2
   exit 1
 fi
+
+# benchmark-worker owns a separate results root. Its verifier artifacts must be
+# derived from that root instead of silently falling back to the image's /runs.
+grep -Fq 'benchmark_artifact_root="$benchmark_results_root/artifacts"' "$delivery_entrypoint"
+grep -Fq 'Cannot create benchmark artifact directory: $benchmark_artifact_root' "$delivery_entrypoint"
+grep -Fq 'Cannot assign benchmark results to $RUN_AS_USER: $benchmark_results_root' "$delivery_entrypoint"
+grep -Fq 'runuser -u "$RUN_AS_USER" -- test -w "$benchmark_artifact_root"' "$delivery_entrypoint"
+grep -Fq 'env SMELL_ARTIFACT_ROOT="$benchmark_artifact_root"' "$delivery_entrypoint"
 
 echo "Mounted source contract self-check passed"

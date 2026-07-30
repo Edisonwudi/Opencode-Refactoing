@@ -308,9 +308,30 @@ python3 scripts/run_smell_dataset.py \
 - 每个样本独立 git checkout、独立容器，requested commit/tree 与 actual
   必须一致，禁止 HEAD fallback。
 - 离线约束：Maven/Gradle 全部走镜像内离线仓库；模型 API 是唯一外联。
-- 交付镜像内以 `benchmark-worker` 方式批量跑（见 1.7 的容器命令）。
+- 外部并发控制器使用交付镜像的 `benchmark-worker` 入口时，必须同时提供
+  `--results-root`。入口会创建可写的 `<results-root>/artifacts`，并将
+  `SMELL_ARTIFACT_ROOT` 唯一设置为该目录后再降权启动 worker；目录不可写时
+  会在调用模型前以退出码 73 失败。不要另行挂载未对齐的 `/runs` artifact
+  目录。
 - 更多 runner 参数（`--limit`、`--offset`、`--projects`、
   `--project-revisions`、dry-run 等）见 `python3 scripts/run_smell_dataset.py --help`。
+
+外部并发控制器的容器调用契约如下；`run_worker.py` 与 plan 由控制器提供，
+而 Agent 源码始终从当前 Git checkout 只读挂载：
+
+```bash
+docker run --rm \
+  --pull=never \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="/path/to/control",dst=/control,readonly \
+  --mount type=bind,src="/path/to/results",dst=/results \
+  --mount type=bind,src="/path/to/secret",dst=/secret,readonly \
+  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
+  benchmark-worker \
+  --plan /control/plan.json \
+  --results-root /results \
+  --secret-file /secret/model-api-key
+```
 
 ---
 

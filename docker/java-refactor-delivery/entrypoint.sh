@@ -149,18 +149,33 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
   [[ -f "$benchmark_runner" ]] || { echo "Benchmark worker not found: $benchmark_runner" >&2; exit 66; }
   [[ -n "$benchmark_results_root" ]] || { echo "benchmark-worker requires --results-root" >&2; exit 64; }
   [[ -s "$benchmark_secret_source" ]] || { echo "Benchmark secret file is missing or empty" >&2; exit 66; }
+  benchmark_artifact_root="$benchmark_results_root/artifacts"
 
   benchmark_secret_target="/dev/shm/minimax-api-key.$$.secret"
   install -m 400 -o "$RUN_AS_USER" -g "$RUN_AS_USER" \
     "$benchmark_secret_source" "$benchmark_secret_target"
   benchmark_args+=("--secret-file" "$benchmark_secret_target")
 
-  mkdir -p "$benchmark_results_root" /tmp/opencode-refactor-worktrees \
+  mkdir -p /tmp/opencode-refactor-worktrees \
     /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
-  chown -R "$RUN_AS_USER:$RUN_AS_USER" "$benchmark_results_root" \
+  if ! mkdir -p "$benchmark_results_root" "$benchmark_artifact_root"; then
+    echo "Cannot create benchmark artifact directory: $benchmark_artifact_root" >&2
+    exit 73
+  fi
+  if ! chown -R "$RUN_AS_USER:$RUN_AS_USER" "$benchmark_results_root"; then
+    echo "Cannot assign benchmark results to $RUN_AS_USER: $benchmark_results_root" >&2
+    exit 73
+  fi
+  chown -R "$RUN_AS_USER:$RUN_AS_USER" \
     /tmp/opencode-refactor-worktrees /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
+  if ! runuser -u "$RUN_AS_USER" -- test -w "$benchmark_artifact_root"; then
+    echo "Benchmark artifact directory is not writable by $RUN_AS_USER: $benchmark_artifact_root" >&2
+    exit 73
+  fi
 
-  exec runuser -u "$RUN_AS_USER" -- python3 "$benchmark_runner" "${benchmark_args[@]}"
+  exec runuser -u "$RUN_AS_USER" -- \
+    env SMELL_ARTIFACT_ROOT="$benchmark_artifact_root" \
+    python3 "$benchmark_runner" "${benchmark_args[@]}"
 fi
 
 mkdir -p "$RUNS_ROOT" /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
