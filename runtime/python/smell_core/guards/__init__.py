@@ -294,7 +294,11 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
                 "details": {"build": build_result, "test": test_result},
             }
         if config.verification_mode == "sample_optimized":
-            execution = _sample_test_execution_evidence(config, test_started_ns)
+            execution = _sample_test_execution_evidence(
+                config,
+                test_started_ns,
+                test_result,
+            )
             test_result["execution_evidence"] = execution
             if not execution["success"]:
                 test_result["success"] = False
@@ -341,8 +345,9 @@ def _command_hash(command: str) -> str:
 def _sample_test_execution_evidence(
     config: ResolvedRunConfig,
     started_ns: int,
+    command_result: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    """Require fresh JUnit XML evidence for every declared sample test class."""
+    """Require fresh XML or explicit direct-Java evidence for a declared test."""
     test_classes = [
         Path(part.strip()).stem
         for part in str(config.sample_test_location or "").split(";")
@@ -361,17 +366,35 @@ def _sample_test_execution_evidence(
             "tests": 0,
             "skipped": 0,
         }
+    fresh_reports: List[tuple[Path, ET.Element]] = []
+    for report in config.project_root.rglob("TEST-*.xml"):
+        try:
+            if report.stat().st_mtime_ns < started_ns:
+                continue
+            fresh_reports.append((report, ET.parse(report).getroot()))
+        except (OSError, ET.ParseError):
+            continue
+
     classes: List[Dict[str, object]] = []
     for test_class in test_classes:
         class_reports: List[str] = []
         class_executed = 0
         class_skipped = 0
-        for report in config.project_root.rglob(f"TEST-*{test_class}.xml"):
-            try:
-                if report.stat().st_mtime_ns < started_ns:
-                    continue
-                root = ET.parse(report).getroot()
-            except (OSError, ET.ParseError):
+        for report, root in fresh_reports:
+            suite_names = [str(root.attrib.get("name") or "")]
+            suite_names.extend(
+                str(case.attrib.get("classname") or "")
+                for case in root.findall(".//testcase")
+            )
+            simple_names = {
+                name.rsplit(".", 1)[-1]
+                for name in suite_names
+                if name
+            }
+            if not any(
+                name == test_class or name.startswith(f"{test_class}$")
+                for name in simple_names
+            ):
                 continue
             tests_text = str(root.attrib.get("tests") or "").strip()
             try:
@@ -395,8 +418,87 @@ def _sample_test_execution_evidence(
                 "reports": sorted(class_reports),
                 "tests": class_executed,
                 "skipped": class_skipped,
+                "evidence_mode": "xml" if class_executed > 0 else "",
             }
         )
+
+    console_evidence: Dict[str, object] = {}
+    rendered_command = ""
+    output = ""
+    if isinstance(command_result, dict):
+        rendered_command = str(
+            command_result.get("command")
+            or command_result.get("script")
+            or ""
+        )
+        output = str(command_result.get("output") or "")
+    console_suite_counts: Dict[str, int] = {test_class: 0 for test_class in test_classes}
+    for match in re.finditer(
+        r"Tests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*"
+        r"Skipped:\s*(\d+).*?\bin\s+([A-Za-z0-9_.$]+)",
+        output,
+    ):
+        tests = int(match.group(1))
+        skipped = int(match.group(2))
+        simple_name = match.group(3).rsplit(".", 1)[-1]
+        non_skipped = max(tests - skipped, 0)
+        if non_skipped <= 0:
+            continue
+        for test_class in test_classes:
+            if simple_name == test_class or simple_name.startswith(f"{test_class}$"):
+                console_suite_counts[test_class] += non_skipped
+    console_suite_classes = [
+        test_class
+        for test_class, count in console_suite_counts.items()
+        if count > 0
+    ]
+    if console_suite_classes:
+        for item in classes:
+            test_class = str(item["test_class"])
+            if bool(item["success"]) or console_suite_counts[test_class] <= 0:
+                continue
+            item["success"] = True
+            item["tests"] = console_suite_counts[test_class]
+            item["evidence_mode"] = "test_runner_console"
+        console_evidence = {
+            "mode": "test_runner_console",
+            "invoked_test_classes": console_suite_classes,
+            "tests": sum(console_suite_counts.values()),
+        }
+    direct_java = bool(
+        re.search(r"(?:^|[;&|]\s*)java(?:\s|$)", rendered_command)
+    )
+    if direct_java:
+        invoked = [
+            test_class
+            for test_class in test_classes
+            if re.search(
+                rf"(?<![\w$])(?:[A-Za-z_$][\w$]*\.)*"
+                rf"{re.escape(test_class)}(?![\w$])",
+                rendered_command,
+            )
+        ]
+        junit_match = re.search(r"\bOK\s+\((\d+)\s+tests?\)", output)
+        junit_core = "org.junit.runner.JUnitCore" in rendered_command
+        console_tests = (
+            int(junit_match.group(1))
+            if junit_core and junit_match
+            else (1 if invoked and not junit_core else 0)
+        )
+        if console_tests > 0:
+            for item in classes:
+                if str(item["test_class"]) not in invoked or bool(item["success"]):
+                    continue
+                item["success"] = True
+                item["tests"] = console_tests if len(invoked) == 1 else 1
+                item["evidence_mode"] = (
+                    "junit_console" if junit_core else "java_main_exit_zero"
+                )
+            console_evidence = {
+                "mode": "junit_console" if junit_core else "java_main_exit_zero",
+                "invoked_test_classes": invoked,
+                "tests": console_tests,
+            }
     missing = [
         str(item["test_class"])
         for item in classes
@@ -436,6 +538,7 @@ def _sample_test_execution_evidence(
         "executed_test_classes": executed_classes,
         "missing_test_classes": missing,
         "reports": reports,
+        "console_evidence": console_evidence,
         "tests": executed,
         "skipped": skipped_total,
     }

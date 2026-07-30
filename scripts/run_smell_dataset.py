@@ -24,7 +24,10 @@ RUNTIME_PYTHON = ROOT / "runtime" / "python"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.config import VERIFICATION_MODES  # noqa: E402
+from smell_core.config import (  # noqa: E402
+    VERIFICATION_MODES,
+    select_dataset_test_command,
+)
 from smell_core.detector_utils import (  # noqa: E402
     parse_parent_from_evidence,
     parse_structural_expectation,
@@ -208,6 +211,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
             raise ValueError(f"{dataset} is missing columns: {', '.join(sorted(missing))}")
         samples: list[Sample] = []
         for row in reader:
+            verification_mode = str(row.get("verification_mode") or "")
             samples.append(
                 Sample(
                     sample_id=str(row["sample_id"]),
@@ -219,8 +223,12 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
                     test_location=str(row.get("test_location") or row.get("test_file") or ""),
-                    test_command=str(row.get("test_command", "")),
-                    verification_mode=str(row.get("verification_mode", "")),
+                    test_command=select_dataset_test_command(
+                        verification_mode=verification_mode,
+                        test_command=row.get("test_command"),
+                        focused_test_command=row.get("focused_test_command"),
+                    ),
+                    verification_mode=verification_mode,
                 )
             )
     return samples
@@ -604,6 +612,30 @@ def _api_key_from_args(args: argparse.Namespace, provider_id: str) -> tuple[str,
             if isinstance(auth, dict) and str(auth.get("key") or "").strip():
                 return str(auth["key"]).strip(), OPENCODE_BATCH_API_KEY_ENV, f"auth_json:{path}"
     return "", "", ""
+
+
+def _validate_model_auth(args: argparse.Namespace) -> None:
+    """Fail before creating run artifacts when a model credential is absent."""
+    if bool(args.dry_run) or bool(args.checkout_only):
+        return
+    provider_id = _provider_id_from_model(str(args.model or ""))
+    if not provider_id:
+        raise ValueError(
+            "MODEL_PROVIDER_MISSING: --model must use provider/model-id format"
+        )
+    api_key, _, _ = _api_key_from_args(args, provider_id)
+    if api_key:
+        return
+    requested_env = str(args.opencode_api_key_env or "").strip()
+    env_hint = (
+        f" Set and export {requested_env}."
+        if requested_env
+        else " Set --opencode-api-key-env or provide OPENCODE_AUTH_JSON."
+    )
+    raise ValueError(
+        f"MODEL_AUTH_MISSING: no API key is configured for provider {provider_id!r}."
+        f"{env_hint}"
+    )
 
 
 def _write_opencode_config(sample_dir: Path, args: argparse.Namespace) -> tuple[Path | None, dict[str, str], dict[str, Any]]:
@@ -1716,6 +1748,10 @@ def main(argv: list[str] | None = None) -> int:
             "IDEA_UNSUPPORTED_LANGUAGE: --idea/java-refactor-agent-idea is Java-only; "
             f"selected non-Java language(s): {languages}. Use --no-idea."
         )
+    try:
+        _validate_model_auth(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = args.run_name or f"smell-refactor-{dataset.stem}-{timestamp}"
     run_dir = Path(args.runs_root).expanduser().resolve() / run_name

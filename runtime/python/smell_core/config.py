@@ -43,6 +43,21 @@ LLM_API_KEY_ENVS = {
 }
 
 
+def select_dataset_test_command(
+    *,
+    verification_mode: object,
+    test_command: object,
+    focused_test_command: object,
+) -> str:
+    """Select the dataset command that matches the declared verification path."""
+    mode = str(verification_mode or "").strip()
+    primary = str(test_command or "").strip()
+    focused = str(focused_test_command or "").strip()
+    if mode == "sample_optimized" and focused:
+        return focused
+    return primary
+
+
 @dataclass
 class CommandConfig:
     command: Optional[str] = None

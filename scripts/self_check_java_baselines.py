@@ -32,6 +32,7 @@ from smell_core.config import (  # noqa: E402
     load_project_overrides,
     load_refactor_config,
     resolve_run_config,
+    select_dataset_test_command,
 )
 from smell_core.guards import run_build_test_guard  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
@@ -157,6 +158,7 @@ def load_samples(
             if missing:
                 raise ValueError(f"{csv_path} is missing required columns: {', '.join(missing)}")
             for row in reader:
+                verification_mode = str(row.get("verification_mode") or "").strip()
                 sample = Sample(
                     csv_name=csv_path.name,
                     sample_id=str(row.get("sample_id") or "").strip(),
@@ -166,9 +168,13 @@ def load_samples(
                     location=str(row.get("location") or "").strip(),
                     evidence=str(row.get("evidence") or "").strip(),
                     test_file=str(row.get("test_file") or "").strip(),
-                    test_command=str(row.get("test_command") or "").strip(),
+                    test_command=select_dataset_test_command(
+                        verification_mode=verification_mode,
+                        test_command=row.get("test_command"),
+                        focused_test_command=row.get("focused_test_command"),
+                    ),
                     target_method=target_method(row.get("group_occurrences")),
-                    verification_mode=str(row.get("verification_mode") or "").strip(),
+                    verification_mode=verification_mode,
                     legacy_test_commit=str(row.get("test_commit") or "").strip(),
                     test_oracle_sha256=str(row.get("test_oracle_sha256") or "").strip(),
                 )

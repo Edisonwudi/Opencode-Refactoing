@@ -53,6 +53,59 @@ def main() -> int:
             )
             == "project_full"
         )
+        focused_dataset = root / "focused.csv"
+        with focused_dataset.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "sample_id",
+                    "language",
+                    "smell_type",
+                    "project_name",
+                    "project_path",
+                    "location",
+                    "test_file",
+                    "test_command",
+                    "focused_test_command",
+                    "verification_mode",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "sample_id": "2",
+                    "language": "java",
+                    "smell_type": "feature_envy",
+                    "project_name": "demo",
+                    "project_path": str(project),
+                    "location": f"{source}:method=f|line=1",
+                    "test_file": "FocusedTest.java",
+                    "test_command": "mvn test",
+                    "focused_test_command": "mvn -Dtest=FocusedTest test",
+                    "verification_mode": "sample_optimized",
+                }
+            )
+        focused_sample = runner._load_samples(focused_dataset)[0]
+        assert focused_sample.test_command == "mvn -Dtest=FocusedTest test"
+        assert focused_sample.raw["test_command"] == "mvn test"
+        print("  ok   sample_optimized selects focused_test_command")
+        auth_args = SimpleNamespace(
+            dry_run=False,
+            checkout_only=False,
+            model="minimax/MiniMax-M2.7",
+            opencode_api_key="",
+            opencode_api_key_env="README_SMOKE_MISSING_KEY",
+            opencode_auth_json="disabled",
+        )
+        try:
+            runner._validate_model_auth(auth_args)
+        except ValueError as exc:
+            assert "MODEL_AUTH_MISSING" in str(exc)
+        else:
+            raise AssertionError("missing model auth must fail before a run starts")
+        auth_args.dry_run = True
+        runner._validate_model_auth(auth_args)
+        print("  ok   missing model auth fails before run artifacts are created")
         strict_oracle = replace(
             sample,
             language="java",
