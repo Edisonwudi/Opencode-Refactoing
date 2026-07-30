@@ -6,7 +6,8 @@ checkpoint 契约（通用 contract + 每种异味的指标适配器）。Agent 
 
 - 本仓库（GitHub）：agent 源码、checkpoint 契约与适配器、批量 runner、自检、文档。
 - 四个环境镜像（java / python / c / cpp，压缩包单独交付，不进 Git）：
-  IDE、语言项目、离线依赖缓存、dataset、OpenCode/Node 运行时。
+  语言工具链、项目、离线依赖缓存、dataset、OpenCode/Node 运行时。当前 Java
+  环境镜像不包含 IDEA/IDEA-Refactoring。
 
 > 拿到仓库和镜像后，照第 1 节的编号顺序执行即可跑通第一个样本。
 
@@ -25,7 +26,7 @@ cd Opencode-Refactoing
 
 ```bash
 mkdir -p images
-cp /path/to/smell-refactor-env-{java,python,c,cpp}.tar.gz images/
+cp /path/to/smell-refactor-env-java.tar.gz images/
 cp /path/to/SHA256SUMS images/
 (cd images && sha256sum -c SHA256SUMS)
 ```
@@ -34,15 +35,19 @@ cp /path/to/SHA256SUMS images/
 对照见 `delivery/README.md`。四个镜像均为 **linux/amd64**，在 amd64
 Linux 主机上开箱即用；ARM 主机（如 Apple Silicon）需
 `--platform linux/amd64` 仿真运行（慢）或按 Dockerfile 重建 ARM 版。
+这里只运行 Java 时只需 Java 归档；同时交付其他语言时，再把对应归档加入
+`images/`，并使用覆盖实际归档集合的 `SHA256SUMS`。
 
 ### 1.3 载入镜像
 
 ```bash
-for lang in java python c cpp; do
-  docker load -i "images/smell-refactor-env-${lang}.tar.gz"
-done
-docker images | grep refactor-env    # 应看到四个镜像
+docker load -i images/smell-refactor-env-java.tar.gz
+docker image inspect \
+  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
+  --format '{{.Id}}'
 ```
+
+如交付了其他语言，再分别 `docker load` 对应归档。
 
 ### 1.4 安装本地依赖并验证源码契约
 
@@ -68,9 +73,10 @@ export SMELL_OPENCODE_BASE_URL="https://api.minimaxi.com/v1"   # 按 provider �
 
 ```bash
 docker run --rm \
+  --pull=never \
   --mount type=bind,src="$PWD",dst=/agent-src,readonly \
   --mount type=bind,src="$PWD/runs",dst=/runs \
-  opencode-java-refactor-env:0.1.0-mounted-source-godclass-bounded-3a10c8ad \
+  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
   self-check
 ```
 
@@ -90,11 +96,14 @@ docker run --rm \
 ### 1.7 跑一个真实样本
 
 ```bash
+: "${SMELL_OPENCODE_API_KEY:?请先设置并 export SMELL_OPENCODE_API_KEY}"
+
 docker run --rm \
+  --pull=never \
   --mount type=bind,src="$PWD",dst=/agent-src,readonly \
   --mount type=bind,src="$PWD/runs",dst=/runs \
   -e SMELL_OPENCODE_API_KEY \
-  opencode-java-refactor-env:0.1.0-mounted-source-godclass-bounded-3a10c8ad \
+  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
   --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
   --sample-id 8 \
   --model minimax/MiniMax-M2.7 \
@@ -104,7 +113,9 @@ docker run --rm \
   --agent java-refactor-agent
 ```
 
-IDEA 语义重构增强路径把最后一行换成 `--agent java-refactor-agent-idea`。
+当前 Java 环境镜像已移除 IDEA 运行时，只支持
+`--agent java-refactor-agent`。如需 IDEA 语义重构，应使用单独的 IDEA
+开发镜像，不能在本交付镜像中选择 `java-refactor-agent-idea`。
 
 ### 1.8 看结果
 
@@ -125,16 +136,17 @@ git pull    # agent 源码即最新版;镜像无需任何操作
 
 Java 环境镜像的唯一构建入口是
 `docker/java-refactor-delivery/Dockerfile.mounted-source`。该 Dockerfile
-只允许固化 IDE、项目快照、dataset、离线仓库、Node/OpenCode 依赖及版本清单；
+只允许固化 Java 工具链、项目快照、dataset、离线仓库、Node/OpenCode 依赖及版本清单；
 Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在运行时
 从 `/agent-src` 只读装配。`npm run check:mounted-source` 会阻断重新复制这些源码
 或绕过挂载入口的 Dockerfile 改动。
 
-只有以下环境契约变化才重建镜像：IDE/工具链、项目快照、dataset、离线依赖，
+只有以下环境契约变化才重建镜像：Java 工具链、项目快照、dataset、离线依赖，
 或 `package-lock.json` / `.opencode/package-lock.json`。其余 Agent 逻辑更新只
 同步仓库；实验结果同时记录 Git commit 与环境镜像 ID，避免把两种版本混为一谈。
 
-只有环境本身（IDE、依赖缓存、dataset）变化才需要重新交付镜像（回到 1.2)。
+只有环境本身（Java 工具链、项目快照、依赖缓存、dataset）变化才需要重新
+交付镜像（回到 1.2）。
 
 ### 1.10 非 Java 语言（python / c / cpp）
 
