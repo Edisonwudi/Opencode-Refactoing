@@ -108,7 +108,7 @@ CLASS_DECL_RE = re.compile(
     r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+extends\s+([A-Za-z_$][A-Za-z0-9_$\.]*))?"
 )
 VAR_DECL_RE = re.compile(
-    r"\b(?:byte|short|int|long|float|double|boolean|char|String|var|[A-Z][A-Za-z0-9_$<>\[\],.?\s]*)\s+([a-zA-Z_$][A-Za-z0-9_$]*)\s*(?:=|;|,)"
+    r"\b(?:(?:byte|short|int|long|float|double|boolean|char|String|var)(?:\s*\[\s*\])*|[A-Z][A-Za-z0-9_$<>\[\],.?\s]*)\s+([a-zA-Z_$][A-Za-z0-9_$]*)\s*(?:=|;|,)"
 )
 
 DEFAULT_THRESHOLDS = {
