@@ -1,6 +1,6 @@
 # IDEA Refactor Path Examples
 
-Read only the file that matches the current Java smell. Treat examples as route patterns, not as task context or mandatory instructions. The current source code and `idea_refactor_locate.availableOperations` remain authoritative.
+Read only the file that matches the current Java smell. Treat examples as route patterns, not as task context or mandatory instructions. The current source code and `idea_refactor_preview` status, candidates, and diagnostics remain authoritative.
 
 | Smell | Reference |
 | --- | --- |

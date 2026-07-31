@@ -42,12 +42,10 @@ generic_smells: &generic_smells
     constraints:
     - Keep every existing branch behavior covered.
     verification:
-    - Reduce case count or density in the labeled function and pass configured project tests.
+    - Remove every switch from the target function and pass configured project tests.
     guards:
     - type: switch_statements
-      max_branches: 8
-      max_density: 10.0
-    retry_hint_template: Reduce switch-heavy branching in the labeled function further.
+    retry_hint_template: The target function still contains a switch; remove it without changing branch behavior.
   code_clone_type1:
     instruction: Centralize the exact duplicated behavior shared by the two labeled functions.
     constraints:
@@ -58,7 +56,7 @@ generic_smells: &generic_smells
     - Pass configured project build and tests.
     guards:
     - type: code_clone_type1
-      min_tokens: 80
+      min_tokens: 30
     retry_hint_template: The labeled pair still contains exact duplicated logic.
   data_clumps:
     instruction: Replace the recurring labeled parameter group with a cohesive language-appropriate abstraction.
@@ -162,8 +160,6 @@ languages:
         - Ensure branch behavior remains equivalent after the refactor.
         guards:
         - type: switch_statements
-          max_branches: 8
-          max_density: 10.0
         retry_hint_template: Reduce the switch-heavy branching further before retrying.
       code_clone_type1:
         instruction: Remove the duplicated logic across the clone locations while
@@ -175,7 +171,7 @@ languages:
           locations.
         guards:
         - type: code_clone_type1
-          min_tokens: 80
+          min_tokens: 30
         retry_hint_template: The two target blocks still look like a type-1 clone.
           Remove or centralize the duplication.
       feature_envy:
@@ -279,12 +275,8 @@ languages:
         - Preserve public behavior and existing subtype contracts.
         - Treat the dataset test as an immutable project-behavior regression oracle; never
           edit, delete, skip, or weaken it to make the refactoring pass.
-        - Follow the evidence refactor_path when it names an existing helper, state field,
-          overload, protocol sibling, or capability split.
-        - When structural_expectation is capability_split, do not implement or delegate
-          the reported method as the final repair. Split the parent capability, migrate
-          real implementers and callers, and remove the unsupported operation from the
-          refusing type's inherited contract.
+        - Inspect the source-derived parent contract, sibling implementers, and production
+          callers before choosing implementation, delegation, or a capability split.
         - A log statement, comment, swallowed exception, or placeholder constant is not an
           implementation of an inherited contract.
         verification:
@@ -293,8 +285,8 @@ languages:
         - Ensure the unchanged project-behavior regression test still passes.
         guards:
         - type: refused_bequest
-        retry_hint_template: The rejecting or empty inheritance pattern remains. Follow the
-          reported refactor_path and change production structure or behavior; do not edit
+        retry_hint_template: The rejecting or empty inheritance pattern remains. Change
+          production structure or behavior; do not edit
           the regression test or replace the body with logging or a placeholder.
   c:
     detect_extensions:

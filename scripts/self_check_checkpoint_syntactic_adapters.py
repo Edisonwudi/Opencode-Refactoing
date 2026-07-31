@@ -12,6 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
+sys.path.insert(0, str(ROOT / "runtime" / "python"))
+
+from smell_core.java.syntactic_detector import compute_cognitive_complexity  # noqa: E402
 
 
 def _run(args: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -83,6 +86,34 @@ ANNOTATED_PARAMS_AFTER = ANNOTATED_PARAMS_BEFORE.replace(
     ", int e, int f",
     ", int e",
 )
+PMD_ELSE_CHAIN_BODY = """\
+if (value == null || value.equals(null)) {
+  writer.write("null");
+} else if (value instanceof JSONObject) {
+  consume(value);
+} else if (value instanceof JSONArray) {
+  consume(value);
+} else if (value instanceof Map) {
+  consume(value);
+} else if (value instanceof Collection) {
+  consume(value);
+} else if (value.getClass().isArray()) {
+  consume(value);
+} else if (value instanceof Number) {
+  consume(value);
+} else if (value instanceof Boolean) {
+  consume(value);
+} else if (value instanceof JSONString) {
+  try {
+    Object output = convert(value);
+    writer.write(output != null ? output.toString() : quote(value.toString()));
+  } catch (Exception error) {
+    throw new IllegalStateException(error);
+  }
+} else {
+  quote(value.toString(), writer);
+}
+"""
 
 
 def _case(smell: str, before: str, after: str, objective: str) -> tuple[float, float]:
@@ -119,7 +150,39 @@ def _case(smell: str, before: str, after: str, objective: str) -> tuple[float, f
         return before_value, after_value
 
 
+def _missing_baseline_fails_closed() -> None:
+    """A threshold-clean original source must not PASS without its checkpoint."""
+    with tempfile.TemporaryDirectory(prefix="checkpoint-missing-baseline-") as temp_dir:
+        project = Path(temp_dir)
+        source = project / "Fixture.java"
+        # Five parameters is accepted by the ordinary max_params=5 detector.
+        # Before the fail-closed fix, verify therefore returned PASS when c000
+        # was absent even though this is still the untouched original source.
+        source.write_text(PARAMS_AFTER, encoding="utf-8")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(ROOT / "runtime" / "python")
+        for command in (["git", "init", "-q"], ["git", "add", "Fixture.java"]):
+            result = _run(command, project, env)
+            if result.returncode != 0:
+                raise AssertionError(result.stderr)
+        result = _run([
+            "git", "-c", "user.name=checkpoint-self-check", "-c",
+            "user.email=checkpoint@example.invalid", "commit", "-qm", "baseline",
+        ], project, env)
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+
+        verified = _bridge(project, env, "verify", "long_parameter_list")
+        details = verified["smell_guard"]["results"][0]["details"]
+        assert verified["status"] == "SMELL_GUARD_FAILED", verified
+        assert verified["checkpoint"]["reason"] == "baseline_checkpoint_missing", verified
+        assert details["reason"] == "BASELINE_CHECKPOINT_MISSING", verified
+
+
 def main() -> int:
+    pmd_score = compute_cognitive_complexity(PMD_ELSE_CHAIN_BODY, "writeValue")
+    assert pmd_score == 29, f"PMD else-chain metric drifted: {pmd_score} != 29"
+    _missing_baseline_fails_closed()
     results = {
         "long_method": _case("long_method", _long_method_source(65), _long_method_source(2), "ast_ncss"),
         "nested_complexity": _case("nested_complexity", NESTED_BEFORE, NESTED_AFTER, "cognitive_complexity"),
@@ -138,7 +201,10 @@ def main() -> int:
         ),
     }
     rendered = " ".join(f"{name}={before:g}->{after:g}" for name, (before, after) in results.items())
-    print(f"checkpoint-syntactic-adapters-self-check PASS unchanged_pass=0 {rendered}")
+    print(
+        "checkpoint-syntactic-adapters-self-check PASS "
+        f"unchanged_pass=0 missing_baseline_pass=0 pmd_else_chain={pmd_score} {rendered}"
+    )
     return 0
 
 

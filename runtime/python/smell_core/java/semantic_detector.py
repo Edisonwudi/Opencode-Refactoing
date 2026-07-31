@@ -310,6 +310,19 @@ class MemberAccessStats:
     unresolved: int = 0
 
 
+@dataclass(frozen=True)
+class FeatureEnvyProfile:
+    envied_field: str = ""
+    envied_type: str = ""
+    envy_access_count: int = 0
+    self_access_count: int = 0
+    envy_access_diff: int = 0
+    direct_field_count: int = 0
+    field_member_count: int = 0
+    fields_without_member_access: int = 0
+    same_class_method_calls: int = 0
+
+
 @dataclass
 class ProjectModel:
     root: Path
@@ -353,6 +366,7 @@ def analyze_feature_envy_target(
     method: Optional[str] = None,
     line: Optional[int] = None,
     expected_receiver_type: str = "",
+    project_model: Optional[ProjectModel] = None,
 ) -> Dict[str, Any]:
     """Return threshold-independent Feature Envy metrics for one method.
 
@@ -362,7 +376,7 @@ def analyze_feature_envy_target(
     the edited source instead of treating an initial non-finding as a repair.
     """
     root = project_root.expanduser().resolve()
-    model = _build_project_model(root, include_tests=False)
+    model = project_model or _build_project_model(root, include_tests=False)
     target_rel = _normalize_rel_path(target_file, root)
     target_method = _normalize_method(method)
     candidates = [item for item in model.methods if _normalize_path(item.file) == target_rel]
@@ -379,28 +393,22 @@ def analyze_feature_envy_target(
             "line": line,
         }
     target = min(candidates, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
-    stats = _member_access_stats(
-        model,
-        target,
-        feature_envy_semantics=True,
-        prefer_environment_symbols=True,
-    )
-    dominant_type, dominant_count = _dominant_access(stats.foreign_by_type)
+    profiles = _designite_feature_envy_profiles(model, target)
     expected_simple = _erase_type(expected_receiver_type).rsplit(".", 1)[-1].strip()
-    expected_count = 0
-    expected_types: Dict[str, int] = {}
-    if expected_simple:
-        for type_name, count in stats.foreign_by_type.items():
-            if _erase_type(type_name).rsplit(".", 1)[-1] == expected_simple:
-                expected_types[type_name] = count
-                expected_count += count
-    ratio = dominant_count / stats.total if stats.total else 0.0
-    expected_ratio = expected_count / stats.total if stats.total else 0.0
-    strict_hit = (
-        target.loc >= int(DEFAULT_THRESHOLDS["feature_envy_min_loc"])
-        and dominant_count >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
-        and ratio >= float(DEFAULT_THRESHOLDS["feature_envy_foreign_ratio"])
+    profile = next(
+        (
+            item
+            for item in profiles
+            if not expected_simple
+            or _erase_type(item.envied_type).rsplit(".", 1)[-1] == expected_simple
+        ),
+        FeatureEnvyProfile(),
     )
+    receiver_matches = (
+        not expected_simple
+        or _erase_type(profile.envied_type).rsplit(".", 1)[-1] == expected_simple
+    )
+    strict_hit = profile.envy_access_diff > 1 and receiver_matches
     return {
         "ok": True,
         "file": target.file,
@@ -411,22 +419,109 @@ def analyze_feature_envy_target(
         "end_line": target.end_line,
         "method_loc": target.loc,
         "expected_receiver_type": expected_receiver_type,
-        "expected_receiver_access": expected_count,
-        "expected_receiver_ratio": round(expected_ratio, 6),
-        "matched_expected_types": expected_types,
-        "dominant_receiver_type": dominant_type,
-        "dominant_receiver_access": dominant_count,
-        "dominant_receiver_ratio": round(ratio, 6),
-        "total_member_access": stats.total,
-        "aggregate_foreign_access": stats.foreign,
-        "local_access": stats.local,
-        "unresolved_access": stats.unresolved,
-        "foreign_type_count": len(stats.foreign_by_type),
-        "foreign_by_type": dict(sorted(stats.foreign_by_type.items())),
-        "foreign_by_origin": dict(sorted(stats.foreign_by_origin.items())),
-        "ignored_by_type": dict(sorted(stats.ignored_by_type.items())),
+        "expected_receiver_access": profile.envy_access_count if receiver_matches else 0,
+        "dominant_receiver_type": profile.envied_type,
+        "dominant_receiver_access": profile.envy_access_count,
+        "envied_field": profile.envied_field,
+        "envied_type": profile.envied_type,
+        "envy_access_count": profile.envy_access_count,
+        "self_access_count": profile.self_access_count,
+        "envy_access_excess": profile.envy_access_diff,
+        "direct_field_count": profile.direct_field_count,
+        "field_member_count": profile.field_member_count,
+        "fields_without_member_access": profile.fields_without_member_access,
+        "same_class_method_calls": profile.same_class_method_calls,
         "strict_detector_hit": strict_hit,
     }
+
+
+def _designite_feature_envy_profile(
+    model: ProjectModel,
+    method: MethodRecord,
+) -> FeatureEnvyProfile:
+    profiles = _designite_feature_envy_profiles(model, method)
+    return profiles[0] if profiles else FeatureEnvyProfile()
+
+
+def _designite_feature_envy_profiles(
+    model: ProjectModel,
+    method: MethodRecord,
+) -> List[FeatureEnvyProfile]:
+    """Mirror Designite 2.8.6's field/member based Feature Envy metric."""
+    if method.body is None or "abstract" in method.modifiers:
+        return []
+    owner = model.classes.get(method.owner_qualified_name)
+    if owner is None:
+        return []
+
+    body_identifiers = {
+        _node_text_from_node(node).strip()
+        for node in _iter_nodes(method.body)
+        if node.type == "identifier"
+    }
+    direct_fields = {
+        name for name in owner.fields
+        if name in body_identifiers
+    }
+    if not direct_fields:
+        return []
+
+    member_counts: Dict[str, int] = {}
+    for expression in _member_access_receiver_expressions(method.body):
+        root = _root_receiver(expression)
+        if root in owner.fields:
+            member_counts[root] = member_counts.get(root, 0) + 1
+        elif root in {"this", "super"}:
+            member = _root_receiver(expression.split(".", 1)[1] if "." in expression else "")
+            if member in owner.fields:
+                member_counts[member] = member_counts.get(member, 0) + 1
+
+    fields_without_members = len(direct_fields.difference(member_counts))
+    same_class_calls = len(
+        set(_implicit_owner_method_invocation_names(method.body, _owner_method_return_types(owner)))
+    )
+    total_field_members = sum(member_counts.values())
+    profiles: List[FeatureEnvyProfile] = []
+    for field_name in sorted(direct_fields):
+        field_type = owner.fields.get(field_name, "")
+        if _is_primitive(field_type):
+            continue
+        if _resolve_model_type(model, field_type) == _resolve_model_type(model, method.owner_qualified_name):
+            continue
+        envy_count = member_counts.get(field_name, 0)
+        self_count = fields_without_members + same_class_calls
+        difference = envy_count - self_count
+        if difference > 1:
+            profiles.append(FeatureEnvyProfile(
+                envied_field=field_name,
+                envied_type=_normalized_receiver_type(model, field_type),
+                envy_access_count=envy_count,
+                self_access_count=self_count,
+                envy_access_diff=difference,
+                direct_field_count=len(direct_fields),
+                field_member_count=total_field_members,
+                fields_without_member_access=fields_without_members,
+                same_class_method_calls=same_class_calls,
+            ))
+    return sorted(
+        profiles,
+        key=lambda item: (-item.envy_access_diff, -item.envy_access_count, item.envied_field),
+    )
+
+
+def _method_overrides_any_parent(
+    model: ProjectModel,
+    method: MethodRecord,
+    owner: ClassRecord,
+) -> bool:
+    parent = model.classes.get(owner.superclass_name)
+    seen: Set[str] = set()
+    while parent is not None and parent.qualified_name not in seen:
+        seen.add(parent.qualified_name)
+        if any(_method_overrides(method, candidate) for candidate in parent.methods):
+            return True
+        parent = model.classes.get(parent.superclass_name)
+    return False
 
 
 def analyze_refused_bequest_target(
@@ -1037,7 +1132,17 @@ def _declaration_parameter_count(declaration: str) -> int:
     match = re.search(r"\((.*)\)", declaration, flags=re.DOTALL)
     if not match or not match.group(1).strip():
         return 0
-    return len([item for item in match.group(1).split(",") if item.strip()])
+    parameters = match.group(1)
+    depth = 0
+    count = 1
+    for char in parameters:
+        if char in "<[(":
+            depth += 1
+        elif char in ">])":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            count += 1
+    return count
 
 
 def _target_method_call_sites(
@@ -1232,50 +1337,16 @@ def find_data_clump_group_occurrences(
     group: str,
     include_tests: bool = True,
 ) -> List[SemanticFinding]:
-    """Find methods containing an explicitly requested data-clump parameter group.
-
-    This intentionally does not apply ``_should_skip_data_clump_group`` because
-    dataset evidence is already a concrete target. Method-level skips still
-    remove constructors, tests, and overrides that are not useful repair targets.
-    """
+    """Filter one group from the ordinary full-project product detector."""
     target_group = _normalize_group(group)
     if not target_group:
         return []
-    group_size = len([item for item in str(group or "").split("|") if item.strip()])
-    if group_size <= 0:
-        return []
     model = _build_project_model(project_root, include_tests=include_tests)
-    matches: List[MethodRecord] = []
-    for method in model.methods:
-        if _should_skip_data_clump_method(method):
-            continue
-        if len(method.parameter_descriptors) < group_size:
-            continue
-        method_groups = {
-            _normalize_group(combo)
-            for combo in _parameter_combinations(method.parameter_descriptors, group_size)
-        }
-        if target_group in method_groups:
-            matches.append(method)
-    if not matches:
-        return []
-    rule_id = f"symbol_solver:data_clumps:{_java_hex_hash(target_group)}"
-    return _sort_findings(
-        [
-            SemanticFinding(
-                smell_type="data_clumps",
-                file=method.file,
-                class_name=method.class_name,
-                method=method.method_signature,
-                begin_line=method.begin_line,
-                end_line=method.end_line,
-                score=float(len(matches)),
-                rule_id=rule_id,
-                evidence=f"group={target_group}; occurrences={len(matches)}; explicit_group=true",
-            )
-            for method in matches
-        ]
-    )
+    return [
+        item
+        for item in _detect_data_clumps(model)
+        if _normalize_group(_parse_group_from_evidence(item.evidence)) == target_group
+    ]
 
 
 def _build_project_model(project_root: Path, *, include_tests: bool) -> ProjectModel:
@@ -1468,134 +1539,196 @@ def _build_method_record(
 def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
     findings: List[SemanticFinding] = []
     for method in model.methods:
-        if method.loc < int(DEFAULT_THRESHOLDS["feature_envy_min_loc"]):
-            continue
-        access_stats = _member_access_stats(model, method, feature_envy_semantics=True)
-        total_access = access_stats.total
-        aggregate_foreign_access = access_stats.foreign
-        if total_access <= 0:
-            continue
-        dominant_type, foreign_access = _dominant_access(access_stats.foreign_by_type)
-        ratio = foreign_access / total_access
-        if (
-            foreign_access >= int(DEFAULT_THRESHOLDS["feature_envy_foreign_access"])
-            and ratio >= float(DEFAULT_THRESHOLDS["feature_envy_foreign_ratio"])
-        ):
-            findings.append(
-                SemanticFinding(
-                    smell_type="feature_envy",
-                    file=method.file,
-                    class_name=method.class_name,
-                    method=method.method_signature,
-                    begin_line=method.begin_line,
-                    end_line=method.end_line,
-                    score=ratio,
-                    rule_id="symbol_solver:feature_envy",
-                    evidence=(
-                        f"foreign_access={foreign_access}; total_access={total_access}; "
-                        f"aggregate_foreign_access={aggregate_foreign_access}; "
-                        f"local_access={access_stats.local}; ratio={ratio:.3f}; loc={method.loc}; "
-                        f"dominant_foreign_type={dominant_type or 'none'}; "
-                        f"foreign_by_type={_format_counter(access_stats.foreign_by_type)}; "
-                        f"foreign_by_origin={_format_counter(access_stats.foreign_by_origin)}; "
-                        f"local_by_origin={_format_counter(access_stats.local_by_origin)}"
-                    ),
-                )
-            )
-    return findings
-
-
-def _detect_refused_bequest(model: ProjectModel) -> List[SemanticFinding]:
-    findings: List[SemanticFinding] = []
-    threshold = float(DEFAULT_THRESHOLDS["refused_bequest_score"])
-    for cls in model.classes.values():
-        if _should_skip_refused_bequest_class(cls):
-            continue
-        parent = model.classes.get(cls.superclass_name)
-        if parent is None:
-            continue
-        parent_methods = _collect_parent_methods(model, parent)
-        if not parent_methods:
-            continue
-        overrides = [
-            method
-            for method in cls.methods
-            if any(_method_overrides(method, parent_method) for parent_method in parent_methods)
-        ]
-        if not overrides:
-            continue
-        suspicious_count = sum(1 for method in overrides if _is_stub_method(method))
-        if suspicious_count < 2:
-            continue
-        suspicious_ratio = suspicious_count / len(overrides)
-        override_ratio = len(overrides) / len(parent_methods)
-        super_usage = sum(method.super_access_count for method in overrides)
-        low_parent_use = 1.0 if super_usage == 0 else max(0.0, 1.0 - (super_usage / (len(overrides) + 1)))
-        if suspicious_ratio < 0.66 or override_ratio < 0.40 or low_parent_use < 0.80:
-            continue
-        score = 0.65 * suspicious_ratio + 0.25 * override_ratio + 0.10 * low_parent_use
-        if score < threshold:
+        # Designite reports Feature Envy at method granularity. A method may
+        # access several foreign fields, but those are metric contributors,
+        # not separate smell findings. Freeze the strongest deterministic
+        # receiver so file+method context always identifies one finding.
+        profile = _designite_feature_envy_profile(model, method)
+        if profile.envy_access_diff <= 1:
             continue
         findings.append(
             SemanticFinding(
-                smell_type="refused_bequest",
-                file=cls.file,
-                class_name=cls.class_name,
-                method="",
-                begin_line=cls.begin_line,
-                end_line=cls.end_line,
-                score=score,
-                rule_id="symbol_solver:refused_bequest",
+                smell_type="feature_envy",
+                file=method.file,
+                class_name=method.class_name,
+                method=method.method_signature,
+                begin_line=method.begin_line,
+                end_line=method.end_line,
+                score=float(profile.envy_access_diff),
+                rule_id="designite-2.8.6:feature_envy",
                 evidence=(
-                    f"parent={parent.class_name}; overrides={len(overrides)}; "
-                    f"parent_methods={len(parent_methods)}; suspicious_overrides={suspicious_count}; "
-                    f"super_calls={super_usage}; score={score:.3f}"
+                    f"envied_field={profile.envied_field}; envied_type={profile.envied_type}; "
+                    f"envy_access={profile.envy_access_count}; self_access={profile.self_access_count}; "
+                    f"envy_access_diff={profile.envy_access_diff}; "
+                    f"direct_fields={profile.direct_field_count}; "
+                    f"field_members={profile.field_member_count}; "
+                    f"fields_without_member_access={profile.fields_without_member_access}; "
+                    f"same_class_method_calls={profile.same_class_method_calls}"
                 ),
             )
         )
     return findings
 
 
-def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
-    group_size = int(DEFAULT_THRESHOLDS["data_clumps_param_group_size"])
-    occurrences_threshold = int(DEFAULT_THRESHOLDS["data_clumps_occurrences"])
-    effective_min_classes = max(int(DEFAULT_THRESHOLDS["data_clumps_min_classes"]), 3)
-    occurrences: Dict[str, List[MethodRecord]] = {}
-    for method in model.methods:
-        if _should_skip_data_clump_method(method):
-            continue
-        if len(method.parameter_descriptors) < group_size:
-            continue
-        for combo in _parameter_combinations(method.parameter_descriptors, group_size):
-            occurrences.setdefault(combo, []).append(method)
-
+def _detect_refused_bequest(model: ProjectModel) -> List[SemanticFinding]:
     findings: List[SemanticFinding] = []
-    for group_key, methods in occurrences.items():
-        if _should_skip_data_clump_group(group_key):
+    for cls in model.classes.values():
+        if _should_skip_refused_bequest_class(cls):
             continue
-        if len(methods) < occurrences_threshold:
-            continue
-        method_names = {method.method_name or "" for method in methods}
-        if len(method_names) < 2:
-            continue
-        class_names = {method.class_name for method in methods}
-        if len(class_names) < effective_min_classes:
-            continue
-        rule_id = f"symbol_solver:data_clumps:{_java_hex_hash(group_key)}"
-        for method in methods:
+        for method in cls.methods:
+            parent = _parent_contract_owner(model, cls, method)
+            if parent is None:
+                continue
+            rejection_kind = _rejection_kind(method)
+            if not rejection_kind:
+                continue
             findings.append(
                 SemanticFinding(
-                    smell_type="data_clumps",
+                    smell_type="refused_bequest",
                     file=method.file,
                     class_name=method.class_name,
                     method=method.method_signature,
                     begin_line=method.begin_line,
                     end_line=method.end_line,
-                    score=float(len(methods)),
-                    rule_id=rule_id,
-                    evidence=f"group={group_key}; occurrences={len(methods)}; classes={len(class_names)}",
+                    score=1.0,
+                    rule_id="symbol_solver:refused_bequest_method",
+                    evidence=(
+                        f"parent={parent.class_name}; target_class={cls.class_name}; "
+                        f"signature={method.method_signature}; "
+                        f"parameter_count={len(method.parameter_descriptors)}; "
+                        f"rejection_kind={rejection_kind}; super_calls={method.super_access_count}"
+                    ),
                 )
             )
+    return findings
+
+
+def _parent_contract_owner(
+    model: ProjectModel,
+    child: ClassRecord,
+    method: MethodRecord,
+) -> Optional[ClassRecord]:
+    pending = [child.superclass_name, *child.interface_names]
+    seen: Set[str] = set()
+    while pending:
+        name = pending.pop(0)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        parent = model.classes.get(name)
+        if parent is None:
+            continue
+        if _parent_declares_method_contract(parent, method):
+            return parent
+        pending.extend([parent.superclass_name, *parent.interface_names])
+    return None
+
+
+def _parent_declares_method_contract(parent: ClassRecord, method: MethodRecord) -> bool:
+    if any(_method_overrides(method, candidate) for candidate in parent.methods):
+        return True
+    return any(
+        re.search(rf"\b{re.escape(method.method_name)}\s*\(", declaration)
+        and _declaration_parameter_count(declaration) == len(method.parameter_descriptors)
+        for declaration in parent.bodyless_method_declarations
+    )
+
+
+def _rejection_kind(method: MethodRecord) -> str:
+    body = method.body
+    if body is None:
+        return ""
+    statements = [child for child in body.children if child.is_named and not _is_comment_node(child)]
+    if not statements:
+        return "empty_override"
+    if len(statements) != 1:
+        return ""
+    statement = statements[0]
+    text = _node_text_from_node(statement)
+    if statement.type == "throw_statement" and "UnsupportedOperationException" in text:
+        return "unsupported_operation"
+    if statement.type == "return_statement":
+        expression = next(
+            (child for child in statement.children if child.is_named and child.type != "return"),
+            None,
+        )
+        if expression is None:
+            return "empty_return"
+        if expression.type == "null_literal":
+            return "null_stub"
+        if _is_constant_literal(expression):
+            return "constant_stub"
+    if statement.type == "expression_statement" and _is_stub_method(method):
+        return "logging_stub"
+    return ""
+
+
+def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
+    minimum_group_size = int(DEFAULT_THRESHOLDS["data_clumps_param_group_size"])
+    occurrences_threshold = int(DEFAULT_THRESHOLDS["data_clumps_occurrences"])
+    effective_min_classes = max(int(DEFAULT_THRESHOLDS["data_clumps_min_classes"]), 3)
+    eligible_methods: List[MethodRecord] = []
+    for method in model.methods:
+        if _should_skip_data_clump_method(method):
+            continue
+        if len(method.parameter_descriptors) < minimum_group_size:
+            continue
+        eligible_methods.append(method)
+
+    findings: List[SemanticFinding] = []
+    # Product contract: a finding is one normalized parameter group with at
+    # least three members. Larger frequent groups are first-class findings,
+    # not silently reduced to arbitrary triplets.
+    maximum_group_size = max(
+        (len(set(method.parameter_descriptors)) for method in eligible_methods),
+        default=minimum_group_size - 1,
+    )
+    previous_frequent: Set[frozenset[str]] = set()
+    for group_size in range(minimum_group_size, maximum_group_size + 1):
+        occurrences: Dict[str, List[MethodRecord]] = {}
+        for method in eligible_methods:
+            descriptors = tuple(dict.fromkeys(method.parameter_descriptors))
+            if len(descriptors) < group_size:
+                continue
+            for combo in _parameter_combinations(descriptors, group_size):
+                if group_size > minimum_group_size:
+                    items = frozenset(combo.split("|"))
+                    if any(
+                        frozenset(subset) not in previous_frequent
+                        for subset in itertools.combinations(items, group_size - 1)
+                    ):
+                        continue
+                occurrences.setdefault(combo, []).append(method)
+
+        frequent: Set[frozenset[str]] = set()
+        for group_key, methods in occurrences.items():
+            if len(methods) < occurrences_threshold:
+                continue
+            method_names = {method.method_name or "" for method in methods}
+            if len(method_names) < 2:
+                continue
+            class_names = {method.class_name for method in methods}
+            if len(class_names) < effective_min_classes:
+                continue
+            frequent.add(frozenset(group_key.split("|")))
+            rule_id = f"symbol_solver:data_clumps:{_java_hex_hash(group_key)}"
+            for method in methods:
+                findings.append(
+                    SemanticFinding(
+                        smell_type="data_clumps",
+                        file=method.file,
+                        class_name=method.class_name,
+                        method=method.method_signature,
+                        begin_line=method.begin_line,
+                        end_line=method.end_line,
+                        score=float(len(methods)),
+                        rule_id=rule_id,
+                        evidence=f"group={group_key}; occurrences={len(methods)}; classes={len(class_names)}",
+                    )
+                )
+        if not frequent:
+            break
+        previous_frequent = frequent
     return findings
 
 
@@ -1753,8 +1886,6 @@ def _is_unused_private_method_candidate(method: MethodRecord) -> bool:
     if method.is_constructor or "private" not in method.modifiers:
         return False
     if method.annotations:
-        return False
-    if method.loc < 3:
         return False
     if method.method_name in {"readObject", "writeObject", "readObjectNoData", "readResolve", "writeReplace", "finalize"}:
         return False
@@ -2199,16 +2330,11 @@ def _is_constant_literal(node: Node) -> bool:
 
 
 def _should_skip_refused_bequest_class(cls: ClassRecord) -> bool:
-    return not cls.superclass_name or cls.kind == "enum"
+    return (not cls.superclass_name and not cls.interface_names) or cls.kind == "enum"
 
 
 def _should_skip_data_clump_method(method: MethodRecord) -> bool:
-    return (
-        _is_test_like_rel_path(method.file)
-        or method.is_constructor
-        or "Override" in method.annotations
-        or "java.lang.Override" in method.annotations
-    )
+    return _is_test_like_rel_path(method.file)
 
 
 def _should_skip_data_clump_group(group_key: str) -> bool:
@@ -2274,7 +2400,7 @@ def _is_framework_like_type(type_name: str) -> bool:
 def _parameter_combinations(values: Sequence[str], group_size: int) -> Iterable[str]:
     seen: Set[str] = set()
     for combo in itertools.combinations(values, group_size):
-        key = "|".join(sorted(combo))
+        key = _normalize_group("|".join(combo))
         if key in seen:
             continue
         seen.add(key)

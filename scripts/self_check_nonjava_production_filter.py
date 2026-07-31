@@ -246,22 +246,26 @@ def check_god_class_min_reduction() -> None:
         assert marginal["status"] == "SMELL_GUARD_FAILED", marginal
         guard = marginal["smell_guard"]["results"][0]
         assert guard["type"] == "god_class" and guard["success"] is False, guard
-        assert "below the required" in guard["message"], guard
+        assert "IMPROVED, not PASS" in guard["message"], guard
         delta = marginal["checkpoint"]["delta"]
         assert delta["metric_progress"] is True, delta  # contract still sees the progress
         reduction = delta["objectives"]["class_loc"]["relative_reduction"]
         assert 0 < reduction < 0.05, delta
 
-        # A real split (a whole method moved out, >=5%) passes resolved.
+        # A real split is IMPROVED while the product detector still reports
+        # the same class finding.
         lines = _py_god_class(11).splitlines()
         body = "\n".join(lines[:-12]) + "\n"
         source.write_text(body + "\n", encoding="utf-8")
-        repaired = run_bridge(project, "verify", *common, "--skip-build-test")
-        assert repaired["success"] is True, repaired
-        assert repaired.get("resolution") == "resolved", repaired
-        reduction = repaired["checkpoint"]["delta"]["objectives"]["class_loc"]["relative_reduction"]
+        improved = run_bridge(project, "verify", *common, "--skip-build-test")
+        assert improved["success"] is False and improved["status"] == "IMPROVED", improved
+        reduction = improved["checkpoint"]["delta"]["objectives"]["class_loc"]["relative_reduction"]
         assert reduction >= 0.05, reduction
-    print("  scenario god-class-floor: marginal=SMELL_GUARD_FAILED(real reduction veto) repaired=PASS resolved")
+
+        source.write_text(_py_god_class(8), encoding="utf-8")
+        repaired = run_bridge(project, "verify", *common, "--skip-build-test")
+        assert repaired["success"] is True and repaired.get("resolution") == "resolved", repaired
+    print("  scenario god-class-floor: marginal=IMPROVED split=IMPROVED detector_clear=PASS")
 
 
 def main() -> int:

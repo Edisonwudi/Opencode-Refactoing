@@ -18,9 +18,9 @@ mysterious_name:
       - op: change-signature:method
         apply_args: '{"parameters":[{"originalIndex":0,"name":"sb","type":"StringBuilder"},{"originalIndex":1,"name":"digitValue","type":"int"}]}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/time/GmtTimeZone.java", line=37, column=35)
-          - idea_refactor_prepare(operation="change-signature:method", expectedOperation="change-signature:method")
-          - idea_refactor_apply(arguments={"parameters":[{"originalIndex":0,"name":"sb","type":"StringBuilder"},{"originalIndex":1,"name":"digitValue","type":"int"}]})
+          - idea_refactor_preview(operation="change-signature:method", file="src/main/java/org/apache/commons/lang3/time/GmtTimeZone.java", line=37, column=35, arguments={"parameters":[{"originalIndex":0,"name":"sb","type":"StringBuilder"},{"originalIndex":1,"name":"digitValue","type":"int"}]})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"parameters":[{"originalIndex":0,"name":"sb","type":"StringBuilder"},{"originalIndex":1,"name":"digitValue","type":"int"}]})
     after: |
       37    private static StringBuilder twoDigits(final StringBuilder sb, final int digitValue) {
       38        return sb.append((char) ('0' + digitValue / 10)).append((char) ('0' + digitValue % 10));
@@ -42,9 +42,9 @@ mysterious_name:
       - op: rename:method
         apply_args: '{"newName":"ellipsize"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/jsoup/examples/ListLinks.java", line=50, column=27)
-          - idea_refactor_prepare(operation="rename:method", expectedOperation="rename:method")
-          - idea_refactor_apply(arguments={"newName":"ellipsize"})
+          - idea_refactor_preview(operation="rename:method", file="src/main/java/org/jsoup/examples/ListLinks.java", line=50, column=27, arguments={"newName":"ellipsize"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"ellipsize"})
     after: |
       30                        ellipsize(src.attr("alt"), 20));
       42            print(" * a: <%s>  (%s)", link.attr("abs:href"), ellipsize(link.text(), 35));
@@ -70,9 +70,9 @@ mysterious_name:
       - op: rename:local-variable
         apply_args: '{"newName":"rightValue"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/ArrayUtils.java", line=6547, column=17)
-          - idea_refactor_prepare(operation="rename:local-variable", expectedOperation="rename:local-variable")
-          - idea_refactor_apply(arguments={"newName":"rightValue"})
+          - idea_refactor_preview(operation="rename:local-variable", file="src/main/java/org/apache/commons/lang3/ArrayUtils.java", line=6547, column=17, arguments={"newName":"rightValue"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"rightValue"})
         idea_ui_steps:
           - In ArrayUtils.java, place the caret on `tmp` inside `reverse(final boolean[] array, final int startIndexInclusive, final int endIndexExclusive)`.
           - Press `Shift+F6`, type `rightValue`, and confirm the in-place rename.
@@ -104,9 +104,9 @@ mysterious_name:
       - op: rename:type
         apply_args: '{"newName":"FieldDifference"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/builder/Diff.java", line=36, column=23)
-          - idea_refactor_prepare(operation="rename:type", expectedOperation="rename:type")
-          - idea_refactor_apply(arguments={"newName":"FieldDifference"})
+          - idea_refactor_preview(operation="rename:type", file="src/main/java/org/apache/commons/lang3/builder/Diff.java", line=36, column=23, arguments={"newName":"FieldDifference"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"FieldDifference"})
     after: |
       36    public abstract class FieldDifference<T> extends Pair<T, T> {
       37

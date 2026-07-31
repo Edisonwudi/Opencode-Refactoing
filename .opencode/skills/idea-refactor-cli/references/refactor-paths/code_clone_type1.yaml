@@ -25,10 +25,10 @@ code_clone_type1:
       - op: extract:method
         apply_args: '{"newName":"processAsInTable","visibility":"private","replaceDuplicates":true}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java", line=1301, column=17, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java", line=1301, column=17, selection={"startLine":1302,"startColumn":13,"endLine":1302,"endColumn":43})
-          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"processAsInTable","visibility":"private","replaceDuplicates":true})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java", line=1301, column=17, arguments={"newName":"processAsInTable","visibility":"private","replaceDuplicates":true})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/jsoup/parser/HtmlTreeBuilderState.java", line=1301, column=17, selection={"startLine":1302,"startColumn":13,"endLine":1302,"endColumn":43}, arguments={"newName":"processAsInTable","visibility":"private","replaceDuplicates":true})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"processAsInTable","visibility":"private","replaceDuplicates":true})
     after: |
       1301        private boolean anythingElse(Token t, HtmlTreeBuilder tb) {
       1302            return processAsInTable(t, tb);
@@ -42,7 +42,7 @@ code_clone_type1:
       1381            return tb.process(t, InTable);
       1382        }
     source: { project: jsoup-1.18.1, class: HtmlTreeBuilderState, verified: "2026-05-09" }
-    notes: "Use idea_refactor_locate(..., suggestSelectionsFor=\"extract:method\") only to inspect candidate ranges. Then run a fresh locate with the selected range before prepare; because the draft already contains the selection, prepare/apply should not consume a selection.patch decision."
+    notes: "Use an initial idea_refactor_preview(operation=\"extract:method\", ...) to inspect selectionCandidates. Then start a fresh preview with the selected range; selection is target state and must not be passed as a decision."
   - id: shared-parent-pull-up-clone
     when: "the clones are identical sibling overrides under a real shared parent, so the right normalization is pull-up rather than a new helper"
     before: |
@@ -57,10 +57,10 @@ code_clone_type1:
       - op: pullUp:method
         apply_args: '{"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/time/FastDateParser.java", line=165, column=9)
-          - idea_refactor_prepare(operation="pullUp:method", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}, expectedOperation="pullUp:method")
-          - idea_refactor_apply(arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"})
-          - idea_refactor_apply(arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}, decisions={"pullUp.duplicate.org.apache.commons.lang3.time.FastDateParser.Strategy.isNumber":"remove_source_duplicate"})
+          - idea_refactor_preview(operation="pullUp:method", file="src/main/java/org/apache/commons/lang3/time/FastDateParser.java", line=165, column=9, arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}, decisions={"pullUp.duplicate.org.apache.commons.lang3.time.FastDateParser.Strategy.isNumber":"remove_source_duplicate"})
     after: |
       165        // isNumber() now inherited from Strategy's default false implementation.
       166        // The JSON decision flow allowed the pull-up to proceed without an IDEA modal.

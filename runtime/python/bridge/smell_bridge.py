@@ -33,20 +33,37 @@ from smell_core.checkpoints import (  # noqa: E402
 from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
 from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
 from smell_core.guards import GuardRunContext, god_class_relative_reduction, run_build_test_guard, run_smell_guards  # noqa: E402
-from smell_core.data_clumps import detect_data_clump_occurrences as detect_generic_data_clump_occurrences  # noqa: E402
-from smell_core.detector_utils import parse_structural_expectation  # noqa: E402
 from smell_core.java.idea_refactor import (  # noqa: E402
     IdeaRefactorPreflightError,
     IdeaRefactorPreflightOptions,
     resolve_idea_refactor_cli,
     run_idea_refactor_preflight,
 )
-from smell_core.java.data_clumps import detect_data_clump_occurrences as detect_java_data_clump_occurrences  # noqa: E402
 from smell_core.languages import get_language  # noqa: E402
 from smell_core.loop_policy import REPAIRABLE_CATEGORY_GROUPS, parse_command_policy  # noqa: E402
 from smell_core.planning import build_plan_context_payload, build_repair_context_payload  # noqa: E402
 from smell_core.prompts.idea_router import build_idea_prompt_route  # noqa: E402
 from smell_core.task_builder import build_task  # noqa: E402
+
+
+TARGET_CONTEXT_KEYS = frozenset({
+    "symbol_kind",
+    "symbol_name",
+    "receiver_type",
+    "group",
+    "parent",
+    "target_class",
+    "target_parameter_count",
+})
+FORBIDDEN_TARGET_CONTEXT_KEYS = frozenset({
+    "score",
+    "threshold",
+    "metric",
+    "metrics",
+    "finding_present",
+    "structural_expectation",
+    "refactor_path",
+})
 
 
 def _config_path(value: Optional[str], env_name: str, bundled) -> str:
@@ -69,6 +86,24 @@ def _json_arg(value: Optional[str]) -> Dict[str, str]:
     if not isinstance(parsed, dict):
         raise ValueError("expected JSON object")
     return {str(key): str(val) for key, val in parsed.items()}
+
+
+def _target_context_arg(value: Optional[str]) -> Dict[str, Any]:
+    if not value:
+        return {}
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("target context must be a JSON object")
+    unknown = sorted(set(map(str, parsed)).difference(TARGET_CONTEXT_KEYS))
+    forbidden = sorted(set(map(str, parsed)).intersection(FORBIDDEN_TARGET_CONTEXT_KEYS))
+    if forbidden:
+        raise ValueError(
+            "target context cannot contain detector verdict fields: "
+            + ", ".join(forbidden)
+        )
+    if unknown:
+        raise ValueError("unsupported target context fields: " + ", ".join(unknown))
+    return {str(key): value for key, value in parsed.items()}
 
 
 def _verify_artifact_dir(args: argparse.Namespace, project_root: Path) -> Path:
@@ -96,6 +131,11 @@ def _write_text_artifact(path: Path, content: str) -> str:
 def _resolve(args: argparse.Namespace):
     refactor_config = load_refactor_config(_refactor_config_path(args.config))
     project_overrides = load_project_overrides(_projects_path(args.projects))
+    smell_evidence = getattr(args, "smell_evidence", None) or os.environ.get("SMELL_EVIDENCE", "")
+    explicit_target_context = _target_context_arg(
+        getattr(args, "target_context_json", None)
+        or os.environ.get("SMELL_TARGET_CONTEXT_JSON", "")
+    )
     resolved = resolve_run_config(
         refactor_config=refactor_config,
         project_overrides=project_overrides,
@@ -111,11 +151,13 @@ def _resolve(args: argparse.Namespace):
         or os.environ.get("SMELL_SAMPLE_TEST_LOCATION", ""),
         sample_test_command=getattr(args, "sample_test_command", None)
         or os.environ.get("SMELL_SAMPLE_TEST_COMMAND", ""),
+        target_context=explicit_target_context,
     )
-    smell_evidence = getattr(args, "smell_evidence", None) or os.environ.get("SMELL_EVIDENCE", "")
     if smell_evidence:
         for guard in resolved.profile.guards:
-            guard["evidence"] = smell_evidence
+            # Retain raw dataset evidence for diagnostics only. Detector and
+            # acceptance code must use target_context + finding_contract.
+            guard["audit_evidence"] = smell_evidence
     for guard in resolved.profile.guards:
         guard.update(_json_arg(getattr(args, "guard_context_json", None)))
     if _is_idea_backed(resolved.language):
@@ -133,15 +175,10 @@ def _is_idea_backed(language: str) -> bool:
     return bool(support and support.idea_backed)
 
 
-def _requires_strict_smell_resolution(smell: str, evidence: str) -> bool:
-    """Return whether metric improvement is progress-only, never final acceptance."""
-    return bool(
-        smell == "code_clone_type1"
-        or (
-            smell == "refused_bequest"
-            and parse_structural_expectation(evidence)
-        )
-    )
+def _requires_structural_resolution(smell: str, evidence: str) -> bool:
+    """Return whether the smell also carries a mandatory structural contract."""
+    del evidence
+    return smell in {"code_clone_type1", "refused_bequest"}
 
 
 def _location_payload(resolved) -> list[dict[str, Any]]:
@@ -257,35 +294,24 @@ def _run_idea_preflight(resolved, args: argparse.Namespace) -> dict[str, Any]:
 def _augment_data_clumps_context(resolved) -> Optional[dict[str, Any]]:
     if resolved.smell != "data_clumps":
         return None
-    analyses: list[dict[str, Any]] = []
+    snapshot = capture_metric_snapshot(resolved, "")
+    analyses = [{
+        "success": bool(snapshot.get("ok")),
+        "group": snapshot.get("group", ""),
+        "occurrence_count": int(dict(snapshot.get("objectives") or {}).get("occurrence_count", 0)),
+        "occurrences": list(snapshot.get("occurrences") or []),
+        "error": snapshot.get("error", ""),
+        "candidate_count": snapshot.get("candidate_count", 0),
+    }]
+    analysis = analyses[0]
     for guard in resolved.profile.guards:
         if str(guard.get("type", "")).strip() != "data_clumps":
             continue
-        evidence = str(guard.get("evidence") or "").strip()
-        if not evidence:
-            continue
-        if resolved.language == "java":
-            analysis = detect_java_data_clump_occurrences(resolved.project_root, evidence=evidence)
-        else:
-            analysis = detect_generic_data_clump_occurrences(
-                resolved.project_root,
-                language=resolved.language,
-                evidence=evidence,
-            )
-        analyses.append(analysis)
-        if not analysis.get("success"):
-            guard["detected_group"] = analysis.get("group", "")
-            guard["occurrence_detection_error"] = analysis.get("error", "")
-            continue
-        occurrences = analysis.get("occurrences") or []
-        guard["detected_group"] = analysis.get("group", "")
-        guard["detected_occurrence_count"] = analysis.get("occurrence_count", 0)
+        occurrences = analysis["occurrences"]
+        guard["detected_group"] = analysis["group"]
+        guard["detected_occurrence_count"] = analysis["occurrence_count"]
         guard["group_occurrences"] = json.dumps(occurrences, ensure_ascii=True)
         guard["listed_occurrence_count"] = str(len(occurrences))
-        if not str(guard.get("reported_occurrence_count") or "").strip():
-            guard["reported_occurrence_count"] = str(analysis.get("occurrence_count", 0))
-    if not analyses:
-        return None
     return {
         "groups": analyses,
     }
@@ -399,6 +425,7 @@ def cmd_capture_baseline(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_id": baseline.get("checkpoint_id"),
         "adapter": baseline.get("adapter"),
         "metrics": baseline.get("metrics"),
+        "finding_contract": baseline.get("finding_contract"),
     }
 
 
@@ -407,6 +434,16 @@ def _checkpoint_context(resolved, evidence: str) -> tuple[Optional[GuardRunConte
         return None, None
     checkpoint = prepare_checkpoint(resolved, evidence)
     if not checkpoint.get("required"):
+        # A migrated smell must never fall back to the ordinary threshold
+        # detector when its immutable baseline is missing.  That detector can
+        # legitimately consider the original source below its coarse
+        # threshold, which would otherwise turn a setup failure into PASS.
+        if checkpoint.get("reason"):
+            return GuardRunContext(
+                checkpoint_required=True,
+                checkpoint_smell=resolved.smell,
+                checkpoint=checkpoint,
+            ), checkpoint
         return None, checkpoint
     delta = dict(checkpoint.get("delta") or {})
     changed = [resolved.project_root / item for item in checkpoint.get("changed_production_java_files") or []]
@@ -439,17 +476,11 @@ def _god_class_min_reduction(resolved) -> float:
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     resolved = _resolve(args)
     evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
-    strict_resolution_required = _requires_strict_smell_resolution(
+    structural_resolution_required = _requires_structural_resolution(
         resolved.smell,
         evidence,
     )
-    build_test_required = bool(
-        os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
-        or (
-            resolved.smell == "refused_bequest"
-            and strict_resolution_required
-        )
-    )
+    build_test_required = os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
     if build_test_required and (
         args.skip_build_test
         or not args.run_build_test
@@ -489,11 +520,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
-    # Contract improvement gate: a real production diff that reduces any valid
-    # target metric vs baseline is an accepted improvement, even when the
-    # strict detector still reports the smell. The detector verdict stays in
-    # smell_guard for reporting; without this gate the loop burns the whole
-    # sample deadline on samples where "detector fully silent" is unreachable.
+    # Metric progress is a useful partial result, but never final acceptance
+    # while the dataset-aligned guard still reports the smell.
     improvement_pass = bool(
         guard_context is not None
         and getattr(guard_context, "has_production_diff", False)
@@ -504,37 +532,33 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     # lines would otherwise pass both the guard and this gate.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
         improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
-    accepted_improvement_pass = improvement_pass and not strict_resolution_required
     build_test_result = None
     if (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(resolved)
     snapshot = _snapshot_project(resolved.project_root) if args.snapshot else None
-    success = (not failed_smell or accepted_improvement_pass) and (
+    behavior_valid = build_test_result is None or bool(build_test_result.get("success"))
+    success = not failed_smell and (
         build_test_result is None or bool(build_test_result.get("success"))
     )
-    resolution = ""
-    if success:
-        resolution = "resolved" if not failed_smell else "improved"
-    elif improvement_pass and (
-        build_test_result is None or bool(build_test_result.get("success"))
-    ):
-        resolution = "improved"
+    progress = bool(success or (improvement_pass and behavior_valid))
+    resolution = (
+        "resolved"
+        if not failed_smell
+        else ("improved" if improvement_pass else "unresolved")
+    )
     continue_hint = ""
     if resolution == "improved":
         remaining = [str(item.get("message") or "") for item in failed_smell if item.get("message")]
-        progress_disposition = (
-            "Progress recorded but not accepted as final"
-            if strict_resolution_required
-            else "Progress accepted"
-        )
         continue_hint = (
-            f"{progress_disposition} (resolution=improved): the checkpoint confirms a real "
+            "Progress recorded but not accepted as final (resolution=improved): "
+            "the checkpoint confirms a real "
             "production diff with metric reduction vs baseline. The detector or structural "
             "guard still reports the smell, so keep refactoring toward resolution=resolved. "
             "Remaining detector signals: "
             + " | ".join(remaining[:3])
-            + " Best partial progress is already saved; do not undo these metric "
-            "gains. Make the next cohesive extraction or simplification, then call "
+            + " Preserve these metric gains; a checkpoint becomes a recoverable best "
+            "partial only after build/tests pass. Make the next cohesive extraction "
+            "or simplification, then call "
             "smell_verify again."
         )
     smell_guard = {
@@ -545,6 +569,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     }
     full_payload = {
         "success": success,
+        "accepted": success,
+        "progress": progress,
         "status": _verify_status(success, smell_guard, build_test_result, improvement_pass=improvement_pass),
         "resolution": resolution,
         "continue_hint": continue_hint,
@@ -585,6 +611,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         artifacts["verify_full"] = _write_json_artifact(artifact_dir / "verify.full.json", full_payload)
     payload = {
         "success": success,
+        "accepted": success,
+        "progress": progress,
         "status": full_payload["status"],
         "resolution": resolution,
         "continue_hint": continue_hint,
@@ -632,6 +660,8 @@ def _verify_status(
         if test.get("success") is False:
             return "TEST_FAILED"
         return "BUILD_TEST_FAILED"
+    if improvement_pass:
+        return "IMPROVED"
     if smell_guard.get("success") is False:
         return "SMELL_GUARD_FAILED"
     return "VERIFY_FAILED"
@@ -963,27 +993,6 @@ def _looks_like_dependency_resolution_failure(text: str) -> bool:
     )
 
 
-def _capability_split_failure(payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """Return the failed positive capability contract, when present."""
-    if not isinstance(payload, dict):
-        return None
-    smell_guard = payload.get("smell_guard")
-    if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
-        return None
-    for result in smell_guard.get("results") or []:
-        if not isinstance(result, dict) or result.get("success") is not False:
-            continue
-        details = result.get("details")
-        if not isinstance(details, dict) or details.get("structural_expectation") != "capability_split":
-            continue
-        profile = details.get("capability_profile")
-        if not isinstance(profile, dict) or profile.get("ok") is not True:
-            continue
-        if profile.get("capability_split_satisfied") is not True:
-            return profile
-    return None
-
-
 def _classify_failure_pack(
     payload: Optional[dict[str, Any]],
     text: str,
@@ -1036,15 +1045,6 @@ def _classify_failure_pack(
             ]
     smell_guard = payload.get("smell_guard") or {}
     if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
-        capability_split_required = bool(
-            smell == "refused_bequest"
-            and parse_structural_expectation(evidence) == "capability_split"
-        )
-        if _capability_split_failure(payload) or capability_split_required:
-            return "STRUCTURAL_ROUTE_MISMATCH", [
-                "The required capability split is still incomplete. Do not implement or delegate the reported method as the final repair.",
-                "Split the parent capability, migrate real implementers and production callers to narrow types, and remove the unsupported operation from the refusing type's inherited contract.",
-            ]
         return "SMELL_GUARD_FAILED", ["Smell guard did not pass; continue the refactoring rather than repairing tests."]
     build_test = payload.get("build_test_guard") or {}
     if isinstance(build_test, dict):
@@ -1090,18 +1090,7 @@ def _smell_guard_failure_highlights(payload: Optional[dict[str, Any]], *, limit:
     if not isinstance(smell_guard, dict) or smell_guard.get("success") is not False:
         return []
     highlights: list[str] = []
-    profile = _capability_split_failure(payload)
-    max_highlights = 2 if profile else 1
-    if profile:
-        target = str(profile.get("target_class") or "?")
-        method = str(profile.get("method") or "?")
-        parent = str(profile.get("reported_parent") or "?")
-        highlights.append(
-            "CAPABILITY_SPLIT_REQUIRED "
-            f"target={target} method={method} parent={parent}; "
-            "implementing the method body is not accepted; split the parent capability "
-            "and migrate implementers and callers."
-        )
+    max_highlights = 1
     for result in smell_guard.get("results") or []:
         if not isinstance(result, dict) or result.get("success") is not False:
             continue
@@ -1190,6 +1179,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config")
     parser.add_argument("--projects")
     parser.add_argument("--smell-evidence", default="")
+    parser.add_argument("--target-context-json", default="")
     parser.add_argument("--guard-context-json", default="")
     parser.add_argument("--idea-refactor-cli")
     parser.add_argument(

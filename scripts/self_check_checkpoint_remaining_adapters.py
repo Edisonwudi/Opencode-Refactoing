@@ -99,14 +99,6 @@ class Fixture {
       case 2: return 2;
       case 3: return 3;
       case 4: return 4;
-      case 5: return 5;
-      case 6: return 6;
-      case 7: return 7;
-      case 8: return 8;
-      case 9: return 9;
-      case 10: return 10;
-      case 11: return 11;
-      case 12: return 12;
       default: return -1;
     }
   }
@@ -115,7 +107,7 @@ class Fixture {
 SWITCH_AFTER = """\
 class Fixture {
   int target(int value) {
-    return value >= 0 && value <= 12 ? value : -1;
+    return value >= 0 && value <= 4 ? value : -1;
   }
 }
 """
@@ -150,7 +142,7 @@ def main() -> int:
             SWITCH_BEFORE,
             SWITCH_AFTER,
             "Fixture.java:method=target|line=2",
-            "switch_count=1; case_count=13; density=13.00",
+            "switch_count=1; case_count=5; density=5.00",
             "switch_case_count",
         ),
         "mysterious_name": _case(

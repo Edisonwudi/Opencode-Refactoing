@@ -147,24 +147,20 @@ def main() -> int:
         else:
             raise AssertionError("sample_optimized verification must require a pinned test file")
         missing_strict_test = replace(strict_oracle, test_location="")
-        try:
+        assert (
             runner._effective_verification_mode(
                 missing_strict_test,
                 argparse.Namespace(verification_mode="auto"),
             )
-        except ValueError as exc:
-            assert "STRICT_ORACLE_TEST_FILE_MISSING" in str(exc)
-        else:
-            raise AssertionError("strict Refused Bequest Oracle must require a pinned test file")
-        try:
+            == "project_full"
+        )
+        assert (
             runner._effective_verification_mode(
                 strict_oracle,
                 argparse.Namespace(verification_mode="local"),
             )
-        except ValueError as exc:
-            assert "STRICT_ORACLE_LOCAL_FORBIDDEN" in str(exc)
-        else:
-            raise AssertionError("strict Refused Bequest Oracle must reject local verification")
+            == "local"
+        )
         prompt = runner._task_prompt(
             sample,
             argparse.Namespace(idea_refactor_cli=""),

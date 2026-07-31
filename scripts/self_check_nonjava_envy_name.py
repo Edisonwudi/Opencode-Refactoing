@@ -8,6 +8,7 @@ asserts the refactored source passes with a strictly decreased objective.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,21 @@ def _bridge(
     location: str,
     evidence: str,
 ) -> dict[str, object]:
+    target_context: dict[str, str] = {}
+    if smell == "feature_envy":
+        match = re.search(
+            r"(?:^|;\s*)(?:envied_receiver|envied_type)=([^;]+)",
+            evidence,
+        )
+        if match:
+            target_context["receiver_type"] = match.group(1).strip()
+    elif smell == "mysterious_name":
+        kind = re.search(r"(?:^|;\s*)kind=([^;]+)", evidence)
+        name = re.search(r"(?:^|;\s*)name=([^;]+)", evidence)
+        if kind:
+            target_context["symbol_kind"] = kind.group(1).strip()
+        if name:
+            target_context["symbol_name"] = name.group(1).strip()
     args = [
         sys.executable,
         str(BRIDGE),
@@ -48,6 +64,11 @@ def _bridge(
         "--smell-evidence",
         evidence,
     ]
+    if target_context:
+        args.extend([
+            "--target-context-json",
+            json.dumps(target_context, separators=(",", ":"), sort_keys=True),
+        ])
     if command == "verify":
         args.append("--skip-build-test")
     result = _run(args, project)

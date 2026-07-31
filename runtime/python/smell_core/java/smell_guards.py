@@ -6,33 +6,34 @@ a Java-specific detector.
 """
 from __future__ import annotations
 
-import copy
 import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..analysis import count_meaningful_lines, extract_snippet
+from ..analysis import (
+    count_parameters,
+    extract_function_signature,
+    extract_snippet,
+)
 from ..config import ResolvedRunConfig
+from ..feature_envy import feature_envy_receiver_from_evidence
 from ..guards.context import GuardRunContext
 from .detector_utils import (
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
     parse_parent_from_evidence as _parse_parent_from_evidence,
-    parse_structural_expectation as _parse_structural_expectation,
-    parse_target_class as _parse_target_class,
-    parse_target_parameter_count as _parse_target_parameter_count,
 )
 from .data_clumps import (
-    data_clump_group_from_evidence,
+    data_clump_occurrence_payloads,
     data_clump_occurrence_threshold,
-    detect_data_clump_occurrences,
+    same_group_data_clump_findings,
 )
 from .semantic_detector import (
     SemanticFinding,
     _build_project_model,
-    analyze_refused_bequest_target,
+    analyze_feature_envy_target,
     find_matching_semantic_finding,
     run_java_semantic_detector,
 )
@@ -128,6 +129,31 @@ def run_java_syntactic_guard(
     )
     if not match and guard_type == "long_parameter_list":
         match = _find_lingering_lpl_signature(config, target, thresholds)
+    if not match and guard_type == "long_parameter_list":
+        threshold = int(thresholds.get("long_parameter_list", 5) or 5)
+        signature = extract_function_signature(target, "java")
+        parameter_count = (
+            count_parameters(signature.signature_text, "java")
+            if signature is not None
+            else 0
+        )
+        if parameter_count > threshold:
+            return {
+                "type": guard_type,
+                "success": False,
+                "message": (
+                    "long_parameter_list guard: the target declaration still has "
+                    f"{parameter_count} parameters (threshold {threshold})."
+                ),
+                "details": {
+                    "detector": "java_target_signature",
+                    "metric": "parameter_count",
+                    "file": str(target.project_path),
+                    "method": target.method,
+                    "score": parameter_count,
+                    "threshold": threshold,
+                },
+            }
     if match:
         return {
             "type": guard_type,
@@ -163,14 +189,12 @@ def _find_lingering_lpl_signature(
     target: Any,
     thresholds: Dict[str, object],
 ) -> Optional[Any]:
-    """Fail-closed fallback for long_parameter_list.
+    """Enforce removal of the frozen long signature after caller migration.
 
-    The finding matcher anchors on the original arity, so an agent can make
-    the target "unfindable" (line drift, added overloads, signature edits)
-    while the original long signature still exists in the file. When the
-    matcher comes back empty, rescan the target file directly: any same-name
-    method whose parameter count still exceeds the LPL threshold means the
-    smell was never repaired.
+    A parameter-object refactoring may add a shorter overload while retaining
+    the original long entrypoint. The product contract therefore scans the
+    same method family and rejects any lingering signature at or above the
+    detector boundary.
     """
     try:
         _, methods = load_project_model(config.project_root, [target.file_path])
@@ -193,7 +217,7 @@ def _find_lingering_lpl_signature(
         worst,
         float(count),
         "custom:long_parameter_list_lingering",
-        f"param_count={count}; threshold={threshold}; matcher_fallback=lingering-signature",
+        f"param_count={count}; threshold={threshold}; contract=lingering-signature",
     )
 
 
@@ -288,7 +312,7 @@ def run_java_clone_guard(
     detection = run_java_syntactic_detector(
         config.project_root,
         target_files=[first.file_path, second.file_path],
-        thresholds={"code_clone_min_tokens": int(guard.get("min_tokens", 80))},
+        thresholds={"code_clone_min_tokens": int(guard.get("min_tokens", 30))},
         include_mysterious_name=False,
     )
     if not detection.ok:
@@ -299,16 +323,22 @@ def run_java_clone_guard(
             "details": {"detector": "java_syntactic_detector", "error": detection.error},
         }
     clone_findings = detection.findings.get("code_clone_type1", [])
-    match = find_matching_clone_pair(
-        clone_findings,
-        left_file=first.file_path,
-        right_file=second.file_path,
-        project_root=config.project_root,
-        left_method=first.method,
-        right_method=second.method,
-        left_line=first.line,
-        right_line=second.line,
-    )
+    match = None
+    if not (
+        context is not None
+        and context.checkpoint_required
+        and context.current_metrics.get("finding_present") is False
+    ):
+        match = find_matching_clone_pair(
+            clone_findings,
+            left_file=first.file_path,
+            right_file=second.file_path,
+            project_root=config.project_root,
+            left_method=first.method,
+            right_method=second.method,
+            left_line=first.line,
+            right_line=second.line,
+        )
     if match:
         left, right = match
         return {
@@ -398,6 +428,10 @@ _NON_DELEGATION_CALLS = {
     "if", "for", "while", "switch", "catch", "synchronized", "try",
     "do", "return", "throw", "new", "assert", "this",
 }
+
+
+def _simple_type_name(value: str) -> str:
+    return str(value or "").strip().split("<", 1)[0].rsplit(".", 1)[-1].lower()
 
 
 def _verify_clone_structural_resolution(
@@ -1213,7 +1247,6 @@ def _proven_one_hop_shared_calls(
 # ---------------------------------------------------------------------------
 
 def _run_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    evidence = _guard_evidence(guard)
     if config.language != "java" or not config.locations:
         return {
             "type": "mysterious_name",
@@ -1229,47 +1262,39 @@ def _run_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, objec
             "message": f"mysterious_name guard: target file not found or not a .java file: {target.file_path}",
             "details": {"detector": "java_syntactic_detector", "file": str(target.file_path)},
         }
-    detection = run_java_syntactic_detector(
-        config.project_root,
-        target_files=[target.file_path],
-        thresholds={"mysterious_name_min_len": int(guard.get("min_len", 2))},
-        include_code_clone=False,
-        include_mysterious_name=True,
+    from ..checkpoint_adapters import capture_metric_snapshot
+
+    snapshot = capture_metric_snapshot(config, "")
+    identity = (
+        config.finding_contract.get("entity_identity")
+        if isinstance(config.finding_contract, dict)
+        and isinstance(config.finding_contract.get("entity_identity"), dict)
+        else {}
     )
-    if not detection.ok:
+    kind = str(identity.get("symbol_kind") or "")
+    name = str(identity.get("symbol_name") or "")
+    if not snapshot.get("ok"):
         return {
             "type": "mysterious_name",
             "success": False,
-            "message": f"mysterious_name guard: detector unavailable: {detection.error}",
-            "details": {"detector": "java_syntactic_detector", "error": detection.error},
+            "message": f"mysterious_name guard: detector unavailable: {snapshot.get('error', '')}",
+            "details": {"detector": "java_syntactic_detector", "error": snapshot.get("error", "")},
         }
-    match = find_matching_syntactic_finding(
-        detection.findings.get("mysterious_name", []),
-        target_file=target.file_path,
-        project_root=config.project_root,
-        method=target.method,
-        line=target.line,
-        original_start_line=target.start_line,
-        original_param_count=target.parameter_count,
-        original_param_type_fingerprint=target.param_type_fingerprint,
-        evidence=evidence,
-    )
-    kind, name = parse_mysterious_evidence(evidence)
-    if match:
+    if snapshot.get("finding_present") is True:
         return {
             "type": "mysterious_name",
             "success": False,
             "message": (
                 f"mysterious_name guard: detector still reports {kind or 'identifier'} "
-                f"'{name or _extract_mysterious_name(evidence)}' at {target.project_path}."
+                f"'{name}' at {target.project_path}."
             ),
             "details": {
                 "detector": "java_syntactic_detector",
-                "file": match.file,
-                "method": match.method,
-                "begin_line": match.begin_line,
-                "rule_id": match.rule_id,
-                "evidence": match.evidence,
+                "file": str(target.project_path),
+                "method": target.method,
+                "target_kind": kind,
+                "target_name": name,
+                "current_metrics": snapshot,
             },
         }
     return {
@@ -1277,29 +1302,16 @@ def _run_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, objec
         "success": True,
         "message": (
             f"mysterious_name guard: detector no longer reports {kind or 'identifier'} "
-            f"'{name or _extract_mysterious_name(evidence)}' at {target.project_path}."
+            f"'{name}' at {target.project_path}."
         ),
         "details": {"detector": "java_syntactic_detector"},
     }
-
-
-def _group_evidence_values(evidence: str, field: str) -> List[str]:
-    match = re.search(
-        rf"(?:^|;\s*){re.escape(field)}=([^;]+)",
-        str(evidence or ""),
-        flags=re.IGNORECASE,
-    )
-    return [part.strip() for part in match.group(1).split("|")] if match else []
 
 
 def _run_semantic_guard(
     config: ResolvedRunConfig,
     guard_type: str,
     evidence: str,
-    *,
-    _shared_detection=None,
-    _shared_project_model=None,
-    _group_member: bool = False,
 ) -> Dict[str, object]:
     """Run a Java semantic guard (feature_envy / data_clumps / refused_bequest / dead_code).
 
@@ -1335,60 +1347,21 @@ def _run_semantic_guard(
         }
     if guard_type == "data_clumps":
         return _run_data_clumps_group_guard(config, guard_type, evidence)
-    if guard_type == "refused_bequest" and len(config.locations) > 1 and not _group_member:
-        detection = run_java_semantic_detector(config.project_root)
-        if not detection.ok:
-            return {
-                "type": guard_type,
-                "success": False,
-                "message": f"{guard_type} guard: semantic detector unavailable: {detection.error}",
-                "details": {"detector": "python_semantic_detector", "error": detection.error},
-            }
-        project_model = _build_project_model(config.project_root, include_tests=False)
-        group_arities = _group_evidence_values(evidence, "target_parameter_counts")
-        group_classes = _group_evidence_values(evidence, "target_classes")
-        member_results = []
-        for index, target in enumerate(config.locations):
-            member_config = copy.copy(config)
-            member_config.locations = [target]
-            member_evidence = evidence
-            if len(group_arities) == len(config.locations):
-                member_evidence += f"; target_parameter_count={group_arities[index]}"
-            if len(group_classes) == len(config.locations):
-                member_evidence += f"; target_class={group_classes[index]}"
-            member_results.append(
-                _run_semantic_guard(
-                    member_config,
-                    guard_type,
-                    member_evidence,
-                    _shared_detection=detection,
-                    _shared_project_model=project_model,
-                    _group_member=True,
-                )
-            )
-        failed_members = [item for item in member_results if not item.get("success")]
-        first_failure = (
-            f" First unresolved target: {failed_members[0].get('message', 'unknown failure')}"
-            if failed_members
-            else ""
-        )
+    if guard_type == "refused_bequest" and len(config.locations) > 1:
         return {
             "type": guard_type,
-            "success": not failed_members,
+            "success": False,
             "message": (
-                f"refused_bequest group guard: {len(member_results) - len(failed_members)}/"
-                f"{len(member_results)} target methods satisfy the structural contract."
-                f"{first_failure}"
+                "refused_bequest guard: a finding contract identifies one rejecting "
+                "override; capture each target method separately."
             ),
             "details": {
                 "detector": "python_semantic_detector",
-                "target_count": len(member_results),
-                "failure_count": len(failed_members),
-                "member_results": member_results,
+                "target_count": len(config.locations),
             },
         }
     target = config.locations[0]
-    detection = _shared_detection or run_java_semantic_detector(config.project_root)
+    detection = run_java_semantic_detector(config.project_root)
     if not detection.ok:
         return {
             "type": guard_type,
@@ -1396,6 +1369,12 @@ def _run_semantic_guard(
             "message": f"{guard_type} guard: semantic detector unavailable: {detection.error}",
             "details": {"detector": "python_semantic_detector", "error": detection.error},
         }
+    contract = config.finding_contract if isinstance(config.finding_contract, dict) else {}
+    identity = (
+        contract.get("entity_identity")
+        if isinstance(contract.get("entity_identity"), dict)
+        else {}
+    )
     match = find_matching_semantic_finding(
         detection.findings.get(guard_type, []),
         target_file=target.file_path,
@@ -1403,7 +1382,11 @@ def _run_semantic_guard(
         method=target.method,
         line=target.line,
         evidence_group="",
-        evidence_parent=_parse_parent_from_evidence(evidence) if guard_type == "refused_bequest" else "",
+        evidence_parent=(
+            str(identity.get("parent") or "")
+            if guard_type == "refused_bequest"
+            else ""
+        ),
     )
     if match:
         return {
@@ -1421,144 +1404,45 @@ def _run_semantic_guard(
                 "evidence": match.evidence,
             },
         }
-    structural_target_removed = False
     if guard_type == "refused_bequest":
-        structural_expectation = _parse_structural_expectation(evidence)
-        if structural_expectation:
-            if structural_expectation not in {
-                "capability_split",
-                "rejecting_override_removed",
-            }:
-                return {
-                    "type": guard_type,
-                    "success": False,
-                    "message": (
-                        "refused_bequest guard: unsupported structural expectation "
-                        f"{structural_expectation!r}."
-                    ),
-                    "details": {
-                        "detector": "python_semantic_detector",
-                        "structural_expectation": structural_expectation,
-                    },
-                }
-            else:
-                profile = analyze_refused_bequest_target(
-                    config.project_root,
-                    target_file=target.file_path,
-                    method=target.method,
-                    line=target.line,
-                    reported_parent=_parse_parent_from_evidence(evidence),
-                    target_parameter_count=_parse_target_parameter_count(evidence),
-                    target_class_name=_parse_target_class(evidence),
-                    project_model=_shared_project_model,
+        original_signature = str(identity.get("method") or target.method or "")
+        original_parent = str(identity.get("parent") or "")
+        relocated = [
+            item
+            for item in detection.findings.get("refused_bequest", [])
+            if (
+                original_signature
+                and str(item.method) == original_signature
+                and (
+                    not original_parent
+                    or _simple_type_name(_parse_parent_from_evidence(item.evidence))
+                    == _simple_type_name(original_parent)
                 )
-                if not profile.get("ok"):
-                    return {
-                        "type": guard_type,
-                        "success": False,
-                        "message": (
-                            "refused_bequest guard: capability-split profile could not "
-                            f"be resolved: {profile.get('error', 'unknown error')}."
-                        ),
-                        "details": {
-                            "detector": "python_semantic_detector",
-                            "structural_expectation": structural_expectation,
-                            "capability_profile": profile,
-                        },
-                    }
-                expectation_satisfied = (
-                    profile.get("capability_split_satisfied")
-                    if structural_expectation == "capability_split"
-                    else profile.get("rejecting_override_removed")
-                )
-                if not expectation_satisfied:
-                    if structural_expectation == "rejecting_override_removed":
-                        failure_message = (
-                            "refused_bequest guard: the rejecting child override is still "
-                            "declared, or the reported safe parent method cannot be resolved."
-                        )
-                    elif profile.get("inherited_rejecting_owners"):
-                        failure_message = (
-                            "refused_bequest guard: the rejected capability was relocated "
-                            "to an inherited ancestor instead of being split. Rejecting "
-                            f"ancestor(s): {', '.join(profile['inherited_rejecting_owners'])}."
-                        )
-                    elif profile.get("descendant_rejecting_owners"):
-                        failure_message = (
-                            "refused_bequest guard: the rejected capability was relocated "
-                            "to a descendant placeholder instead of being split. Rejecting "
-                            f"descendant(s): {', '.join(profile['descendant_rejecting_owners'])}."
-                        )
-                    elif profile.get("orphaned_real_implementers"):
-                        failure_message = (
-                            "refused_bequest guard: real implementers lost an explicit "
-                            "capability contract during the split. Migrate them to a "
-                            "narrow capability type instead of leaving incidental methods. "
-                            "Orphaned implementer(s): "
-                            f"{', '.join(profile['orphaned_real_implementers'])}."
-                        )
-                    else:
-                        failure_message = (
-                            "refused_bequest guard: the reported parent capability is "
-                            "still inherited and still exposes the target method."
-                        )
-                    return {
-                        "type": guard_type,
-                        "success": False,
-                        "message": failure_message,
-                        "details": {
-                            "detector": "python_semantic_detector",
-                            "structural_expectation": structural_expectation,
-                            "capability_profile": profile,
-                        },
-                    }
-                structural_target_removed = True
-    if (
-        guard_type == "refused_bequest"
-        and not structural_target_removed
-        and _requires_unsupported_throw_removal(evidence)
-    ):
-        unsupported_throw = _target_method_unsupported_throw(config, target)
-        if unsupported_throw:
+            )
+        ]
+        if relocated:
+            first = relocated[0]
             return {
                 "type": guard_type,
                 "success": False,
                 "message": (
-                    "refused_bequest guard: target method still directly throws "
-                    "UnsupportedOperationException. Remove or replace the rejecting override "
-                    "instead of hiding it from override-based detection."
+                    "refused_bequest guard: the rejecting behavior was moved to another "
+                    f"type instead of resolved: {first.file}#{first.method}."
                 ),
                 "details": {
                     "detector": "python_semantic_detector",
-                    "file": str(target.project_path),
-                    "method": target.method,
-                    "begin_line": target.line,
-                    "explicit_unsupported_throw": True,
+                    "relocated_findings": [_semantic_finding_to_dict(item) for item in relocated],
                 },
             }
-    if (
-        guard_type == "refused_bequest"
-        and not structural_target_removed
-        and _requires_empty_override_removal(evidence)
-    ):
-        empty_override = _target_method_empty_override(config, target)
-        if empty_override:
-            return {
-                "type": guard_type,
-                "success": False,
-                "message": (
-                    "refused_bequest guard: target method is still an empty inherited "
-                    "contract implementation. Implement, delegate, or remove the empty "
-                    "override according to the reported refactor path."
-                ),
-                "details": {
-                    "detector": "python_semantic_detector",
-                    "file": str(target.project_path),
-                    "method": target.method,
-                    "begin_line": target.line,
-                    "empty_override": True,
-                },
-            }
+        return {
+            "type": guard_type,
+            "success": True,
+            "message": (
+                "refused_bequest guard: the frozen method-level rejecting finding is gone "
+                "and no equivalent rejecting finding was relocated in the hierarchy."
+            ),
+            "details": {"detector": "python_semantic_detector"},
+        }
     return {
         "type": guard_type,
         "success": True,
@@ -1576,30 +1460,37 @@ def _run_data_clumps_group_guard(
     evidence: str,
 ) -> Dict[str, object]:
     target = config.locations[0]
-    target_group = data_clump_group_from_evidence(evidence)
+    contract = config.finding_contract if isinstance(config.finding_contract, dict) else {}
+    identity = contract.get("entity_identity") if isinstance(contract.get("entity_identity"), dict) else {}
+    target_group = str(identity.get("group") or "")
     if not target_group:
         return {
             "type": guard_type,
             "success": False,
-            "message": "data_clumps guard: missing group=... evidence; cannot validate the clump family.",
+            "message": "data_clumps guard: checkpoint finding contract has no normalized parameter group.",
             "details": {"detector": "python_semantic_detector"},
         }
-    analysis = detect_data_clump_occurrences(config.project_root, evidence=evidence, limit=20)
-    if not analysis.get("success"):
+    detection = run_java_semantic_detector(config.project_root, include_tests=False)
+    if not detection.ok:
         return {
             "type": guard_type,
             "success": False,
-            "message": f"data_clumps guard: semantic detector unavailable: {analysis.get('error', '')}",
+            "message": f"data_clumps guard: semantic detector unavailable: {detection.error}",
             "details": {
                 "detector": "python_semantic_detector",
                 "group": target_group,
-                "error": analysis.get("error", ""),
+                "error": detection.error,
             },
         }
-    occurrence_count = int(analysis.get("occurrence_count") or 0)
+    matches = same_group_data_clump_findings(
+        detection.findings.get("data_clumps", []),
+        evidence=f"group={target_group}",
+    )
+    occurrence_count = len(matches)
+    occurrences = data_clump_occurrence_payloads(matches, limit=20)
     threshold = data_clump_occurrence_threshold()
     if occurrence_count >= threshold:
-        remaining_occurrences = list(analysis.get("occurrences") or [])
+        remaining_occurrences = occurrences
         first = remaining_occurrences[0] if remaining_occurrences else {}
         return {
             "type": guard_type,
@@ -1754,7 +1645,7 @@ def _run_feature_envy_guard(
             "details": {"detector": "python_semantic_detector", "language": config.language},
         }
     target = config.locations[0]
-    detection = run_java_semantic_detector(config.project_root)
+    detection = run_java_semantic_detector(config.project_root, include_tests=False)
     if not detection.ok:
         return {
             "type": "feature_envy",
@@ -1998,47 +1889,6 @@ def _extract_mysterious_name(evidence: str) -> str:
         if match:
             return match.group(1).strip()
     return ""
-
-
-def _requires_unsupported_throw_removal(evidence: str) -> bool:
-    return bool(
-        re.search(
-            r"\bexplicit_unsupported_throw(?:\s*=\s*(?:true|1|yes))?\b",
-            evidence,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _requires_empty_override_removal(evidence: str) -> bool:
-    return bool(
-        re.search(
-            r"(?:empty_override|unimplemented_contract|unimplemented_loader|resource_leak_contract)"
-            r"(?:\s*=\s*(?:true|1|yes))?",
-            evidence,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _target_method_unsupported_throw(config: ResolvedRunConfig, target) -> bool:
-    try:
-        snippet = extract_snippet(target, config.language)
-    except Exception:
-        return False
-    if snippet is None:
-        return False
-    return bool(re.search(r"\bthrow\s+new\s+UnsupportedOperationException\b", snippet.body_text))
-
-
-def _target_method_empty_override(config: ResolvedRunConfig, target) -> bool:
-    try:
-        snippet = extract_snippet(target, config.language)
-    except Exception:
-        return False
-    if snippet is None:
-        return False
-    return count_meaningful_lines(snippet.body_text, config.language) == 0
 
 
 # ---------------------------------------------------------------------------

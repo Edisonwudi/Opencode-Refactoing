@@ -247,6 +247,13 @@ def count_parameters(signature_text: str, language: str) -> int:
 def estimate_complexity(snippet: SourceSnippet, language: str) -> int:
     if snippet.complexity_hint is not None:
         return snippet.complexity_hint
+    if language == "java":
+        name_match = re.search(
+            r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
+            snippet.signature_text,
+        )
+        method_name = name_match.group(1) if name_match else ""
+        return java_cognitive_complexity_from_text(snippet.body_text, method_name)
     wrapped_source = _wrap_body_source(snippet.body_text, language)
     if wrapped_source is None:
         return _estimate_complexity_from_text(snippet.body_text, language)
@@ -257,6 +264,29 @@ def estimate_complexity(snippet: SourceSnippet, language: str) -> int:
     if body_node is None:
         return _estimate_complexity_from_text(snippet.body_text, language)
     return _estimate_complexity_from_node(body_node, language, source_bytes)
+
+
+def java_cognitive_complexity_from_text(
+    body_text: str,
+    method_name: str = "",
+) -> int:
+    """Compute the PMD Java CognitiveComplexity metric used by the dataset.
+
+    This mirrors PMD's ``CognitiveComplexityVisitor`` instead of maintaining a
+    generic nesting approximation. Keeping it public lets the fast Java
+    detector and checkpoint adapter share the same metric implementation.
+    """
+    wrapped = _wrap_body_source(body_text, "java")
+    if wrapped is None:
+        return _estimate_complexity_from_text(body_text, "java")
+    function_node, source_bytes = _find_first_function_node(wrapped, "java")
+    if function_node is None:
+        return _estimate_complexity_from_text(body_text, "java")
+    body_node = function_node.child_by_field_name("body")
+    if body_node is None:
+        return _estimate_complexity_from_text(body_text, "java")
+    name = method_name or _extract_declared_name(function_node, "java", source_bytes) or ""
+    return _java_cognitive_complexity(body_node, source_bytes, name)
 
 
 def estimate_switch_branches(snippet: SourceSnippet, language: str) -> int:
@@ -1031,6 +1061,14 @@ def _python_parameter_name(node: Node, source_bytes: bytes) -> Optional[str]:
 
 
 def _estimate_complexity_from_node(body_node: Node, language: str, source_bytes: bytes) -> int:
+    if language == "java":
+        function = body_node.parent
+        method_name = (
+            _extract_declared_name(function, "java", source_bytes)
+            if function is not None
+            else ""
+        ) or ""
+        return _java_cognitive_complexity(body_node, source_bytes, method_name)
     control_types = COMPLEXITY_NODE_TYPES.get(language, set())
     total = 0
     for node in _iter_nodes(body_node):
@@ -1038,6 +1076,128 @@ def _estimate_complexity_from_node(body_node: Node, language: str, source_bytes:
             continue
         total += 1 + _control_nesting_depth(node, control_types)
     return total
+
+
+_JAVA_COGNITIVE_CONTROLS = {
+    "for_statement",
+    "enhanced_for_statement",
+    "while_statement",
+    "do_statement",
+    "switch_expression",
+    "switch_statement",
+    "catch_clause",
+    "ternary_expression",
+}
+
+
+def _java_cognitive_complexity(
+    body_node: Node,
+    source_bytes: bytes,
+    method_name: str,
+) -> int:
+    def logical_operator(node: Node) -> str:
+        if node.type != "binary_expression":
+            return ""
+        for child in node.children:
+            if child.is_named:
+                continue
+            token = _node_text(source_bytes, child).strip()
+            if token in {"&&", "||"}:
+                return token
+        return ""
+
+    def is_recursive_call(node: Node) -> bool:
+        if not method_name or node.type != "method_invocation":
+            return False
+        name_node = node.child_by_field_name("name")
+        return bool(
+            name_node is not None
+            and _node_text(source_bytes, name_node).strip() == method_name
+        )
+
+    complexity = 0
+    nesting = 0
+    current_boolean_operator = ""
+
+    def structural() -> None:
+        nonlocal complexity, nesting
+        complexity += 1 + nesting
+        nesting += 1
+
+    def reset_boolean_sequence() -> None:
+        nonlocal current_boolean_operator
+        current_boolean_operator = ""
+
+    def walk(node: Node) -> None:
+        nonlocal complexity, nesting, current_boolean_operator
+
+        if node.type == "block":
+            for child in node.named_children:
+                # PMD ends a boolean-operation run at every block statement.
+                reset_boolean_sequence()
+                walk(child)
+            return
+
+        if is_recursive_call(node):
+            complexity += 1
+
+        if node.type == "if_statement":
+            condition = node.child_by_field_name("condition")
+            consequence = node.child_by_field_name("consequence")
+            alternative = node.child_by_field_name("alternative")
+            if condition is not None:
+                walk(condition)
+            is_else_if = node.parent is not None and node.parent.type == "if_statement"
+            if not is_else_if:
+                structural()
+            if consequence is not None:
+                walk(consequence)
+            if not is_else_if:
+                nesting -= 1
+            if alternative is not None:
+                # PMD treats every else as hybrid complexity: +1 and one
+                # nesting level while visiting the complete alternative.
+                complexity += 1
+                nesting += 1
+                walk(alternative)
+                nesting -= 1
+            return
+
+        if node.type in _JAVA_COGNITIVE_CONTROLS:
+            structural()
+            for child in node.named_children:
+                walk(child)
+            nesting -= 1
+            return
+
+        if node.type in {"lambda_expression", "class_body"}:
+            nesting += 1
+            for child in node.named_children:
+                walk(child)
+            nesting -= 1
+            return
+
+        if node.type == "binary_expression":
+            operator = logical_operator(node)
+            if operator and operator != current_boolean_operator:
+                complexity += 1
+                current_boolean_operator = operator
+
+        if node.type == "unary_expression":
+            text = _node_text(source_bytes, node).lstrip()
+            if text.startswith("!"):
+                reset_boolean_sequence()
+
+        if node.type in {"break_statement", "continue_statement"}:
+            text = _node_text(source_bytes, node)
+            if re.search(r"\b(?:break|continue)\s+[A-Za-z_$][A-Za-z0-9_$]*", text):
+                complexity += 1
+
+        for child in node.named_children:
+            walk(child)
+
+    walk(body_node)
+    return complexity
 
 
 def _estimate_switch_branches_from_node(body_node: Node, language: str, source_bytes: bytes) -> int:

@@ -74,7 +74,7 @@ def _build_smell_evidence_hint(config: ResolvedRunConfig) -> str:
     evidence_lines = []
     for guard in config.profile.guards:
         guard_type = str(guard.get("type", "")).strip()
-        evidence = str(guard.get("evidence", "")).strip()
+        evidence = str(guard.get("audit_evidence", "")).strip()
         if guard_type == "mysterious_name" and evidence:
             evidence_lines.append(f"- Target evidence: `{evidence}`")
         if guard_type == "data_clumps" and evidence:
@@ -83,10 +83,10 @@ def _build_smell_evidence_hint(config: ResolvedRunConfig) -> str:
         return ""
     suffix = ""
     if config.smell == "mysterious_name":
-        suffix = "- This exact identifier is the primary target. For `param=...`, `local=...`, or `kind=...; name=...`, rename that identifier before changing other short names.\n"
+        suffix = "- This identifier is selection context only; baseline capture must also confirm it as a strict detector finding.\n"
     if config.smell == "data_clumps":
         suffix = (
-            "- Treat the reported parameter group as a cross-method family. Before editing, inspect the listed occurrence methods and choose a refactoring that reduces the repeated group, not just the anchor method.\n"
+            "- Treat the reported group only as a selector for the product detector's cross-method finding family.\n"
         )
     return "Smell evidence:\n" f"{chr(10).join(evidence_lines)}\n" f"{suffix}\n"
 
@@ -263,7 +263,7 @@ def _build_idea_refactor_tool_hint(config: ResolvedRunConfig) -> str:
     # ── Section 3: Delegated CLI reference ─────────────────────────
     lines.append("IDEA CLI protocol reference:")
     lines.append("- In OpenCode, load the `idea-refactor-cli` skill before executing `idea_native`, `idea_edit`, or `mixed` Java source steps.")
-    lines.append("- That skill owns the detailed locate/prepare/apply/rollback lifecycle, selection repair, decisions, stale draft handling, and fallback rules.")
+    lines.append("- That skill owns the detailed preview/proposal/apply/rollback lifecycle, selection repair, decisions, stale proposal handling, and fallback rules.")
     lines.append("")
     lines.append("IDEA edit fallback for Java:")
     lines.append("- Prefer native IDEA refactorings first.")

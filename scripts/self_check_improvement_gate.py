@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Regression checks for the contract improvement gate in bridge verify.
+"""Regression checks for the contract improvement outcome in bridge verify.
 
 Semantics under test: a real production diff that reduces any valid target
-metric vs baseline is an accepted improvement (PASS, resolution="improved")
-even when the strict detector still reports the smell. Without a diff or
-without metric reduction the old failure semantics must be unchanged.
-Refused Bequest rows with an explicit structural expectation are stricter:
-metric improvement is progress-only and cannot become final acceptance.
+metric vs baseline is recorded as IMPROVED, never PASS, while the
+product detector still reports the smell. Without a diff or metric
+reduction the ordinary failure semantics remain unchanged.
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = REPO_ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
 sys.path.insert(0, str(BRIDGE.parent))
 
-from smell_bridge import _requires_strict_smell_resolution  # noqa: E402
+from smell_bridge import _requires_structural_resolution  # noqa: E402
 
 
 def _method(index: int, controls: int) -> str:
@@ -59,19 +57,20 @@ def _bridge(project: Path, subcommand: str) -> dict:
 
 
 def main() -> int:
-    assert _requires_strict_smell_resolution(
+    assert _requires_structural_resolution(
         "refused_bequest",
         "parents=Parent; structural_expectation=capability_split",
     )
-    assert _requires_strict_smell_resolution(
+    assert _requires_structural_resolution(
         "refused_bequest",
         "parents=Parent; structural_expectation=rejecting_override_removed",
     )
-    assert not _requires_strict_smell_resolution(
+    assert _requires_structural_resolution(
         "refused_bequest",
         "parents=Parent",
     )
-    assert not _requires_strict_smell_resolution(
+    assert _requires_structural_resolution("code_clone_type1", "")
+    assert not _requires_structural_resolution(
         "god_class",
         "structural_expectation=capability_split",
     )
@@ -94,7 +93,7 @@ def main() -> int:
         first = _bridge(root, "verify")
         assert first["success"] is False, first
         assert first["status"] == "SMELL_GUARD_FAILED", first["status"]
-        assert first.get("resolution", "") == "", first.get("resolution")
+        assert first.get("resolution") == "unresolved", first.get("resolution")
 
         # 2) Improvement edit: drop two methods and ten padding lines. All of
         # nom/wmc/loc shrink but the detector must still report the class.
@@ -102,11 +101,14 @@ def main() -> int:
         second = _bridge(root, "verify")
         guard = second.get("smell_guard") or {}
         assert guard.get("success") is False, "detector should still report the class"
-        assert second["success"] is True, second
-        assert second["status"] == "PASS", second["status"]
+        assert second["success"] is False, second
+        assert second["accepted"] is False, second
+        assert second["progress"] is True, second
+        assert second["status"] == "IMPROVED", second["status"]
         assert second.get("resolution") == "improved", second.get("resolution")
         checkpoint = second.get("checkpoint") or {}
-        assert checkpoint.get("accepted") is True, checkpoint
+        assert checkpoint.get("accepted") is False, checkpoint
+        assert checkpoint.get("best_partial_eligible") is False, checkpoint
 
         # 3) Cosmetic-only edit on the ORIGINAL baseline class (comment change
         # only): production diff exists but every metric is back at baseline,

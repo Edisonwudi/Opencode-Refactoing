@@ -20,11 +20,11 @@ feature_envy:
       - op: move:method
         apply_args: '{"targetClassFqcn":"org.apache.commons.cli.Util"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/DefaultParser.java", line=153, column=17)
+          - idea_refactor_preview(operation="move:method", file="src/main/java/org/apache/commons/cli/DefaultParser.java", line=153, column=17, arguments={"targetClassFqcn":"org.apache.commons.cli.Util"})
           - inspect source context for nav:call-hierarchy before choosing the native refactor target
           - inspect source context for nav:workspace-symbol before choosing the native refactor target
-          - idea_refactor_prepare(operation="move:method", expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetClassFqcn":"org.apache.commons.cli.Util"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetClassFqcn":"org.apache.commons.cli.Util"})
     after: |
       // DefaultParser.java — indexOfEqual removed
       365        if (Util.indexOfEqual(token) == -1) {
@@ -59,14 +59,14 @@ feature_envy:
       - op: move:method
         apply_args: '{"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}'
         cli_steps:
-          - idea_refactor_locate(file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=74, column=18)
+          - idea_refactor_preview(operation="move:method", file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=74, column=18, arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
           - inspect source context for nav:call-hierarchy before choosing the native refactor target
-          - idea_refactor_locate(file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=75, column=14)
+          - idea_refactor_preview(operation="move:method", file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=75, column=14, arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
           - inspect source context for nav:hover before choosing the native refactor target
-          - idea_refactor_locate(file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=74, column=18)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
-          - idea_refactor_apply(arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}, decisions={"move:method.conflict.de1a7bd7ba9a635d":"refactor_anyway"})
+          - idea_refactor_preview(operation="move:method", file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=74, column=18, arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}, decisions={"move:method.conflict.de1a7bd7ba9a635d":"refactor_anyway"})
     after: |
       /* KeyPairCleanupService.java */
       62                        keyPersistenceService.removeKey(key.getKeyId());
@@ -89,7 +89,7 @@ feature_envy:
       255        }
       256    }
     source: { project: Stirling-PDF-v2.1.5, class: KeyPairCleanupService -> KeyPersistenceService, verified: "2026-05-11", mode: "OpenCode IDEA tools" }
-    notes: "Verified with idea_refactor_locate/idea_refactor_prepare/idea_refactor_apply against an attached IDEA service. prepare surfaced a private-field accessibility conflict; the first apply round remained at needs_decision, and the second apply round succeeded only after idea_refactor_apply(decisions={\"move:method.conflict.de1a7bd7ba9a635d\":\"refactor_anyway\"}). The resulting temporary project still compiled with ./gradlew :proprietary:compileJava. This exact method pair is not one of the dataset's recorded feature_envy cases."
+    notes: "Verified against an attached IDEA service. Preview surfaced a private-field accessibility conflict; the first apply round remained at needs_decision, and the second apply round succeeded only after idea_refactor_apply(proposalId=\"<preview.proposalId>\", decisions={\"move:method.conflict.de1a7bd7ba9a635d\":\"refactor_anyway\"}). The resulting temporary project still compiled with ./gradlew :proprietary:compileJava. This exact method pair is not one of the dataset's recorded feature_envy cases."
   - id: extract-slice-then-move-to-envied-receiver
     when: "a receiver-heavy slice inside a larger source method must move to the envied receiver; extract:method is only a temporary isolation step, and the plan must not stop after extract:method or leave the helper in the original source class"
     before: |
@@ -110,16 +110,16 @@ feature_envy:
       - op: extract:method
         apply_args: '{"newName":"sendSecret","visibility":"private","makeStatic":false,"replaceDuplicates":false}'
         cli_steps:
-          - idea_refactor_locate(file="src/demo/Source.java", line=13, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/demo/Source.java", line=13, column=9, selection={"startLine":13,"startColumn":9,"endLine":13,"endColumn":33})
-          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"sendSecret","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+          - idea_refactor_preview(operation="extract:method", file="src/demo/Source.java", line=13, column=9, arguments={"newName":"sendSecret","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+          - idea_refactor_preview(operation="extract:method", file="src/demo/Source.java", line=13, column=9, selection={"startLine":13,"startColumn":9,"endLine":13,"endColumn":33}, arguments={"newName":"sendSecret","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"sendSecret","visibility":"private","makeStatic":false,"replaceDuplicates":false})
       - op: move:method
         apply_args: '{"targetVariableName":"receiver","newName":"sendSecret"}'
         cli_steps:
-          - idea_refactor_locate(file="src/demo/Source.java", line=17, column=18)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"receiver","newName":"sendSecret"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"receiver","newName":"sendSecret"}, decisions={"move:method.visibility.938852b473beaaab":"escalate_visibility"})
+          - idea_refactor_preview(operation="move:method", file="src/demo/Source.java", line=17, column=18, arguments={"targetVariableName":"receiver","newName":"sendSecret"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"receiver","newName":"sendSecret"}, decisions={"move:method.visibility.938852b473beaaab":"escalate_visibility"})
     after: |
       /* Source.java */
       3     class Receiver {

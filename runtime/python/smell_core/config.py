@@ -296,6 +296,8 @@ class ResolvedRunConfig:
     test_source: str = "projects.yaml"
     sample_test_location: str = ""
     sample_test_command: str = ""
+    target_context: Dict[str, Any] = field(default_factory=dict)
+    finding_contract: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -335,6 +337,8 @@ class ResolvedRunConfig:
             "test_source": self.test_source,
             "sample_test_location": self.sample_test_location,
             "sample_test_command": self.sample_test_command,
+            "target_context": copy.deepcopy(self.target_context),
+            "finding_contract": copy.deepcopy(self.finding_contract),
         }
 
 
@@ -468,6 +472,7 @@ def resolve_run_config(
     verification_mode: str = "local",
     sample_test_location: str = "",
     sample_test_command: str = "",
+    target_context: Optional[Dict[str, Any]] = None,
 ) -> ResolvedRunConfig:
     project_root_path = Path(project_root).expanduser().resolve()
     override_lookup_root = (
@@ -551,6 +556,7 @@ def resolve_run_config(
         test_source=test_source,
         sample_test_location=str(sample_test_location or ""),
         sample_test_command=str(sample_test_command or ""),
+        target_context=copy.deepcopy(target_context or {}),
     )
 
 

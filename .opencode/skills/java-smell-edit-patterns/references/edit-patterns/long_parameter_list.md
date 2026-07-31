@@ -28,10 +28,13 @@ Source operation shape: `introduce:parameter-object`. See [`operation-translatio
 
 Route-specific edit steps:
 
-1. Name the request object from the utility purpose.
-2. Move all traveling parameters into immutable fields/accessors.
-3. Change the static method and every caller to pass the request object.
+1. Preview and apply `introduce:parameter-object` with `keepMethodAsDelegate=false`.
+2. Name the request object from the utility purpose.
+3. Move all traveling parameters into immutable fields/accessors.
+4. Migrate every production caller to pass the request object and delete the original long signature.
 
 Verification fit delta: The old multi-argument signature should be gone or reduced below the threshold.
 
-Avoid: Do not keep the old long method as the primary implementation.
+Avoid: Do not keep the old long method as a delegate or compatibility shell. A
+`custom:long_parameter_list_lingering` result is a continuation request to migrate the
+remaining callers and remove that signature; it is not permission to relax the guard.

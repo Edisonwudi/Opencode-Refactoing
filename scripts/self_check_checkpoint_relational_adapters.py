@@ -122,20 +122,32 @@ class Parent {
 class Left extends Parent {
   int below;
   int above;
+  int width;
+  int height;
+  int depth;
   boolean between;
-  Left(int below, int above, boolean between) {
+  Left(int below, int above, int width, int height, int depth, boolean between) {
     this.below = below;
     this.above = above;
+    this.width = width;
+    this.height = height;
+    this.depth = depth;
     this.between = between;
   }
 }
 class Right extends Parent {
   int below;
   int above;
+  int width;
+  int height;
+  int depth;
   boolean between;
-  Right(int below, int above, boolean between) {
+  Right(int below, int above, int width, int height, int depth, boolean between) {
     this.below = below;
     this.above = above;
+    this.width = width;
+    this.height = height;
+    this.depth = depth;
     this.between = between;
   }
 }
@@ -144,21 +156,27 @@ CLONE_PARENT_CONSTRUCTOR_AFTER = """\
 class Parent {
   int below;
   int above;
+  int width;
+  int height;
+  int depth;
   boolean between;
-  Parent(int below, int above, boolean between) {
+  Parent(int below, int above, int width, int height, int depth, boolean between) {
     this.below = below;
     this.above = above;
+    this.width = width;
+    this.height = height;
+    this.depth = depth;
     this.between = between;
   }
 }
 class Left extends Parent {
-  Left(int below, int above, boolean between) {
-    super(below, above, between);
+  Left(int below, int above, int width, int height, int depth, boolean between) {
+    super(below, above, width, height, depth, between);
   }
 }
 class Right extends Parent {
-  Right(int below, int above, boolean between) {
-    super(below, above, between);
+  Right(int below, int above, int width, int height, int depth, boolean between) {
+    super(below, above, width, height, depth, between);
   }
 }
 """
@@ -351,7 +369,12 @@ def _case(
         for rejected in rejected_intermediates:
             source.write_text(rejected, encoding="utf-8")
             invalid = _bridge(project, env, "verify", smell, location, evidence)
-            assert invalid.get("status") == "SMELL_GUARD_FAILED", invalid
+            assert invalid.get("status") in {"SMELL_GUARD_FAILED", "IMPROVED"}, invalid
+            assert invalid.get("success") is False, invalid
+            assert invalid.get("accepted") is False, invalid
+            if invalid.get("status") == "IMPROVED":
+                assert invalid.get("progress") is True, invalid
+                assert invalid.get("resolution") == "improved", invalid
         source.write_text(after, encoding="utf-8")
         repaired = _bridge(project, env, "verify", smell, location, evidence)
         if repaired.get("status") != "PASS":

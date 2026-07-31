@@ -142,11 +142,10 @@ class SmellGuideBuilder:
             "",
             "- Identify overrides that reject, ignore, or duplicate parent behavior.",
             "- Treat the supplied sample test as an immutable project-behavior regression oracle; never edit or weaken it.",
-            "- Read the evidence refactor_path first and inspect the named helper, state, overload, sibling protocol, or capability boundary.",
-            "- If evidence requires capability_split, do not implement or delegate the reported method as the final repair; split the parent capability and migrate implementers and callers.",
+            "- Derive the parent contract, sibling implementations, and caller impact from source before choosing a route.",
             "- Do not guess `safe-delete`; this route does not expose a `safe-delete` IDEA CLI operation.",
             "- For pure super-delegation or delete-legal useless overrides, prefer `inline:method` with `keepMethodDeclaration=false`.",
-            "- Unless evidence requires capability_split, when the method is required by an interface or abstract parent, keep it and use `idea_edit` to implement the narrow contract.",
+            "- When the method is required by an interface or abstract parent, implementing or delegating the narrow contract is valid if behavior is preserved.",
             "- When real behavior is owned by a narrower subtype, use `pushDown:method` instead of leaving a rejecting hook on the parent.",
             "- Use pull-up or push-down only when the ownership boundary is genuinely wrong; do not flatten the hierarchy broadly.",
             "- Remove useless overrides only when parent behavior is actually correct for the subtype.",
@@ -158,7 +157,7 @@ class SmellGuideBuilder:
         return "\n".join([
             f"IDEA refactoring hints for {smell}:",
             "",
-            "- Use IDEA locate/prepare/apply on the smallest change that directly addresses the reported smell.",
+            "- Use IDEA preview/apply with an explicit proposalId on the smallest change that directly addresses the reported smell.",
             "- Choose the native refactoring that matches the real structure you see.",
         ])
 

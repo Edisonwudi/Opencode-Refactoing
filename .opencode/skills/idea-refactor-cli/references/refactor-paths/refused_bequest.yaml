@@ -30,9 +30,9 @@ refused_bequest:
       - op: inline:method
         apply_args: '{"keepMethodDeclaration":false}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/builder/StandardToStringStyle.java", line=55, column=20)
-          - idea_refactor_prepare(operation="inline:method", expectedOperation="inline:method")
-          - idea_refactor_apply(arguments={"keepMethodDeclaration":false})
+          - idea_refactor_preview(operation="inline:method", file="src/main/java/org/apache/commons/lang3/builder/StandardToStringStyle.java", line=55, column=20, arguments={"keepMethodDeclaration":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"keepMethodDeclaration":false})
     after: |
       // StandardToStringStyle.getArrayEnd() removed entirely.
       // Callers now invoke ToStringStyle.getArrayEnd() directly via inheritance.
@@ -350,9 +350,9 @@ refused_bequest:
       - op: pushDown:method
         apply_args: '{"makeAbstract":null,"targetSubclasses":[]}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/builder/RecursiveToStringStyle.java", line=77, column=21)
-          - idea_refactor_prepare(operation="pushDown:method", expectedOperation="pushDown:method")
-          - idea_refactor_apply(arguments={"makeAbstract":null,"targetSubclasses":[]})
+          - idea_refactor_preview(operation="pushDown:method", file="src/main/java/org/apache/commons/lang3/builder/RecursiveToStringStyle.java", line=77, column=21, arguments={"makeAbstract":null,"targetSubclasses":[]})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"makeAbstract":null,"targetSubclasses":[]})
     after: |
       // RecursiveToStringStyle — accept() removed from parent
       53    public class RecursiveToStringStyle extends ToStringStyle {

@@ -27,6 +27,7 @@ from ..analysis import (
     extract_snippet,
     method_basename,
     normalize_for_clone,
+    python_switch_metrics,
 )
 from ..config import CommandConfig, ResolvedRunConfig, interpolate_command_text
 from ..data_clumps import (
@@ -37,10 +38,6 @@ from ..data_clumps import (
 from ..feature_envy import (
     analyze_feature_envy_target as analyze_generic_feature_envy_target,
     feature_envy_receiver_from_evidence,
-)
-from ..mysterious_name import (
-    detect_mysterious_names as detect_generic_mysterious_names,
-    find_matching_name_finding,
 )
 from ..checkpoint_contract import checkpoint_gate_result
 from .context import GuardRunContext
@@ -635,16 +632,12 @@ def _run_nested_complexity_guard(config: ResolvedRunConfig, guard: Dict[str, obj
 
 
 def _run_switch_statements_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    max_branches = int(guard.get("max_branches", 12))
     syntactic_handler = get_syntactic_guard(config.language)
     if syntactic_handler is not None:
         syntactic = syntactic_handler(
             config,
             "switch_statements",
-            {
-                "switch_case_count": max_branches,
-                "switch_density": float(guard.get("max_density", 10.0)),
-            },
+            {},
             str(guard.get("evidence", "")),
         )
         if syntactic is not None:
@@ -658,12 +651,16 @@ def _run_switch_statements_guard(config: ResolvedRunConfig, guard: Dict[str, obj
             "details": None,
         }
     branch_count = estimate_switch_branches(snippet, config.language)
-    success = branch_count <= max_branches
+    if config.language == "python":
+        switch_count, _, _ = python_switch_metrics(snippet)
+    else:
+        switch_count = len(re.findall(r"\bswitch\s*\(", snippet.body_text))
+    success = switch_count == 0
     return {
         "type": "switch_statements",
         "success": success,
-        "message": f"Target has switch-style branch count {branch_count} (threshold {max_branches}).",
-        "details": {"branch_count": branch_count, "max_branches": max_branches},
+        "message": f"Target has {switch_count} switch construct(s); branch count is {branch_count}.",
+        "details": {"switch_count": switch_count, "branch_count": branch_count},
     }
 
 
@@ -804,72 +801,63 @@ def _run_generic_feature_envy_guard(config: ResolvedRunConfig, guard: Dict[str, 
 
 
 def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    from ..java.syntactic_detector import parse_mysterious_evidence
-
-    evidence = str(guard.get("evidence") or "")
-    kind, name = parse_mysterious_evidence(evidence)
-    if not name:
+    target = config.locations[0] if config.locations else None
+    if target is None:
         return {
             "type": "mysterious_name",
             "success": False,
-            "message": "mysterious_name guard: missing kind=...; name=... evidence; cannot validate the rename.",
+            "message": "mysterious_name guard: missing target location.",
             "details": {"detector": "tree_sitter_generic"},
         }
-    target = config.locations[0] if config.locations else None
-    if target is None or not target.file_path.is_file():
-        return {
-            "type": "mysterious_name",
-            "success": True,
-            "message": f"mysterious_name guard: the target of reported {kind or 'name'} '{name}' no longer resolves.",
-            "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
-        }
-    try:
-        findings = detect_generic_mysterious_names(target.file_path, language=config.language)
-    except Exception as exc:
+    from ..checkpoint_adapters import capture_metric_snapshot
+
+    identity = (
+        config.finding_contract.get("entity_identity")
+        if isinstance(config.finding_contract, dict)
+        and isinstance(config.finding_contract.get("entity_identity"), dict)
+        else {}
+    )
+    selector = config.target_context if isinstance(config.target_context, dict) else {}
+    kind = str(identity.get("symbol_kind") or selector.get("symbol_kind") or "")
+    name = str(identity.get("symbol_name") or selector.get("symbol_name") or "")
+    snapshot = capture_metric_snapshot(config, "")
+    if not snapshot.get("ok"):
         return {
             "type": "mysterious_name",
             "success": False,
-            "message": f"mysterious_name guard: generic detector unavailable: {exc}",
-            "details": {"detector": "tree_sitter_generic", "error": str(exc)},
+            "message": f"mysterious_name guard: detector unavailable: {snapshot.get('error', '')}",
+            "details": {
+                "detector": "tree_sitter_generic",
+                "error": snapshot.get("error", ""),
+            },
         }
-    try:
-        snippet = extract_snippet(target, config.language)
-    except Exception:
-        snippet = None
-    if snippet is None:
-        return {
-            "type": "mysterious_name",
-            "success": True,
-            "message": f"mysterious_name guard: the function owning reported {kind or 'name'} '{name}' no longer resolves.",
-            "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
-        }
-    match = find_matching_name_finding(
-        findings,
-        kind=kind,
-        name=name,
-        scope=(snippet.start_line, snippet.end_line),
-    )
-    if match is not None:
+    if snapshot.get("finding_present") is True:
         return {
             "type": "mysterious_name",
             "success": False,
             "message": (
-                f"mysterious_name guard: reported {match.kind} '{name}' is still present "
-                f"({match.reason}); rename it to a descriptive identifier."
+                f"mysterious_name guard: detector still reports {kind or 'identifier'} "
+                f"'{name}' at {target.project_path}."
             ),
             "details": {
                 "detector": "tree_sitter_generic",
                 "target_kind": kind,
                 "target_name": name,
-                "finding": match.evidence,
-                "line": match.line,
+                "current_metrics": snapshot,
             },
         }
     return {
         "type": "mysterious_name",
         "success": True,
-        "message": f"mysterious_name guard: reported {kind or 'name'} '{name}' no longer appears in the target.",
-        "details": {"detector": "tree_sitter_generic", "target_kind": kind, "target_name": name},
+        "message": (
+            f"mysterious_name guard: detector no longer reports {kind or 'identifier'} "
+            f"'{name}' at {target.project_path}."
+        ),
+        "details": {
+            "detector": "tree_sitter_generic",
+            "target_kind": kind,
+            "target_name": name,
+        },
     }
 
 

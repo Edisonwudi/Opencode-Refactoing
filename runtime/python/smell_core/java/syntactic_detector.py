@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..analysis import java_cognitive_complexity_from_text
 from .detector_utils import (
     normalize_group as _normalize_group,
     normalize_method as _normalize_method,
@@ -117,8 +118,9 @@ DEFAULT_THRESHOLDS = {
     "cognitive_complexity": 20,
     "switch_density": 10.0,
     "switch_case_count": 8,
-    "code_clone_min_tokens": 80,
+    "code_clone_min_tokens": 30,
     "mysterious_name_min_len": 2,
+    "mysterious_name_profile": "strict",
 }
 
 DEFAULT_EXCLUDE_PATHS = [
@@ -213,7 +215,30 @@ def run_java_syntactic_detector(
     project_root = project_root.expanduser().resolve()
     try:
         java_files = _resolve_java_files(project_root, include_tests=include_tests, target_files=target_files)
-        _, methods = load_project_model(project_root, java_files)
+        classes, methods = load_project_model(project_root, java_files)
+        mysterious_findings = (
+            _detect_mysterious_name(
+                methods,
+                int(config["mysterious_name_min_len"]),
+                DEFAULT_LOW_INFO_NAMES,
+                profile=str(config["mysterious_name_profile"]),
+                exclude_tests=True,
+            )
+            if include_mysterious_name
+            else []
+        )
+        if include_mysterious_name:
+            mysterious_findings.extend(
+                _detect_mysterious_names_outside_methods(
+                    project_root,
+                    java_files,
+                    classes,
+                    methods,
+                    int(config["mysterious_name_min_len"]),
+                    DEFAULT_LOW_INFO_NAMES,
+                    profile=str(config["mysterious_name_profile"]),
+                )
+            )
         findings = {
             "long_method": _detect_long_method(methods, int(config["long_method_ncss"])),
             "long_parameter_list": _detect_long_parameter_list(methods, int(config["long_parameter_list"])),
@@ -224,11 +249,7 @@ def run_java_syntactic_detector(
                 int(config["switch_case_count"]),
             ),
             "code_clone_type1": _detect_code_clone(methods, int(config["code_clone_min_tokens"])) if include_code_clone else [],
-            "mysterious_name": (
-                _detect_mysterious_name(methods, int(config["mysterious_name_min_len"]), DEFAULT_LOW_INFO_NAMES)
-                if include_mysterious_name
-                else []
-            ),
+            "mysterious_name": mysterious_findings,
         }
         return JavaSyntacticDetectionResult(ok=True, findings={k: _sort_findings(v) for k, v in findings.items()})
     except Exception as exc:
@@ -258,7 +279,14 @@ def find_matching_syntactic_finding(
             continue
         if target_method and _normalize_method(finding.method) != target_method:
             continue
-        if not has_strong_anchor and line and finding.begin_line and abs(finding.begin_line - line) > 3:
+        if (
+            not has_strong_anchor
+            and line
+            and finding.begin_line
+            and not (
+                finding.begin_line <= line <= (finding.end_line or finding.begin_line)
+            )
+        ):
             continue
         if evidence_group and _normalize_group(_parse_group_from_evidence(finding.evidence)) != _normalize_group(evidence_group):
             continue
@@ -427,8 +455,8 @@ def _detect_long_parameter_list(methods: Sequence[JavaMethodInfo], threshold: in
 def _detect_nested_complexity(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
     rows = []
     for method in methods:
-        score = compute_cognitive_complexity(method.body_text)
-        if score <= threshold:
+        score = compute_cognitive_complexity(method.body_text, method.method_name)
+        if score < threshold:
             continue
         rows.append(_finding("nested_complexity", method, float(score), "custom:cognitive_complexity", f"complexity={score}; threshold={threshold}"))
     return rows
@@ -443,8 +471,6 @@ def _detect_switch_statements(
     for method in methods:
         switch_count, case_count, density = compute_switch_metrics(method.body_text)
         if switch_count == 0:
-            continue
-        if density <= density_threshold and case_count <= case_threshold:
             continue
         score = max(float(case_count), float(density))
         rows.append(
@@ -462,11 +488,15 @@ def _detect_switch_statements(
 def _detect_code_clone(methods: Sequence[JavaMethodInfo], min_tokens: int) -> List[JavaSyntacticFinding]:
     groups: Dict[str, List[Tuple[JavaMethodInfo, int]]] = defaultdict(list)
     for method in methods:
-        tokens = tokenize_clone(method.body_text)
-        if len(tokens) < min_tokens:
+        body_tokens = tokenize_clone(method.body_text)
+        if _is_thin_forwarder(method.body_text):
             continue
-        digest = hashlib.sha1(" ".join(tokens).encode("utf-8")).hexdigest()
-        groups[digest].append((method, len(tokens)))
+        declaration_tokens = tokenize_clone(method.signature)
+        token_count = len(body_tokens) + len(declaration_tokens)
+        if token_count < min_tokens:
+            continue
+        digest = hashlib.sha1(" ".join(body_tokens).encode("utf-8")).hexdigest()
+        groups[digest].append((method, token_count))
 
     rows = []
     for digest, occurrences in groups.items():
@@ -484,6 +514,18 @@ def _detect_code_clone(methods: Sequence[JavaMethodInfo], min_tokens: int) -> Li
                 )
             )
     return rows
+
+
+def _is_thin_forwarder(body_text: str) -> bool:
+    """Exclude one-statement delegation shells from type-1 clone findings."""
+    compact = re.sub(r"\s+", " ", mask_comments_and_strings(body_text)).strip()
+    return bool(
+        re.fullmatch(
+            r"\{\s*(?:return\s+)?(?:super|this|[A-Za-z_$][A-Za-z0-9_$.]*)"
+            r"\s*\([^;{}]*\)\s*;\s*\}",
+            compact,
+        )
+    )
 
 
 def _detect_mysterious_name(
@@ -505,23 +547,168 @@ def _detect_mysterious_name(
             reason = _suspicious_name_reason(method.method_name, min_len, low_info, allow_too_short=True)
             if reason:
                 evidence = _mysterious_evidence("method", method.method_name, reason) if strict_mode else f"name={method.method_name}; reason={reason}"
-                rows.append(_finding("mysterious_name", method, 1.0, "custom:mysterious_method_name", evidence, end_line=method.begin_line))
+                rows.append(
+                    _finding(
+                        "mysterious_name",
+                        method,
+                        1.0,
+                        "custom:mysterious_method_name",
+                        evidence,
+                        begin_line=method.begin_line,
+                        end_line=method.begin_line,
+                    )
+                )
         for pname in method.parameter_names:
             if not _is_valid_java_identifier(pname):
                 continue
             reason = _suspicious_name_reason(pname, min_len, low_info, allow_too_short=not strict_mode)
             if reason:
                 evidence = _mysterious_evidence("param", pname, reason) if strict_mode else f"param={pname}; reason={reason}"
-                rows.append(_finding("mysterious_name", method, 1.0, "custom:mysterious_parameter_name", evidence, end_line=method.begin_line))
+                rows.append(
+                    _finding(
+                        "mysterious_name",
+                        method,
+                        1.0,
+                        "custom:mysterious_parameter_name",
+                        evidence,
+                        begin_line=method.begin_line,
+                        end_line=method.begin_line,
+                    )
+                )
         masked_body = mask_comments_and_strings(method.body_text)
-        for var in VAR_DECL_RE.findall(masked_body):
+        seen_local_names: set[str] = set()
+        for declaration in VAR_DECL_RE.finditer(masked_body):
+            var = declaration.group(1)
             if not _is_valid_java_identifier(var):
+                continue
+            if var in seen_local_names:
                 continue
             reason = _suspicious_name_reason(var, min_len, low_info, allow_too_short=not strict_mode)
             if reason:
-                evidence = _mysterious_evidence("local", var, reason) if strict_mode else f"local={var}; reason={reason}"
-                rows.append(_finding("mysterious_name", method, 1.0, "custom:mysterious_local_name", evidence, end_line=method.begin_line))
+                seen_local_names.add(var)
+                evidence = (
+                    _mysterious_evidence("local", var, reason)
+                    if strict_mode
+                    else f"local={var}; reason={reason}"
+                )
+                declaration_line = method.begin_line + masked_body.count(
+                    "\n", 0, declaration.start(1)
+                )
+                rows.append(
+                    _finding(
+                        "mysterious_name",
+                        method,
+                        1.0,
+                        "custom:mysterious_local_name",
+                        evidence,
+                        begin_line=declaration_line,
+                        end_line=declaration_line,
+                    )
+                )
     return rows
+
+
+def _detect_mysterious_names_outside_methods(
+    project_root: Path,
+    java_files: Sequence[Path],
+    classes: Sequence[JavaClassInfo],
+    methods: Sequence[JavaMethodInfo],
+    min_len: int,
+    low_info_names: Iterable[str],
+    *,
+    profile: str,
+) -> List[JavaSyntacticFinding]:
+    """Detect locals in static, instance, lambda, and anonymous initializer scopes."""
+    low_info = {name.lower() for name in low_info_names}
+    strict_mode = profile == "strict"
+    rows: List[JavaSyntacticFinding] = []
+    methods_by_file: Dict[str, List[JavaMethodInfo]] = defaultdict(list)
+    classes_by_file: Dict[str, List[JavaClassInfo]] = defaultdict(list)
+    for method in methods:
+        methods_by_file[method.rel_path].append(method)
+    for cls in classes:
+        classes_by_file[cls.rel_path].append(cls)
+
+    for file_path in java_files:
+        rel_path = str(file_path.resolve().relative_to(project_root.resolve())).replace("\\", "/")
+        if _should_exclude_mysterious_path(rel_path, profile, True, True):
+            continue
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+        masked = mask_comments_and_strings(text)
+        line_starts = _build_line_starts(text)
+        brace_ranges = _brace_ranges(masked)
+        seen: Set[Tuple[str, str]] = set()
+        for declaration in VAR_DECL_RE.finditer(masked):
+            name = declaration.group(1)
+            if not _is_valid_java_identifier(name):
+                continue
+            line = _idx_to_line(line_starts, declaration.start(1))
+            if any(method.begin_line <= line <= method.end_line for method in methods_by_file[rel_path]):
+                continue
+            reason = _suspicious_name_reason(name, min_len, low_info, allow_too_short=not strict_mode)
+            if not reason:
+                continue
+            cls = _find_enclosing_class(classes_by_file[rel_path], line)
+            if cls is None:
+                continue
+            containing = [
+                (start, end)
+                for start, end in brace_ranges
+                if start < declaration.start(1) < end
+            ]
+            if not containing:
+                continue
+            scope_start, scope_end = min(containing, key=lambda item: item[1] - item[0])
+            class_only = (
+                _idx_to_line(line_starts, scope_start) == cls.begin_line
+                and _idx_to_line(line_starts, scope_end) == cls.end_line
+            )
+            kind = "field" if class_only else "local"
+            if kind != "local":
+                continue
+            scope_id = _initializer_scope_id(masked, containing)
+            if (scope_id, name) in seen:
+                continue
+            seen.add((scope_id, name))
+            evidence = (
+                _mysterious_evidence(kind, name, reason)
+                if strict_mode
+                else f"local={name}; reason={reason}"
+            )
+            rows.append(
+                JavaSyntacticFinding(
+                    smell_type="mysterious_name",
+                    file=rel_path,
+                    class_name=cls.class_name,
+                    method=f"<initializer:{scope_id}>",
+                    begin_line=line,
+                    end_line=line,
+                    score=1.0,
+                    rule_id="custom:mysterious_initializer_local_name",
+                    evidence=evidence,
+                )
+            )
+    return rows
+
+
+def _brace_ranges(masked_text: str) -> List[Tuple[int, int]]:
+    stack: List[int] = []
+    ranges: List[Tuple[int, int]] = []
+    for index, char in enumerate(masked_text):
+        if char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            ranges.append((stack.pop(), index))
+    return ranges
+
+
+def _initializer_scope_id(masked_text: str, containing: Sequence[Tuple[int, int]]) -> str:
+    fragments: List[str] = []
+    for start, _ in sorted(containing, key=lambda item: item[1] - item[0])[:3]:
+        context_start = max(0, masked_text.rfind("\n", 0, start - 1) + 1)
+        fragment = re.sub(r"\s+", " ", masked_text[context_start:start]).strip()
+        fragments.append(fragment[-120:])
+    return hashlib.sha1("|".join(fragments).encode("utf-8")).hexdigest()[:16]
 
 
 def _finding(
@@ -531,6 +718,7 @@ def _finding(
     rule_id: str,
     evidence: str,
     *,
+    begin_line: Optional[int] = None,
     end_line: Optional[int] = None,
 ) -> JavaSyntacticFinding:
     return JavaSyntacticFinding(
@@ -538,7 +726,7 @@ def _finding(
         file=method.rel_path,
         class_name=method.class_name,
         method=method.signature,
-        begin_line=method.begin_line,
+        begin_line=method.begin_line if begin_line is None else begin_line,
         end_line=method.end_line if end_line is None else end_line,
         score=score,
         rule_id=rule_id,
@@ -575,23 +763,8 @@ def count_non_comment_loc(block_text: str) -> int:
     return count
 
 
-def compute_cognitive_complexity(block_text: str) -> int:
-    masked = mask_comments_and_strings(block_text)
-    # 'case' is excluded: switch itself already counts as a branch.
-    # 'do' is excluded: the paired 'while' counts the do-while loop once.
-    token_iter = re.finditer(r"\bif\b|\bfor\b|\bwhile\b|\bcatch\b|\bswitch\b|\{|\}", masked)
-    depth = 0
-    score = 0
-    for token in token_iter:
-        t = token.group(0)
-        if t == "{":
-            depth += 1
-            continue
-        if t == "}":
-            depth = max(depth - 1, 0)
-            continue
-        score += 1 + max(depth - 1, 0)
-    return score
+def compute_cognitive_complexity(block_text: str, method_name: str = "") -> int:
+    return java_cognitive_complexity_from_text(block_text, method_name)
 
 
 def compute_switch_metrics(block_text: str) -> Tuple[int, int, float]:
@@ -1123,7 +1296,9 @@ def _suspicious_name_reason(name: str, min_len: int, low_info_names: set[str], a
 
 
 def _is_valid_java_identifier(name: str) -> bool:
-    return bool(IDENT_RE.match(name)) and name not in JAVA_KEYWORDS
+    # ``var`` is a restricted type name, not a reserved identifier; it remains
+    # legal as a method, parameter, field, or local-variable name.
+    return bool(IDENT_RE.match(name)) and (name not in JAVA_KEYWORDS or name == "var")
 
 
 def _should_exclude_mysterious_path(rel_path: str, profile: str, exclude_tests: bool, exclude_generated: bool) -> bool:

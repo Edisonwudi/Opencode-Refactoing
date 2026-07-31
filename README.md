@@ -128,6 +128,13 @@ runs/<run-name>/samples/<sample>/
   failure_pack       # 失败时的结构化原因(在 verify.json 内)
 ```
 
+`results.csv` 会独立记录 `status`、`resolution`、`accepted`、`progress`
+和 `termination_reason`，`note` 另记录 `final_verify_source`。当 OpenCode 正常结束、
+最后一个已完成工具调用就是可解析的 `smell_verify` 时，runner 直接持久化该
+权威结果；超时、缺少结果或 verify 后仍有工具调用时，才执行独立的
+`runner_fallback` 验收。每样本容器内 Maven `install` 产生的临时本地仓库
+元数据不会覆盖 smell/build/test 的最终状态。
+
 ### 1.9 日常更新
 
 ```bash
@@ -242,14 +249,20 @@ key 来源优先级：`--opencode-api-key`（不推荐）>
   异味的指标采集、目标定位与改善判断（如 god_class 取 nom/wmc/loc/atfd,
   feature_envy 取 expected_receiver_access,long_method 取 ast_ncss)。
 
-### 3.2 PASS 的两个层级（`resolution`）
+### 3.2 PASS 与 IMPROVED（`resolution`）
 
-- `resolved`：检测器不再报告目标异味。这是**唯一提前终止通行证**。
-- `improved`:checkpoint 确认"真实生产 diff + 任一目标指标相对基线下降"
+- `PASS / resolved`：数据集同源检测器不再报告目标异味。这是唯一验收通过状态。
+- `IMPROVED / improved`：checkpoint 确认"真实生产 diff + 任一目标指标相对基线下降"
   （此时 build/test 也会强制执行）。`improved` 不终止 loop：插件按同一
-  预算让 agent 继续冲 `resolved`，并把剩余检测器信号和"不要回撤已保存
-  的 best partial"注入续跑提示；预算耗尽后按最终工作树的真实状态结算
-  `resolved / improved / failed`。
+  预算让 agent 继续冲 `resolved`，并把剩余检测器信号和"保留当前指标
+  改善"注入续跑提示；预算耗尽后仍有异味就保留 `IMPROVED`，
+  不得转换为 `PASS`。
+
+checkpoint 会保存每次指标、production patch 和 build/test 结果，但只有
+`build_test_success=true` 的 checkpoint 才能成为可恢复的 `best` 或
+`best_partial`。
+合法候选先按 `resolved > improved` 排序，再比较指标改善；编译或测试失败的
+checkpoint 只保留作诊断证据，`restorable=false`。
 
 ### 3.3 有效 PASS 的硬规则
 

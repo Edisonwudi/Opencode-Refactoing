@@ -13,7 +13,7 @@ from .checkpoint_adapters import CHECKPOINT_SMELLS, capture_metric_snapshot
 from .checkpoint_contract import CHECKPOINT_CONTRACT_VERSION, evaluate_checkpoint_contract
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _run_git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -69,6 +69,38 @@ def _source_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
 
 
+def _canonical_hash(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _finding_contract(smell: str, metrics: dict[str, Any], target_context: Any) -> dict[str, Any]:
+    detector_id = str(metrics.get("detector") or "").strip()
+    detector_profile = metrics.get("detector_profile")
+    identity = metrics.get("finding_identity")
+    if not detector_id:
+        raise ValueError("CHECKPOINT_BASELINE_CAPTURE_FAILED: detector_id_missing")
+    if not isinstance(detector_profile, dict) or not detector_profile:
+        raise ValueError("CHECKPOINT_BASELINE_CAPTURE_FAILED: detector_profile_missing")
+    if not isinstance(identity, dict) or not identity:
+        raise ValueError("CHECKPOINT_BASELINE_CAPTURE_FAILED: finding_identity_missing")
+    stable_identity = json.loads(json.dumps(identity, sort_keys=True, ensure_ascii=True))
+    return {
+        "detector_id": detector_id,
+        "detector_profile": detector_profile,
+        "detector_profile_hash": _canonical_hash(detector_profile),
+        "finding_id": _canonical_hash({"smell": smell, "identity": stable_identity}),
+        "entity_identity": stable_identity,
+        "baseline_metrics": dict(metrics.get("objectives") or {}),
+        "selection_context": dict(target_context) if isinstance(target_context, dict) else {},
+    }
+
+
 def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:
     """Capture the immutable c000 metric snapshot for a migrated smell."""
     smell = str(config.smell)
@@ -82,6 +114,10 @@ def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:
     baseline_path = task_root / "c000-baseline" / "manifest.json"
     if baseline_path.is_file():
         existing = _read_json(baseline_path)
+        if int(existing.get("schema_version") or 0) != CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                "CHECKPOINT_SCHEMA_MISMATCH: checkpoint v2 and older must be recaptured"
+            )
         if (
             str(existing.get("project_root")) != str(root)
             or str(existing.get("location")) != location
@@ -93,6 +129,18 @@ def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:
     metrics = capture_metric_snapshot(config, evidence)
     if not metrics.get("ok") or not metrics.get("objectives"):
         raise ValueError(f"CHECKPOINT_BASELINE_CAPTURE_FAILED: {metrics.get('error', 'no measurable objectives')}")
+    candidate_count = int(metrics.get("candidate_count") or 0)
+    if candidate_count != 1:
+        if candidate_count > 1:
+            raise ValueError(f"TARGET_AMBIGUOUS: detector returned {candidate_count} matching findings")
+        raise ValueError("BASELINE_FINDING_NOT_FOUND")
+    if metrics.get("finding_present") is not True:
+        raise ValueError("BASELINE_FINDING_NOT_FOUND")
+    finding_contract = _finding_contract(
+        smell,
+        metrics,
+        getattr(config, "target_context", {}),
+    )
     targets = []
     for target in config.locations:
         try:
@@ -119,6 +167,7 @@ def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:
         "targets": targets,
         "adapter": metrics.get("adapter", smell),
         "metrics": metrics,
+        "finding_contract": finding_contract,
     }
     _write_json(baseline_path, manifest)
     _write_json(task_root / "task-state.json", {
@@ -133,7 +182,14 @@ def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:
 
 def load_checkpoint_baseline(project_root: Path, smell: str, location: str) -> dict[str, Any] | None:
     path = checkpoint_task_root(project_root, smell, location) / "c000-baseline" / "manifest.json"
-    return _read_json(path) if path.is_file() else None
+    if not path.is_file():
+        return None
+    payload = _read_json(path)
+    if int(payload.get("schema_version") or 0) != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            "CHECKPOINT_SCHEMA_MISMATCH: checkpoint v2 and older must be recaptured"
+        )
+    return payload
 
 
 def _changed_paths(root: Path, base_commit: str) -> list[str]:
@@ -206,7 +262,24 @@ def prepare_checkpoint(config: Any, evidence: str) -> dict[str, Any]:
     checkpoint_id = f"c{sequence:03d}"
     checkpoint_dir = task_root / f"{checkpoint_id}-verify"
     baseline_metrics = dict(baseline.get("metrics") or {})
+    finding_contract = dict(baseline.get("finding_contract") or {})
+    config.finding_contract = finding_contract
     current = capture_metric_snapshot(config, evidence)
+    expected_detector = str(finding_contract.get("detector_id") or "")
+    current_detector = str(current.get("detector") or "")
+    expected_profile_hash = str(finding_contract.get("detector_profile_hash") or "")
+    current_profile_hash = _canonical_hash(current.get("detector_profile") or {})
+    if (
+        not finding_contract
+        or current_detector != expected_detector
+        or current_profile_hash != expected_profile_hash
+    ):
+        return {
+            "required": False,
+            "reason": "detector_profile_mismatch",
+            "finding_contract": finding_contract,
+            "current_metrics": current,
+        }
     changed = _changed_paths(root, str(baseline.get("project_commit") or ""))
     production_sources = [path for path in changed if _is_production_source(path, str(config.language))]
     has_production_diff = bool(production_sources)
@@ -249,6 +322,7 @@ def prepare_checkpoint(config: Any, evidence: str) -> dict[str, Any]:
         "production_diff_hash": hashlib.sha256(production_patch.encode("utf-8", errors="surrogateescape")).hexdigest(),
         "baseline_metrics": baseline_metrics,
         "current_metrics": current,
+        "finding_contract": finding_contract,
         "delta": delta,
         "accepted": False,
         "best_checkpoint": False,
@@ -283,14 +357,35 @@ def finalize_checkpoint(
     manifest = _read_json(manifest_path)
     accepted = bool(verify_payload.get("success"))
     manifest["accepted"] = accepted
+    manifest["progress"] = bool(verify_payload.get("progress"))
+    manifest["resolution"] = str(verify_payload.get("resolution") or "")
     manifest["verify_status"] = verify_payload.get("status")
     manifest["build_test_success"] = bool((verify_payload.get("build_test_guard") or {}).get("success")) \
         if verify_payload.get("build_test_guard") is not None else None
-    manifest["best_checkpoint"] = accepted
+    behavior_valid = manifest["build_test_success"] is True
+    manifest["best_checkpoint"] = bool(accepted and behavior_valid)
     state_path = task_root / "task-state.json"
     state = _read_json(state_path)
     candidate_rank = _partial_checkpoint_rank(manifest, verify_payload)
+    manifest["best_partial_eligible"] = candidate_rank is not None
+    manifest["restorable"] = bool((accepted and behavior_valid) or candidate_rank is not None)
     current_is_best_partial = False
+    existing = state.get("best_partial")
+    if isinstance(existing, dict) and existing.get("build_test_success") is not True:
+        # Old task-state files could point at a structurally better but
+        # behavior-breaking checkpoint. Keep its manifest on disk for audit,
+        # but never retain it as a recovery target.
+        state.pop("best_partial", None)
+    existing_best = str(state.get("best") or "")
+    if existing_best:
+        existing_best_path = task_root / f"{existing_best}-verify" / "manifest.json"
+        existing_best_manifest = (
+            _read_json(existing_best_path) if existing_best_path.is_file() else {}
+        )
+        if existing_best_manifest.get("build_test_success") is not True:
+            # A local/unchecked PASS is still useful evidence, but it is not a
+            # behavior-preserving recovery target.
+            state.pop("best", None)
     if candidate_rank is not None:
         existing = state.get("best_partial")
         existing_rank = tuple(existing.get("rank") or ()) if isinstance(existing, dict) else ()
@@ -304,6 +399,9 @@ def finalize_checkpoint(
                 "checkpoint_id": checkpoint_id,
                 "rank": list(candidate_rank),
                 "objectives": dict((manifest.get("current_metrics") or {}).get("objectives") or {}),
+                "resolution": manifest.get("resolution"),
+                "progress": manifest.get("progress"),
+                "restorable": True,
                 "smell_guard_success": bool((verify_payload.get("smell_guard") or {}).get("success")),
                 "build_test_success": manifest.get("build_test_success"),
                 "production_patch": rendered_patch,
@@ -324,7 +422,7 @@ def finalize_checkpoint(
     stored_verify = dict(verify_payload)
     stored_verify["checkpoint"] = manifest
     _write_json(manifest_path.parent / "verify.json", stored_verify)
-    if accepted:
+    if accepted and behavior_valid:
         state["best"] = checkpoint_id
     _write_json(state_path, state)
     return manifest
@@ -334,7 +432,9 @@ def _partial_checkpoint_rank(
     manifest: dict[str, Any],
     verify_payload: dict[str, Any],
 ) -> tuple[int, float, int] | None:
-    """Rank structurally useful checkpoints without weakening final acceptance."""
+    """Rank behavior-valid partial checkpoints without weakening acceptance."""
+    if manifest.get("build_test_success") is not True:
+        return None
     delta = manifest.get("delta")
     if not isinstance(delta, dict) or delta.get("metric_progress") is not True:
         return None
@@ -352,7 +452,15 @@ def _partial_checkpoint_rank(
             reductions.append(float(reduction))
     if not reductions:
         return None
-    smell_complete = int(bool((verify_payload.get("smell_guard") or {}).get("success")))
+    resolution = str(verify_payload.get("resolution") or "").strip()
+    if resolution == "resolved":
+        resolution_rank = 2
+    elif resolution == "improved":
+        resolution_rank = 1
+    else:
+        # Backward-compatible interpretation for old inline callers. New
+        # checkpoints always carry an explicit resolution.
+        resolution_rank = 2 if bool((verify_payload.get("smell_guard") or {}).get("success")) else 1
     net_progress = round(sum(reductions), 6)
     improved_count = sum(value > 0 for value in reductions)
-    return smell_complete, net_progress, improved_count
+    return resolution_rank, net_progress, improved_count

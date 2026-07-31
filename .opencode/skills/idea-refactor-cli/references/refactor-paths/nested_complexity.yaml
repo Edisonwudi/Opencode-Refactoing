@@ -40,10 +40,10 @@ nested_complexity:
       - op: extract:method
         apply_args: '{"newName":"applyPropertyToOption","visibility":"private"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/Parser.java", line=277, column=1, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/Parser.java", line=264, column=18, selection={"startLine":277,"startColumn":1,"endLine":295,"endColumn":14})
-          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"applyPropertyToOption","visibility":"private"})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/cli/Parser.java", line=277, column=1, arguments={"newName":"applyPropertyToOption","visibility":"private"})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/cli/Parser.java", line=264, column=18, selection={"startLine":277,"startColumn":1,"endLine":295,"endColumn":14}, arguments={"newName":"applyPropertyToOption","visibility":"private"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"applyPropertyToOption","visibility":"private"})
     after: |
       264    protected void processProperties(final Properties properties) throws ParseException {
       265        if (properties == null) {
@@ -117,10 +117,10 @@ nested_complexity:
       - op: extract:method
         apply_args: '{"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/ibatis/datasource/pooled/PooledDataSource.java", line=397, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/apache/ibatis/datasource/pooled/PooledDataSource.java", line=391, column=18, selection={"startLine":397,"startColumn":9,"endLine":422,"endColumn":10})
-          - idea_refactor_prepare(operation="extract:method", arguments={"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false}, expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/ibatis/datasource/pooled/PooledDataSource.java", line=397, column=9, arguments={"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/ibatis/datasource/pooled/PooledDataSource.java", line=391, column=18, selection={"startLine":397,"startColumn":9,"endLine":422,"endColumn":10}, arguments={"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"releaseValidConnection","visibility":"private","makeStatic":false,"replaceDuplicates":false})
       - op: idea_edit
         argument_contract: "Read src/main/java/org/apache/ibatis/datasource/pooled/PooledDataSource.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
         cli_steps:

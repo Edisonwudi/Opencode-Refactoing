@@ -52,6 +52,18 @@ class Subject {
 }
 """
 
+RESOLVED_SOURCE = """\
+class Collaborator {
+  void a() {}
+  void b() {}
+  void c() {}
+  void d() {}
+}
+class Subject {
+  void target() {}
+}
+"""
+
 
 def _run(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=str(cwd), env=env, text=True, capture_output=True, check=False)
@@ -124,11 +136,25 @@ def main() -> int:
 
         source.write_text(REFACTORED_SOURCE, encoding="utf-8")
         repaired = _bridge(project, env, "verify")
-        if repaired.get("status") != "PASS" or repaired.get("success") is not True:
-            raise AssertionError(f"metric-improving refactor did not pass: {repaired}")
+        if (
+            repaired.get("status") != "IMPROVED"
+            or repaired.get("success") is not False
+            or repaired.get("accepted") is not False
+            or repaired.get("progress") is not True
+            or repaired.get("resolution") != "improved"
+        ):
+            raise AssertionError(f"metric-improving refactor was misclassified: {repaired}")
         delta = repaired["checkpoint"]["delta"]["objectives"]["expected_receiver_access"]
         if delta.get("before") != 4 or delta.get("after") != 3 or delta.get("absolute_reduction") != 1:
             raise AssertionError(f"unexpected metric delta: {delta}")
+        if repaired["checkpoint"].get("best_partial_eligible") is not False:
+            raise AssertionError(
+                f"unchecked checkpoint became restorable: {repaired['checkpoint']}"
+            )
+        if repaired["checkpoint"].get("best_checkpoint") is not False:
+            raise AssertionError(
+                f"unchecked PASS-like checkpoint became best: {repaired['checkpoint']}"
+            )
 
         checkpoint_root = project / ".smell-artifacts" / "checkpoints"
         manifests = sorted(checkpoint_root.glob("*/c*-verify/manifest.json"))
@@ -138,18 +164,35 @@ def main() -> int:
         if len(task_states) != 1:
             raise AssertionError(f"expected one checkpoint state, found {task_states}")
         state = json.loads(task_states[0].read_text(encoding="utf-8"))
-        best_partial = state.get("best_partial") or {}
-        if best_partial.get("checkpoint_id") != "c002":
-            raise AssertionError(f"metric-improving checkpoint was not retained: {state}")
-        production_patch = project / str(best_partial.get("production_patch") or "")
+        if state.get("best_partial") is not None:
+            raise AssertionError(f"unchecked checkpoint was retained as best partial: {state}")
+        repaired_manifest_path = manifests[-1]
+        repaired_manifest = json.loads(repaired_manifest_path.read_text(encoding="utf-8"))
+        production_patch = repaired_manifest_path.parent / str(
+            repaired_manifest.get("production_patch") or "production.patch"
+        )
         if not production_patch.is_file():
             raise AssertionError(f"production-only patch is missing: {production_patch}")
         patch_text = production_patch.read_text(encoding="utf-8")
         if "Fixture.java" not in patch_text or ".smell-artifacts" in patch_text:
             raise AssertionError(f"production-only patch has the wrong scope: {patch_text[:500]}")
+
+        source.write_text(RESOLVED_SOURCE, encoding="utf-8")
+        resolved = _bridge(project, env, "verify")
+        if (
+            resolved.get("status") != "PASS"
+            or resolved.get("accepted") is not True
+            or resolved["checkpoint"].get("best_checkpoint") is not False
+            or resolved["checkpoint"].get("restorable") is not False
+        ):
+            raise AssertionError(f"unchecked resolved checkpoint became restorable: {resolved}")
+        final_state = json.loads(task_states[0].read_text(encoding="utf-8"))
+        if final_state.get("best") is not None or final_state.get("best_partial") is not None:
+            raise AssertionError(f"unchecked checkpoint left a recovery pointer: {final_state}")
         print(
             "feature-envy-checkpoint-self-check PASS "
-            "baseline=4 strict_hit=true unchanged=EDIT_REQUIRED refactored=4->3 required=1"
+            "baseline=4 strict_hit=true unchanged=EDIT_REQUIRED "
+            "refactored=4->3 status=IMPROVED resolved=PASS unchecked_restorable=false"
         )
     return 0
 

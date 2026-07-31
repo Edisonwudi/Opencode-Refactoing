@@ -104,9 +104,20 @@ def evaluate_checkpoint_contract(
 def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return a guard failure when the shared contract blocks acceptance."""
     delta = dict(checkpoint.get("delta") or {})
-    if delta.get("metric_progress") is True:
+    current_metrics = checkpoint.get("current_metrics")
+    finding_remains = bool(
+        isinstance(current_metrics, Mapping)
+        and current_metrics.get("finding_present") is True
+    )
+    if delta.get("metric_progress") is True and not finding_remains:
         return None
-    reason = str(delta.get("reason") or "NO_STRUCTURAL_PROGRESS")
+    checkpoint_reason = str(checkpoint.get("reason") or "").strip()
+    if checkpoint.get("required") is False and checkpoint_reason:
+        reason = checkpoint_reason.upper()
+    elif finding_remains and delta.get("metric_progress") is True:
+        reason = "FINDING_REMAINS"
+    else:
+        reason = str(delta.get("reason") or "NO_STRUCTURAL_PROGRESS")
     if reason == "TARGET_NOT_LOCATED":
         # target_missing means the adapter could not measure the target; it is
         # not a smell verdict. Arbitrating "genuinely removed" vs "made
@@ -115,7 +126,17 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         return None
     messages = {
         "EDIT_REQUIRED": "the unchanged production baseline is not an accepted repair",
+        "BASELINE_CHECKPOINT_MISSING": (
+            "the immutable baseline checkpoint is missing; verification cannot "
+            "fall back to the threshold detector"
+        ),
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",
+        "DETECTOR_PROFILE_MISMATCH": (
+            "the detector implementation or profile changed; recapture the immutable baseline"
+        ),
+        "FINDING_REMAINS": (
+            "the same detector finding improved but is still present; record this result as IMPROVED, not PASS"
+        ),
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
         "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
         "SEMANTIC_CONTRACT_REGRESSION": (

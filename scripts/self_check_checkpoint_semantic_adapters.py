@@ -148,11 +148,11 @@ def main() -> int:
         "parents=Packet; flags=returns_null; refactor_path=implement_contract",
         "rejection_signals",
     )
-    ungated_null = _refused_snapshot(
+    evidence_free_null = _refused_snapshot(
         NULL_RETURN_BEFORE,
         "parents=Packet; refactor_path=implement_contract",
     )
-    assert ungated_null["objectives"]["rejection_signals"] == 0, ungated_null
+    assert evidence_free_null["objectives"]["rejection_signals"] == 1, evidence_free_null
     print(
         "checkpoint-semantic-adapters-self-check PASS unchanged_pass=0 "
         f"god_class_nom={god[0]:g}->{god[1]:g} "

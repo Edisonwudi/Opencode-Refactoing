@@ -15,6 +15,7 @@ const datasetRunnerFile = path.join(root, "scripts", "run_smell_dataset.py")
 function parseArgs(argv) {
   const options = {
     requireDataset: false,
+    ideaProtocolOnly: false,
     dataset: process.env.SELF_CHECK_DATASET || "/opt/dataset/java/delivery_schema/mysterious_name.csv",
     sampleId: process.env.SELF_CHECK_SAMPLE_ID || "8",
     model: process.env.SELF_CHECK_MODEL || "zai/glm-4.7",
@@ -23,6 +24,8 @@ function parseArgs(argv) {
     const arg = argv[index]
     if (arg === "--require-dataset") {
       options.requireDataset = true
+    } else if (arg === "--idea-protocol-only") {
+      options.ideaProtocolOnly = true
     } else if (arg === "--dataset-smoke-dataset") {
       options.dataset = argv[++index] || ""
     } else if (arg === "--dataset-smoke-sample-id") {
@@ -211,7 +214,9 @@ async function makeFixtureProject() {
     [
       "public class SelfCheckSample {",
       "  public int add(int left, int right) {",
-      "    return left + right;",
+      "    int total = left + right;",
+      ...Array.from({ length: 61 }, (_, index) => `    total += ${index + 1};`),
+      "    return total;",
       "  }",
       "}",
       "",
@@ -234,25 +239,49 @@ async function makeFixtureProject() {
 async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
   const env = cleanSmellIdentityEnv(process.env)
   env.SMELL_ARTIFACT_ROOT = artifactRoot
+  const sourceFile = path.join(fixtureRoot, "src", "main", "java", "SelfCheckSample.java")
+  const originalSource = await readFile(sourceFile, "utf8")
+  const identityArgs = [
+    "--project-root",
+    fixtureRoot,
+    "--language",
+    "java",
+    "--smell",
+    "long_method",
+    "--location",
+    "src/main/java/SelfCheckSample.java:2",
+    "--verification-mode",
+    "local",
+  ]
+  const baseline = await run(
+    "python3",
+    [bridgeFile, "capture-baseline", ...identityArgs],
+    { cwd: fixtureRoot, env },
+  )
+  if (baseline.exitCode !== 0) {
+    throw new SelfCheckError("bridge_capture_baseline", "Unable to capture fixture baseline.", baseline)
+  }
+  await writeFile(
+    sourceFile,
+    [
+      "public class SelfCheckSample {",
+      "  public void add(int left, int right) {}",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8",
+  )
   const result = await run(
     "python3",
     [
       bridgeFile,
       "verify",
-      "--project-root",
-      fixtureRoot,
-      "--language",
-      "java",
-      "--smell",
-      "long_method",
-      "--location",
-      "src/main/java/SelfCheckSample.java:2",
-      "--verification-mode",
-      "local",
+      ...identityArgs,
       "--no-snapshot",
     ],
     { cwd: fixtureRoot, env },
   )
+  await writeFile(sourceFile, originalSource, "utf8")
   if (result.exitCode !== 0) {
     throw new SelfCheckError("bridge_verify", "smell_bridge.py verify exited non-zero.", result)
   }
@@ -518,7 +547,8 @@ async function runPluginNormalizeSelfCheck(pluginModule) {
     results.push(verifyNormalizedFailureResult(scenario, normalized, maxLen))
   }
   const ideaResults = await runPluginIdeaResultSelfCheck(hooks, maxLen)
-  return { hookKeys: Object.keys(hooks).sort(), maxLen, scenarios: results, ideaResults }
+  const ideaProposalResults = await runPluginIdeaProposalSelfCheck(hooks)
+  return { hookKeys: Object.keys(hooks).sort(), maxLen, scenarios: results, ideaResults, ideaProposalResults }
 }
 
 async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
@@ -538,6 +568,8 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
         argv: ["locate", "--project-root", "/p"],
       },
       expectSuccess: false,
+      expectTransportSuccess: false,
+      expectComplete: false,
     },
     {
       name: "idea_success_payload",
@@ -549,6 +581,46 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
         argv: ["locate", "--project-root", "/p"],
       },
       expectSuccess: true,
+      expectTransportSuccess: true,
+      expectComplete: true,
+    },
+    {
+      name: "idea_needs_decision_nonterminal",
+      ideaResult: {
+        exitCode: 0,
+        stdout: '{"status":"needs_decision"}',
+        stderr: "",
+        json: {
+          status: "needs_decision",
+          operation: "extract:method",
+          nextCliCommandExample: { action: "apply", argumentsJson: {}, decisionsJson: { scope: { choice: "selection_0" } } },
+        },
+        argv: ["prepare", "--project-root", "/p", "--operation", "extract:method"],
+      },
+      expectSuccess: false,
+      expectTransportSuccess: true,
+      expectComplete: false,
+      expectActionRequired: "decision",
+      expectNextAction: "apply",
+    },
+    {
+      name: "idea_needs_more_info_nonterminal",
+      ideaResult: {
+        exitCode: 0,
+        stdout: '{"status":"needs_more_info"}',
+        stderr: "",
+        json: {
+          status: "needs_more_info",
+          operation: "extract:method",
+          nextCliCommandExample: { action: "prepare", argumentsJson: { newName: "extractBlock" }, decisionsJson: {} },
+        },
+        argv: ["prepare", "--project-root", "/p", "--operation", "extract:method"],
+      },
+      expectSuccess: false,
+      expectTransportSuccess: true,
+      expectComplete: false,
+      expectActionRequired: "input",
+      expectNextAction: "prepare",
     },
     {
       name: "idea_empty_payload_nonzero_exit",
@@ -560,6 +632,8 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
         argv: ["apply", "--project-root", "/p"],
       },
       expectSuccess: false,
+      expectTransportSuccess: false,
+      expectComplete: false,
     },
     {
       name: "idea_huge_stderr_truncated",
@@ -571,6 +645,8 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
         argv: ["edit"],
       },
       expectSuccess: false,
+      expectTransportSuccess: false,
+      expectComplete: false,
     },
   ]
   const results = []
@@ -612,6 +688,10 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
       )
     }
     if (typeof parsed.success !== "boolean") errors.push("parsed.success is not boolean")
+    if (typeof parsed.transport_success !== "boolean") errors.push("parsed.transport_success is not boolean")
+    if (typeof parsed.complete !== "boolean") errors.push("parsed.complete is not boolean")
+    if (typeof parsed.action_required !== "string") errors.push("parsed.action_required is not a string")
+    if (typeof parsed.next_action !== "string") errors.push("parsed.next_action is not a string")
     if (typeof parsed.status !== "string" || !parsed.status) errors.push("parsed.status is missing")
     if (!parsed.wrapper || typeof parsed.wrapper !== "object") {
       errors.push("parsed.wrapper missing")
@@ -623,6 +703,18 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
     }
     if (parsed.success !== scenario.expectSuccess) {
       errors.push(`success expected ${scenario.expectSuccess} got ${parsed.success}`)
+    }
+    if (parsed.transport_success !== scenario.expectTransportSuccess) {
+      errors.push(`transport_success expected ${scenario.expectTransportSuccess} got ${parsed.transport_success}`)
+    }
+    if (parsed.complete !== scenario.expectComplete) {
+      errors.push(`complete expected ${scenario.expectComplete} got ${parsed.complete}`)
+    }
+    if (parsed.action_required !== (scenario.expectActionRequired || "")) {
+      errors.push(`action_required expected '${scenario.expectActionRequired || ""}' got '${parsed.action_required}'`)
+    }
+    if (parsed.next_action !== (scenario.expectNextAction || "")) {
+      errors.push(`next_action expected '${scenario.expectNextAction || ""}' got '${parsed.next_action}'`)
     }
     if (!rendered.metadata || typeof rendered.metadata !== "object" || Array.isArray(rendered.metadata)) {
       errors.push("metadata is not a plain object")
@@ -657,12 +749,202 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
       lineCount: lines.length,
       parsedStatus: parsed.status,
       parsedSuccess: parsed.success,
+      parsedTransportSuccess: parsed.transport_success,
+      parsedComplete: parsed.complete,
+      parsedActionRequired: parsed.action_required,
+      parsedNextAction: parsed.next_action,
       wrapperExitCode: parsed.wrapper ? parsed.wrapper.exit_code : null,
       metadataExitCode: typeof rendered.metadata.exitCode === "number" ? rendered.metadata.exitCode : null,
       metadataStderrLength: typeof rendered.metadata.stderr === "string" ? rendered.metadata.stderr.length : null,
     })
   }
   return results
+}
+
+async function runPluginIdeaProposalSelfCheck(hooks) {
+  for (const name of ["runIdeaPreviewProtocol", "renderIdeaApplyProtocolResult"]) {
+    if (typeof hooks[name] !== "function") {
+      throw new SelfCheckError("plugin_self_test_hooks", `Plugin __selfTest is missing ${name}.`, {
+        keys: Object.keys(hooks).sort(),
+      })
+    }
+  }
+  const calls = []
+  const runner = async (_worktree, _cli, argv) => {
+    calls.push(argv)
+    if (argv[0] === "locate") {
+      return {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        argv,
+        json: {
+          status: "ok",
+          draftId: "draft-1",
+          resolvedContext: { stableTargetId: "method:Foo#run", kind: "method" },
+          availableOperations: [{ operation: "rename:method" }],
+          diagnostics: [],
+        },
+      }
+    }
+    return {
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      argv,
+      json: {
+        status: "ok",
+        draftId: "draft-1",
+        operation: "rename:method",
+        resolvedContext: { stableTargetId: "method:Foo#run", kind: "method" },
+        inputs: [{ name: "newName", type: "string", required: true }],
+        diagnostics: [],
+      },
+    }
+  }
+  const preview = await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      target: { fqcn: "demo.Foo", memberName: "run", parameterTypes: [] },
+      arguments: { newName: "execute" },
+      detail: "compact",
+    },
+    runner,
+  })
+  const previewPayload = JSON.parse(preview.output)
+  const previewErrors = []
+  if (previewPayload.status !== "ready") previewErrors.push(`status=${previewPayload.status}`)
+  if (previewPayload.proposalId !== "draft-1") previewErrors.push(`proposalId=${previewPayload.proposalId}`)
+  if (previewPayload.nextAction !== "apply") previewErrors.push(`nextAction=${previewPayload.nextAction}`)
+  if ("raw" in previewPayload) previewErrors.push("compact preview leaked raw payload")
+  if (calls.length !== 2 || calls[0][0] !== "locate" || calls[1][0] !== "prepare") {
+    previewErrors.push(`unexpected call sequence=${JSON.stringify(calls.map((argv) => argv[0]))}`)
+  }
+  if (!calls[1].includes("--draft-id") || !calls[1].includes("draft-1")) {
+    previewErrors.push("prepare did not use explicit draft id")
+  }
+  const initialCalls = calls.map((argv) => argv[0])
+
+  const continuationCalls = []
+  await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      proposalId: "draft-1",
+      arguments: { newName: "executeAgain" },
+    },
+    runner: async (worktree, cli, argv) => {
+      continuationCalls.push(argv)
+      return runner(worktree, cli, argv)
+    },
+  })
+  if (continuationCalls.length !== 1 || continuationCalls[0][0] !== "prepare") {
+    previewErrors.push("proposal continuation performed locate")
+  }
+
+  const selectionCalls = []
+  const selectionPreview = await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "extract:method",
+      target: { fqcn: "demo.Foo", memberName: "run", parameterTypes: [] },
+    },
+    runner: async (_worktree, _cli, argv) => {
+      selectionCalls.push(argv)
+      return {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        argv,
+        json: {
+          status: "ok",
+          draftId: "draft-selection",
+          availableOperations: [],
+          operationCandidates: [{
+            operation: "extract:method",
+            candidates: [{ startLine: 4, startColumn: 5, endLine: 8, endColumn: 6 }],
+          }],
+          diagnostics: [],
+        },
+      }
+    },
+  })
+  const selectionPayload = JSON.parse(selectionPreview.output)
+  if (selectionPayload.status !== "needs_selection" || selectionPayload.nextAction !== "preview") {
+    previewErrors.push(`selection state=${selectionPayload.status}/${selectionPayload.nextAction}`)
+  }
+  if (selectionCalls.length !== 1 || selectionCalls[0][0] !== "locate") {
+    previewErrors.push("selection discovery unexpectedly prepared")
+  }
+
+  const apply = hooks.renderIdeaApplyProtocolResult(
+    "draft-1",
+    {
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      argv: ["apply"],
+      json: {
+        status: "ok",
+        applied: true,
+        operation: "rename:method",
+        result: { changedFiles: 1, changedFilePaths: ["src/Foo.java"] },
+        diagnostics: [],
+      },
+    },
+    "compact",
+    7,
+  )
+  const applyPayload = JSON.parse(apply.output)
+  if (applyPayload.status !== "applied" || applyPayload.nextAction !== "verify") {
+    previewErrors.push(`apply state=${applyPayload.status}/${applyPayload.nextAction}`)
+  }
+  if (JSON.stringify(applyPayload.changedFilePaths) !== JSON.stringify(["src/Foo.java"])) {
+    previewErrors.push(`changedFilePaths=${JSON.stringify(applyPayload.changedFilePaths)}`)
+  }
+  const stalePayload = JSON.parse(hooks.renderIdeaApplyProtocolResult(
+    "draft-1",
+    {
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      argv: ["apply"],
+      json: {
+        status: "failed",
+        applied: false,
+        diagnostics: [{ code: "STALE_DRAFT", summary: "Source changed after preview." }],
+      },
+    },
+    "full",
+    3,
+  ).output)
+  if (stalePayload.status !== "stale" || stalePayload.nextAction !== "preview" || !stalePayload.raw) {
+    previewErrors.push(`stale state=${stalePayload.status}/${stalePayload.nextAction}`)
+  }
+  if (previewErrors.length) {
+    throw new SelfCheckError("plugin_idea_proposal_assertions", "IDEA proposal protocol self-check failed.", {
+      errors: previewErrors,
+      preview: previewPayload,
+      apply: applyPayload,
+    })
+  }
+  return {
+    status: previewPayload.status,
+    proposalId: previewPayload.proposalId,
+    initialCalls,
+    continuationCalls: continuationCalls.map((argv) => argv[0]),
+    selectionStatus: selectionPayload.status,
+    applyStatus: applyPayload.status,
+    staleStatus: stalePayload.status,
+    changedFilePaths: applyPayload.changedFilePaths,
+  }
 }
 
 async function runPluginFailureIntegrationSelfCheck(smellVerify) {
@@ -883,19 +1165,13 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
   }
 
-  const structuralFailure = hooks.classifyFailureForContinue({
+  const removedStructuralFailure = hooks.classifyFailureForContinue({
     failure_category: "STRUCTURAL_ROUTE_MISMATCH",
     verify_status: "SMELL_GUARD_FAILED",
     highlights: ["CAPABILITY_SPLIT_REQUIRED target=ReadOnlyPacket method=toBytes parent=Packet"],
     artifact_paths: {},
   })
-  assertEqual("structural_route_mismatch_repairable", structuralFailure.ok, true, "ok")
-  assertEqual(
-    "structural_route_mismatch_category",
-    structuralFailure.category,
-    "STRUCTURAL_ROUTE_MISMATCH",
-    "category",
-  )
+  assertEqual("structural_route_category_removed", removedStructuralFailure.ok, false, "ok")
 
   function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED" } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status))
@@ -1089,10 +1365,10 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     ].join("\n"),
   })
   assertCond(
-    "command_prompt_capability_split_route_lock",
-    routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
-      && routeLockedPrompt.includes("A body-only implementation or delegation"),
-    "capability split route lock missing from initial command prompt",
+    "command_prompt_ignores_dataset_route_lock",
+    !routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
+      && routeLockedPrompt.includes("uniquely match a real product-detector finding"),
+    "dataset route metadata entered the command contract",
   )
   const restoredAfterRestart = hooks.restoreCommandLoopState(
     JSON.stringify(hooks.commandLoopStateSnapshot(state)),
@@ -1118,7 +1394,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const secondPayload = JSON.parse(second.output)
   assertEqual("command_decision_no_progress", secondPayload.loop.termination_reason, "NO_PROGRESS", "termination")
 
-  // Round-3 semantics: an improved PASS keeps the loop running toward
+  // An IMPROVED result keeps the loop running toward
   // resolved (with the bridge continue_hint), and only identical best-partial
   // objectives across verifies count as no-progress.
   const improvedState = {
@@ -1130,10 +1406,17 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     lastFailureFingerprint: "",
   }
   const improved = {
-    success: true,
-    status: "PASS",
+    success: false,
+    accepted: false,
+    progress: true,
+    status: "IMPROVED",
     resolution: "improved",
     continue_hint: "keep going to resolved",
+    failure_pack: {
+      failure_category: "SMELL_GUARD_FAILED",
+      failure_group: "smell",
+      retryable: true,
+    },
     checkpoint: { best_partial: { objectives: { loc: 400 } } },
   }
   const improvedFirst = { output: JSON.stringify(improved), metadata: {} }
@@ -1144,35 +1427,13 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const improvedSecond = { output: JSON.stringify(improved), metadata: {} }
   hooks.applyCommandLoopDecision(improvedSecond, improvedState)
   const improvedSecondPayload = JSON.parse(improvedSecond.output)
-  assertEqual("improved_no_progress_stop", improvedSecondPayload.loop.termination_reason, "PASS", "termination")
-  assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
-
-  const structuralState = {
-    policy: state.policy,
-    startedAt: Date.now(),
-    continuationCount: 0,
-    capRecoveryUsed: false,
-    noProgressCount: 0,
-    lastFailureFingerprint: "",
-  }
-  const structuralImproved = {
-    ...improved,
-    failure_pack: {
-      failure_category: "STRUCTURAL_ROUTE_MISMATCH",
-      failure_group: "smell",
-      retryable: true,
-    },
-  }
-  const structuralResult = { output: JSON.stringify(structuralImproved), metadata: {} }
-  hooks.applyCommandLoopDecision(structuralResult, structuralState)
-  const structuralPayload = JSON.parse(structuralResult.output)
-  assertEqual("structural_decision_continue", structuralPayload.loop.decision, "continue", "decision")
-  assertCond(
-    "structural_instruction_overrides_metric_hint",
-    structuralPayload.loop.instruction.startsWith("Capability split is mandatory.")
-      && !structuralPayload.loop.instruction.includes("keep going to resolved"),
-    "generic metric continue_hint overrode structural route correction",
+  assertEqual(
+    "improved_no_progress_stop",
+    improvedSecondPayload.loop.termination_reason,
+    "IMPROVED_NO_PROGRESS",
+    "termination",
   )
+  assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
 
   const resolved = { success: true, status: "PASS", resolution: "resolved" }
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
@@ -1371,6 +1632,22 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
+  if (options.ideaProtocolOnly) {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "idea-proposal-self-check-"))
+    try {
+      const compiledFile = await compilePluginForSelfCheck(tempRoot)
+      const pluginModule = await import(`${pathToFileURL(compiledFile).href}?idea_protocol=${Date.now()}`)
+      const result = await runPluginNormalizeSelfCheck(pluginModule)
+      console.log(JSON.stringify({
+        success: true,
+        node: process.version,
+        ideaProposalProtocol: result.ideaProposalResults,
+      }, null, 2))
+      return
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
+    }
+  }
   const fixtureRoot = await makeFixtureProject()
   const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "smell-verify-self-check-artifacts-"))
   try {

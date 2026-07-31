@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 entrypoint="$repo_root/docker/mounted-source/entrypoint.sh"
 delivery_entrypoint="$repo_root/docker/java-refactor-delivery/entrypoint.sh"
 dockerfile="$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source"
+idea_dockerfile="$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source-idea"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mounted-source-contract.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -63,6 +64,9 @@ grep -Fq 'benchmark_artifact_root="$benchmark_results_root/artifacts"' "$deliver
 grep -Fq 'Cannot create benchmark artifact directory: $benchmark_artifact_root' "$delivery_entrypoint"
 grep -Fq 'Cannot assign benchmark results to $RUN_AS_USER: $benchmark_results_root' "$delivery_entrypoint"
 grep -Fq 'runuser -u "$RUN_AS_USER" -- test -w "$benchmark_artifact_root"' "$delivery_entrypoint"
+grep -Fq '/tmp/idea-cache /tmp/idea-state /tmp/idea-runtime' "$delivery_entrypoint"
 grep -Fq 'env SMELL_ARTIFACT_ROOT="$benchmark_artifact_root"' "$delivery_entrypoint"
+grep -Fq 'COPY docker/mounted-source/entrypoint.sh /usr/local/bin/run-mounted-opencode-agent' "$idea_dockerfile"
+grep -Fq '/usr/local/bin/run-mounted-opencode-agent \' "$idea_dockerfile"
 
 echo "Mounted source contract self-check passed"

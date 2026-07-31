@@ -11,7 +11,6 @@ permission:
   edit: allow
   external_directory: allow
   skill:
-    "java-smell-edit-patterns": allow
     "idea-refactor-cli": allow
 ---
 
@@ -22,18 +21,16 @@ Treat the task input as the source of truth for the project root, language,
 smell type, target location, evidence, verification mode, and IDEA preference.
 Do not assume hidden task context or hidden tool contracts.
 
-IDEA CLI enhancement is available in this agent. The shared
-`java-smell-edit-patterns` skill remains authoritative for smell-specific
-strategy in both UI and batch execution. Load `idea-refactor-cli` only when
-Java semantic refactoring is useful. Pass `projectRoot` or `ideaProjectRoot`
-explicitly to IDEA tools.
+IDEA CLI enhancement is available in this agent. The `idea-refactor-cli` skill
+is authoritative for smell-specific strategy and the explicit proposal
+protocol. Pass `projectRoot` or `ideaProjectRoot` explicitly to IDEA tools.
 
 Workflow:
 
 1. Read the complete task input before editing. If project root, smell type, or
    target location is missing, report the missing field instead of guessing.
-2. Load `java-smell-edit-patterns`, then read only the edit-pattern reference
-   matching the smell type.
+2. Load `idea-refactor-cli`, then read only the refactor-path reference matching
+   the smell type.
 3. Inspect the target Java code and form a concise behavior-preserving repair
    plan from the user-provided smell evidence and the actual source.
 4. Execute the plan. Prefer IDEA-backed operations for Java semantic source

@@ -70,6 +70,12 @@ def main() -> int:
             },
         },
     ) == "SAMPLE_TEST_FAILED"
+    assert _verify_status(
+        False,
+        {"success": False},
+        {"success": True, "verification_mode": "sample_optimized"},
+        improvement_pass=True,
+    ) == "IMPROVED"
     baseline = {"ok": True, "objectives": {"primary": 10, "secondary": 3}}
 
     unchanged = evaluate_checkpoint_contract(baseline, baseline, has_production_diff=False)
@@ -176,7 +182,7 @@ def main() -> int:
         "best_partial": {
             "checkpoint_id": "c003",
             "smell_guard_success": False,
-            "build_test_success": None,
+            "build_test_success": True,
             "production_patch": ".smell-artifacts/checkpoints/task/c003-verify/production.patch",
         },
         "current_metrics": {"objectives": {"occurrence_count": 3}},
@@ -211,6 +217,7 @@ def main() -> int:
     rank = _partial_checkpoint_rank(
         {
             "production_diff": True,
+            "build_test_success": True,
             "delta": {
                 "metric_progress": True,
                 "target_missing": False,
@@ -220,9 +227,39 @@ def main() -> int:
                 },
             },
         },
-        {"smell_guard": {"success": False}},
+        {"resolution": "improved", "smell_guard": {"success": False}},
     )
-    assert rank == (0, 0.4, 1), rank
+    assert rank == (1, 0.4, 1), rank
+    resolved_rank = _partial_checkpoint_rank(
+        {
+            "production_diff": True,
+            "build_test_success": True,
+            "delta": {
+                "metric_progress": True,
+                "target_missing": False,
+                "objectives": {
+                    "primary": {"relative_reduction": 0.1},
+                },
+            },
+        },
+        {"resolution": "resolved", "smell_guard": {"success": True}},
+    )
+    assert resolved_rank == (2, 0.1, 1), resolved_rank
+    invalid_rank = _partial_checkpoint_rank(
+        {
+            "production_diff": True,
+            "build_test_success": False,
+            "delta": {
+                "metric_progress": True,
+                "target_missing": False,
+                "objectives": {
+                    "primary": {"relative_reduction": 0.9},
+                },
+            },
+        },
+        {"resolution": "resolved", "smell_guard": {"success": True}},
+    )
+    assert invalid_rank is None, invalid_rank
 
     failure_pack = _build_failure_pack({
         "status": "SMELL_GUARD_FAILED",
@@ -280,13 +317,13 @@ def main() -> int:
             }],
         },
     }, {})
-    assert structural_pack["failure_category"] == "STRUCTURAL_ROUTE_MISMATCH", structural_pack
+    assert structural_pack["failure_category"] == "SMELL_GUARD_FAILED", structural_pack
     assert structural_pack["failure_group"] == "smell", structural_pack
     assert structural_pack["retryable"] is True, structural_pack
     assert structural_pack["highlights"][0].startswith(
-        "CAPABILITY_SPLIT_REQUIRED target=example.ReadOnlyPacket"
+        "GUARD_TARGET refused_bequest guard:"
     ), structural_pack
-    assert "implement or delegate" in structural_pack["recommendations"][0], structural_pack
+    assert "continue the refactoring" in structural_pack["recommendations"][0], structural_pack
 
     invalid_test_evidence_pack = _build_failure_pack({
         "status": "SAMPLE_TEST_FAILED",
@@ -360,15 +397,17 @@ def main() -> int:
         "parents=IPacket; structural_expectation=capability_split; "
         "refactor_path=split_readable_packets_from_writable_packets"
     ))
-    assert (
-        checkpoint_only_structural_pack["failure_category"]
-        == "STRUCTURAL_ROUTE_MISMATCH"
-    ), checkpoint_only_structural_pack
+    assert checkpoint_only_structural_pack["failure_category"] == "SMELL_GUARD_FAILED", (
+        checkpoint_only_structural_pack
+    )
     assert checkpoint_only_structural_pack["failure_group"] == "smell", (
         checkpoint_only_structural_pack
     )
 
-    print(f"checkpoint-contract-self-check PASS smells={len(EXPECTED)} unchanged_pass=0 strict_decrease=PASS feedback=PASS")
+    print(
+        f"checkpoint-contract-self-check PASS smells={len(EXPECTED)} "
+        "unchanged_pass=0 metric_decrease=IMPROVED feedback=PASS"
+    )
     return 0
 
 

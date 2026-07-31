@@ -23,9 +23,9 @@ dead_code:
       - op: delete:method
         apply_args: '{"safe":true}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/CacheIndex.java", line=15, column=19)
-          - idea_refactor_prepare(operation="delete:method", arguments={"safe":true}, expectedOperation="delete:method")
-          - idea_refactor_apply(arguments={"safe":true})
+          - idea_refactor_preview(operation="delete:method", file="src/main/java/demo/CacheIndex.java", line=15, column=19, arguments={"safe":true})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"safe":true})
     after: |
       /* CacheIndex.java */
       10    final class CacheIndex {

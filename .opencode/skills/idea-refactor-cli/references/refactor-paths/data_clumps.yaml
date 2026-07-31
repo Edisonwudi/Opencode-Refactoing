@@ -33,9 +33,9 @@ data_clumps:
       - op: introduce:parameter-object
         apply_args: '{"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false}'
         cli_steps:
-          - idea_refactor_locate(file="parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/TableMetaTSDB.java", line=34, column=20)
-          - idea_refactor_prepare(operation="introduce:parameter-object", expectedOperation="introduce:parameter-object")
-          - idea_refactor_apply(arguments={"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false})
+          - idea_refactor_preview(operation="introduce:parameter-object", file="parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/TableMetaTSDB.java", line=34, column=20, arguments={"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"className":"DdlApplyRequest","packageName":"com.alibaba.otter.canal.parse.inbound.mysql.tsdb","parameterNames":["position","schema","ddl","extra"],"keepMethodAsDelegate":false})
       - op: idea_edit
         argument_contract: "Read parse/src/main/java/com/alibaba/otter/canal/parse/inbound/mysql/tsdb/DatabaseTableMeta.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
         cli_steps:

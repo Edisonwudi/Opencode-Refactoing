@@ -8,62 +8,23 @@ contracts, delegating to real owners, splitting interfaces, or pushing behavior 
 ## Common verification fit
 
 - The reported child/parent contract mismatch should be gone.
-- Unsupported-operation throws or empty overrides called out by evidence must be deleted,
-  implemented, or delegated.
+- Unsupported-operation throws, empty overrides, null stubs, and constant stubs reported
+  by the product detector must be deleted, implemented, or delegated.
 - The supplied sample test is an immutable project-behavior regression oracle. Keep it
   unchanged and make production code satisfy both the smell guard and that behavior test.
-- Use the evidence `refactor_path` as the primary route and inspect the referenced existing
-  helper, overload, state field, sibling protocol, or capability boundary before editing.
+- Derive the repair route from the source. Evidence may help locate a target, but it cannot
+  require a particular route or make a non-finding pass/fail.
 
-## Route lock for structural expectations
+## Source-derived hierarchy protocol
 
-An evidence `structural_expectation` is an acceptance contract, not one optional route
-among the generic Refused Bequest alternatives. It overrides the implementation and
-delegation routes below.
-
-For `structural_expectation=capability_split`:
-
-1. Do not implement or delegate the reported rejecting/empty/null-returning method as
-   the final repair. That may remove a body-level symptom while leaving the refused
-   capability in the inheritance contract.
-2. Before editing, make a small capability matrix: list the parent operations, the
-   relevant concrete types, and which operations each type genuinely supports.
-3. Introduce or reuse narrow capability types, assign real implementers to them, migrate
-   production declarations and callers, and remove the unsupported method from the
-   refusing type's inherited contract.
-4. Treat a passing build or behavior test with the reported parent capability still
-   inherited as an incomplete route, not evidence that implementing the method was valid.
-
-Map the evidence path by intent rather than falling back to a generic body implementation:
-
-- readable/writable or inbound/outbound paths require directional interfaces;
-- leaf/non-leaf paths require operations owned by the matching page kind plus caller
-  narrowing;
-- a path naming a narrower base plus composition requires moving the subtype to that base
-  and composing only its supported collaborator behavior;
-- `rejecting_override_removed` requires deleting the rejecting override only after
-  confirming the inherited parent behavior is safe.
-
-## Hierarchy migration protocol
-
-Apply this protocol whenever evidence supplies `structural_expectation`, especially
-`capability_split`:
-
-1. Before editing, inspect the reported class, its parent and interfaces, sibling
-   implementations, and every production call site of the target contract.
-2. Treat `refactor_path` as one cohesive hierarchy migration even when the task names one
-   target method. A disappearing target declaration is not sufficient by itself.
-3. Remove the unwanted capability from classes that refuse it while preserving the
-   capability for real implementers.
-4. Never relocate an empty, throwing, null-returning, constant, placeholder, or
-   compatibility no-op implementation into an ancestor, interface default, or sibling.
-5. Change declarations, implementations, production types, and callers consistently.
-   Compile after the structural edit and before the final `smell_verify`.
-6. When evidence supplies `refactor_group_id`, use it only to identify the shared design
-   boundary and related production code. Do not edit or weaken tests.
-7. Inspect the complete production diff before acceptance. Reject API widening, scattered
-   casts, or compatibility shims unless existing callers make them necessary and behavior
-   verification covers them.
+1. Inspect the reported method, its parent/interface declaration, sibling implementations,
+   and production callers.
+2. Choose the narrowest correct route: implement real behavior, delegate to an existing
+   semantic owner, delete a redundant override, or split an overly broad capability.
+3. Never relocate an empty, throwing, null-returning, constant, placeholder, or
+   compatibility no-op implementation into an ancestor, interface default, or descendant.
+4. Change declarations, implementations, production types, and callers consistently, then
+   compile and run the configured behavior tests.
 
 ## Capability migration closure
 

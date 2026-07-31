@@ -157,7 +157,8 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
   benchmark_args+=("--secret-file" "$benchmark_secret_target")
 
   mkdir -p /tmp/opencode-refactor-worktrees \
-    /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
+    /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data \
+    /tmp/idea-cache /tmp/idea-state /tmp/idea-runtime
   if ! mkdir -p "$benchmark_results_root" "$benchmark_artifact_root"; then
     echo "Cannot create benchmark artifact directory: $benchmark_artifact_root" >&2
     exit 73
@@ -167,7 +168,9 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
     exit 73
   fi
   chown -R "$RUN_AS_USER:$RUN_AS_USER" \
-    /tmp/opencode-refactor-worktrees /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
+    /tmp/opencode-refactor-worktrees \
+    /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data \
+    /tmp/idea-cache /tmp/idea-state /tmp/idea-runtime
   if ! runuser -u "$RUN_AS_USER" -- test -w "$benchmark_artifact_root"; then
     echo "Benchmark artifact directory is not writable by $RUN_AS_USER: $benchmark_artifact_root" >&2
     exit 73
@@ -178,9 +181,14 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
     python3 "$benchmark_runner" "${benchmark_args[@]}"
 fi
 
-mkdir -p "$RUNS_ROOT" /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
+mkdir -p "$RUNS_ROOT" \
+  /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data \
+  /tmp/idea-cache /tmp/idea-state /tmp/idea-runtime
 if [[ "$(id -u)" == "0" && "$RUN_AS_USER" != "root" ]]; then
-  chown -R "$RUN_AS_USER:$RUN_AS_USER" "$RUNS_ROOT" /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data
+  chown -R "$RUN_AS_USER:$RUN_AS_USER" \
+    "$RUNS_ROOT" \
+    /tmp/idea-system /tmp/idea-config /tmp/idea-log /tmp/idea-data \
+    /tmp/idea-cache /tmp/idea-state /tmp/idea-runtime
 elif [[ ! -w "$RUNS_ROOT" ]]; then
   echo "Runs directory is not writable: $RUNS_ROOT" >&2
   exit 73

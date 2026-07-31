@@ -213,7 +213,7 @@ def _required_end_state(smell: str, after_summary: str) -> str:
             base
             + " Removing or inlining a throwing override is valid only when the plan marks the contract risk "
             + "and proves the inherited parent behavior is acceptable for existing callers. "
-            + "Use the evidence refactor_path as the primary repair route and treat the supplied test as an immutable "
+            + "Choose the repair route from the source-derived hierarchy and treat the supplied test as an immutable "
             + "project-behavior regression oracle, not as production code to edit. Logging, comments, swallowed exceptions, "
             + "and placeholder constants are not valid contract implementations. For relaxed clear-path rows, broader hierarchy "
             + "or interface changes should be planned as explicit ordered steps with risk tags."

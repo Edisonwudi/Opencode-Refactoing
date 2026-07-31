@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,16 +28,9 @@ from smell_core.config import (  # noqa: E402
     VERIFICATION_MODES,
     select_dataset_test_command,
 )
-from smell_core.detector_utils import (  # noqa: E402
-    parse_parent_from_evidence,
-    parse_structural_expectation,
-)
-from smell_core.java.semantic_detector import (  # noqa: E402
-    _build_project_model,
-    analyze_refused_bequest_target,
-)
 from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
-from smell_core.location import parse_locations, split_location_descriptors  # noqa: E402
+from smell_core.location import split_location_descriptors  # noqa: E402
+from smell_core.java.data_clumps import data_clump_group_from_evidence  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
@@ -48,21 +41,9 @@ from smell_core.project_revision import (  # noqa: E402
     verify_checkout,
     verify_test_oracle,
 )
-from normalize_maven_offline_repo import metadata_fingerprint  # noqa: E402
 
 
 OPENCODE_BATCH_API_KEY_ENV = "SMELL_OPENCODE_API_KEY"
-MAVEN_OFFLINE_REPOSITORY = Path(
-    os.environ.get(
-        "MAVEN_OFFLINE_REPOSITORY",
-        "/opt/buildenv/offline-home/.m2/repository",
-    )
-)
-MAVEN_SETTINGS_FILES = (
-    Path("/opt/buildenv/maven-offline-settings.xml"),
-    Path("/opt/buildenv/maven-global-settings.xml"),
-    Path("/opt/buildenv/offline-home/.m2/settings.xml"),
-)
 ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 ZAI_PROVIDER_MODELS: dict[str, Any] = {
     "glm-4.7": {
@@ -96,6 +77,7 @@ class Sample:
     location: str
     evidence: str
     raw: dict[str, str]
+    target_context: dict[str, Any] = field(default_factory=dict)
     test_location: str = ""
     test_command: str = ""
     verification_mode: str = ""
@@ -202,12 +184,58 @@ def _dataset_evidence(row: dict[str, str | None]) -> str:
     return evidence
 
 
+def _dataset_target_context(row: dict[str, str | None]) -> dict[str, Any]:
+    """Translate oracle identity into selector-only runtime context.
+
+    This boundary deliberately admits no scores, thresholds, expected
+    structures, or refactoring routes. The product detector must independently
+    emit the selected finding.
+    """
+    smell = str(row.get("smell_type") or "").strip()
+    evidence = str(row.get("evidence") or "")
+    if smell == "data_clumps":
+        group = data_clump_group_from_evidence(evidence)
+        return {"group": group} if group else {}
+    if smell == "mysterious_name":
+        for field, kind in (
+            ("method", "method"),
+            ("param", "param"),
+            ("local", "local"),
+            ("name", ""),
+        ):
+            match = re.search(
+                rf"(?:^|;\s*){field}=([^;]+)",
+                evidence,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+            context: dict[str, Any] = {"symbol_name": match.group(1).strip()}
+            if kind:
+                context["symbol_kind"] = kind
+            return context
+    return {}
+
+
 def _dataset_location(row: dict[str, str | None]) -> str:
-    """Promote the reviewed LPL method anchor into the runtime location."""
+    """Promote reviewed method anchors into the runtime location.
+
+    These four metrics are method-scoped. Their reviewed occurrence contains
+    the stable method identity that the guard needs after line drift.
+    Mysterious-name and feature-envy rows intentionally keep their dedicated
+    identifier/receiver anchors.
+    """
     location = str(row.get("location") or "").strip()
     if ":method=" in location or ":class=" in location:
         return location
-    if str(row.get("smell_type") or "").strip() != "long_parameter_list":
+    smell = str(row.get("smell_type") or "").strip()
+    method_scoped_smells = {
+        "long_method",
+        "long_parameter_list",
+        "nested_complexity",
+        "switch_statements",
+    }
+    if smell not in method_scoped_smells:
         return location
     raw_occurrences = str(row.get("group_occurrences") or "").strip()
     if not raw_occurrences:
@@ -215,14 +243,14 @@ def _dataset_location(row: dict[str, str | None]) -> str:
     try:
         occurrence = json.loads(raw_occurrences)
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError("long_parameter_list group_occurrences is not valid JSON") from exc
+        raise ValueError(f"{smell} group_occurrences is not valid JSON") from exc
     if not isinstance(occurrence, dict):
-        raise ValueError("long_parameter_list group_occurrences must be a JSON object")
+        raise ValueError(f"{smell} group_occurrences must be a JSON object")
     method = str(occurrence.get("method") or "").strip()
     file_name = str(occurrence.get("file") or "").strip()
     begin_line = str(occurrence.get("begin_line") or "").strip()
     if not method or not file_name:
-        raise ValueError("long_parameter_list group_occurrences must declare file and method")
+        raise ValueError(f"{smell} group_occurrences must declare file and method")
     location_file = location.rsplit(":", 1)[0].strip()
     if location_file != file_name:
         raise ValueError(
@@ -255,6 +283,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     location=_dataset_location(row),
                     evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
+                    target_context=_dataset_target_context(row),
                     test_location=str(row.get("test_location") or row.get("test_file") or ""),
                     test_command=select_dataset_test_command(
                         verification_mode=verification_mode,
@@ -296,29 +325,10 @@ def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> st
             if sample.test_command.strip() and sample.test_location.strip()
             else "project_full"
         )
-    strict_oracle = bool(
-        sample.smell == "refused_bequest"
-        and parse_structural_expectation(sample.evidence)
-    )
-    if strict_oracle and not sample.test_command.strip():
-        raise ValueError(
-            "STRICT_ORACLE_TEST_COMMAND_MISSING: structurally constrained Refused Bequest "
-            f"sample {sample.sample_id} must declare test_command"
-        )
-    if strict_oracle and not sample.test_location.strip():
-        raise ValueError(
-            "STRICT_ORACLE_TEST_FILE_MISSING: structurally constrained Refused Bequest "
-            f"sample {sample.sample_id} must declare test_file"
-        )
     if requested == "sample_optimized" and not sample.test_location.strip():
         raise ValueError(
             "SAMPLE_ORACLE_TEST_FILE_MISSING: sample_optimized verification requires "
             f"sample {sample.sample_id} to declare test_file"
-        )
-    if strict_oracle and requested == "local":
-        raise ValueError(
-            "STRICT_ORACLE_LOCAL_FORBIDDEN: structurally constrained Refused Bequest "
-            f"sample {sample.sample_id} cannot use local verification"
         )
     if requested not in VERIFICATION_MODES:
         raise ValueError(
@@ -389,47 +399,6 @@ def _declared_sibling_projects(sample: Sample) -> list[str]:
         for name in re.split(r"[|,;]", raw)
         if name.strip()
     ]
-
-
-def _evidence_values(evidence: str, field: str) -> list[str]:
-    match = re.search(
-        rf"(?:^|;\s*){re.escape(field)}=([^;]+)",
-        str(evidence or ""),
-        flags=re.IGNORECASE,
-    )
-    return [part.strip() for part in match.group(1).split("|")] if match else []
-
-
-def _pin_refused_bequest_target_classes(sample: Sample) -> Sample:
-    """Capture pre-refactor class identities so deleted methods cannot drift by line."""
-    if sample.smell != "refused_bequest" or not parse_structural_expectation(sample.evidence):
-        return sample
-    targets = parse_locations(sample.location, sample.project_root)
-    arities = _evidence_values(sample.evidence, "target_parameter_counts")
-    model = _build_project_model(sample.project_root, include_tests=False)
-    target_classes: list[str] = []
-    for index, target in enumerate(targets):
-        arity = int(arities[index]) if len(arities) == len(targets) else None
-        profile = analyze_refused_bequest_target(
-            sample.project_root,
-            target_file=target.file_path,
-            method=target.method,
-            line=target.line,
-            reported_parent=parse_parent_from_evidence(sample.evidence),
-            target_parameter_count=arity,
-            project_model=model,
-        )
-        target_class = str(profile.get("target_class") or "").strip()
-        if not profile.get("ok") or not target_class:
-            raise ProjectRevisionError(
-                "TARGET_CLASS_PIN_FAILED",
-                f"cannot pin pre-refactor target class for {target.raw}",
-                target=target.raw,
-                detector_error=str(profile.get("error") or ""),
-            )
-        target_classes.append(target_class)
-    evidence = sample.evidence + "; target_classes=" + "|".join(target_classes)
-    return replace(sample, evidence=evidence)
 
 
 def _prepare_worktree(
@@ -781,6 +750,8 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
     if opencode_returncode != 0:
         if opencode_returncode == 124 and verify_returncode == 0 and verify_success and verify_status == "PASS":
             return "PASS_AFTER_OPENCODE_TIMEOUT"
+        if opencode_returncode == 124 and verify_status == "IMPROVED":
+            return "IMPROVED"
         return "OPENCODE_FAILED"
     return verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
 
@@ -881,6 +852,19 @@ def _copy_verify_artifacts(sample_dir: Path, verify_payload: dict[str, Any], att
             shutil.copyfile(str(source), str(dst))
 
 
+def _persist_verify_payload(
+    sample_dir: Path,
+    verify_payload: dict[str, Any],
+    attempt_suffix: str = "",
+) -> None:
+    verify_path = _attempt_artifact_path(sample_dir, "verify.json", attempt_suffix)
+    verify_path.write_text(
+        json.dumps(verify_payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    _copy_verify_artifacts(sample_dir, verify_payload, attempt_suffix)
+
+
 def _run_verify(
     sample: Sample,
     sample_dir: Path,
@@ -912,6 +896,11 @@ def _run_verify(
         cmd.extend(["--projects", args.projects])
     if sample.evidence:
         cmd.extend(["--smell-evidence", sample.evidence])
+    if sample.target_context:
+        cmd.extend([
+            "--target-context-json",
+            json.dumps(sample.target_context, separators=(",", ":"), sort_keys=True),
+        ])
     if sample.test_location:
         cmd.extend(["--sample-test-location", sample.test_location])
     if sample.test_command:
@@ -928,9 +917,7 @@ def _run_verify(
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         payload = {"success": False, "status": "VERIFY_OUTPUT_PARSE_FAILED", "stdout": proc.stdout, "stderr": proc.stderr}
-    verify_path = _attempt_artifact_path(sample_dir, "verify.json", attempt_suffix)
-    verify_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-    _copy_verify_artifacts(sample_dir, payload, attempt_suffix)
+    _persist_verify_payload(sample_dir, payload, attempt_suffix)
     return proc.returncode, payload
 
 
@@ -968,6 +955,7 @@ def _parse_session_id_from_json_events(events_text: str) -> str:
 def _verification_trace(events_text: str) -> dict[str, Any]:
     """Summarize completed smell_verify calls from one OpenCode JSON stream."""
     calls = 0
+    tools_after_last_verify = 0
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_status = ""
@@ -981,12 +969,19 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         if event.get("type") != "tool_use":
             continue
         part = event.get("part")
-        if not isinstance(part, dict) or part.get("tool") != "smell_verify":
+        if not isinstance(part, dict):
             continue
         state = part.get("state")
         if not isinstance(state, dict) or state.get("status") != "completed":
             continue
+        if part.get("tool") != "smell_verify":
+            if calls:
+                tools_after_last_verify += 1
+            continue
         calls += 1
+        tools_after_last_verify = 0
+        # A malformed newer verify must not leave an older payload reusable.
+        last_payload = None
         metadata = state.get("metadata")
         if isinstance(metadata, dict):
             meta_loop = metadata.get("loop")
@@ -1016,9 +1011,11 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         last_status = str(last_payload.get("status") or "")
     return {
         "smell_verify_calls": calls,
+        "tools_after_last_verify": tools_after_last_verify,
         "last_loop_decision": last_decision,
         "last_status": last_status,
         "last_output_parsed": last_payload is not None,
+        "last_payload": last_payload,
         "last_cap_recovery_used": last_cap_recovery_used,
         "command_loop_state": last_command_loop_state,
     }
@@ -1047,6 +1044,26 @@ def _runner_closure_action(
     ):
         return "continue"
     return "stop"
+
+
+def _reusable_verify_payload(
+    trace: dict[str, Any],
+    *,
+    opencode_returncode: int,
+) -> dict[str, Any] | None:
+    """Reuse the command's final authoritative verify when no later tool ran."""
+    if opencode_returncode != 0:
+        return None
+    payload = trace.get("last_payload")
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload.get("success"), bool):
+        return None
+    if not str(payload.get("status") or "").strip():
+        return None
+    if int(trace.get("tools_after_last_verify") or 0) != 0:
+        return None
+    return payload
 
 
 def _runner_continuation_prompt(action: str, continuation: int, max_continuations: int, instruction: str) -> str:
@@ -1145,9 +1162,21 @@ def _run_opencode(
     env["SMELL_SMELL"] = sample.smell
     env["SMELL_LOCATION"] = sample.location
     env["SMELL_EVIDENCE"] = sample.evidence
+    if sample.target_context:
+        env["SMELL_TARGET_CONTEXT_JSON"] = json.dumps(
+            sample.target_context, separators=(",", ":"), sort_keys=True
+        )
+    else:
+        env.pop("SMELL_TARGET_CONTEXT_JSON", None)
     env["SMELL_VERIFICATION_MODE"] = verification_mode
     env["SMELL_SAMPLE_TEST_LOCATION"] = sample.test_location
     env["SMELL_SAMPLE_TEST_COMMAND"] = sample.test_command
+    # Keep the command-owned authoritative verify bundle inside this sample.
+    # The runner can then persist the final tool payload without rerunning the
+    # same guard/build/test sequence merely to obtain durable artifacts.
+    agent_artifact_root = sample_dir / "agent-artifacts"
+    agent_artifact_root.mkdir(parents=True, exist_ok=True)
+    env["SMELL_ARTIFACT_ROOT"] = str(agent_artifact_root)
     if args.projects:
         env["SMELL_PROJECTS"] = args.projects
     if args.idea_refactor_cli:
@@ -1177,6 +1206,7 @@ def _run_opencode(
             "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_timeout_seconds": args.sample_deadline,
+            "final_verify_mode": "reuse_agent_tool_or_runner_fallback",
             "idle_watchdog_enabled": False,
         },
     }
@@ -1297,6 +1327,10 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         "verification_mode",
         "agent",
         "status",
+        "resolution",
+        "accepted",
+        "progress",
+        "termination_reason",
         "opencode_returncode",
         "verify_returncode",
         "duration_seconds",
@@ -1309,52 +1343,6 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({key: row.get(key, "") for key in fieldnames})
-
-
-def _record_buildenv_mutation(
-    run_dir: Path,
-    row: dict[str, Any],
-    *,
-    sample_index: int,
-    before: str,
-    after: str,
-) -> None:
-    original_status = str(row.get("status") or "")
-    evidence = {
-        "status": "BUILDENV_MUTATED",
-        "sample_index": sample_index,
-        "sample_id": row.get("sample_id"),
-        "project_name": row.get("project_name"),
-        "original_status": original_status,
-        "repository": str(MAVEN_OFFLINE_REPOSITORY),
-        "before_fingerprint": before,
-        "after_fingerprint": after,
-    }
-    evidence_path = run_dir / f"buildenv-integrity-failure-{sample_index}.json"
-    evidence_path.write_text(
-        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    row["status"] = "BUILDENV_MUTATED"
-    row["note"] = (
-        f"{row.get('note') or ''};"
-        f"original_status={original_status};"
-        f"evidence={evidence_path}"
-    ).lstrip(";")
-
-    sample_dir = Path(str(row.get("sample_dir") or ""))
-    result_path = sample_dir / "result.json"
-    if result_path.is_file():
-        try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            result = {}
-        result.update(row)
-        result["buildenv_integrity"] = evidence
-        result_path.write_text(
-            json.dumps(result, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
 
 
 def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1384,7 +1372,6 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
             target_commit=rev.project_commit,
             revisions=revisions,
         )
-        prepared = _pin_refused_bequest_target_classes(prepared)
         audit = verify_checkout(prepared.project_root, rev)
         audit.update(
             audit_test_commit(
@@ -1392,10 +1379,6 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
                 sample.raw.get("test_commit", ""),
                 rev.project_commit,
             )
-        )
-        audit["target_class_pins"] = _evidence_values(
-            prepared.evidence,
-            "target_classes",
         )
         if prepared.sibling_revision_audit:
             audit["sibling_checkouts"] = list(prepared.sibling_revision_audit)
@@ -1480,17 +1463,12 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 revision_audit["sibling_checkouts"] = list(
                     execution_sample.sibling_revision_audit
                 )
-        execution_sample = _pin_refused_bequest_target_classes(execution_sample)
         revision_audit.update(
             audit_test_commit(
                 sample.project_root.resolve(),
                 sample.raw.get("test_commit", ""),
                 rev.project_commit,
             )
-        )
-        revision_audit["target_class_pins"] = _evidence_values(
-            execution_sample.evidence,
-            "target_classes",
         )
         revision_audit.update(
             verify_test_oracle(
@@ -1578,6 +1556,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     reminder_used = False
     attempt_index = 0
     opencode_returncode = 0
+    final_trace: dict[str, Any] = {}
     while True:
         remaining = int(model_deadline - time.monotonic())
         if remaining <= 0:
@@ -1603,13 +1582,19 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             trace = _verification_trace(events_path.read_text(encoding="utf-8"))
         except OSError:
             trace = _verification_trace("")
+        final_trace = trace
+        trace_summary = {
+            key: value
+            for key, value in trace.items()
+            if key != "last_payload"
+        }
         controller_attempts.append(
             {
                 "attempt": attempt_index,
                 "suffix": attempt_suffix,
                 "opencode_returncode": opencode_returncode,
                 "session_id": session_id,
-                **trace,
+                **trace_summary,
             }
         )
         restored_state = trace.get("command_loop_state")
@@ -1639,9 +1624,20 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         )
         attempt_index += 1
 
-    verify_returncode, verify_payload = _run_verify(
-        execution_sample, sample_dir, args, verification_mode
+    reusable_verify = _reusable_verify_payload(
+        final_trace,
+        opencode_returncode=opencode_returncode,
     )
+    if reusable_verify is not None:
+        verify_payload = reusable_verify
+        verify_returncode = 0 if verify_payload.get("success") is True else 1
+        final_verify_source = "agent_tool"
+        _persist_verify_payload(sample_dir, verify_payload)
+    else:
+        verify_returncode, verify_payload = _run_verify(
+            execution_sample, sample_dir, args, verification_mode
+        )
+        final_verify_source = "runner_fallback"
     try:
         post_oracle_audit = verify_test_oracle(
             execution_sample.project_root,
@@ -1661,9 +1657,19 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             "prior_verify": verify_payload,
         }
         verify_returncode = 1
+        final_verify_source = "post_oracle"
     if agent == "java-refactor-agent-idea":
         _close_idea_project(execution_sample.project_root, sample_dir, args)
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
+    resolution = str(verify_payload.get("resolution") or "")
+    accepted = _is_accepted_status(final_status)
+    progress = bool(verify_payload.get("progress")) or accepted
+    loop_payload = verify_payload.get("loop")
+    termination_reason = (
+        str(loop_payload.get("termination_reason") or "")
+        if isinstance(loop_payload, dict)
+        else ""
+    )
     last = {
         "attempt": attempt_index,
         "opencode_returncode": opencode_returncode,
@@ -1671,6 +1677,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "verify_payload": verify_payload,
         "status": final_status,
         "failure_category": _failure_category_from_verify_payload(verify_payload),
+        "verify_source": final_verify_source,
         "session_id": session_id,
         "is_continuation": attempt_index > 0,
     }
@@ -1678,7 +1685,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     note = (
         f"loop_policy={args.loop_mode}:{args.loop_max};"
         f"runner_continuations={continuations_dispatched};"
-        f"verify_reminders={reminders_dispatched}"
+        f"verify_reminders={reminders_dispatched};"
+        f"final_verify_source={final_verify_source}"
     )
 
     row = {
@@ -1691,6 +1699,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "verification_mode": verification_mode,
         "agent": agent,
         "status": final_status,
+        "resolution": resolution,
+        "accepted": accepted,
+        "progress": progress,
+        "termination_reason": termination_reason,
         "opencode_returncode": last["opencode_returncode"],
         "verify_returncode": last["verify_returncode"],
         "duration_seconds": f"{time.time() - started:.1f}",
@@ -1733,7 +1745,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-deadline",
         type=int,
         default=1800,
-        help="Single per-phase time budget in seconds for the command loop and final verify; the runner adds only a 60-second OpenCode shutdown grace.",
+        help="Single per-phase time budget for the command loop and any required runner fallback verify; "
+        "the runner adds only a 60-second OpenCode shutdown grace.",
     )
     parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="auto")
     parser.add_argument(
@@ -1805,6 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
             "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_timeout_seconds": args.sample_deadline,
+            "final_verify_mode": "reuse_agent_tool_or_runner_fallback",
             "idle_watchdog_enabled": False,
         },
         "dry_run": args.dry_run,
@@ -1833,17 +1847,6 @@ def main(argv: list[str] | None = None) -> int:
 
     results_path = run_dir / "results.csv"
     failures = 0
-    java_batch = bool(samples) and all(sample.language == "java" for sample in samples)
-    buildenv_fingerprint = ""
-    if java_batch:
-        if not MAVEN_OFFLINE_REPOSITORY.is_dir():
-            parser.error(
-                f"Java batch requires Maven offline repository: {MAVEN_OFFLINE_REPOSITORY}"
-            )
-        buildenv_fingerprint = metadata_fingerprint(
-            MAVEN_OFFLINE_REPOSITORY,
-            MAVEN_SETTINGS_FILES,
-        )
     for index, sample in enumerate(samples, start=1):
         print(f"[{index}/{len(samples)}] {sample.sample_id} {sample.project_name} {sample.smell} {sample.location}", flush=True)
         try:
@@ -1871,26 +1874,10 @@ def main(argv: list[str] | None = None) -> int:
                 "sample_dir": "",
                 "note": str(exc),
             }
-        if java_batch:
-            current_fingerprint = metadata_fingerprint(
-                MAVEN_OFFLINE_REPOSITORY,
-                MAVEN_SETTINGS_FILES,
-            )
-            if current_fingerprint != buildenv_fingerprint:
-                _record_buildenv_mutation(
-                    run_dir,
-                    row,
-                    sample_index=index,
-                    before=buildenv_fingerprint,
-                    after=current_fingerprint,
-                )
         if not _is_accepted_status(row.get("status")):
             failures += 1
         _append_result(results_path, row)
         print(f"  -> {row.get('status')} {row.get('sample_dir')}", flush=True)
-        if row.get("status") == "BUILDENV_MUTATED":
-            print("  -> aborting batch: shared build environment changed", flush=True)
-            break
     return 1 if failures else 0
 
 

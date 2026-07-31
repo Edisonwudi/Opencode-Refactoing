@@ -35,9 +35,9 @@ god_class:
       - op: extract:class
         apply_args: '{"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/PanelController.java", line=3, column=7)
-          - idea_refactor_prepare(operation="extract:class", arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]}, expectedOperation="extract:class")
-          - idea_refactor_apply(arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]})
+          - idea_refactor_preview(operation="extract:class", file="src/main/java/demo/PanelController.java", line=3, column=7, arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"className":"PanelState","memberNames":["left","top","width","height","scroll","focusIndex","selectedIndex","dirty","metrics","audit","resize","scrollTo","focus","clear"]})
       - op: idea_edit
         argument_contract: "Read src/main/java/demo/PanelController.java, choose the exact unique oldString for the declaration/block being replaced, and call idea_edit with the replacement Java source as newString; replaceAll=false."
         cli_steps:
@@ -127,51 +127,51 @@ god_class:
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
       - op: move:method
         apply_args: '{"targetVariableName":"worker"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/demo/God.java", line=7, column=7)
-          - idea_refactor_prepare(operation="move:method", arguments={"targetVariableName":"worker"}, expectedOperation="move:method")
-          - idea_refactor_apply(arguments={"targetVariableName":"worker"})
+          - idea_refactor_preview(operation="move:method", file="src/main/java/demo/God.java", line=7, column=7, arguments={"targetVariableName":"worker"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"worker"})
     after: |
       /* God.java */
       3     class God {

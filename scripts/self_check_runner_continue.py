@@ -60,6 +60,9 @@ check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "S
 check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
 check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS_AFTER_OPENCODE_TIMEOUT")
 check("opencode_timeout_verify_fail", R._compute_status(124, 0, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+check("improved_not_accepted", R._compute_status(0, 1, make_payload("IMPROVED")), "IMPROVED")
+check("timeout_preserves_improved", R._compute_status(124, 1, make_payload("IMPROVED")), "IMPROVED")
+check("improved_status_not_accepted", R._is_accepted_status("IMPROVED"), False)
 check(
     "provider_quota_overrides_verify",
     R._compute_status(R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, 0, make_payload("PASS")),
@@ -149,6 +152,24 @@ check(
     ),
     "src/Foo.java:42",
 )
+for smell in ("long_method", "nested_complexity", "switch_statements"):
+    check(
+        f"{smell}_method_anchor_promoted",
+        R._dataset_location(
+            {
+                "smell_type": smell,
+                "location": "src/Foo.java:42",
+                "group_occurrences": json.dumps(
+                    {
+                        "file": "src/Foo.java",
+                        "method": "target",
+                        "begin_line": "42",
+                    }
+                ),
+            }
+        ),
+        "src/Foo.java:method=target|line=42",
+    )
 
 print("== single time budget ==")
 check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)
@@ -176,7 +197,7 @@ check("policy_instruction", resolved.loop.instruction, "Use the pack")
 quoted_argv = parse_command_policy("--loop-max=2 '--loop-instruction=修复最新 failure pack 并保持行为不变' -- task")
 check("policy_instruction_quoted_argv", quoted_argv.loop.instruction, "修复最新 failure pack 并保持行为不变")
 check_true("policy_allows_guard", resolved.loop.allows("SMELL_GUARD_FAILED"))
-check_true("policy_allows_structural_route_mismatch", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"))
+check("policy_removes_dataset_route_category", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"), False)
 check("policy_blocks_compile", resolved.loop.allows("BUILD_COMPILE_ERROR"), False)
 check("policy_task", resolved.task, "Project root: /tmp/p")
 disabled = parse_command_policy('--loop-max=0 -- Project root: /tmp/p')
@@ -276,16 +297,59 @@ state_trace = R._verification_trace(verify_event(
     },
 ))
 check("trace_command_loop_state", state_trace["command_loop_state"], persisted_state)
-pass_trace = R._verification_trace(verify_event({"status": "PASS", "loop": {"decision": "stop"}}))
+pass_trace = R._verification_trace(verify_event({
+    "success": True,
+    "status": "PASS",
+    "loop": {"decision": "stop"},
+}))
 check(
     "pass_stops",
     R._runner_closure_action(pass_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
     "stop",
 )
+check("trace_keeps_last_payload", pass_trace["last_payload"]["status"], "PASS")
+check("trace_no_tools_after_final_verify", pass_trace["tools_after_last_verify"], 0)
+check(
+    "normal_exit_reuses_final_verify",
+    R._reusable_verify_payload(pass_trace, opencode_returncode=0)["status"],
+    "PASS",
+)
+check(
+    "timeout_requires_runner_fallback",
+    R._reusable_verify_payload(pass_trace, opencode_returncode=124),
+    None,
+)
+post_verify_tool = json.dumps({
+    "type": "tool_use",
+    "part": {
+        "tool": "edit",
+        "state": {"status": "completed", "output": "changed"},
+    },
+})
+edited_after_verify = R._verification_trace(
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}})
+    + "\n"
+    + post_verify_tool
+)
+check("trace_counts_tools_after_verify", edited_after_verify["tools_after_last_verify"], 1)
+check(
+    "post_verify_tool_requires_runner_fallback",
+    R._reusable_verify_payload(edited_after_verify, opencode_returncode=0),
+    None,
+)
+check(
+    "parsed_but_incomplete_verify_requires_fallback",
+    R._reusable_verify_payload(
+        R._verification_trace(verify_event({"status": "PASS"})),
+        opencode_returncode=0,
+    ),
+    None,
+)
 malformed = json.dumps({"type": "tool_use", "part": {"tool": "smell_verify", "state": {"status": "completed", "output": "truncated"}}})
 malformed_trace = R._verification_trace(malformed)
 check("malformed_still_counts_verify", malformed_trace["smell_verify_calls"], 1)
 check("malformed_has_no_decision", malformed_trace["last_loop_decision"], "")
+check("malformed_verify_not_reusable", R._reusable_verify_payload(malformed_trace, opencode_returncode=0), None)
 truncated_with_metadata = json.dumps({
     "type": "tool_use",
     "part": {
@@ -361,6 +425,22 @@ for name, mutation in (
     )
 check_true("verify_prompt_marker", "verify-required" in R._runner_continuation_prompt("verify_required", 0, 2, "repair"))
 check_true("continue_prompt_marker", "continue 1/2" in R._runner_continuation_prompt("continue", 1, 2, "repair"))
+check("buildenv_mutation_status_removed", hasattr(R, "_record_buildenv_mutation"), False)
+
+with tempfile.TemporaryDirectory() as tmp:
+    sample_dir = Path(tmp) / "sample"
+    sample_dir.mkdir()
+    source_diff = Path(tmp) / "source.patch"
+    source_diff.write_text("diff --git a/A.java b/A.java\n", encoding="utf-8")
+    persisted = {
+        "success": True,
+        "status": "PASS",
+        "artifacts": {"diff": str(source_diff)},
+    }
+    R._persist_verify_payload(sample_dir, persisted)
+    check_true("reused_verify_json_persisted", (sample_dir / "verify.json").is_file())
+    check("reused_verify_status", json.loads((sample_dir / "verify.json").read_text())["status"], "PASS")
+    check("reused_verify_diff_copied", (sample_dir / "diff.patch").read_text(), source_diff.read_text())
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
@@ -474,12 +554,11 @@ refused_skill = (
     / "edit-patterns"
     / "refused_bequest.md"
 ).read_text(encoding="utf-8")
-check_true("refused_skill_maps_callers", "every production call site of the target contract" in refused_skill)
+check_true("refused_skill_maps_callers", "production callers" in refused_skill)
 check_true("refused_skill_rejects_relocation", "Never relocate an empty, throwing, null-returning" in refused_skill)
-check_true("refused_skill_uses_group_boundary", "`refactor_group_id`" in refused_skill)
 check_true(
-    "refused_skill_locks_capability_split_route",
-    "Do not implement or delegate the reported rejecting/empty/null-returning method" in refused_skill,
+    "refused_skill_source_derived_route",
+    "Choose the narrowest correct route: implement real behavior, delegate" in refused_skill,
 )
 check_true(
     "refused_skill_requires_impact_ledger",
@@ -495,6 +574,16 @@ check_true(
     "refused_skill_avoids_broad_alias_and_downcasts",
     "making it extend every new narrow capability" in refused_skill
     and "scatter downcasts" in refused_skill,
+)
+
+idea_agent = (
+    ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md"
+).read_text(encoding="utf-8")
+check_true("idea_agent_loads_idea_skill", "Load `idea-refactor-cli`" in idea_agent)
+check(
+    "idea_agent_does_not_load_plain_skill",
+    "Load `java-smell-edit-patterns`" in idea_agent,
+    False,
 )
 print()
 if failures:

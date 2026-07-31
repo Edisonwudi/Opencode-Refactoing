@@ -31,10 +31,10 @@ long_method:
       - op: extract:method
         apply_args: '{"newName":"appendOptionsToUsage","visibility":"private"}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=854, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=844, column=18, selection={"startLine":854,"startColumn":9,"endLine":878,"endColumn":10})
-          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"appendOptionsToUsage","visibility":"private"})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=854, column=9, arguments={"newName":"appendOptionsToUsage","visibility":"private"})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/cli/HelpFormatter.java", line=844, column=18, selection={"startLine":854,"startColumn":9,"endLine":878,"endColumn":10}, arguments={"newName":"appendOptionsToUsage","visibility":"private"})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"appendOptionsToUsage","visibility":"private"})
     after: |
       844    public void printUsage(final PrintWriter pw, final int width, final String app, final Options options) {
       845        final StringBuilder buff = new StringBuilder(getSyntaxPrefix()).append(app).append(Char.SP);
@@ -78,10 +78,10 @@ long_method:
       - op: extract:method
         apply_args: '{"newName":"computeGapBits","visibility":"private","makeStatic":true}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=329, column=9, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=255, column=25, selection={"startLine":329,"startColumn":9,"endLine":341,"endColumn":58})
-          - idea_refactor_prepare(operation="extract:method", expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"computeGapBits","visibility":"private","makeStatic":true})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=329, column=9, arguments={"newName":"computeGapBits","visibility":"private","makeStatic":true})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=255, column=25, selection={"startLine":329,"startColumn":9,"endLine":341,"endColumn":58}, arguments={"newName":"computeGapBits","visibility":"private","makeStatic":true})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"computeGapBits","visibility":"private","makeStatic":true})
     after: |
       255    public static String random(int count, int start, int end, final boolean letters,
       256            final boolean numbers, final char[] chars, final Random random) {
@@ -136,11 +136,11 @@ long_method:
       - op: extract:method
         apply_args: '{"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, suggestSelectionsFor="extract:method", expectedOperation="extract:method")
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, selection={"startLine":1515,"startColumn":29,"endLine":1538,"endColumn":80})
-          - idea_refactor_prepare(operation="extract:method", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, expectedOperation="extract:method")
-          - idea_refactor_apply(arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
-          - idea_refactor_apply(arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, decisions={"extract.multipleOutputVariables":"use_extract_method_object"})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
+          - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, selection={"startLine":1515,"startColumn":29,"endLine":1538,"endColumn":80}, arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, decisions={"extract.multipleOutputVariables":"use_extract_method_object"})
     after: |
       1514                            // resolve the variable
       1515                            ResolveAndReplaceVariableMethodObject resolveAndReplaceVariableMethodObject = new ResolveAndReplaceVariableMethodObject(builder, priorVariables, substitutionInVariablesEnabled, substitutionInValuesDisabled, undefinedVariableException, altered, lengthChange, bufEnd, pos, startPos, endPos, varName, varDefaultValue).invoke();

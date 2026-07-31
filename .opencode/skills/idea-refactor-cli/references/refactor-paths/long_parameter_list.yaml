@@ -22,9 +22,9 @@ long_parameter_list:
       - op: introduce:parameter-object
         apply_args: '{"className":"RandomRequest","packageName":"org.apache.commons.lang3","parameterNames":["count","start","end","letters","numbers","chars","random"],"keepMethodAsDelegate":false}'
         cli_steps:
-          - idea_refactor_locate(file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=255, column=25)
-          - idea_refactor_prepare(operation="introduce:parameter-object", expectedOperation="introduce:parameter-object")
-          - idea_refactor_apply(arguments={"className":"RandomRequest","packageName":"org.apache.commons.lang3","parameterNames":["count","start","end","letters","numbers","chars","random"],"keepMethodAsDelegate":false})
+          - idea_refactor_preview(operation="introduce:parameter-object", file="src/main/java/org/apache/commons/lang3/RandomStringUtils.java", line=255, column=25, arguments={"className":"RandomRequest","packageName":"org.apache.commons.lang3","parameterNames":["count","start","end","letters","numbers","chars","random"],"keepMethodAsDelegate":false})
+
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"className":"RandomRequest","packageName":"org.apache.commons.lang3","parameterNames":["count","start","end","letters","numbers","chars","random"],"keepMethodAsDelegate":false})
     after: |
       // Old 7-param signature is GONE — replaced entirely by:
       247    public static String random(RandomRequest randomRequest) {

@@ -1,0 +1,89 @@
+{
+  "summary": {
+    "rows": 751,
+    "baseline_hit": 751,
+    "baseline_metric_unavailable": 0,
+    "original_guard_pass": 0,
+    "evidence_free_same_finding": 751,
+    "by_smell": {
+      "code_clone_type1": {
+        "rows": 31,
+        "hit": 31,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 31
+      },
+      "data_clumps": {
+        "rows": 30,
+        "hit": 30,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 30
+      },
+      "dead_code": {
+        "rows": 30,
+        "hit": 30,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 30
+      },
+      "feature_envy": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      },
+      "god_class": {
+        "rows": 30,
+        "hit": 30,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 30
+      },
+      "long_method": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      },
+      "long_parameter_list": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      },
+      "mysterious_name": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      },
+      "nested_complexity": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      },
+      "refused_bequest": {
+        "rows": 30,
+        "hit": 30,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 30
+      },
+      "switch_statements": {
+        "rows": 100,
+        "hit": 100,
+        "unavailable": 0,
+        "ambiguous": 0,
+        "evidence_free_stable": 100
+      }
+    }
+  },
+  "failures": []
+}
