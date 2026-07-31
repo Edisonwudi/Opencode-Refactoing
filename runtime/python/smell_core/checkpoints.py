@@ -90,7 +90,7 @@ def _finding_contract(smell: str, metrics: dict[str, Any], target_context: Any) 
     if not isinstance(identity, dict) or not identity:
         raise ValueError("CHECKPOINT_BASELINE_CAPTURE_FAILED: finding_identity_missing")
     stable_identity = json.loads(json.dumps(identity, sort_keys=True, ensure_ascii=True))
-    return {
+    contract = {
         "detector_id": detector_id,
         "detector_profile": detector_profile,
         "detector_profile_hash": _canonical_hash(detector_profile),
@@ -99,6 +99,12 @@ def _finding_contract(smell: str, metrics: dict[str, Any], target_context: Any) 
         "baseline_metrics": dict(metrics.get("objectives") or {}),
         "selection_context": dict(target_context) if isinstance(target_context, dict) else {},
     }
+    finding_catalog = metrics.get("project_finding_catalog")
+    if isinstance(finding_catalog, list):
+        contract["baseline_finding_catalog"] = json.loads(
+            json.dumps(finding_catalog, sort_keys=True, ensure_ascii=True)
+        )
+    return contract
 
 
 def capture_checkpoint_baseline(config: Any, evidence: str) -> dict[str, Any]:

@@ -10,6 +10,7 @@ reduction the ordinary failure semantics remain unchanged.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,15 @@ def _class_source(methods: int, controls: int, padding: int) -> str:
     return f"class Smelly {{\n{body}\n{pad}\n}}\n"
 
 
-def _bridge(project: Path, subcommand: str) -> dict:
+def _bridge(
+    project: Path,
+    subcommand: str,
+    *,
+    smell: str = "god_class",
+    location: str = "Smelly.java:1",
+    evidence: str = "nom=12;wmc=36;loc=110;atfd=0;class=Smelly",
+    target_context: dict[str, str] | None = None,
+) -> dict:
     cmd = [
         sys.executable,
         str(BRIDGE),
@@ -41,19 +50,89 @@ def _bridge(project: Path, subcommand: str) -> dict:
         "--project-root",
         str(project),
         "--smell",
-        "god_class",
+        smell,
         "--location",
-        "Smelly.java:1",
+        location,
         "--smell-evidence",
-        "nom=12;wmc=36;loc=110;atfd=0;class=Smelly",
+        evidence,
     ]
+    if target_context:
+        cmd += ["--target-context-json", json.dumps(target_context, sort_keys=True)]
     if subcommand == "verify":
         cmd += ["--skip-build-test", "--no-snapshot"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, f"bridge failed: {proc.stderr[-500:]}"
-    import json
-
     return json.loads(proc.stdout)
+
+
+REFUSED_BASELINE = """\
+interface Capability {
+  Object target();
+}
+class ExistingSibling implements Capability {
+  public Object target() { throw new UnsupportedOperationException(); }
+}
+class Subject implements Capability {
+  public Object target() { throw new UnsupportedOperationException(); }
+  public Object supported() { return new Object(); }
+}
+"""
+
+REFUSED_RESOLVED = """\
+interface Capability {
+  Object target();
+}
+class ExistingSibling implements Capability {
+  public Object target() { throw new UnsupportedOperationException(); }
+}
+class Subject {
+  public Object supported() { return new Object(); }
+}
+"""
+
+REFUSED_RELOCATED = REFUSED_RESOLVED + """\
+class CompatibilityShell implements Capability {
+  public Object target() { throw new UnsupportedOperationException(); }
+}
+"""
+
+
+def _refused_bequest_baseline_delta_case() -> None:
+    with tempfile.TemporaryDirectory(prefix="improvement-gate-refused-") as tmp:
+        root = Path(tmp)
+        source = root / "Fixture.java"
+        source.write_text(REFUSED_BASELINE, encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "baseline"],
+            cwd=root,
+            check=True,
+        )
+        common = {
+            "smell": "refused_bequest",
+            "location": "Fixture.java:method=target|line=8",
+            "evidence": "",
+            "target_context": {"target_class": "Subject", "parent": "Capability"},
+        }
+        baseline = _bridge(root, "capture-baseline", **common)
+        assert baseline.get("success") is True, baseline
+
+        # A rejecting sibling that was already present at c000 is not a
+        # relocation of the target finding.
+        source.write_text(REFUSED_RESOLVED, encoding="utf-8")
+        resolved = _bridge(root, "verify", **common)
+        assert resolved.get("status") == "PASS", resolved
+
+        # A newly introduced equivalent rejecting override is a structural
+        # failure. Even though the target metric fell from 1 to 0, it must not
+        # be reported as IMPROVED.
+        source.write_text(REFUSED_RELOCATED, encoding="utf-8")
+        relocated = _bridge(root, "verify", **common)
+        assert relocated.get("status") == "SMELL_GUARD_FAILED", relocated
+        assert relocated.get("resolution") == "unresolved", relocated
+        results = (relocated.get("smell_guard") or {}).get("results") or []
+        assert any("moved to another type" in str(item.get("message") or "") for item in results), results
 
 
 def main() -> int:
@@ -117,6 +196,8 @@ def main() -> int:
         third = _bridge(root, "verify")
         assert third["success"] is False, third
         assert third["status"] == "SMELL_GUARD_FAILED", third["status"]
+
+    _refused_bequest_baseline_delta_case()
 
     print("improvement-gate self-check passed")
     return 0

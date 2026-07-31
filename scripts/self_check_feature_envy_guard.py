@@ -43,6 +43,24 @@ class Subject {
     local.d();
   }
 
+  void transitivelyAliased() {
+    Collaborator first = this.collaborator;
+    Collaborator second = first;
+    second.a();
+    second.b();
+    second.c();
+    second.d();
+  }
+
+  void reassignedAlias() {
+    Collaborator local = collaborator;
+    local = new Collaborator();
+    local.a();
+    local.b();
+    local.c();
+    local.d();
+  }
+
   void dominantField() {
     collaborator.a();
     collaborator.b();
@@ -60,6 +78,16 @@ class Subject {
     helperA();
     helperB();
     helperC();
+  }
+
+  void explicitSelfBalanced() {
+    collaborator.a();
+    collaborator.b();
+    collaborator.c();
+    collaborator.d();
+    this.helperA();
+    this.helperB();
+    this.helperC();
   }
 
   void helperA() {}
@@ -97,18 +125,27 @@ def main() -> int:
             if finding.class_name == "Subject"
         }
 
-        for method in ("direct", "dominantField"):
+        for method in ("direct", "aliased", "transitivelyAliased", "dominantField"):
             if method not in findings:
                 raise AssertionError(f"Expected Feature Envy finding for {method}")
-        if "aliased" in findings:
-            raise AssertionError("Local alias access must not be invented as direct field-member access")
+        if "reassignedAlias" in findings:
+            raise AssertionError("A reassigned local must not retain stale field provenance")
         if "selfBalanced" in findings:
             raise AssertionError("Same-class calls must offset the envy-access metric")
+        if "explicitSelfBalanced" in findings:
+            raise AssertionError("this-qualified self calls must equal unqualified self calls")
 
         direct = _metrics(findings["direct"].evidence)
+        aliased = _metrics(findings["aliased"].evidence)
+        transitive = _metrics(findings["transitivelyAliased"].evidence)
         dominant = _metrics(findings["dominantField"].evidence)
         if direct[:2] != (4, 0):
             raise AssertionError(f"Direct field metric is incorrect: {direct}")
+        if aliased[:2] != direct[:2] or transitive[:2] != direct[:2]:
+            raise AssertionError(
+                f"Stable aliases must preserve field provenance: direct={direct} "
+                f"alias={aliased} transitive={transitive}"
+            )
         if dominant[:2] != (4, 0):
             raise AssertionError(f"Dominant receiver metric is incorrect: {dominant}")
         if not direct[2].endswith("Collaborator") or direct[3] != "collaborator":
@@ -118,7 +155,8 @@ def main() -> int:
 
         print(
             "feature-envy-self-check PASS "
-            f"direct={direct[0]}/{direct[1]} dominant={dominant[3]}:{dominant[0]}"
+            f"direct={direct[0]}/{direct[1]} alias={aliased[0]}/{aliased[1]} "
+            f"dominant={dominant[3]}:{dominant[0]}"
         )
     return 0
 

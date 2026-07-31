@@ -78,15 +78,21 @@ DETECTOR_PROFILES = {
     "nested_complexity": {"metric": "cognitive_complexity", "finding_min": 20},
     "switch_statements": {"definition": "target_method_contains_switch"},
     "code_clone_type1": {"definition": "exact_normalized_tokens", "finding_min_tokens": 30},
-    "feature_envy": {"definition": "designite_2.8.6_envy_access_diff", "finding_min_exclusive": 1},
+    "feature_envy": {
+        "definition": "designite_2.8.6_envy_access_diff_alias_provenance_self_symbols",
+        "finding_min_exclusive": 1,
+    },
     "data_clumps": {
         "group_size": 3,
         "min_occurrences": 3,
         "min_classes": 3,
         "min_method_names": 2,
+        "exclude_parameter_object_owner_constructor": True,
     },
     "mysterious_name": {"definition": "strict_symbol_name", "profile": "strict"},
-    "refused_bequest": {"definition": "method_level_rejecting_override"},
+    "refused_bequest": {
+        "definition": "method_level_rejecting_override_baseline_delta",
+    },
     "dead_code": {"definition": "unused_private_declaration_refs_zero"},
     "god_class": {"definition": "multi_metric_profile", "profile": "delivery-v1"},
 }
@@ -947,6 +953,13 @@ def _semantic_finding(config: Any, smell: str, evidence: str) -> dict[str, Any]:
     else:
         parent = str(identity.get("parent") or selector.get("parent") or "")
         method = str(identity.get("method") or target.method or "")
+        target_class = str(
+            identity.get("target_class")
+            or identity.get("class")
+            or selector.get("target_class")
+            or target.class_name
+            or ""
+        )
         matches = [
             item for item in findings
             if (
@@ -961,6 +974,10 @@ def _semantic_finding(config: Any, smell: str, evidence: str) -> dict[str, Any]:
                     not parent
                     or _simple_type(_evidence_value(item.evidence, "parent"))
                     == _simple_type(parent)
+                )
+                and (
+                    not target_class
+                    or _simple_type(item.class_name) == _simple_type(target_class)
                 )
             )
         ]
@@ -977,7 +994,7 @@ def _semantic_finding(config: Any, smell: str, evidence: str) -> dict[str, Any]:
             "target_class": _evidence_value(match.evidence, "target_class"),
             "rejection_kind": _evidence_value(match.evidence, "rejection_kind"),
         }
-    return {
+    snapshot = {
         "ok": True,
         "detector": "python_semantic_detector",
         "objectives": objectives,
@@ -990,6 +1007,22 @@ def _semantic_finding(config: Any, smell: str, evidence: str) -> dict[str, Any]:
         ),
         "evidence": match.evidence if match else "",
     }
+    if smell == "refused_bequest":
+        # The immutable project-level catalog lets the strict guard distinguish
+        # a newly relocated rejection from unrelated rejecting overrides that
+        # already existed at c000. It contains detector output only—no dataset
+        # evidence or oracle labels.
+        snapshot["project_finding_catalog"] = [
+            {
+                "file": str(item.file).replace("\\", "/"),
+                "class_name": str(item.class_name or ""),
+                "method": str(item.method or ""),
+                "rule_id": str(item.rule_id or ""),
+                "parent": _evidence_value(item.evidence, "parent"),
+            }
+            for item in findings
+        ]
+    return snapshot
 
 
 def _god_class(config: Any, evidence: str) -> dict[str, Any]:

@@ -28,6 +28,29 @@ class A { void target(boolean confReq, int maxTokSize, int qop) {} }
 class B { void other(boolean confReq, int maxTokSize, int qop) {} }
 class C { void third(boolean confReq, int maxTokSize, long qop) {} }
 """
+DATA_PARAMETER_OBJECT_AFTER = """\
+final class RequestOptions {
+  private final boolean confReq;
+  private final int maxTokSize;
+  private final int qop;
+  RequestOptions(boolean confReq, int maxTokSize, int qop) {
+    this.confReq = confReq;
+    this.maxTokSize = maxTokSize;
+    this.qop = qop;
+  }
+}
+class A { void target(RequestOptions options) {} }
+class B { void other(boolean confReq, int maxTokSize, int qop) {} }
+class C { void third(boolean confReq, int maxTokSize, int qop) {} }
+"""
+DATA_FAKE_WRAPPER_AFTER = """\
+final class RequestOptions {
+  RequestOptions(boolean confReq, int maxTokSize, int qop) {}
+}
+class A { void target(RequestOptions options) {} }
+class B { void other(boolean confReq, int maxTokSize, int qop) {} }
+class C { void third(boolean confReq, int maxTokSize, int qop) {} }
+"""
 CLONE_BODY = "int total = 0; for (int i = 0; i < 20; i++) { total += i; } if (total > 10) { total--; } consume(total);"
 CLONE_BEFORE = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ {CLONE_BODY} }}\n  void consume(int value) {{}}\n}}\n"
 CLONE_MUTATION_ONLY = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ int total = 0; consume(total); }}\n  void consume(int value) {{}}\n}}\n"
@@ -468,6 +491,13 @@ def _line_shifted_overload_identity_case() -> str:
 def main() -> int:
     line_shifted_overload_identity = _line_shifted_overload_identity_case()
     data = _case(
+        "data_clumps", DATA_BEFORE, DATA_PARAMETER_OBJECT_AFTER,
+        "Fixture.java:method=target|line=1",
+        "group=boolean:confreq|int:maxtoksize|int:qop; occurrences=3",
+        "occurrence_count",
+        rejected_intermediates=(DATA_FAKE_WRAPPER_AFTER,),
+    )
+    data_type_change = _case(
         "data_clumps", DATA_BEFORE, DATA_AFTER,
         "Fixture.java:method=target|line=1",
         "group=boolean:confreq|int:maxtoksize|int:qop; occurrences=3",
@@ -551,6 +581,7 @@ def main() -> int:
     print(
         "checkpoint-relational-adapters-self-check PASS unchanged_pass=0 "
         f"data_clumps={data[0]:g}->{data[1]:g} "
+        f"data_clumps_type_change={data_type_change[0]:g}->{data_type_change[1]:g} "
         f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
         f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g} "
         f"transitive_parent_clone={transitive_parent_clone[0]:g}->{transitive_parent_clone[1]:g} "

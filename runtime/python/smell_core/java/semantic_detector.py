@@ -459,26 +459,35 @@ def _designite_feature_envy_profiles(
         for node in _iter_nodes(method.body)
         if node.type == "identifier"
     }
+    shadowed_names = set(method.parameters).union(method.local_variables)
+    aliases = _stable_owner_field_aliases(method, owner)
     direct_fields = {
         name for name in owner.fields
-        if name in body_identifiers
+        if name in body_identifiers and name not in shadowed_names
     }
-    if not direct_fields:
-        return []
+    direct_fields.update(aliases.values())
 
     member_counts: Dict[str, int] = {}
     for expression in _member_access_receiver_expressions(method.body):
-        root = _root_receiver(expression)
-        if root in owner.fields:
-            member_counts[root] = member_counts.get(root, 0) + 1
-        elif root in {"this", "super"}:
-            member = _root_receiver(expression.split(".", 1)[1] if "." in expression else "")
-            if member in owner.fields:
-                member_counts[member] = member_counts.get(member, 0) + 1
+        field_name = _owner_field_for_receiver_expression(
+            expression,
+            owner,
+            shadowed_names=shadowed_names,
+            aliases=aliases,
+        )
+        if field_name:
+            direct_fields.add(field_name)
+            member_counts[field_name] = member_counts.get(field_name, 0) + 1
+
+    if not direct_fields:
+        return []
 
     fields_without_members = len(direct_fields.difference(member_counts))
     same_class_calls = len(
-        set(_implicit_owner_method_invocation_names(method.body, _owner_method_return_types(owner)))
+        set(_feature_envy_self_method_invocation_names(
+            method.body,
+            _owner_method_return_types(owner),
+        ))
     )
     total_field_members = sum(member_counts.values())
     profiles: List[FeatureEnvyProfile] = []
@@ -489,6 +498,8 @@ def _designite_feature_envy_profiles(
         if _resolve_model_type(model, field_type) == _resolve_model_type(model, method.owner_qualified_name):
             continue
         envy_count = member_counts.get(field_name, 0)
+        # Designite's metric counts foreign member accesses, but represents
+        # self interest by distinct directly used fields and owner methods.
         self_count = fields_without_members + same_class_calls
         difference = envy_count - self_count
         if difference > 1:
@@ -507,6 +518,126 @@ def _designite_feature_envy_profiles(
         profiles,
         key=lambda item: (-item.envy_access_diff, -item.envy_access_count, item.envied_field),
     )
+
+
+def _stable_owner_field_aliases(
+    method: MethodRecord,
+    owner: ClassRecord,
+) -> Dict[str, str]:
+    """Return local aliases with one stable assignment from an owner field.
+
+    This is deliberately provenance-based rather than name-based. A local
+    assigned again is not treated as an alias, and only a direct field
+    reference or another stable alias can establish provenance.
+    """
+    if method.body is None:
+        return {}
+    writes: Dict[str, List[str]] = {}
+    for node in _iter_nodes(method.body):
+        if node.type == "variable_declarator":
+            name_node = node.child_by_field_name("name")
+            value_node = node.child_by_field_name("value")
+            if name_node is not None and value_node is not None:
+                name = _node_text_from_node(name_node).strip()
+                if name:
+                    writes.setdefault(name, []).append(_node_text_from_node(value_node).strip())
+        elif node.type == "assignment_expression":
+            left_node = node.child_by_field_name("left")
+            right_node = node.child_by_field_name("right")
+            if left_node is None or right_node is None or left_node.type != "identifier":
+                continue
+            name = _node_text_from_node(left_node).strip()
+            if name:
+                writes.setdefault(name, []).append(_node_text_from_node(right_node).strip())
+
+    aliases: Dict[str, str] = {}
+    unresolved = dict(writes)
+    shadowed_fields = set(method.parameters).union(method.local_variables)
+    while unresolved:
+        progressed = False
+        for name, expressions in list(unresolved.items()):
+            source = ""
+            valid = True
+            for expression in expressions:
+                candidate = _direct_owner_field_reference(
+                    expression,
+                    owner,
+                    shadowed_fields=shadowed_fields,
+                )
+                root = _root_receiver(expression)
+                if not candidate:
+                    candidate = aliases.get(root, "")
+                if not candidate and source and root == name:
+                    # Preserve provenance while walking an object chain, for
+                    # example ``scope = scope.parent`` in a loop update.
+                    candidate = source
+                if not candidate or (source and candidate != source):
+                    valid = False
+                    break
+                source = candidate
+            if not valid or not source:
+                continue
+            aliases[name] = source
+            del unresolved[name]
+            progressed = True
+        if not progressed:
+            break
+    return aliases
+
+
+def _feature_envy_self_method_invocation_names(
+    body: Node,
+    owner_method_returns: Mapping[str, str],
+) -> Iterable[str]:
+    """Yield equivalent unqualified and ``this.`` calls to owner methods."""
+    if not owner_method_returns:
+        return
+    for node in _iter_nodes(body):
+        if node.type != "method_invocation" or _is_receiver_operand(node):
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        name = _node_text_from_node(name_node).strip()
+        if name not in owner_method_returns:
+            continue
+        receiver = node.child_by_field_name("object")
+        if receiver is None or _node_text_from_node(receiver).strip() == "this":
+            yield name
+
+
+def _direct_owner_field_reference(
+    expression: str,
+    owner: ClassRecord,
+    *,
+    shadowed_fields: Set[str],
+) -> str:
+    value = str(expression or "").strip()
+    explicit = re.fullmatch(r"(?:[A-Za-z_$][\w$]*\.)?this\s*\.\s*([A-Za-z_$][\w$]*)", value)
+    if explicit and explicit.group(1) in owner.fields:
+        return explicit.group(1)
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", value) and value in owner.fields and value not in shadowed_fields:
+        return value
+    return ""
+
+
+def _owner_field_for_receiver_expression(
+    expression: str,
+    owner: ClassRecord,
+    *,
+    shadowed_names: Set[str],
+    aliases: Mapping[str, str],
+) -> str:
+    root = _root_receiver(expression)
+    if root in aliases:
+        return aliases[root]
+    if root in owner.fields and root not in shadowed_names:
+        return root
+    if root in {"this", "super"}:
+        member = _root_receiver(expression.split(".", 1)[1] if "." in expression else "")
+        if member in owner.fields:
+            return member
+    return ""
 
 
 def _method_overrides_any_parent(
@@ -1702,6 +1833,10 @@ def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
 
         frequent: Set[frozenset[str]] = set()
         for group_key, methods in occurrences.items():
+            methods = [
+                method for method in methods
+                if not _is_parameter_group_owner_constructor(model, method, group_key)
+            ]
             if len(methods) < occurrences_threshold:
                 continue
             method_names = {method.method_name or "" for method in methods}
@@ -2335,6 +2470,47 @@ def _should_skip_refused_bequest_class(cls: ClassRecord) -> bool:
 
 def _should_skip_data_clump_method(method: MethodRecord) -> bool:
     return _is_test_like_rel_path(method.file)
+
+
+def _is_parameter_group_owner_constructor(
+    model: ProjectModel,
+    method: MethodRecord,
+    group_key: str,
+) -> bool:
+    """Exclude a parameter object's own canonical constructor as a consumer.
+
+    The constructor must own matching fields and directly initialize every
+    member of the candidate group. Merely introducing an empty wrapper with a
+    matching signature is therefore not enough to reduce the finding.
+    """
+    if not method.is_constructor or method.body is None:
+        return False
+    owner = model.classes.get(method.owner_qualified_name)
+    if owner is None:
+        return False
+    group = set(str(group_key or "").split("|"))
+    if not group:
+        return False
+    parameters = {
+        f"{type_name}:{_stem_name(name)}": name
+        for name, type_name in method.parameters.items()
+    }
+    fields = {
+        f"{type_name}:{_stem_name(name)}": name
+        for name, type_name in owner.fields.items()
+    }
+    if not group.issubset(parameters) or not group.issubset(fields):
+        return False
+    body_text = method.body_text
+    for descriptor in group:
+        parameter_name = parameters[descriptor]
+        field_name = fields[descriptor]
+        assignment = re.compile(
+            rf"\bthis\s*\.\s*{re.escape(field_name)}\s*=\s*{re.escape(parameter_name)}\b"
+        )
+        if not assignment.search(body_text):
+            return False
+    return True
 
 
 def _should_skip_data_clump_group(group_key: str) -> bool:

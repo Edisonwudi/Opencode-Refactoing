@@ -520,12 +520,15 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     guard_context, checkpoint = _checkpoint_context(resolved, evidence)
     smell_results = run_smell_guards(resolved, guard_context)
     failed_smell = [item for item in smell_results if not item.get("success")]
-    # Metric progress is a useful partial result, but never final acceptance
-    # while the dataset-aligned guard still reports the smell.
+    # Metric progress is a useful partial result, but only while the same
+    # product-detector finding remains. A different structural guard failure
+    # (for example, relocating a rejected capability) is not IMPROVED.
     improvement_pass = bool(
         guard_context is not None
         and getattr(guard_context, "has_production_diff", False)
         and getattr(guard_context, "metric_progress", False)
+        and isinstance(getattr(guard_context, "current_metrics", None), dict)
+        and guard_context.current_metrics.get("finding_present") is True
     )
     # God-class (non-Java) additionally requires a meaningful reduction: its
     # ordinary guard only checks measurability, so a token extraction of a few

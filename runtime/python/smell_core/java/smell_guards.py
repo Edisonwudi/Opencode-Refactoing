@@ -66,6 +66,13 @@ def run_java_smell_guard(
     guard_type = str(guard.get("type", "")).strip()
     if guard_type == "feature_envy":
         return _run_feature_envy_guard(config, guard, context)
+    if guard_type == "refused_bequest":
+        return _run_semantic_guard(
+            config,
+            "refused_bequest",
+            _guard_evidence(guard),
+            context=context,
+        )
     handler = _JAVA_GUARD_DISPATCH.get(guard_type)
     if handler is None:
         return None
@@ -1312,6 +1319,7 @@ def _run_semantic_guard(
     config: ResolvedRunConfig,
     guard_type: str,
     evidence: str,
+    context: Optional[GuardRunContext] = None,
 ) -> Dict[str, object]:
     """Run a Java semantic guard (feature_envy / data_clumps / refused_bequest / dead_code).
 
@@ -1369,14 +1377,23 @@ def _run_semantic_guard(
             "message": f"{guard_type} guard: semantic detector unavailable: {detection.error}",
             "details": {"detector": "python_semantic_detector", "error": detection.error},
         }
-    contract = config.finding_contract if isinstance(config.finding_contract, dict) else {}
+    raw_contract = getattr(config, "finding_contract", None)
+    contract = raw_contract if isinstance(raw_contract, dict) else {}
     identity = (
         contract.get("entity_identity")
         if isinstance(contract.get("entity_identity"), dict)
         else {}
     )
+    guard_findings = detection.findings.get(guard_type, [])
+    if guard_type == "refused_bequest":
+        target_class = str(identity.get("target_class") or identity.get("class") or "")
+        if target_class:
+            guard_findings = [
+                item for item in guard_findings
+                if _normalize_class_name(item.class_name) == _normalize_class_name(target_class)
+            ]
     match = find_matching_semantic_finding(
-        detection.findings.get(guard_type, []),
+        guard_findings,
         target_file=target.file_path,
         project_root=config.project_root,
         method=target.method,
@@ -1407,6 +1424,26 @@ def _run_semantic_guard(
     if guard_type == "refused_bequest":
         original_signature = str(identity.get("method") or target.method or "")
         original_parent = str(identity.get("parent") or "")
+        baseline_catalog = contract.get("baseline_finding_catalog")
+        if not isinstance(baseline_catalog, list) or not baseline_catalog:
+            return {
+                "type": guard_type,
+                "success": False,
+                "message": (
+                    "refused_bequest guard: immutable baseline finding catalog is unavailable; "
+                    "recapture c000 with the current detector profile."
+                ),
+                "details": {
+                    "detector": "python_semantic_detector",
+                    "reason": "BASELINE_FINDING_CATALOG_UNAVAILABLE",
+                    "checkpoint_id": getattr(context, "checkpoint_id", "") if context else "",
+                },
+            }
+        baseline_keys = {
+            _refused_bequest_finding_key(item)
+            for item in baseline_catalog
+            if isinstance(item, dict)
+        }
         relocated = [
             item
             for item in detection.findings.get("refused_bequest", [])
@@ -1418,6 +1455,7 @@ def _run_semantic_guard(
                     or _simple_type_name(_parse_parent_from_evidence(item.evidence))
                     == _simple_type_name(original_parent)
                 )
+                and _refused_bequest_finding_key(item) not in baseline_keys
             )
         ]
         if relocated:
@@ -1869,6 +1907,27 @@ def _feature_envy_finding_key(finding: SemanticFinding | Dict[str, Any]) -> Tupl
     return (_normalize_path(file), class_name.strip().lower(), _normalize_method(method))
 
 
+def _refused_bequest_finding_key(
+    finding: SemanticFinding | Dict[str, Any],
+) -> Tuple[str, str, str, str]:
+    if isinstance(finding, dict):
+        file = str(finding.get("file") or "")
+        class_name = str(finding.get("class_name") or finding.get("class") or "")
+        method = str(finding.get("method") or "")
+        parent = str(finding.get("parent") or "")
+    else:
+        file = finding.file
+        class_name = finding.class_name
+        method = finding.method
+        parent = _parse_parent_from_evidence(finding.evidence)
+    return (
+        _normalize_path(file),
+        _normalize_class_name(class_name),
+        _normalize_method(method),
+        _normalize_class_name(parent),
+    )
+
+
 def _semantic_finding_to_dict(finding: SemanticFinding) -> Dict[str, object]:
     return {
         "smell_type": finding.smell_type,
@@ -1900,5 +1959,4 @@ _JAVA_GUARD_DISPATCH = {
     "dead_code": lambda c, g: _run_semantic_guard(c, "dead_code", _guard_evidence(g)),
     "god_class": _run_god_class_guard,
     "mysterious_name": _run_mysterious_name_guard,
-    "refused_bequest": lambda c, g: _run_semantic_guard(c, "refused_bequest", _guard_evidence(g)),
 }
