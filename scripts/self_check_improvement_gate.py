@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = REPO_ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
 sys.path.insert(0, str(BRIDGE.parent))
 
-from smell_bridge import _requires_structural_resolution  # noqa: E402
+from smell_bridge import _requires_structural_resolution, _verified_improvement  # noqa: E402
 
 
 def _method(index: int, controls: int) -> str:
@@ -136,6 +136,11 @@ def _refused_bequest_baseline_delta_case() -> None:
 
 
 def main() -> int:
+    assert _verified_improvement(True, True)
+    assert not _verified_improvement(True, False), (
+        "metric progress with failing build/tests must remain unresolved"
+    )
+    assert not _verified_improvement(False, True)
     assert _requires_structural_resolution(
         "refused_bequest",
         "parents=Parent; structural_expectation=capability_split",

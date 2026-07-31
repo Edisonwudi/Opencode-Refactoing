@@ -543,11 +543,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     success = not failed_smell and (
         build_test_result is None or bool(build_test_result.get("success"))
     )
-    progress = bool(success or (improvement_pass and behavior_valid))
+    verified_improvement = _verified_improvement(improvement_pass, behavior_valid)
+    progress = bool(success or verified_improvement)
     resolution = (
         "resolved"
-        if not failed_smell
-        else ("improved" if improvement_pass else "unresolved")
+        if success
+        else ("improved" if verified_improvement else "unresolved")
     )
     continue_hint = ""
     if resolution == "improved":
@@ -574,7 +575,12 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "success": success,
         "accepted": success,
         "progress": progress,
-        "status": _verify_status(success, smell_guard, build_test_result, improvement_pass=improvement_pass),
+        "status": _verify_status(
+            success,
+            smell_guard,
+            build_test_result,
+            improvement_pass=verified_improvement,
+        ),
         "resolution": resolution,
         "continue_hint": continue_hint,
         "smell_guard": smell_guard,
@@ -629,6 +635,11 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     if failure_pack is not None:
         payload["failure_pack"] = failure_pack
     return payload
+
+
+def _verified_improvement(metric_improvement: bool, behavior_valid: bool) -> bool:
+    """An IMPROVED outcome requires both detector progress and valid behavior."""
+    return bool(metric_improvement and behavior_valid)
 
 
 def cmd_resolve_command(args: argparse.Namespace) -> dict[str, Any]:
