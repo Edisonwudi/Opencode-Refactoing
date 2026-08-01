@@ -139,10 +139,7 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         ),
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
         "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
-        "SEMANTIC_CONTRACT_REGRESSION": (
-            "the refactoring removed or narrowed unrelated public/protected API "
-            "from the target type"
-        ),
+        "SEMANTIC_CONTRACT_REGRESSION": "the refactoring violated a smell-specific structural contract",
     }
     return {
         "type": smell,
@@ -223,6 +220,19 @@ def _adapter_next_action(checkpoint: Mapping[str, Any]) -> str:
     if not isinstance(current, Mapping):
         return ""
     if adapter == "feature_envy":
+        delta = checkpoint.get("delta")
+        semantic = delta.get("semantic_contract") if isinstance(delta, Mapping) else None
+        regressions = semantic.get("regressions") if isinstance(semantic, Mapping) else None
+        if isinstance(regressions, list) and any(
+            str(item).startswith("same_owner_receiver_finding_relocated:")
+            for item in regressions
+        ):
+            return (
+                "move the relocated receiver-heavy helper out of the original source class; "
+                "use a receiver-owned operation when that boundary can execute it, otherwise "
+                "use an independent workflow that preserves the existing receiver API and mock "
+                "interactions; do not retain a same-class fallback"
+            )
         receiver = str(current.get("expected_receiver_type") or "").strip()
         count = _integer(current.get("expected_receiver_access"))
         if receiver and count is not None and count > 0:
@@ -313,6 +323,96 @@ def _semantic_contract_delta(
     shedding an unwanted inherited capability is the purpose of this smell.
     No project, class, method, or sample name is encoded in this policy.
     """
+    if smell == "feature_envy":
+        if current.get("finding_present") is True:
+            return {"applicable": False, "regressions": []}
+        baseline_profile = baseline.get("detector_profile")
+        current_profile = current.get("detector_profile")
+        relocation_contract_enabled = bool(
+            isinstance(baseline_profile, Mapping)
+            and isinstance(current_profile, Mapping)
+            and baseline_profile.get("language") == "java"
+            and current_profile.get("language") == "java"
+            and baseline_profile.get("reject_same_owner_receiver_relocation") is True
+            and current_profile.get("reject_same_owner_receiver_relocation") is True
+        )
+        if not relocation_contract_enabled:
+            return {"applicable": False, "regressions": []}
+        before_ok = baseline.get("owner_receiver_analysis_ok") is True
+        after_ok = current.get("owner_receiver_analysis_ok") is True
+        before = _feature_envy_owner_receiver_entries(baseline.get("owner_receiver_findings"))
+        after = _feature_envy_owner_receiver_entries(current.get("owner_receiver_findings"))
+        if not before_ok or not after_ok:
+            return {
+                "applicable": True,
+                "regressions": ["same_owner_receiver_analysis_unavailable"],
+            }
+        additions = [after[key] for key in sorted(set(after).difference(before))]
+        return {
+            "applicable": True,
+            "new_same_owner_receiver_findings": additions,
+            "regressions": [
+                "same_owner_receiver_finding_relocated:"
+                f"{item.get('file', '')}#{item.get('method', '')}"
+                for item in additions
+            ],
+        }
+    if smell == "data_clumps":
+        if current.get("finding_present") is True:
+            return {"applicable": False, "regressions": []}
+        continuity_ok = current.get("legacy_type_continuity_ok") is True
+        count = _integer(current.get("legacy_type_occurrence_count"))
+        passing_max = _integer(current.get("passing_max"))
+        occurrences = current.get("legacy_type_occurrences")
+        inline_copy_ok = current.get("inline_copy_analysis_ok") is True
+        inline_copy_expansions = current.get("inline_copy_expansions")
+        if not continuity_ok or count is None or passing_max is None:
+            return {
+                "applicable": True,
+                "regressions": ["legacy_type_signature_continuity_unavailable"],
+            }
+        surviving: list[str] = []
+        if isinstance(occurrences, list):
+            for item in occurrences[:8]:
+                if not isinstance(item, Mapping):
+                    continue
+                file_name = str(item.get("file") or "")
+                method = str(item.get("method") or "")
+                surviving.append(f"{file_name}#{method}".rstrip("#"))
+        regressions = (
+            [f"legacy_type_signature_group_remains:{item}" for item in surviving]
+            if count > passing_max
+            else []
+        )
+        if count > passing_max and not regressions:
+            regressions = [f"legacy_type_signature_group_remains:{count}"]
+        if not inline_copy_ok:
+            regressions.append("inline_copy_analysis_unavailable")
+        expanded_windows: list[dict[str, Any]] = []
+        if isinstance(inline_copy_expansions, list):
+            for item in inline_copy_expansions[:8]:
+                if not isinstance(item, Mapping):
+                    continue
+                expanded_windows.append(dict(item))
+                source_file = str(item.get("source_file") or "")
+                source_method = str(item.get("source_method") or "")
+                before_count = _integer(item.get("baseline_occurrences")) or 0
+                after_count = _integer(item.get("current_occurrences")) or 0
+                regressions.append(
+                    "inlined_body_window_expanded:"
+                    f"{source_file}#{source_method}:{before_count}->{after_count}"
+                )
+        return {
+            "applicable": True,
+            "legacy_type_occurrence_count": count,
+            "passing_max": passing_max,
+            "surviving_signatures": surviving,
+            "inline_copy_contract_available": bool(
+                current.get("inline_copy_contract_available")
+            ),
+            "expanded_body_windows": expanded_windows,
+            "regressions": regressions,
+        }
     if smell != "refused_bequest":
         return {"applicable": False, "regressions": []}
     before = baseline.get("contract_snapshot")
@@ -391,6 +491,29 @@ def _api_entries(value: Any) -> dict[str, Mapping[str, Any]]:
             continue
         key = str(item.get("api_key") or "").strip()
         if key:
+            entries[key] = item
+    return entries
+
+
+def _feature_envy_owner_receiver_entries(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, list):
+        return {}
+    entries: dict[str, dict[str, Any]] = {}
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        item = {
+            "file": str(raw.get("file") or ""),
+            "class": str(raw.get("class") or ""),
+            "method": str(raw.get("method") or ""),
+            "envied_field": str(raw.get("envied_field") or ""),
+            "envied_type": str(raw.get("envied_type") or ""),
+        }
+        key = "#".join(
+            item[name]
+            for name in ("file", "class", "method", "envied_field", "envied_type")
+        )
+        if key.strip("#"):
             entries[key] = item
     return entries
 

@@ -18,10 +18,24 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 from smell_core.java.smell_guards import _find_clone_target_method
 from smell_core.java.syntactic_detector import load_java_source_model
 
-DATA_BEFORE = """\
-class A { void target(boolean confReq, int maxTokSize, int qop) {} }
-class B { void other(boolean confReq, int maxTokSize, int qop) {} }
-class C { void third(boolean confReq, int maxTokSize, int qop) {} }
+DATA_INLINE_BODY = """\
+    int total = maxTokSize;
+    for (int index = 0; index < qop; index++) {
+      total += index;
+    }
+    if (confReq) {
+      total++;
+    } else {
+      total--;
+    }
+    System.out.println(total);
+"""
+DATA_BEFORE = f"""\
+class A {{ void target(boolean confReq, int maxTokSize, int qop) {{
+{DATA_INLINE_BODY}
+}} }}
+class B {{ void other(boolean confReq, int maxTokSize, int qop) {{}} }}
+class C {{ void third(boolean confReq, int maxTokSize, int qop) {{}} }}
 """
 DATA_AFTER = """\
 class A { void target(boolean confReq, int maxTokSize, int qop) {} }
@@ -50,6 +64,66 @@ final class RequestOptions {
 class A { void target(RequestOptions options) {} }
 class B { void other(boolean confReq, int maxTokSize, int qop) {} }
 class C { void third(boolean confReq, int maxTokSize, int qop) {} }
+"""
+DATA_RENAMED_WRAPPERS_AFTER = """\
+final class RequestOptions {
+  private final boolean confReq;
+  private final int maxTokSize;
+  private final int qop;
+  RequestOptions(boolean confReq, int maxTokSize, int qop) {
+    this.confReq = confReq;
+    this.maxTokSize = maxTokSize;
+    this.qop = qop;
+  }
+}
+class A { void target(boolean p0, int p1, int p2) { target(new RequestOptions(p0, p1, p2)); } void target(RequestOptions options) {} }
+class B { void other(boolean p0, int p1, int p2) { other(new RequestOptions(p0, p1, p2)); } void other(RequestOptions options) {} }
+class C { void third(boolean p0, int p1, int p2) { third(new RequestOptions(p0, p1, p2)); } void third(RequestOptions options) {} }
+"""
+DATA_INLINE_DUPLICATION_AFTER = f"""\
+final class RequestOptions {{
+  final boolean confReq;
+  final int maxTokSize;
+  final int qop;
+  RequestOptions(boolean confReq, int maxTokSize, int qop) {{
+    this.confReq = confReq;
+    this.maxTokSize = maxTokSize;
+    this.qop = qop;
+  }}
+}}
+class A {{ void target(RequestOptions options) {{
+    boolean confReq = options.confReq;
+    int maxTokSize = options.maxTokSize;
+    int qop = options.qop;
+{DATA_INLINE_BODY}
+}} }}
+class B {{ void other(RequestOptions options) {{
+    boolean confReq = options.confReq;
+    int maxTokSize = options.maxTokSize;
+    int qop = options.qop;
+{DATA_INLINE_BODY}
+}} }}
+class C {{ void third(RequestOptions options) {{}} }}
+"""
+DATA_SPARE_TYPES_BEFORE = """\
+class A { void target(String driver, String url, String user, String password, boolean emitUpdates, boolean force) {} }
+class B { void other(String driver, String url, String user, String password, boolean emitUpdates, boolean force) {} }
+class C { void third(String driver, String url, String user, String password, boolean emitUpdates, boolean force) {} }
+"""
+DATA_SPARE_TYPES_AFTER = """\
+final class RemoteOptions {
+  final String url;
+  final String password;
+  final boolean force;
+  RemoteOptions(String url, String password, boolean force) {
+    this.url = url;
+    this.password = password;
+    this.force = force;
+  }
+}
+class A { void target(String driver, RemoteOptions options, String user, boolean emitUpdates) {} }
+class B { void other(String driver, RemoteOptions options, String user, boolean emitUpdates) {} }
+class C { void third(String driver, RemoteOptions options, String user, boolean emitUpdates) {} }
 """
 CLONE_BODY = "int total = 0; for (int i = 0; i < 20; i++) { total += i; } if (total > 10) { total--; } consume(total);"
 CLONE_BEFORE = f"class Fixture {{\n  void left() {{ {CLONE_BODY} }}\n  void right() {{ {CLONE_BODY} }}\n  void consume(int value) {{}}\n}}\n"
@@ -347,12 +421,25 @@ def _run(args: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Complete
     return subprocess.run(args, cwd=str(cwd), env=env, text=True, capture_output=True, check=False)
 
 
-def _bridge(project: Path, env: dict[str, str], command: str, smell: str, location: str, evidence: str) -> dict:
+def _bridge(
+    project: Path,
+    env: dict[str, str],
+    command: str,
+    smell: str,
+    location: str,
+    evidence: str,
+    target_context: dict[str, str] | None = None,
+) -> dict:
     args = [
         sys.executable, str(BRIDGE), command,
         "--project-root", str(project), "--language", "java",
         "--smell", smell, "--location", location, "--smell-evidence", evidence,
     ]
+    if target_context:
+        args.extend([
+            "--target-context-json",
+            json.dumps(target_context, separators=(",", ":"), sort_keys=True),
+        ])
     if command == "verify":
         args.extend(["--verification-mode", "local", "--skip-build-test"])
     result = _run(args, ROOT, env)
@@ -369,6 +456,7 @@ def _case(
     evidence: str,
     objective: str,
     rejected_intermediates: tuple[str, ...] = (),
+    target_context: dict[str, str] | None = None,
 ) -> tuple[float, float]:
     with tempfile.TemporaryDirectory(prefix=f"checkpoint-{smell}-") as temp_dir:
         project = Path(temp_dir)
@@ -385,21 +473,44 @@ def _case(
         ], project, env)
         if result.returncode:
             raise AssertionError(result.stderr)
-        baseline = _bridge(project, env, "capture-baseline", smell, location, evidence)
+        baseline = _bridge(
+            project, env, "capture-baseline", smell, location, evidence, target_context
+        )
         before_value = float(baseline["metrics"]["objectives"][objective])
-        unchanged = _bridge(project, env, "verify", smell, location, evidence)
+        unchanged = _bridge(
+            project, env, "verify", smell, location, evidence, target_context
+        )
         assert unchanged["smell_guard"]["results"][0]["details"]["reason"] == "EDIT_REQUIRED", unchanged
         for rejected in rejected_intermediates:
             source.write_text(rejected, encoding="utf-8")
-            invalid = _bridge(project, env, "verify", smell, location, evidence)
+            invalid = _bridge(
+                project, env, "verify", smell, location, evidence, target_context
+            )
             assert invalid.get("status") in {"SMELL_GUARD_FAILED", "IMPROVED"}, invalid
             assert invalid.get("success") is False, invalid
             assert invalid.get("accepted") is False, invalid
             if invalid.get("status") == "IMPROVED":
                 assert invalid.get("progress") is True, invalid
                 assert invalid.get("resolution") == "improved", invalid
+            if smell == "data_clumps" and rejected == DATA_RENAMED_WRAPPERS_AFTER:
+                semantic = invalid["checkpoint"]["delta"]["semantic_contract"]
+                assert semantic["legacy_type_occurrence_count"] == 3, semantic
+                assert len(semantic["surviving_signatures"]) == 3, semantic
+                assert all(
+                    str(item).startswith("legacy_type_signature_group_remains:")
+                    for item in semantic["regressions"]
+                ), semantic
+            if smell == "data_clumps" and rejected == DATA_INLINE_DUPLICATION_AFTER:
+                semantic = invalid["checkpoint"]["delta"]["semantic_contract"]
+                assert semantic["expanded_body_windows"], semantic
+                assert any(
+                    str(item).startswith("inlined_body_window_expanded:")
+                    for item in semantic["regressions"]
+                ), semantic
         source.write_text(after, encoding="utf-8")
-        repaired = _bridge(project, env, "verify", smell, location, evidence)
+        repaired = _bridge(
+            project, env, "verify", smell, location, evidence, target_context
+        )
         if repaired.get("status") != "PASS":
             raise AssertionError(f"{smell} repaired source did not pass: {repaired}")
         after_value = float(repaired["checkpoint"]["delta"]["objectives"][objective]["after"])
@@ -495,13 +606,24 @@ def main() -> int:
         "Fixture.java:method=target|line=1",
         "group=boolean:confreq|int:maxtoksize|int:qop; occurrences=3",
         "occurrence_count",
-        rejected_intermediates=(DATA_FAKE_WRAPPER_AFTER,),
+        rejected_intermediates=(
+            DATA_FAKE_WRAPPER_AFTER,
+            DATA_RENAMED_WRAPPERS_AFTER,
+            DATA_INLINE_DUPLICATION_AFTER,
+        ),
     )
     data_type_change = _case(
         "data_clumps", DATA_BEFORE, DATA_AFTER,
         "Fixture.java:method=target|line=1",
         "group=boolean:confreq|int:maxtoksize|int:qop; occurrences=3",
         "occurrence_count",
+    )
+    data_spare_types = _case(
+        "data_clumps", DATA_SPARE_TYPES_BEFORE, DATA_SPARE_TYPES_AFTER,
+        "Fixture.java:method=target|line=1",
+        "group=boolean:force|string:password|string:url; occurrences=3",
+        "occurrence_count",
+        target_context={"group": "boolean:force|string:password|string:url"},
     )
     clone = _case(
         "code_clone_type1", CLONE_BEFORE, CLONE_AFTER,
@@ -582,6 +704,7 @@ def main() -> int:
         "checkpoint-relational-adapters-self-check PASS unchanged_pass=0 "
         f"data_clumps={data[0]:g}->{data[1]:g} "
         f"data_clumps_type_change={data_type_change[0]:g}->{data_type_change[1]:g} "
+        f"data_clumps_spare_types={data_spare_types[0]:g}->{data_spare_types[1]:g} "
         f"code_clone_type1={clone[0]:g}->{clone[1]:g} "
         f"parent_clone={parent_clone[0]:g}->{parent_clone[1]:g} "
         f"transitive_parent_clone={transitive_parent_clone[0]:g}->{transitive_parent_clone[1]:g} "

@@ -576,6 +576,79 @@ check_true(
     and "scatter downcasts" in refused_skill,
 )
 
+feature_envy_skill = (
+    ROOT
+    / ".opencode"
+    / "skills"
+    / "java-smell-edit-patterns"
+    / "references"
+    / "edit-patterns"
+    / "feature_envy.md"
+).read_text(encoding="utf-8")
+check_true(
+    "feature_envy_skill_closes_receiver_operation",
+    "at most one semantically named receiver operation" in feature_envy_skill
+    and "field and its aliases before `smell_verify`" in feature_envy_skill,
+)
+check_true(
+    "feature_envy_skill_preserves_ordered_effects",
+    "outgoing write, callback, or notification" in feature_envy_skill
+    and "must not collapse multiple effects into one result" in feature_envy_skill,
+)
+check_true(
+    "feature_envy_skill_rejects_accessor_gaming",
+    "one trivial getter, setter, or method-reference wrapper" in feature_envy_skill
+    and "bulk snapshot" in feature_envy_skill,
+)
+check_true(
+    "feature_envy_skill_handles_mocked_receiver_boundary",
+    "extract-collaboration-workflow-preserve-receiver-api" in feature_envy_skill
+    and "Mockito-style `wanted but not invoked`" in feature_envy_skill
+    and "same-source-class fallback" in feature_envy_skill,
+)
+data_clumps_skill = (
+    ROOT
+    / ".opencode"
+    / "skills"
+    / "java-smell-edit-patterns"
+    / "references"
+    / "edit-patterns"
+    / "data_clumps.md"
+).read_text(encoding="utf-8")
+check_true(
+    "data_clumps_skill_uses_declaration_budget",
+    "projected occurrences = N - migrated old declarations" in data_clumps_skill
+    and "call expressions are compile-repair sites" in data_clumps_skill,
+)
+check_true(
+    "data_clumps_skill_accounts_for_holder_occurrence",
+    "constructor or factory for a new holder" in data_clumps_skill
+    and "migrating at least `N - 1` old declarations" in data_clumps_skill,
+)
+check_true(
+    "data_clumps_skill_preserves_api_without_gaming",
+    "keep at most one compatibility entry" in data_clumps_skill
+    and "do not disguise the group with `Object...`" in data_clumps_skill,
+)
+check_true(
+    "data_clumps_skill_rejects_parameter_rename_bypass",
+    "freezes the baseline declaration owners and the original group's" in data_clumps_skill
+    and "parameter slots and types" in data_clumps_skill
+    and "legacy_type_signature_group_remains" in data_clumps_skill,
+)
+check_true(
+    "data_clumps_skill_rejects_inline_copy_bypass",
+    "inlined_body_window_expanded" in data_clumps_skill
+    and "restore one shared implementation" in data_clumps_skill,
+)
+check_true(
+    "data_clumps_skill_separates_semantic_components",
+    "semantic connected component" in data_clumps_skill
+    and "Matching parameter" in data_clumps_skill
+    and "names/types alone is not an edge" in data_clumps_skill
+    and "cross-domain bag" in data_clumps_skill,
+)
+
 idea_agent = (
     ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md"
 ).read_text(encoding="utf-8")

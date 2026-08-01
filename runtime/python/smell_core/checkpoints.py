@@ -104,6 +104,11 @@ def _finding_contract(smell: str, metrics: dict[str, Any], target_context: Any) 
         contract["baseline_finding_catalog"] = json.loads(
             json.dumps(finding_catalog, sort_keys=True, ensure_ascii=True)
         )
+    occurrence_contract = metrics.get("occurrence_contract")
+    if isinstance(occurrence_contract, list):
+        contract["baseline_occurrence_contract"] = json.loads(
+            json.dumps(occurrence_contract, sort_keys=True, ensure_ascii=True)
+        )
     return contract
 
 

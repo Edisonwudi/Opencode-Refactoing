@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -34,6 +35,7 @@ from .detector_utils import (
     parse_group_from_evidence as _parse_group_from_evidence,
     parse_parent_from_evidence as _parse_parent_from_evidence,
 )
+from .syntactic_detector import tokenize_clone
 
 
 DEFAULT_THRESHOLDS = {
@@ -71,6 +73,9 @@ DEFAULT_EXCLUDE_PATHS = [
     "dist",
     "node_modules",
 ]
+
+DATA_CLUMP_INLINE_WINDOW_TOKENS = 24
+DATA_CLUMP_INLINE_WINDOWS_PER_METHOD = 4
 
 DATA_CLUMP_COORD_STEMS = {
     "x",
@@ -357,6 +362,360 @@ def run_java_semantic_detector(
         return SemanticDetectionResult(ok=True, findings=findings)
     except Exception as exc:
         return _failed(f"Python semantic detector failed: {exc}")
+
+
+def analyze_data_clump_type_continuity(
+    project_root: Path,
+    *,
+    group: str,
+    baseline_occurrences: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Track baseline declarations and business-body dispersion.
+
+    The product finding uses normalized ``type:name`` groups.  A repair must not
+    make that finding disappear by renaming the parameters on the same baseline
+    declarations or by copying their business bodies into callers.  This profile
+    reuses the semantic project model and frozen product-detector occurrences; it
+    does not discover a second dataset-defined finding.
+    """
+    try:
+        model = _build_project_model(project_root, include_tests=False)
+        normalized_group = _normalize_group(group)
+        group_types = Counter(
+            token.rsplit(":", 1)[0]
+            for token in normalized_group.split("|")
+            if ":" in token
+        )
+        if not group_types:
+            return {
+                "ok": False,
+                "error": "data_clump_type_group_unavailable",
+                "occurrence_count": 0,
+                "occurrences": [],
+            }
+
+        contract_occurrences = [
+            dict(item) for item in baseline_occurrences if isinstance(item, Mapping)
+        ]
+        if not all(
+            isinstance(item.get("group_parameter_positions"), list)
+            for item in contract_occurrences
+        ):
+            position_error = _freeze_data_clump_parameter_positions(
+                contract_occurrences,
+                model=model,
+                normalized_group=normalized_group,
+            )
+            if position_error:
+                return {
+                    "ok": False,
+                    "error": position_error,
+                    "occurrence_count": 0,
+                    "occurrences": [],
+                    "occurrence_contract": contract_occurrences,
+                    "inline_copy_contract_available": False,
+                    "inline_copy_expansions": [],
+                }
+        methods_by_owner: Dict[Tuple[str, str, str], List[MethodRecord]] = {}
+        for method in model.methods:
+            key = (
+                _normalize_path(method.file),
+                str(method.class_name or "").lower(),
+                _normalize_method(method.method_name),
+            )
+            methods_by_owner.setdefault(key, []).append(method)
+        survivors: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+        for occurrence in contract_occurrences:
+            owner_key = (
+                _normalize_path(str(occurrence.get("file") or "")),
+                str(occurrence.get("class") or occurrence.get("class_name") or "").lower(),
+                _normalize_method(str(occurrence.get("method_name") or occurrence.get("method") or "")),
+            )
+            positions = occurrence.get("group_parameter_positions")
+            if not isinstance(positions, list) or not positions:
+                continue
+            for method in methods_by_owner.get(owner_key, []):
+                if not _method_retains_data_clump_positions(method, positions):
+                    continue
+                identity = (method.file, method.class_name, method.method_signature)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                survivors.append({
+                    "file": method.file,
+                    "class": method.class_name,
+                    "method_name": method.method_name,
+                    "method": method.method_signature,
+                    "begin_line": method.begin_line,
+                })
+        survivors.sort(key=lambda item: (
+            str(item.get("file") or ""),
+            int(item.get("begin_line") or 0),
+            str(item.get("method") or ""),
+        ))
+        method_streams = _data_clump_method_token_streams(model)
+        if not any(
+            isinstance(item.get("unique_body_windows"), list)
+            for item in contract_occurrences
+        ):
+            _freeze_data_clump_body_windows(
+                contract_occurrences,
+                method_streams=method_streams,
+                group_types=group_types,
+            )
+        inline_expansions = _expanded_data_clump_body_windows(
+            contract_occurrences,
+            method_streams=method_streams,
+        )
+        return {
+            "ok": True,
+            "group_types": dict(sorted(group_types.items())),
+            "occurrence_count": len(survivors),
+            "occurrences": survivors,
+            "occurrence_contract": contract_occurrences,
+            "inline_copy_contract_available": any(
+                bool(item.get("unique_body_windows"))
+                for item in contract_occurrences
+            ),
+            "inline_copy_expansions": inline_expansions,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"data_clump_type_continuity_failed: {exc}",
+            "occurrence_count": 0,
+            "occurrences": [],
+            "occurrence_contract": [],
+            "inline_copy_contract_available": False,
+            "inline_copy_expansions": [],
+        }
+
+
+def _freeze_data_clump_parameter_positions(
+    contract_occurrences: List[Dict[str, Any]],
+    *,
+    model: ProjectModel,
+    normalized_group: str,
+) -> str:
+    """Pin the detector group's baseline parameter slots on each declaration."""
+    methods_by_identity = {
+        (
+            _normalize_path(method.file),
+            str(method.class_name or "").lower(),
+            str(method.method_signature or "").strip().lower(),
+        ): method
+        for method in model.methods
+    }
+    group_members = [item for item in normalized_group.split("|") if item]
+    if not group_members:
+        return "data_clump_group_members_unavailable"
+    for occurrence in contract_occurrences:
+        identity = (
+            _normalize_path(str(occurrence.get("file") or "")),
+            str(occurrence.get("class") or occurrence.get("class_name") or "").lower(),
+            str(occurrence.get("method") or "").strip().lower(),
+        )
+        method = methods_by_identity.get(identity)
+        if method is None:
+            return (
+                "data_clump_baseline_declaration_unavailable:"
+                f"{occurrence.get('file', '')}#{occurrence.get('method', '')}"
+            )
+        descriptors = [_normalize_group(item) for item in method.parameter_descriptors]
+        unused = set(range(len(descriptors)))
+        positions: List[Dict[str, Any]] = []
+        for member in group_members:
+            index = next(
+                (candidate for candidate in sorted(unused) if descriptors[candidate] == member),
+                None,
+            )
+            if index is None:
+                return (
+                    "data_clump_baseline_group_position_unavailable:"
+                    f"{method.file}#{method.method_signature}:{member}"
+                )
+            unused.remove(index)
+            type_name = member.rsplit(":", 1)[0]
+            positions.append({
+                "index": index,
+                "type": type_name,
+                "descriptor": member,
+            })
+        occurrence["baseline_parameter_count"] = len(method.parameter_types)
+        occurrence["group_parameter_positions"] = sorted(
+            positions,
+            key=lambda item: int(item["index"]),
+        )
+    return ""
+
+
+def _method_retains_data_clump_positions(
+    method: MethodRecord,
+    positions: Sequence[Mapping[str, Any]],
+) -> bool:
+    for item in positions:
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            return False
+        if index < 0 or index >= len(method.parameter_types):
+            return False
+        current_type = _normalize_group(
+            f"{method.parameter_types[index]}:value"
+        ).rsplit(":", 1)[0]
+        if current_type != str(item.get("type") or ""):
+            return False
+    return True
+
+
+def _data_clump_method_token_streams(
+    model: ProjectModel,
+) -> List[Tuple[MethodRecord, List[str], str]]:
+    streams: List[Tuple[MethodRecord, List[str], str]] = []
+    separator = "\x1f"
+    for method in model.methods:
+        tokens = tokenize_clone(method.body_text)
+        if len(tokens) < DATA_CLUMP_INLINE_WINDOW_TOKENS:
+            continue
+        encoded = separator + separator.join(tokens) + separator
+        streams.append((method, tokens, encoded))
+    return streams
+
+
+def _freeze_data_clump_body_windows(
+    contract_occurrences: List[Dict[str, Any]],
+    *,
+    method_streams: Sequence[Tuple[MethodRecord, List[str], str]],
+    group_types: Counter[str],
+) -> None:
+    """Freeze source-unique windows from detector-owned baseline methods.
+
+    A unique window may move once during a legitimate refactoring.  It becomes
+    a regression only when the same frozen business logic is dispersed to more
+    locations than it occupied at baseline.
+    """
+    streams_by_identity = {
+        (
+            _normalize_path(method.file),
+            str(method.class_name or "").lower(),
+            str(method.method_signature or "").strip().lower(),
+        ): (method, tokens)
+        for method, tokens, _ in method_streams
+        if _method_contains_data_clump_types(method, group_types)
+    }
+    for occurrence in contract_occurrences:
+        identity = (
+            _normalize_path(str(occurrence.get("file") or "")),
+            str(occurrence.get("class") or occurrence.get("class_name") or "").lower(),
+            str(occurrence.get("method") or "").strip().lower(),
+        )
+        source = streams_by_identity.get(identity)
+        if source is None:
+            occurrence["unique_body_windows"] = []
+            continue
+        source_method, source_tokens = source
+        frozen: List[Dict[str, Any]] = []
+        for start in _sample_data_clump_window_starts(len(source_tokens)):
+            window = source_tokens[
+                start:start + DATA_CLUMP_INLINE_WINDOW_TOKENS
+            ]
+            baseline_count, _ = _count_data_clump_window(window, method_streams)
+            if baseline_count != 1:
+                continue
+            frozen.append({
+                "window_id": _java_hex_hash("\x1f".join(window)),
+                "tokens": window,
+                "baseline_occurrences": baseline_count,
+                "source_file": source_method.file,
+                "source_class": source_method.class_name,
+                "source_method": source_method.method_signature,
+            })
+            if len(frozen) >= DATA_CLUMP_INLINE_WINDOWS_PER_METHOD:
+                break
+        occurrence["unique_body_windows"] = frozen
+
+
+def _method_contains_data_clump_types(
+    method: MethodRecord,
+    group_types: Counter[str],
+) -> bool:
+    current_types = Counter(
+        _normalize_group(f"{type_name}:value").rsplit(":", 1)[0]
+        for type_name in method.parameter_types
+    )
+    return all(
+        current_types[type_name] >= count
+        for type_name, count in group_types.items()
+    )
+
+
+def _sample_data_clump_window_starts(token_count: int) -> List[int]:
+    maximum = token_count - DATA_CLUMP_INLINE_WINDOW_TOKENS
+    if maximum < 0:
+        return []
+    if maximum == 0:
+        return [0]
+    # Try more positions than we retain because common validation or delegation
+    # syntax may not be globally unique even when the business slice is.
+    slots = min(12, maximum + 1)
+    return sorted({round(index * maximum / (slots - 1)) for index in range(slots)})
+
+
+def _count_data_clump_window(
+    window: Sequence[str],
+    method_streams: Sequence[Tuple[MethodRecord, List[str], str]],
+) -> Tuple[int, List[str]]:
+    separator = "\x1f"
+    needle = separator + separator.join(window) + separator
+    total = 0
+    locations: List[str] = []
+    for method, _, encoded in method_streams:
+        count = encoded.count(needle)
+        if count <= 0:
+            continue
+        total += count
+        label = f"{method.file}#{method.method_signature}"
+        locations.extend([label] * min(count, 3))
+    return total, locations[:8]
+
+
+def _expanded_data_clump_body_windows(
+    contract_occurrences: Sequence[Mapping[str, Any]],
+    *,
+    method_streams: Sequence[Tuple[MethodRecord, List[str], str]],
+) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for occurrence in contract_occurrences:
+        windows = occurrence.get("unique_body_windows")
+        if not isinstance(windows, list):
+            continue
+        for item in windows:
+            if not isinstance(item, Mapping):
+                continue
+            tokens = item.get("tokens")
+            if not isinstance(tokens, list) or not all(
+                isinstance(token, str) for token in tokens
+            ):
+                continue
+            window_id = str(item.get("window_id") or "")
+            if not window_id or window_id in seen:
+                continue
+            seen.add(window_id)
+            baseline_count = int(item.get("baseline_occurrences") or 0)
+            current_count, locations = _count_data_clump_window(tokens, method_streams)
+            if current_count <= baseline_count:
+                continue
+            expanded.append({
+                "window_id": window_id,
+                "source_file": str(item.get("source_file") or occurrence.get("file") or ""),
+                "source_method": str(item.get("source_method") or occurrence.get("method") or ""),
+                "baseline_occurrences": baseline_count,
+                "current_occurrences": current_count,
+                "current_locations": locations,
+            })
+    return expanded[:20]
 
 
 def analyze_feature_envy_target(

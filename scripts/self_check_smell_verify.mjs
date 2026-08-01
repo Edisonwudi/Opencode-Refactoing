@@ -1370,6 +1370,121 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && routeLockedPrompt.includes("uniquely match a real product-detector finding"),
     "dataset route metadata entered the command contract",
   )
+  assertCond(
+    "checkpoint_target_identity_prompt_hook",
+    typeof hooks?.checkpointTargetIdentityPrompt === "function",
+    "missing checkpointTargetIdentityPrompt",
+  )
+  const featureTargetIdentityPrompt = hooks.checkpointTargetIdentityPrompt("feature_envy", {
+    metrics: {
+      method: "render()",
+      envied_field: "document",
+      envied_type: "example.Document",
+      objectives: { envy_access_count: 9, envy_access_diff: 7 },
+    },
+  })
+  assertCond(
+    "checkpoint_target_identity_exact_receiver",
+    featureTargetIdentityPrompt.includes("field=document")
+      && featureTargetIdentityPrompt.includes("type=example.Document")
+      && featureTargetIdentityPrompt.includes("receiver-operation closure"),
+    "feature-envy detector identity missing from prompt",
+  )
+  assertCond(
+    "checkpoint_target_identity_has_no_metric_coaching",
+    !featureTargetIdentityPrompt.includes("envy_access_count")
+      && !featureTargetIdentityPrompt.includes("envy_access_diff")
+      && !featureTargetIdentityPrompt.includes("threshold")
+      && !featureTargetIdentityPrompt.includes("PASS target"),
+    "feature-envy identity prompt leaked metric coaching",
+  )
+  assertEqual(
+    "checkpoint_target_identity_other_smell_ignored",
+    hooks.checkpointTargetIdentityPrompt("data_clumps", { metrics: { group: "int:x|string:y|boolean:z" } }),
+    "",
+    "data-clumps prompt",
+  )
+  assertCond("test_source_path_hook", typeof hooks?.isTestSourcePath === "function", "missing isTestSourcePath")
+  assertCond("test_source_path_maven", hooks.isTestSourcePath("module/src/test/java/example/FooTest.java"), "Maven test path was not protected")
+  assertCond("test_source_path_gradle", hooks.isTestSourcePath("module/src/tests/java/example/FooTest.java"), "Gradle test path was not protected")
+  assertCond("test_source_path_top_level", hooks.isTestSourcePath("tests/example_test.py"), "top-level test path was not protected")
+  assertCond("test_source_path_production", !hooks.isTestSourcePath("src/main/java/example/Contest.java"), "production path was misclassified as test source")
+  assertCond("source_edit_paths_hook", typeof hooks?.sourceEditPaths === "function", "missing sourceEditPaths")
+  const directTestEdits = hooks.sourceEditPaths("edit", {
+    filePath: "/repo/src/test/java/example/FooTest.java",
+    oldString: "old",
+    newString: "new",
+  })
+  assertEqual("source_edit_paths_direct", directTestEdits[0], "/repo/src/test/java/example/FooTest.java", "direct edit path")
+  const patchTestEdits = hooks.sourceEditPaths("apply_patch", {
+    patchText: [
+      "*** Begin Patch",
+      "*** Update File: /repo/src/main/java/example/Foo.java",
+      "*** Update File: /repo/src/test/java/example/FooTest.java",
+      "*** End Patch",
+    ].join("\n"),
+  })
+  assertCond(
+    "source_edit_paths_patch",
+    patchTestEdits.includes("/repo/src/main/java/example/Foo.java")
+      && patchTestEdits.includes("/repo/src/test/java/example/FooTest.java"),
+    "apply_patch paths were not extracted",
+  )
+  assertEqual("source_edit_paths_read_ignored", hooks.sourceEditPaths("read", { filePath: "/repo/src/test/Foo.java" }).length, 0, "read path count")
+  assertCond(
+    "immutable_test_source_gate_hook",
+    typeof hooks?.applyImmutableTestSourceGate === "function",
+    "missing applyImmutableTestSourceGate",
+  )
+  const testModifiedVerify = {
+    output: JSON.stringify({
+      success: true,
+      accepted: true,
+      progress: true,
+      status: "PASS",
+      resolution: "resolved",
+      snapshot: {
+        changed_files: [
+          "src/main/java/example/Foo.java",
+          "src/test/java/example/FooTest.java",
+        ],
+      },
+    }),
+    metadata: {},
+  }
+  const blockedTestPaths = hooks.applyImmutableTestSourceGate(testModifiedVerify)
+  const testModifiedPayload = JSON.parse(testModifiedVerify.output)
+  assertEqual("immutable_test_source_gate_count", blockedTestPaths.length, 1, "blocked path count")
+  assertEqual("immutable_test_source_gate_status", testModifiedPayload.status, "SAMPLE_TEST_FAILED", "status")
+  assertEqual("immutable_test_source_gate_resolution", testModifiedPayload.resolution, "unresolved", "resolution")
+  assertEqual("immutable_test_source_gate_accepted", testModifiedPayload.accepted, false, "accepted")
+  assertEqual(
+    "immutable_test_source_gate_reason",
+    testModifiedPayload.build_test_guard.details.reason,
+    "TEST_SOURCE_MODIFIED",
+    "reason",
+  )
+  const productionOnlyVerify = {
+    output: JSON.stringify({
+      success: true,
+      accepted: true,
+      status: "PASS",
+      snapshot: { changed_files: ["src/main/java/example/Foo.java"] },
+    }),
+    metadata: {},
+  }
+  assertEqual(
+    "immutable_test_source_gate_production_only",
+    hooks.applyImmutableTestSourceGate(productionOnlyVerify).length,
+    0,
+    "blocked path count",
+  )
+  assertEqual(
+    "immutable_test_source_gate_preserves_pass",
+    JSON.parse(productionOnlyVerify.output).status,
+    "PASS",
+    "status",
+  )
   const restoredAfterRestart = hooks.restoreCommandLoopState(
     JSON.stringify(hooks.commandLoopStateSnapshot(state)),
   )

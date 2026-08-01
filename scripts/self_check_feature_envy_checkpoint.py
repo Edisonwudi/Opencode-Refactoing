@@ -52,6 +52,27 @@ class Subject {
 }
 """
 
+RELOCATED_SOURCE = """\
+class Collaborator {
+  void a() {}
+  void b() {}
+  void c() {}
+  void d() {}
+}
+class Subject {
+  static final Collaborator RECEIVER = new Collaborator();
+  void target() {
+    relocatedWork();
+  }
+  void relocatedWork() {
+    RECEIVER.a();
+    RECEIVER.b();
+    RECEIVER.c();
+    RECEIVER.d();
+  }
+}
+"""
+
 RESOLVED_SOURCE = """\
 class Collaborator {
   void a() {}
@@ -177,6 +198,20 @@ def main() -> int:
         if "Fixture.java" not in patch_text or ".smell-artifacts" in patch_text:
             raise AssertionError(f"production-only patch has the wrong scope: {patch_text[:500]}")
 
+        source.write_text(RELOCATED_SOURCE, encoding="utf-8")
+        relocated = _bridge(project, env, "verify")
+        if relocated.get("status") != "SMELL_GUARD_FAILED":
+            raise AssertionError(f"same-owner Feature Envy relocation unexpectedly passed: {relocated}")
+        relocated_delta = relocated["checkpoint"]["delta"]
+        if relocated_delta.get("reason") != "SEMANTIC_CONTRACT_REGRESSION":
+            raise AssertionError(f"relocation used the wrong checkpoint reason: {relocated_delta}")
+        regressions = relocated_delta.get("semantic_contract", {}).get("regressions", [])
+        if not any(
+            str(item).startswith("same_owner_receiver_finding_relocated:")
+            for item in regressions
+        ):
+            raise AssertionError(f"relocated finding was not identified: {relocated_delta}")
+
         source.write_text(RESOLVED_SOURCE, encoding="utf-8")
         resolved = _bridge(project, env, "verify")
         if (
@@ -192,7 +227,8 @@ def main() -> int:
         print(
             "feature-envy-checkpoint-self-check PASS "
             "baseline=4 strict_hit=true unchanged=EDIT_REQUIRED "
-            "refactored=4->3 status=IMPROVED resolved=PASS unchecked_restorable=false"
+            "refactored=4->3 status=IMPROVED relocated=REJECTED "
+            "resolved=PASS unchecked_restorable=false"
         )
     return 0
 

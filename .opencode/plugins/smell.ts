@@ -110,6 +110,7 @@ const checkpointObjectiveHints: Record<string, string> = {
   mysterious_name: "Remove the exact labeled suspicious identifier by giving it a meaningful name and updating its usages; unrelated renames do not count.",
   dead_code: "Remove the exact labeled dead declaration safely; editing unrelated declarations does not count.",
 }
+const SOURCE_EDIT_TOOLS = new Set(["edit", "write", "patch", "apply_patch", "multiedit", "multi_edit", "idea_edit"])
 
 function addOptional(args: string[], flag: string, value?: string) {
   if (value && value.trim()) {
@@ -865,6 +866,98 @@ function recordValue(value: unknown): Record<string, unknown> | null {
 
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
+}
+
+function isTestSourcePath(value: unknown): boolean {
+  if (typeof value !== "string" || !value.trim()) return false
+  const normalized = value.replaceAll("\\", "/").toLowerCase()
+  return /(^|\/)src\/tests?(\/|$)/.test(normalized)
+    || /(^|\/)(tests?|__tests__)(\/|$)/.test(normalized)
+}
+
+function sourceEditPaths(toolName: string, args: unknown): string[] {
+  if (!SOURCE_EDIT_TOOLS.has(toolName)) return []
+  const payload = recordValue(args)
+  if (!payload) return []
+  const paths = new Set<string>()
+  for (const key of ["filePath", "file", "path"]) {
+    const value = payload[key]
+    if (typeof value === "string" && value.trim()) paths.add(value.trim())
+  }
+  for (const edit of arrayValue(payload.edits)) {
+    const entry = recordValue(edit)
+    if (!entry) continue
+    for (const key of ["filePath", "file", "path"]) {
+      const value = entry[key]
+      if (typeof value === "string" && value.trim()) paths.add(value.trim())
+    }
+  }
+  for (const key of ["patchText", "patch"]) {
+    const value = payload[key]
+    if (typeof value !== "string") continue
+    for (const line of value.split(/\r?\n/)) {
+      const applyPatchPath = line.match(/^\*\*\* (?:Update|Add|Delete) File:\s+(.+?)\s*$/)?.[1]
+      if (applyPatchPath) paths.add(applyPatchPath)
+      const gitPatchPath = line.match(/^diff --git a\/(.+?) b\/(.+?)\s*$/)?.[2]
+      if (gitPatchPath) paths.add(gitPatchPath)
+    }
+  }
+  return [...paths]
+}
+
+function applyImmutableTestSourceGate(normalized: { output: string; metadata: Record<string, unknown> }): string[] {
+  let payload: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(normalized.output)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return []
+    payload = parsed as Record<string, unknown>
+  } catch {
+    return []
+  }
+  const snapshot = recordValue(payload.snapshot)
+  const changedTestPaths = arrayValue(snapshot?.changed_files)
+    .filter((value): value is string => typeof value === "string" && isTestSourcePath(value))
+  if (changedTestPaths.length === 0) return []
+
+  const uniquePaths = [...new Set(changedTestPaths)]
+  const priorStatus = String(payload.status || "")
+  const message = `TEST_SOURCE_MODIFIED: restore immutable test source before verification: ${uniquePaths.join(", ")}`
+  payload.success = false
+  payload.accepted = false
+  payload.progress = false
+  payload.status = "SAMPLE_TEST_FAILED"
+  payload.resolution = "unresolved"
+  payload.build_test_guard = {
+    type: "build_test",
+    success: false,
+    message,
+    details: {
+      reason: "TEST_SOURCE_MODIFIED",
+      changed_test_paths: uniquePaths,
+      prior_status: priorStatus,
+    },
+  }
+  payload.failure_pack = {
+    failure_category: "SAMPLE_TEST_FAILED",
+    failure_group: "test",
+    retryable: true,
+    verify_status: "SAMPLE_TEST_FAILED",
+    highlights: [message],
+    recommendations: ["Restore every test-source change and preserve the test-visible API or production behavior."],
+    repair_contract: {
+      repair_agent_may_edit: true,
+      prefer_narrow_fix: true,
+      must_rerun_smell_verify: true,
+      do_not_weaken_tests: true,
+    },
+  }
+  normalized.output = safeJsonStringify(payload)
+  normalized.metadata.test_source_gate = {
+    blocked: true,
+    changedTestPaths: uniquePaths,
+    priorStatus,
+  }
+  return uniquePaths
 }
 
 function compactTarget(payload: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -1663,7 +1756,26 @@ function parseCommandPolicyResult(result: BridgeResult): CommandPolicy {
   return payload as unknown as CommandPolicy
 }
 
-function commandPolicyPrompt(policy: CommandPolicy): string {
+function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, unknown> | null): string {
+  if (smell !== "feature_envy") return ""
+  const metrics = recordValue(payload?.metrics)
+  if (!metrics) return ""
+  const findingIdentity = recordValue(metrics.finding_identity)
+  const enviedField = String(findingIdentity?.envied_field || metrics.envied_field || "").trim()
+  const enviedType = String(findingIdentity?.envied_type || metrics.envied_type || "").trim()
+  const method = String(findingIdentity?.method || metrics.method || "").trim()
+  if (!enviedField && !enviedType) return ""
+
+  return [
+    "",
+    "Product-detector target identity (selection only; dataset evidence is audit-only):",
+    `- Frozen target method: ${method || "the method in Target location"}.`,
+    `- Exact envied receiver: field=${enviedField || "unknown"}, type=${enviedType || "unknown"}.`,
+    "- Apply the loaded Feature Envy receiver-operation closure to this exact receiver. Do not refactor a different collaborator merely because it is convenient.",
+  ].join("\n")
+}
+
+function commandPolicyPrompt(policy: CommandPolicy, targetIdentityPrompt: string = ""): string {
   const allowed = policy.loop.allowed_failure_groups.join(", ") || "none"
   const lines = [
     policy.task,
@@ -1692,7 +1804,7 @@ function commandPolicyPrompt(policy: CommandPolicy): string {
       `- Adapter objective: ${checkpointObjectiveHints[smell]}`,
     )
   }
-  return lines.join("\n")
+  return `${lines.join("\n")}${targetIdentityPrompt}`
 }
 
 function defaultCommandPolicy(
@@ -2005,6 +2117,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const bridgeArgs = ["verify", ...commonArgs(resolved)]
         if (args.noSnapshot) bridgeArgs.push("--no-snapshot")
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
+        applyImmutableTestSourceGate(normalized)
         if (commandState) {
           applyCommandLoopDecision(normalized, commandState)
           normalized.metadata.command_loop_state = toJsonSafe(commandLoopStateSnapshot(commandState))
@@ -2218,10 +2331,19 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     },
 
     "tool.execute.before": async (input, output) => {
+      const sessionID = typeof input.sessionID === "string" ? input.sessionID : ""
+      if (sessionID && commandLoopStates.has(sessionID)) {
+        const protectedPaths = sourceEditPaths(input.tool, output.args).filter(isTestSourcePath)
+        if (protectedPaths.length > 0) {
+          throw new Error(
+            `TEST_SOURCE_EDIT_BLOCKED: tests are immutable acceptance evidence during smell refactoring: ${protectedPaths.join(", ")}. `
+            + "Preserve the test-visible API or repair production behavior instead.",
+          )
+        }
+      }
       if (input.tool !== "bash") return
       const command = String(output.args?.command ?? "")
       if (!command) return
-      const sessionID = typeof input.sessionID === "string" ? input.sessionID : ""
       if (sessionID && commandLoopStates.has(sessionID) && DIRECT_BUILD_COMMAND_RE.test(command)) {
         throw new Error(
           "Do not run Maven or Gradle directly during a smell-refactor command. "
@@ -2245,6 +2367,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       const result = await runBridge(worktree, ["resolve-command", "--arguments", input.arguments])
       const policy = parseCommandPolicyResult(result)
       const identity = commandTaskIdentity(policy.task)
+      let targetIdentityPrompt = ""
       if (identity.smell && checkpointSmells.has(identity.smell)) {
         if (!identity.projectRoot || !identity.location) {
           throw new Error("CHECKPOINT_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
@@ -2266,6 +2389,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             `CHECKPOINT_BASELINE_CAPTURE_FAILED: ${truncateText(baselineResult.stderr || baselineResult.stdout)}`,
           )
         }
+        targetIdentityPrompt = checkpointTargetIdentityPrompt(identity.smell, baselinePayload)
       }
       commandLoopStates.set(input.sessionID, newCommandLoopState(policy))
       idleRuntime.clearSession(input.sessionID)
@@ -2281,7 +2405,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         maxContinuations: policy.loop.max_continuations,
         instruction: policy.loop.instruction,
       })
-      output.parts = [{ type: "text", text: commandPolicyPrompt(policy) }] as typeof output.parts
+      output.parts = [{ type: "text", text: commandPolicyPrompt(policy, targetIdentityPrompt) }] as typeof output.parts
     },
 
     event: async ({ event }) => {
@@ -2348,6 +2472,10 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   runIdeaPreviewProtocol,
   selectionCandidates,
   parseCommandPolicyResult,
+  checkpointTargetIdentityPrompt,
+  isTestSourcePath,
+  sourceEditPaths,
+  applyImmutableTestSourceGate,
   commandPolicyPrompt,
   defaultCommandPolicy,
   newCommandLoopState,

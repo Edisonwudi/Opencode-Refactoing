@@ -104,6 +104,9 @@ def _case(
 
         baseline = _bridge(project, "capture-baseline", language, smell, location, evidence)
         assert baseline["success"] is True, baseline
+        if smell == "feature_envy" and language != "java":
+            profile = baseline["metrics"]["detector_profile"]
+            assert profile["reject_same_owner_receiver_relocation"] is False, profile
         before_value = float(baseline["metrics"]["objectives"][objective])
         assert before_value > 0, baseline
         unchanged = _bridge(project, "verify", language, smell, location, evidence)

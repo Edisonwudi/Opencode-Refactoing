@@ -33,6 +33,7 @@ from .java.data_clumps import (
     same_group_data_clump_findings,
 )
 from .java.semantic_detector import (
+    analyze_data_clump_type_continuity,
     analyze_feature_envy_target,
     build_refused_bequest_impact_map,
     run_java_semantic_detector,
@@ -88,6 +89,9 @@ DETECTOR_PROFILES = {
         "min_classes": 3,
         "min_method_names": 2,
         "exclude_parameter_object_owner_constructor": True,
+        "track_baseline_parameter_types": True,
+        "track_baseline_parameter_positions": True,
+        "track_baseline_body_dispersion": True,
     },
     "mysterious_name": {"definition": "strict_symbol_name", "profile": "strict"},
     "refused_bequest": {
@@ -120,15 +124,20 @@ def capture_metric_snapshot(config: Any, evidence: str) -> dict[str, Any]:
     snapshot.setdefault("adapter", str(config.smell))
     snapshot.setdefault("objectives", {})
     snapshot.setdefault("ok", bool(snapshot["objectives"]))
-    snapshot.setdefault(
-        "detector_profile",
-        {
-            "version": DETECTOR_PROFILE_VERSION,
-            "smell": str(config.smell),
-            "language": str(config.language),
-            **DETECTOR_PROFILES.get(str(config.smell), {}),
-        },
-    )
+    detector_profile = {
+        "version": DETECTOR_PROFILE_VERSION,
+        "smell": str(config.smell),
+        "language": str(config.language),
+        **DETECTOR_PROFILES.get(str(config.smell), {}),
+    }
+    if str(config.smell) == "feature_envy":
+        # The relocation analysis is implemented by the Java semantic detector.
+        # Marking it active for tree-sitter adapters made an unavailable Java-only
+        # proof reject otherwise valid non-Java Move Method refactorings.
+        detector_profile["reject_same_owner_receiver_relocation"] = (
+            str(config.language).lower() == "java"
+        )
+    snapshot.setdefault("detector_profile", detector_profile)
     snapshot.setdefault("candidate_count", 1 if snapshot.get("finding_present") is True else 0)
     return snapshot
 
@@ -713,6 +722,32 @@ def _feature_envy(config: Any, evidence: str) -> dict[str, Any]:
     if match is not None:
         expected_receiver = _evidence_value(match.evidence, "envied_type")
         profile["expected_receiver_type"] = expected_receiver
+    anchor_file = str(identity.get("file") or (match.file if match is not None else target.project_path))
+    anchor_class = str(
+        identity.get("class")
+        or (match.class_name if match is not None else profile.get("class_name") or "")
+    )
+    match_receiver = _evidence_value(match.evidence, "envied_type") if match is not None else ""
+    anchor_receiver = str(
+        identity.get("envied_type")
+        or expected_receiver
+        or match_receiver
+        or ""
+    )
+    owner_receiver_findings = [
+        {
+            "file": str(item.file).replace("\\", "/"),
+            "class": str(item.class_name or ""),
+            "method": str(item.method or ""),
+            "envied_field": _evidence_value(item.evidence, "envied_field"),
+            "envied_type": _evidence_value(item.evidence, "envied_type"),
+        }
+        for item in findings
+        if _same_file(item.file, anchor_file)
+        and str(item.class_name or "") == anchor_class
+        and _simple_type(_evidence_value(item.evidence, "envied_type"))
+        == _simple_type(anchor_receiver)
+    ]
     return {
         **profile,
         "adapter": "feature_envy",
@@ -724,6 +759,8 @@ def _feature_envy(config: Any, evidence: str) -> dict[str, Any]:
         },
         "finding_present": match is not None,
         "candidate_count": len(candidates),
+        "owner_receiver_analysis_ok": bool(anchor_file and anchor_class and anchor_receiver),
+        "owner_receiver_findings": owner_receiver_findings,
         "finding_identity": (
             _semantic_identity(
                 config,
@@ -783,6 +820,19 @@ def _data_clumps(config: Any, evidence: str) -> dict[str, Any]:
             group = next(iter(groups)) if len(groups) == 1 else group
         occurrence_count = len(matches)
         threshold = data_clump_occurrence_threshold()
+        baseline_occurrences = []
+        contract = getattr(config, "finding_contract", None)
+        if isinstance(contract, dict):
+            frozen = contract.get("baseline_occurrence_contract")
+            if isinstance(frozen, list):
+                baseline_occurrences = frozen
+        if not baseline_occurrences:
+            baseline_occurrences = data_clump_occurrence_payloads(matches, limit=1000)
+        type_continuity = analyze_data_clump_type_continuity(
+            config.project_root,
+            group=group,
+            baseline_occurrences=baseline_occurrences,
+        )
         return {
             "ok": True,
             "detector": "python_semantic_detector",
@@ -791,6 +841,19 @@ def _data_clumps(config: Any, evidence: str) -> dict[str, Any]:
             "passing_max": threshold - 1,
             "remaining_reductions": max(0, occurrence_count - (threshold - 1)),
             "occurrences": data_clump_occurrence_payloads(matches, limit=20),
+            "occurrence_contract": list(
+                type_continuity.get("occurrence_contract") or baseline_occurrences
+            ),
+            "legacy_type_continuity_ok": bool(type_continuity.get("ok")),
+            "legacy_type_occurrence_count": int(type_continuity.get("occurrence_count") or 0),
+            "legacy_type_occurrences": list(type_continuity.get("occurrences") or []),
+            "inline_copy_analysis_ok": bool(type_continuity.get("ok")),
+            "inline_copy_contract_available": bool(
+                type_continuity.get("inline_copy_contract_available")
+            ),
+            "inline_copy_expansions": list(
+                type_continuity.get("inline_copy_expansions") or []
+            ),
             "finding_present": occurrence_count >= threshold,
             "candidate_count": len(candidate_groups),
             "finding_identity": identity or _identity(config, target, group=group),
