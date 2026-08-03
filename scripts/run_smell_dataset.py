@@ -24,7 +24,11 @@ RUNTIME_PYTHON = ROOT / "runtime" / "python"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
+from smell_core.loop_policy import (  # noqa: E402
+    LoopPolicy,
+    parse_command_policy,
+    resolve_command_payload,
+)
 from smell_core.location import split_location_descriptors  # noqa: E402
 from smell_core.target_context import parse_target_context_json  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
@@ -714,6 +718,54 @@ def _command_arguments(task: str, args: argparse.Namespace, verification_mode: s
     # instruction as the final option, so no controller flag may follow it.
     options.append(f"--loop-instruction={args.loop_instruction}")
     return " ".join(options) + " -- " + task
+
+
+def _initial_command_loop_state(
+    sample: Sample,
+    args: argparse.Namespace,
+    verification_mode: str,
+    *,
+    started_at_ms: int | None = None,
+) -> dict[str, Any]:
+    """Freeze trusted v3 state before the first OpenCode process starts.
+
+    A verify-required reminder runs in a new OpenCode process.  The first
+    model turn may have made no ``smell_verify`` call, so there may be no tool
+    metadata from which to recover state.  Resolve it here through the same
+    Python policy/identity authority used by the command hook.
+    """
+
+    task = _task_prompt(sample, args, verification_mode)
+    payload = resolve_command_payload(
+        _command_arguments(task, args, verification_mode),
+        defaults={
+            "project_root": str(sample.project_root),
+            "project_override_root": (
+                str(sample.canonical_project_root)
+                if sample.canonical_project_root
+                else None
+            ),
+            "language": sample.language,
+            "smell": sample.smell,
+            "location": sample.location,
+            "target_context_json": (
+                json.dumps(
+                    sample.target_context,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if sample.target_context
+                else None
+            ),
+            "sample_test_location": sample.test_location,
+            "sample_test_command": sample.test_command,
+        },
+        started_at_ms=started_at_ms,
+    )
+    state = payload.get("command_loop_state")
+    if not isinstance(state, dict):
+        raise ValueError("INVALID_COMMAND_LOOP_STATE: resolver returned no initial state")
+    return state
 
 
 def _copy_verify_artifacts(sample_dir: Path, verify_payload: dict[str, Any], attempt_suffix: str = "") -> None:
@@ -1566,7 +1618,11 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     controller_attempts: list[dict[str, Any]] = []
     session_id = ""
     continuation_prompt = ""
-    command_loop_state: dict[str, Any] | None = None
+    command_loop_state: dict[str, Any] | None = _initial_command_loop_state(
+        execution_sample,
+        args,
+        verification_mode,
+    )
     continuations_dispatched = 0
     reminders_dispatched = 0
     reminder_used = False

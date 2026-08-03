@@ -59,6 +59,8 @@ function cleanSmellIdentityEnv(env) {
     "SMELL_VERIFICATION_MODE",
     "SMELL_SAMPLE_TEST_LOCATION",
     "SMELL_SAMPLE_TEST_COMMAND",
+    "SMELL_COMMAND_LOOP_STATE_JSON",
+    "SMELL_BASELINE_SEAL",
   ]) {
     delete cleaned[key]
   }
@@ -142,8 +144,21 @@ function parseLeadingJsonObject(stage, text) {
   })
 }
 
+function nearestNodeModules(start) {
+  let current = path.resolve(start)
+  while (true) {
+    const candidate = path.join(current, "node_modules")
+    if (existsSync(candidate)) return candidate
+    const parent = path.dirname(current)
+    if (parent === current) return ""
+    current = parent
+  }
+}
+
 async function readPackageVersion(packageRoot, packageName) {
-  const packageJson = path.join(packageRoot, "node_modules", packageName, "package.json")
+  const nodeModules = nearestNodeModules(packageRoot)
+  if (!nodeModules) return ""
+  const packageJson = path.join(nodeModules, packageName, "package.json")
   if (!existsSync(packageJson)) return ""
   const parsed = JSON.parse(await readFile(packageJson, "utf8"))
   return String(parsed.version || "")
@@ -357,8 +372,9 @@ async function compilePluginForSelfCheck(tempRoot) {
   const opencodePluginDir = path.join(tempRoot, ".opencode", "plugins")
   await mkdir(opencodePluginDir, { recursive: true })
   await symlink(path.join(root, "runtime"), path.join(tempRoot, "runtime"), "dir")
-  if (existsSync(path.join(root, "node_modules"))) {
-    await symlink(path.join(root, "node_modules"), path.join(tempRoot, "node_modules"), "dir")
+  const rootNodeModules = nearestNodeModules(root)
+  if (rootNodeModules) {
+    await symlink(rootNodeModules, path.join(tempRoot, "node_modules"), "dir")
   }
   const opencodeNodeModules = path.join(root, ".opencode", "node_modules")
   if (existsSync(opencodeNodeModules)) {
@@ -1202,7 +1218,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
     highlights: ["CAPABILITY_SPLIT_REQUIRED target=ReadOnlyPacket method=toBytes parent=Packet"],
     artifact_paths: {},
   })
-  assertEqual("structural_route_category_removed", removedStructuralFailure.ok, false, "ok")
+  assertEqual("structural_route_category_preserved", removedStructuralFailure.category, "STRUCTURAL_ROUTE_MISMATCH", "category")
+  assertEqual("unused_repairable_flag_removed", typeof removedStructuralFailure.ok, "undefined", "ok")
 
   function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED", nextAction = "" } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status, { next_action: nextAction }))
@@ -1368,13 +1385,19 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertCond("command_state_restore_hook", typeof hooks?.restoreCommandLoopState === "function", "missing restoreCommandLoopState")
   assertEqual(
     "java_checkpoint_identity_detected",
-    hooks.isJavaCheckpointIdentity({ language: "java", smell: "long_method", location: "Foo.java:1" }),
+    hooks.isJavaCheckpointIdentity({ checkpointRequired: true, language: "java", smell: "long_method", location: "Foo.java:1" }),
     true,
     "identity",
   )
   assertEqual(
     "non_java_identity_unchanged",
-    hooks.isJavaCheckpointIdentity({ language: "python", smell: "long_method", location: "foo.py:1" }),
+    hooks.isJavaCheckpointIdentity({ checkpointRequired: true, language: "python", smell: "long_method", location: "foo.py:1" }),
+    false,
+    "identity",
+  )
+  assertEqual(
+    "bridge_checkpoint_requirement_is_authoritative",
+    hooks.isJavaCheckpointIdentity({ checkpointRequired: false, language: "java", smell: "long_method", location: "Foo.java:1" }),
     false,
     "identity",
   )
@@ -1383,6 +1406,18 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       task: "task",
       verification_mode: "project_full",
       allow_test_changes: false,
+      checkpoint_required: true,
+      identity: {
+        project_root: "/tmp/project",
+        project_override_root: "",
+        language: "java",
+        smell: "long_method",
+        location: "Foo.java:1",
+        target_context_json: "",
+        verification_mode: "project_full",
+        sample_test_location: "",
+        sample_test_command: "",
+      },
       loop: {
         mode: "verify-failure",
         max_continuations: 2,
@@ -1398,6 +1433,24 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
+  const serializedState = hooks.commandLoopStateSnapshot(state)
+  assertCond(
+    "command_state_valid_snapshot_restores",
+    Boolean(hooks.restoreCommandLoopState(JSON.stringify(serializedState))),
+    "valid state did not restore",
+  )
+  assertEqual(
+    "command_state_invalid_cap_flag_rejected",
+    hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, cap_recovery_used: "false" })),
+    undefined,
+    "cap_recovery_used",
+  )
+  assertEqual(
+    "command_state_invalid_fingerprint_rejected",
+    hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, last_failure_fingerprint: 7 })),
+    undefined,
+    "last_failure_fingerprint",
+  )
   const failure = {
     success: false,
     status: "SMELL_GUARD_FAILED",
@@ -1712,8 +1765,8 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         throw new SelfCheckError("unowned_checkpoint", "Unowned Java checkpoint verification was not rejected.", {})
       } catch (error) {
         assertCond(
-          "unowned_java_checkpoint_fails_closed",
-          String(error?.message || error).includes("CHECKPOINT_CONTROLLER_IDENTITY_MISSING"),
+          "unowned_session_without_command_state_fails_closed",
+          String(error?.message || error).includes("COMMAND_POLICY_STATE_MISSING"),
           String(error?.message || error),
         )
       }
@@ -1802,6 +1855,17 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       const successPath = normalizeToolResult(repairedResult)
       assertEqual("command_policy_pass_decision", successPath.loop?.decision, "stop", "loop.decision")
       assertEqual("command_policy_pass_reason", successPath.loop?.termination_reason, "PASS", "termination_reason")
+      const serializedCommandState = repairedResult.metadata?.command_loop_state
+      assertCond(
+        "command_policy_state_exported",
+        Boolean(serializedCommandState && typeof serializedCommandState === "object"),
+        "command loop state was not exported for runner handoff",
+      )
+      // The interactive fixture omitted Language from its command text. A
+      // real batch controller resolves that field before first launch; model
+      // the exact controller-owned transfer state used by the runner.
+      const batchCommandState = JSON.parse(JSON.stringify(serializedCommandState))
+      batchCommandState.policy.identity.language = "java"
 
       Object.assign(process.env, {
         SMELL_PROJECT_ROOT: fixtureRoot,
@@ -1811,6 +1875,44 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         SMELL_VERIFICATION_MODE: "project_full",
       })
       delete process.env.SMELL_BASELINE_SEAL
+      delete process.env.SMELL_COMMAND_LOOP_STATE_JSON
+      const reloadedWithoutState = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      try {
+        await reloadedWithoutState.tool.smell_verify.execute(verifyArgs, {
+          sessionID: "batch-reload-no-state",
+          agent: "java-refactor-agent",
+          directory: fixtureRoot,
+        })
+        throw new SelfCheckError("batch_reload_no_state", "Batch identity without command state was accepted.", {})
+      } catch (error) {
+        assertCond(
+          "batch_reload_without_state_fails_closed",
+          String(error?.message || error).includes("COMMAND_POLICY_STATE_MISSING"),
+          String(error?.message || error),
+        )
+      }
+      process.env.SMELL_COMMAND_LOOP_STATE_JSON = JSON.stringify(batchCommandState)
+      process.env.SMELL_LOCATION = "src/main/java/OtherSample.java:1"
+      const reloadedWithWrongIdentity = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      try {
+        await reloadedWithWrongIdentity.tool.smell_verify.execute(verifyArgs, {
+          sessionID: "batch-reload-wrong-identity",
+          agent: "java-refactor-agent",
+          directory: fixtureRoot,
+        })
+        throw new SelfCheckError(
+          "batch_reload_wrong_identity",
+          "Stale command state was accepted for another target.",
+          {},
+        )
+      } catch (error) {
+        assertCond(
+          "batch_reload_identity_mismatch_fails_closed",
+          String(error?.message || error).includes("COMMAND_POLICY_STATE_IDENTITY_MISMATCH"),
+          String(error?.message || error),
+        )
+      }
+      process.env.SMELL_LOCATION = "src/main/java/SelfCheckSample.java:2"
       const reloadedWithoutSeal = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
       try {
         await reloadedWithoutSeal.tool.smell_verify.execute(verifyArgs, {
@@ -1818,7 +1920,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
           agent: "java-refactor-agent",
           directory: fixtureRoot,
         })
-        throw new SelfCheckError("batch_reload_no_seal", "Batch identity without its external seal was accepted.", {})
+        throw new SelfCheckError("batch_reload_no_seal", "Restored command state without its external seal was accepted.", {})
       } catch (error) {
         assertCond(
           "batch_reload_without_seal_fails_closed",
@@ -1843,6 +1945,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         "SMELL_SMELL",
         "SMELL_LOCATION",
         "SMELL_VERIFICATION_MODE",
+        "SMELL_COMMAND_LOOP_STATE_JSON",
         "SMELL_BASELINE_SEAL",
       ]) delete process.env[key]
       const normalizeUnit = await runPluginNormalizeSelfCheck(pluginModule)

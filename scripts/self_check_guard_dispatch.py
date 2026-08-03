@@ -96,7 +96,6 @@ def main() -> int:
         GuardRunContext(
             checkpoint_required=True,
             checkpoint_smell="long_method",
-            checkpoint_id="c000-self-check",
             checkpoint=checkpoint,
         ),
     )

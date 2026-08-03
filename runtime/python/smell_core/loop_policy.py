@@ -3,12 +3,27 @@ from __future__ import annotations
 import argparse
 import re
 import shlex
+import time
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 LOOP_MODES = {"off", "verify-failure"}
 FAILURE_GROUPS = {"smell", "compile", "test"}
+COMMAND_LOOP_STATE_VERSION = 3
+CHECKPOINT_SMELLS = frozenset({
+    "long_method",
+    "nested_complexity",
+    "long_parameter_list",
+    "feature_envy",
+    "data_clumps",
+    "code_clone_type1",
+    "god_class",
+    "refused_bequest",
+    "switch_statements",
+    "mysterious_name",
+    "dead_code",
+})
 REPAIRABLE_CATEGORY_GROUPS = {
     "SMELL_GUARD_FAILED": "smell",
     "BUILD_COMPILE_ERROR": "compile",
@@ -58,6 +73,22 @@ class ResolvedCommandPolicy:
         }
 
 
+@dataclass(frozen=True)
+class CommandTaskIdentity:
+    project_root: str
+    smell: str
+    location: str
+    verification_mode: str
+    project_override_root: str = ""
+    language: str = ""
+    target_context_json: str = ""
+    sample_test_location: str = ""
+    sample_test_command: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
 class _PolicyParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise ValueError(f"INVALID_LOOP_POLICY: {message}")
@@ -73,6 +104,173 @@ def _split_policy_and_task(arguments: str) -> tuple[str, str]:
     if not task:
         raise ValueError("INVALID_LOOP_POLICY: task text after ' -- ' must not be empty")
     return policy_text.strip(), task
+
+
+_COMMAND_TASK_FIELDS = {
+    "project root": "project_root",
+    "language": "language",
+    "smell type": "smell",
+    "target location": "location",
+    "target context": "target_context_json",
+    "verification mode": "verification_mode",
+    "sample test location": "sample_test_location",
+    "sample test command": "sample_test_command",
+}
+_COMMAND_TASK_FIELD_RE = re.compile(
+    r"(?:^\s*|;\s*)(?P<label>"
+    + "|".join(re.escape(label) for label in _COMMAND_TASK_FIELDS)
+    + r")\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _command_task_fields(task: str) -> dict[str, str]:
+    """Parse canonical command fields without interpreting free-form task text.
+
+    A field starts at the beginning of a physical line or after a semicolon.
+    This supports both the runner's multiline prompt and the README's compact
+    one-line example while leaving ordinary semicolons inside values intact.
+    """
+
+    fields: dict[str, str] = {}
+    for raw_line in str(task or "").splitlines():
+        matches = list(_COMMAND_TASK_FIELD_RE.finditer(raw_line))
+        for index, match in enumerate(matches):
+            key = _COMMAND_TASK_FIELDS[match.group("label").lower()]
+            value_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_line)
+            value = raw_line[match.end() : value_end].strip()
+            if not value:
+                raise ValueError(
+                    f"INVALID_COMMAND_TASK_IDENTITY: {match.group('label')} must not be empty"
+                )
+            if key in fields:
+                raise ValueError(
+                    f"INVALID_COMMAND_TASK_IDENTITY: duplicate {match.group('label')} field"
+                )
+            fields[key] = value
+    return fields
+
+
+def parse_command_task_identity(
+    task: str,
+    *,
+    verification_mode: str,
+    defaults: Mapping[str, str | None] | None = None,
+) -> CommandTaskIdentity:
+    """Resolve and validate the controller-owned identity for a command task."""
+
+    fields = _command_task_fields(task)
+    defaults = defaults or {}
+    batch_project_root = str(defaults.get("project_root") or "").strip()
+    batch_smell = str(defaults.get("smell") or "").strip()
+    batch_location = str(defaults.get("location") or "").strip()
+    has_batch_identity = bool(batch_project_root and batch_smell and batch_location)
+
+    if has_batch_identity:
+        # A batch controller may carry the identity outside command text. Keep
+        # that state authoritative so model-visible task text cannot retarget
+        # baseline capture or verification.
+        fields.update(
+            {
+                "project_root": batch_project_root,
+                "smell": batch_smell,
+                "location": batch_location,
+                "language": str(defaults.get("language") or "").strip(),
+                "target_context_json": str(defaults.get("target_context_json") or "").strip(),
+            }
+        )
+
+    task_mode = str(fields.get("verification_mode") or "").strip()
+    if task_mode and task_mode != verification_mode:
+        raise ValueError(
+            "COMMAND_TASK_VERIFICATION_MODE_MISMATCH: task Verification mode "
+            f"'{task_mode}' does not match command policy '{verification_mode}'"
+        )
+
+    missing = [
+        label
+        for label, key in (
+            ("Project root", "project_root"),
+            ("Smell type", "smell"),
+            ("Target location", "location"),
+        )
+        if not str(fields.get(key) or "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "INVALID_COMMAND_TASK_IDENTITY: missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    def optional_value(key: str) -> str:
+        default_value = str(defaults.get(key) or "").strip()
+        return default_value or str(fields.get(key) or "").strip()
+
+    return CommandTaskIdentity(
+        project_root=str(fields["project_root"]).strip(),
+        project_override_root=optional_value("project_override_root"),
+        language=str(fields.get("language") or "").strip(),
+        smell=str(fields["smell"]).strip(),
+        location=str(fields["location"]).strip(),
+        target_context_json=str(fields.get("target_context_json") or "").strip(),
+        verification_mode=verification_mode,
+        sample_test_location=optional_value("sample_test_location"),
+        sample_test_command=optional_value("sample_test_command"),
+    )
+
+
+def initial_command_loop_state(
+    command_payload: Mapping[str, Any],
+    *,
+    started_at_ms: int | None = None,
+) -> dict[str, Any]:
+    """Create the controller-transferable state before the first model turn."""
+
+    policy = {
+        "task": "Continue the current smell refactoring task.",
+        "verification_mode": command_payload["verification_mode"],
+        "allow_test_changes": command_payload["allow_test_changes"],
+        "checkpoint_required": command_payload["checkpoint_required"],
+        "identity": dict(command_payload["identity"]),
+        "loop": dict(command_payload["loop"]),
+    }
+    return {
+        "schema_version": COMMAND_LOOP_STATE_VERSION,
+        "policy": policy,
+        "started_at": (
+            int(started_at_ms)
+            if started_at_ms is not None
+            else int(time.time() * 1000)
+        ),
+        "continuation_count": 0,
+        "cap_recovery_used": False,
+        "no_progress_count": 0,
+        "last_failure_fingerprint": "",
+    }
+
+
+def resolve_command_payload(
+    arguments: str,
+    *,
+    defaults: Mapping[str, str | None] | None = None,
+    started_at_ms: int | None = None,
+) -> dict[str, Any]:
+    """Resolve command policy, identity and initial transferable state once."""
+
+    policy = parse_command_policy(arguments)
+    identity = parse_command_task_identity(
+        policy.task,
+        verification_mode=policy.verification_mode,
+        defaults=defaults,
+    )
+    payload = policy.to_dict()
+    payload["identity"] = identity.to_dict()
+    payload["checkpoint_required"] = identity.smell in CHECKPOINT_SMELLS
+    payload["command_loop_state"] = initial_command_loop_state(
+        payload,
+        started_at_ms=started_at_ms,
+    )
+    return payload
 
 
 def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:

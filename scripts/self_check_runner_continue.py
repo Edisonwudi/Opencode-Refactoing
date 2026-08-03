@@ -24,7 +24,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
 import run_smell_dataset as R  # noqa: E402
-from smell_core.loop_policy import parse_command_policy  # noqa: E402
+from smell_core.loop_policy import (  # noqa: E402
+    parse_command_policy,
+    parse_command_task_identity,
+)
 
 failures: list[str] = []
 
@@ -227,6 +230,102 @@ check_true("policy_allows_guard", resolved.loop.allows("SMELL_GUARD_FAILED"))
 check("policy_removes_dataset_route_category", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"), False)
 check("policy_blocks_compile", resolved.loop.allows("BUILD_COMPILE_ERROR"), False)
 check("policy_task", resolved.task, "Project root: /tmp/p")
+readme_identity = parse_command_task_identity(
+    (
+        "Project root: /abs/java-project; Smell type: long_method; "
+        "Target location: src/main/java/Foo.java:42"
+    ),
+    verification_mode="sample_optimized",
+)
+check("readme_semicolon_project", readme_identity.project_root, "/abs/java-project")
+check("readme_semicolon_smell", readme_identity.smell, "long_method")
+check(
+    "readme_semicolon_location",
+    readme_identity.location,
+    "src/main/java/Foo.java:42",
+)
+readme_bridge = subprocess.run(
+    [
+        sys.executable,
+        str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"),
+        "resolve-command",
+        "--arguments",
+        (
+            "--verification-mode=sample_optimized --loop-max=2 -- "
+            "Project root: /abs/java-project; Smell type: long_method; "
+            "Target location: src/main/java/Foo.java:42"
+        ),
+    ],
+    cwd=ROOT,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+check("readme_bridge_resolve_rc", readme_bridge.returncode, 0)
+if readme_bridge.returncode == 0:
+    readme_bridge_payload = json.loads(readme_bridge.stdout)
+    check(
+        "readme_bridge_structured_identity",
+        readme_bridge_payload["identity"]["location"],
+        "src/main/java/Foo.java:42",
+    )
+    check("readme_bridge_checkpoint_required", readme_bridge_payload["checkpoint_required"], True)
+    initial_state = readme_bridge_payload["command_loop_state"]
+    check("readme_bridge_state_schema", initial_state["schema_version"], 3)
+    check(
+        "readme_bridge_state_identity",
+        initial_state["policy"]["identity"]["project_root"],
+        "/abs/java-project",
+    )
+    check("readme_bridge_state_continuations", initial_state["continuation_count"], 0)
+multiline_identity = parse_command_task_identity(
+    "\n".join(
+        [
+            "Project root: /tmp/p",
+            "Language: java",
+            "Smell type: feature_envy",
+            "Target location: src/Foo.java:10",
+            "Verification mode: project_full",
+            "Test changes: forbidden.",
+            "",
+            "Repair the target and preserve behavior.",
+        ]
+    ),
+    verification_mode="project_full",
+)
+check("multiline_identity_language", multiline_identity.language, "java")
+check("multiline_identity_mode", multiline_identity.verification_mode, "project_full")
+for name, task, expected_prefix in [
+    (
+        "identity_missing_required",
+        "Project root: /tmp/p; Smell type: long_method",
+        "INVALID_COMMAND_TASK_IDENTITY:",
+    ),
+    (
+        "identity_duplicate_field",
+        (
+            "Project root: /tmp/p; Project root: /tmp/q; "
+            "Smell type: long_method; Target location: Foo.java:1"
+        ),
+        "INVALID_COMMAND_TASK_IDENTITY:",
+    ),
+    (
+        "identity_mode_mismatch",
+        (
+            "Project root: /tmp/p; Smell type: long_method; "
+            "Target location: Foo.java:1; Verification mode: sample_optimized"
+        ),
+        "COMMAND_TASK_VERIFICATION_MODE_MISMATCH:",
+    ),
+]:
+    try:
+        parse_command_task_identity(
+            task,
+            verification_mode="project_full",
+        )
+        failures.append(f"{name}: expected ValueError")
+    except ValueError as exc:
+        check_true(name, str(exc).startswith(expected_prefix))
 disabled = parse_command_policy('--loop-max=0 -- Project root: /tmp/p')
 check("zero_disables", disabled.loop.mode, "off")
 for name, raw in [
@@ -574,6 +673,11 @@ check_true(
     "baseline_capture_precedes_model",
     run_sample_source.index("_run_capture_baseline(") < run_sample_source.index("_run_opencode("),
 )
+check_true(
+    "initial_command_state_precedes_model",
+    run_sample_source.index("_initial_command_loop_state(")
+    < run_sample_source.index("_run_opencode("),
+)
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
@@ -664,6 +768,110 @@ roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "proje
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
 check_true("prompt_freezes_test_policy", "Test changes: forbidden" in prompt_plain)
+initial_controller_state = R._initial_command_loop_state(
+    sample,
+    args,
+    "project_full",
+    started_at_ms=123456,
+)
+check("initial_controller_state_schema", initial_controller_state["schema_version"], 3)
+check("initial_controller_state_started_at", initial_controller_state["started_at"], 123456)
+check(
+    "initial_controller_state_identity",
+    initial_controller_state["policy"]["identity"]["location"],
+    sample.location,
+)
+check(
+    "initial_controller_state_task_redacted",
+    initial_controller_state["policy"]["task"],
+    "Continue the current smell refactoring task.",
+)
+
+print("== zero-verify state handoff integration ==")
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    project = temp / "project"
+    artifacts = temp / "artifacts"
+    project.mkdir()
+    artifacts.mkdir()
+    fake = temp / "fake-opencode-state"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+continued = "--session" in sys.argv
+if continued:
+    raw = os.environ.get("SMELL_COMMAND_LOOP_STATE_JSON", "")
+    if not raw:
+        raise SystemExit(21)
+    state = json.loads(raw)
+    identity = state.get("policy", {}).get("identity", {})
+    if state.get("schema_version") != 3 or identity.get("location") != "Foo.java:1":
+        raise SystemExit(22)
+print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
+""",
+        encoding="utf-8",
+    )
+    os.chmod(fake, 0o755)
+    handoff_sample = Sample(
+        sample_id="state",
+        language="java",
+        smell="long_method",
+        project_name="p",
+        project_root=project,
+        location="Foo.java:1",
+        evidence="",
+        raw={},
+    )
+    handoff_args = argparse.Namespace(
+        opencode_bin=str(fake),
+        model="minimax/MiniMax-M2.7",
+        opencode_api_key="",
+        opencode_api_key_env="",
+        opencode_auth_json="disabled",
+        opencode_base_url="",
+        projects="",
+        sample_deadline=60,
+        allow_test_changes=False,
+        loop_mode="verify-failure",
+        loop_max=2,
+        loop_no_progress_limit=1,
+        loop_on="smell,compile,test",
+        loop_instruction="repair narrowly",
+    )
+    handoff_state = R._initial_command_loop_state(
+        handoff_sample,
+        handoff_args,
+        "project_full",
+        started_at_ms=123456,
+    )
+    first_rc, first_session = R._run_opencode(
+        handoff_sample,
+        artifacts,
+        handoff_args,
+        "java-refactor-agent",
+        "project_full",
+        command_loop_state=handoff_state,
+        hard_timeout_seconds=5,
+    )
+    check("zero_verify_first_process_rc", first_rc, 0)
+    check("zero_verify_first_process_session", first_session, "ses_zero_verify")
+    second_rc, second_session = R._run_opencode(
+        handoff_sample,
+        artifacts,
+        handoff_args,
+        "java-refactor-agent",
+        "project_full",
+        session_id=first_session,
+        continuation_prompt=R._runner_continuation_prompt(
+            "verify_required", 0, 2, "repair narrowly"
+        ),
+        command_loop_state=handoff_state,
+        attempt_suffix=".continue-1",
+        hard_timeout_seconds=5,
+    )
+    check("zero_verify_second_process_receives_state", second_rc, 0)
+    check("zero_verify_second_process_session", second_session, "ses_zero_verify")
+
 allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
 allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")
 allowed_roundtrip = parse_command_policy(R._command_arguments(allowed_prompt, allowed_args, "project_full"))

@@ -43,16 +43,10 @@ from smell_core.guards import (  # noqa: E402
     run_smell_guards,
     validate_java_strict_verification_contract,
 )
-from smell_core.java.idea_refactor import (  # noqa: E402
-    IdeaRefactorPreflightError,
-    IdeaRefactorPreflightOptions,
-    resolve_idea_refactor_cli,
-    run_idea_refactor_preflight,
+from smell_core.loop_policy import (  # noqa: E402
+    REPAIRABLE_CATEGORY_GROUPS,
+    resolve_command_payload,
 )
-from smell_core.languages import get_language  # noqa: E402
-from smell_core.loop_policy import REPAIRABLE_CATEGORY_GROUPS, parse_command_policy  # noqa: E402
-from smell_core.planning import build_plan_context_payload, build_repair_context_payload  # noqa: E402
-from smell_core.prompts.idea_router import build_idea_prompt_route  # noqa: E402
 from smell_core.target_context import parse_target_context_json  # noqa: E402
 
 
@@ -344,238 +338,7 @@ def _resolve(args: argparse.Namespace):
     if smell_evidence and resolved.language != "java":
         for guard in resolved.profile.guards:
             guard["evidence"] = smell_evidence
-    if _is_idea_backed(resolved.language):
-        resolved.idea_refactor_cli = resolve_idea_refactor_cli(
-            resolved,
-            getattr(args, "idea_refactor_cli", None)
-            or os.environ.get("SMELL_IDEA_REFACTOR_CLI")
-            or os.environ.get("IDEA_REFACTOR_CLI"),
-        )
     return resolved
-
-
-def _is_idea_backed(language: str) -> bool:
-    support = get_language(language)
-    return bool(support and support.idea_backed)
-
-
-def _location_payload(resolved) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = []
-    for item in resolved.locations:
-        idea_project_path = None
-        try:
-            idea_project_path = str(item.file_path.relative_to(resolved.idea_project_root))
-        except ValueError:
-            pass
-        payload.append(
-            {
-                "raw": item.raw,
-                "project_path": str(item.project_path),
-                "idea_project_path": idea_project_path,
-                "file_path": str(item.file_path),
-                "display_path": item.display_path,
-                "line": item.line,
-                "method": item.method,
-                "class_name": item.class_name,
-                "start_line": item.start_line,
-                "signature_text": item.signature_text,
-                "parameter_count": item.parameter_count,
-            }
-        )
-    return payload
-
-
-def _profile_payload(resolved) -> dict[str, Any]:
-    return {
-        "instruction": resolved.profile.instruction,
-        "constraints": list(resolved.profile.constraints),
-        "verification": list(resolved.profile.verification),
-        "guards": list(resolved.profile.guards),
-        "retry_hint_template": resolved.profile.retry_hint_template,
-    }
-
-
-def _route_payload(resolved) -> dict[str, Any]:
-    if not _is_idea_backed(resolved.language) or not resolved.idea_refactor_ready:
-        return {
-            "smell": resolved.smell,
-            "route_ids": [],
-            "preferred_operations": [],
-            "guide": "",
-            "examples": [],
-        }
-    route = build_idea_prompt_route(str(resolved.idea_refactor_cli or "idea-refactor"), resolved.idea_project_root, resolved)
-    return {
-        "smell": route.smell,
-        "route_ids": list(route.route_ids),
-        "preferred_operations": list(route.preferred_operations),
-        "guide": route.guide,
-        "examples": list(route.examples),
-    }
-
-
-def _run_idea_preflight(resolved, args: argparse.Namespace) -> dict[str, Any]:
-    if not _is_idea_backed(resolved.language):
-        return {
-            "requested": False,
-            "ready": False,
-            "status": "unsupported_language",
-            "message": f"IDEA refactoring is not configured for language '{resolved.language}'.",
-        }
-    if not getattr(args, "ensure_idea_service", False):
-        return {
-            "requested": False,
-            "ready": False,
-            "status": "skipped",
-            "message": "IDEA service preflight was disabled.",
-        }
-    if os.environ.get("SMELL_IDEA_PREPARED") == "1":
-        resolved.idea_refactor_ready = True
-        return {
-            "requested": False,
-            "ready": True,
-            "status": "externally_prepared",
-            "message": "IDEA refactoring service was prepared by the batch runner.",
-        }
-    try:
-        payload = run_idea_refactor_preflight(
-            resolved,
-            IdeaRefactorPreflightOptions(
-                required=True,
-                open=bool(getattr(args, "idea_open", False)),
-                timeout=max(1, int(getattr(args, "idea_timeout", 60))),
-                poll_interval=max(0.1, float(getattr(args, "idea_poll_interval", 1.0))),
-                cli_path=getattr(args, "idea_refactor_cli", None) or resolved.idea_refactor_cli,
-            ),
-        )
-    except IdeaRefactorPreflightError as exc:
-        return {
-            "requested": True,
-            "ready": False,
-            "status": "failed",
-            "code": exc.code,
-            "message": str(exc),
-            "returncode": exc.returncode,
-            "stdout": exc.stdout,
-            "stderr": exc.stderr,
-        }
-    resolved.idea_refactor_ready = True
-    return {
-        "requested": True,
-        "ready": True,
-        "status": "ok",
-        "message": "IDEA refactoring service is ready.",
-        "details": payload,
-    }
-
-
-def _augment_data_clumps_context(resolved) -> Optional[dict[str, Any]]:
-    if resolved.smell != "data_clumps":
-        return None
-    snapshot = capture_metric_snapshot(resolved, "")
-    analyses = [{
-        "success": bool(snapshot.get("ok")),
-        "group": snapshot.get("group", ""),
-        "occurrence_count": int(dict(snapshot.get("objectives") or {}).get("occurrence_count", 0)),
-        "occurrences": list(snapshot.get("occurrences") or []),
-        "error": snapshot.get("error", ""),
-        "candidate_count": snapshot.get("candidate_count", 0),
-    }]
-    analysis = analyses[0]
-    for guard in resolved.profile.guards:
-        if str(guard.get("type", "")).strip() != "data_clumps":
-            continue
-        occurrences = analysis["occurrences"]
-        guard["detected_group"] = analysis["group"]
-        guard["detected_occurrence_count"] = analysis["occurrence_count"]
-        guard["group_occurrences"] = json.dumps(occurrences, ensure_ascii=True)
-        guard["listed_occurrence_count"] = str(len(occurrences))
-    return {
-        "groups": analyses,
-    }
-
-
-def cmd_build_context(args: argparse.Namespace) -> dict[str, Any]:
-    resolved = _resolve(args)
-    data_clumps_context = _augment_data_clumps_context(resolved)
-    idea_preflight = _run_idea_preflight(resolved, args)
-    route_payload = _route_payload(resolved)
-    context_payload = {
-        "project_root": str(resolved.project_root),
-        "roots": {
-            "dataset": str(resolved.dataset_root),
-            "idea": str(resolved.idea_project_root),
-            "build": str(resolved.build_root),
-        },
-        "cwd": str(resolved.cwd),
-        "language": resolved.language,
-        "smell": resolved.smell,
-        "locations": _location_payload(resolved),
-        "profile": _profile_payload(resolved),
-        "build": resolved.build.to_dict(),
-        "test": resolved.test.to_dict(),
-        "idea_refactor_cli": resolved.idea_refactor_cli,
-        "idea_refactor_ready": bool(resolved.idea_refactor_ready),
-        "idea_preflight": idea_preflight,
-        "idea": {
-            "ready": bool(resolved.idea_refactor_ready),
-            "cli": (
-                resolved.idea_refactor_cli
-                if _is_idea_backed(resolved.language) and resolved.idea_refactor_ready
-                else None
-            ),
-            "root": (
-                str(resolved.idea_project_root)
-                if _is_idea_backed(resolved.language) and resolved.idea_refactor_ready
-                else ""
-            ),
-            "recommended_skill": (
-                "idea-refactor-cli"
-                if _is_idea_backed(resolved.language) and resolved.idea_refactor_ready
-                else ""
-            ),
-        },
-    }
-    if data_clumps_context is not None:
-        context_payload["data_clumps"] = data_clumps_context
-    full_payload = {
-        "core_root": str(PROJECT_ROOT / "smell_core"),
-        "config": resolved.to_dict(),
-        "context": context_payload,
-    }
-    mode = str(getattr(args, "mode", "repair") or "repair").strip().lower()
-    if mode == "plan":
-        plan_context = build_plan_context_payload(
-            resolved=resolved,
-            context_payload=context_payload,
-            route_payload=route_payload,
-        )
-        plan_context["mode"] = "plan"
-        return plan_context
-    if mode == "repair":
-        payload = build_repair_context_payload(
-            context_payload=context_payload,
-            route_payload=route_payload,
-        )
-        payload["core_root"] = full_payload["core_root"]
-        payload["config"] = full_payload["config"]
-        return payload
-    raise ValueError(f"unsupported context mode {mode!r}; expected 'plan' or 'repair'")
-
-
-def cmd_build_plan_context(args: argparse.Namespace) -> dict[str, Any]:
-    context_args = argparse.Namespace(**vars(args))
-    context_args.mode = "plan"
-    return cmd_build_context(context_args)
-
-
-def cmd_run_build_test_guard(args: argparse.Namespace) -> dict[str, Any]:
-    resolved = _resolve(args)
-    result = run_build_test_guard(resolved)
-    return {
-        "success": bool(result.get("success")),
-        "result": result,
-    }
 
 
 def _compact_delta(value: Any) -> Optional[dict[str, Any]]:
@@ -870,16 +633,9 @@ def _checkpoint_context(
             ), checkpoint
         return None, checkpoint
     delta = dict(checkpoint.get("delta") or {})
-    changed = [
-        resolved.project_root / item
-        for item in checkpoint.get("changed_production_source_files") or []
-    ]
     context = GuardRunContext(
-        changed_java_files=changed,
         checkpoint_required=True,
         checkpoint_smell=resolved.smell,
-        checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
-        baseline_metrics=dict(checkpoint.get("baseline_metrics") or {}),
         current_metrics=dict(checkpoint.get("current_metrics") or {}),
         metric_delta=delta,
         has_production_diff=bool(checkpoint.get("production_diff")),
@@ -1131,7 +887,19 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
 
 
 def cmd_resolve_command(args: argparse.Namespace) -> dict[str, Any]:
-    return parse_command_policy(args.arguments).to_dict()
+    return resolve_command_payload(
+        args.arguments,
+        defaults={
+            "project_root": os.environ.get("SMELL_PROJECT_ROOT"),
+            "project_override_root": os.environ.get("SMELL_CANONICAL_PROJECT_ROOT"),
+            "language": os.environ.get("SMELL_LANGUAGE"),
+            "smell": os.environ.get("SMELL_SMELL"),
+            "location": os.environ.get("SMELL_LOCATION"),
+            "target_context_json": os.environ.get("SMELL_TARGET_CONTEXT_JSON"),
+            "sample_test_location": os.environ.get("SMELL_SAMPLE_TEST_LOCATION"),
+            "sample_test_command": os.environ.get("SMELL_SAMPLE_TEST_COMMAND"),
+        },
+    )
 
 
 def _verify_status(
@@ -1538,11 +1306,6 @@ def _snapshot_project(root: Path) -> dict[str, Any]:
     }
 
 
-def cmd_snapshot(args: argparse.Namespace) -> dict[str, Any]:
-    root = Path(args.project_root).expanduser().resolve()
-    return _snapshot_project(root)
-
-
 def _artifact_paths_from_verify_payload(payload: Optional[dict[str, Any]], discovered: dict[str, str]) -> dict[str, str]:
     paths: dict[str, str] = dict(discovered)
     evidence_path = paths.get("guard_evidence") or paths.get("verify_full")
@@ -1668,6 +1431,18 @@ def _looks_like_dependency_resolution_failure(text: str) -> bool:
     )
 
 
+def _timed_out_build_test_step(payload: dict[str, Any]) -> str:
+    build_test = payload.get("build_test_guard")
+    details = build_test.get("details") if isinstance(build_test, dict) else None
+    if not isinstance(details, dict):
+        return ""
+    for label in ("build", "test"):
+        result = details.get(label)
+        if isinstance(result, dict) and result.get("status") == "timeout":
+            return label
+    return ""
+
+
 def _classify_failure_pack(
     payload: Optional[dict[str, Any]],
     text: str,
@@ -1697,6 +1472,12 @@ def _classify_failure_pack(
     if status == "TEST_SOURCE_DELETED":
         return "TEST_BEHAVIOR_REGRESSION", [
             "Restore every baseline test file; api_migration permits API edits, not deletion of behavior checks."
+        ]
+    timed_out_step = _timed_out_build_test_step(payload)
+    if timed_out_step:
+        return "TIMEOUT_OR_MODAL_SUSPECTED", [
+            f"The configured {timed_out_step} command exceeded its controller timeout.",
+            "Treat this as an execution/infrastructure failure; do not automatically rewrite production or test code.",
         ]
     if status == "SAMPLE_TEST_SPEC_MISSING":
         return "SAMPLE_TEST_SPEC_MISSING", [
@@ -1844,6 +1625,7 @@ def _build_failure_pack(
         evidence=evidence,
     )
     failure_group = REPAIRABLE_CATEGORY_GROUPS.get(category, "")
+    repairable = bool(failure_group)
     patterns = [
         "DependencyResolutionException",
         "Could not resolve dependencies",
@@ -1889,16 +1671,16 @@ def _build_failure_pack(
     return {
         "failure_category": category,
         "failure_group": failure_group,
-        "retryable": bool(failure_group),
+        "retryable": repairable,
         "verify_status": payload.get("status") if isinstance(payload, dict) else "",
         "artifact_paths": paths,
         "highlights": highlights,
         "next_action": _bounded_text(next_action),
         "recommendations": _bounded_strings(recommendations),
         "repair_contract": {
-            "repair_agent_may_edit": True,
-            "prefer_narrow_fix": True,
-            "must_rerun_smell_verify": True,
+            "repair_agent_may_edit": repairable,
+            "prefer_narrow_fix": repairable,
+            "must_rerun_smell_verify": repairable,
             "tests_may_change": tests_may_change,
         },
     }
@@ -1915,7 +1697,6 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smell-evidence", default="")
     parser.add_argument("--target-context-json", default="")
     parser.add_argument("--baseline-seal", default="")
-    parser.add_argument("--idea-refactor-cli")
     parser.add_argument(
         "--verification-mode",
         choices=("local", "auto", "sample_optimized", "project_full"),
@@ -1943,29 +1724,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     baseline_parser.set_defaults(func=cmd_capture_baseline)
 
-    context_parser = subparsers.add_parser("build-context")
-    _add_common(context_parser)
-    context_parser.add_argument("--attempt", type=int, default=1)
-    context_parser.add_argument("--total-attempts", type=int, default=3)
-    context_parser.add_argument("--mode", choices=("plan", "repair"), default="repair")
-    context_parser.set_defaults(
-        func=cmd_build_context,
-        ensure_idea_service=False,
-        idea_open=False,
-    )
-
-    plan_context_parser = subparsers.add_parser("build-plan-context")
-    _add_common(plan_context_parser)
-    plan_context_parser.set_defaults(
-        func=cmd_build_plan_context,
-        ensure_idea_service=False,
-        idea_open=False,
-    )
-
-    build_test_parser = subparsers.add_parser("run-build-test-guard")
-    _add_common(build_test_parser)
-    build_test_parser.set_defaults(func=cmd_run_build_test_guard)
-
     verify_parser = subparsers.add_parser("verify")
     _add_common(verify_parser)
     verify_parser.add_argument("--skip-build-test", action="store_true")
@@ -1981,10 +1739,6 @@ def build_parser() -> argparse.ArgumentParser:
         run_build_test=True,
         snapshot=True,
     )
-
-    snapshot_parser = subparsers.add_parser("snapshot")
-    snapshot_parser.add_argument("--project-root", required=True)
-    snapshot_parser.set_defaults(func=cmd_snapshot)
 
     return parser
 

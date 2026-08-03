@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import hashlib
+import signal
 import subprocess
 import tempfile
 import time
@@ -404,6 +405,7 @@ def run_build_test_guard(
             label="build",
             project_root=config.project_root,
             source=config.build_source,
+            timeout_seconds=config.defaults.shell_timeout,
         )
         if not build_result["success"]:
             return {
@@ -428,6 +430,7 @@ def run_build_test_guard(
             project_root=config.project_root,
             source=config.test_source,
             force_fresh_test_execution=fresh_execution_required,
+            timeout_seconds=config.defaults.shell_timeout,
         )
         if not test_result["success"]:
             message = f"Tests failed. {test_result['summary_text']}"
@@ -1287,6 +1290,7 @@ def _run_command_config(
     project_root: Path,
     source: str = "",
     force_fresh_test_execution: bool = False,
+    timeout_seconds: int = 0,
 ) -> Dict[str, object]:
     rendered_command = ""
     rendered_script = ""
@@ -1320,17 +1324,39 @@ def _run_command_config(
             "summary_text": f"No configured {label} command.",
             "output": "",
         }
-    proc = subprocess.run(
-        command,
-        cwd=str(cwd),
-        env={**os.environ, **env},
-        shell=shell,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = _run_captured_command(
+            command,
+            cwd=str(cwd),
+            env={**os.environ, **env},
+            shell=shell,
+            timeout=max(1, int(timeout_seconds)) if timeout_seconds else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        captured = exc.stdout or ""
+        output = (
+            captured.decode("utf-8", errors="replace")
+            if isinstance(captured, bytes)
+            else str(captured)
+        )
+        message = f"{label.capitalize()} timed out after {int(timeout_seconds)} seconds."
+        command_summary = _summarize_command_output(output, label=label, returncode=124)
+        return {
+            "label": label,
+            "success": False,
+            "status": "timeout",
+            "returncode": 124,
+            "command": rendered_command,
+            "script": rendered_script,
+            "cwd": str(cwd),
+            "source": source,
+            "summary": command_summary["summary"],
+            "failure_highlights": [message, *command_summary["failure_highlights"]],
+            "diagnostics": command_summary["diagnostics"],
+            "tail": command_summary["tail"],
+            "summary_text": message,
+            "output": output,
+        }
     output = proc.stdout or ""
     command_summary = _summarize_command_output(output, label=label, returncode=proc.returncode)
     return {
@@ -1349,6 +1375,102 @@ def _run_command_config(
         "summary_text": command_summary["summary_text"],
         "output": output,
     }
+
+
+def _run_captured_command(
+    command: object,
+    *,
+    cwd: str,
+    env: Dict[str, str],
+    shell: bool,
+    timeout: Optional[int],
+) -> subprocess.CompletedProcess[str]:
+    """Run one build/test command and terminate its whole process group on timeout."""
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        shell=shell,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=os.name == "posix",
+    )
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(proc)
+        stdout, _ = proc.communicate()
+        captured = exc.stdout or ""
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", errors="replace")
+        final_output = str(stdout or "")
+        initial_output = str(captured)
+        if final_output.startswith(initial_output):
+            # ``communicate`` after termination normally returns the complete
+            # stream, including bytes already attached to TimeoutExpired.
+            captured = final_output
+        elif not initial_output.startswith(final_output):
+            # Be conservative for platform-specific pipe behavior where the
+            # second read contains only the post-timeout tail.
+            captured = f"{initial_output}{final_output}"
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=str(captured),
+        ) from exc
+    return subprocess.CompletedProcess(command, proc.returncode, stdout=stdout, stderr=None)
+
+
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    if os.name == "posix":
+        # ``communicate`` can time out after the shell/group leader has
+        # already exited when a background child still owns stdout.  The
+        # process group may therefore remain alive even though ``poll`` is no
+        # longer ``None``; always address the group by its original pgid.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        # Give every group member a bounded grace period to flush termination
+        # diagnostics. Waiting only on the leader is insufficient: it may
+        # already have exited while a background child still owns the pipe.
+        grace_deadline = time.monotonic() + 1.0
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        except PermissionError:
+            # macOS can report EPERM briefly for an exited/zombie group.
+            pass
+        remaining_grace = grace_deadline - time.monotonic()
+        if remaining_grace > 0:
+            time.sleep(remaining_grace)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+        return
+
+    # Non-POSIX runtimes cannot address a process group by the leader's pid.
+    # Retain the best-effort direct-child behavior for completeness.
+    if proc.poll() is not None:  # pragma: no cover - delivery/runtime is POSIX
+        return
+    proc.terminate()  # pragma: no cover - delivery/runtime is POSIX
+    try:  # pragma: no cover - delivery/runtime is POSIX
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:  # pragma: no cover - delivery/runtime is POSIX
+        proc.kill()
+        proc.wait()
 
 
 def _force_fresh_gradle_test_execution(command_text: str) -> str:

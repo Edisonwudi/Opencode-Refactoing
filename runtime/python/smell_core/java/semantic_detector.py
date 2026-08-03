@@ -740,31 +740,6 @@ def _method_retains_data_clump_positions(
     return True
 
 
-def _data_clump_group_positions(
-    method: MethodRecord,
-    group_key: str,
-) -> List[Dict[str, Any]]:
-    """Return the current parameter slots occupied by one detector group."""
-    members = [item for item in _normalize_qualified_group(group_key).split("|") if item]
-    descriptors = [_normalize_qualified_group(item) for item in method.parameter_descriptors]
-    unused = set(range(len(descriptors)))
-    positions: List[Dict[str, Any]] = []
-    for member in members:
-        index = next(
-            (candidate for candidate in sorted(unused) if descriptors[candidate] == member),
-            None,
-        )
-        if index is None:
-            return []
-        unused.remove(index)
-        positions.append({
-            "index": index,
-            "type": member.rsplit(":", 1)[0],
-            "descriptor": member,
-        })
-    return sorted(positions, key=lambda item: int(item["index"]))
-
-
 def _data_clump_method_token_streams(
     model: ProjectModel,
 ) -> List[Tuple[MethodRecord, List[str], str]]:
@@ -2095,21 +2070,6 @@ def _lpl_usage_sort_key(item: Mapping[str, Any]) -> Tuple[str, int, str]:
         int(item.get("line") or 0),
         str(item.get("expression") or ""),
     )
-
-
-def _method_overrides_any_parent(
-    model: ProjectModel,
-    method: MethodRecord,
-    owner: ClassRecord,
-) -> bool:
-    parent = model.classes.get(owner.superclass_name)
-    seen: Set[str] = set()
-    while parent is not None and parent.qualified_name not in seen:
-        seen.add(parent.qualified_name)
-        if any(_method_overrides(method, candidate) for candidate in parent.methods):
-            return True
-        parent = model.classes.get(parent.superclass_name)
-    return False
 
 
 def analyze_refused_bequest_target(
@@ -5370,11 +5330,6 @@ def _is_unused_private_method_candidate(method: MethodRecord) -> bool:
     return True
 
 
-def _count_member_accesses(model: ProjectModel, method: MethodRecord) -> Tuple[int, int]:
-    stats = _member_access_stats(model, method)
-    return stats.total, stats.foreign
-
-
 def _member_access_stats(
     model: ProjectModel,
     method: MethodRecord,
@@ -5469,19 +5424,6 @@ def _record_member_access(
 
 def _increment_counter(counter: Dict[str, int], key: str) -> None:
     counter[key] = counter.get(key, 0) + 1
-
-
-def _format_counter(counter: Mapping[str, int]) -> str:
-    if not counter:
-        return "none"
-    return ",".join(f"{key}:{counter[key]}" for key in sorted(counter))
-
-
-def _dominant_access(counter: Mapping[str, int]) -> Tuple[str, int]:
-    if not counter:
-        return "", 0
-    type_name, count = min(counter.items(), key=lambda item: (-item[1], item[0]))
-    return type_name, count
 
 
 def _normalized_receiver_type(model: ProjectModel, type_name: str) -> str:
@@ -5739,11 +5681,6 @@ def _member_access_receiver_expressions(body: Node) -> Iterable[str]:
         yield _node_text_from_node(receiver).strip()
 
 
-def _member_access_receivers(body: Node) -> Iterable[str]:
-    for expression in _member_access_receiver_expressions(body):
-        yield _root_receiver(expression)
-
-
 def _is_foreign_type(model: ProjectModel, receiver_type: str, owner_type: str) -> bool:
     receiver = _resolve_model_type(model, receiver_type)
     owner = _resolve_model_type(model, owner_type)
@@ -5756,24 +5693,6 @@ def _is_foreign_type(model: ProjectModel, receiver_type: str, owner_type: str) -
     if _is_subtype(model, owner, receiver):
         return False
     return True
-
-
-def _collect_parent_methods(model: ProjectModel, parent: ClassRecord) -> List[MethodRecord]:
-    methods: List[MethodRecord] = []
-    current: Optional[ClassRecord] = parent
-    seen: Set[str] = set()
-    while current is not None and current.qualified_name not in seen:
-        seen.add(current.qualified_name)
-        for method in current.methods:
-            if method.is_constructor:
-                continue
-            if {"private", "static", "final"} & method.modifiers:
-                continue
-            if "abstract" in method.modifiers:
-                continue
-            methods.append(method)
-        current = model.classes.get(current.superclass_name)
-    return methods
 
 
 def _method_overrides(method: MethodRecord, parent_method: MethodRecord) -> bool:

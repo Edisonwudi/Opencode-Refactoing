@@ -9,10 +9,9 @@ every sample with the authoritative detectors
 in this repository.
 
 Dataset CSVs are stored in container (image) path format
-(``/opt/projects/<lang>/<name>``), matching
-``scripts/convert_dataset_to_image_paths.py``: candidates and the scan cache
-keep local checkout paths, and the conversion happens at the write boundary
-(``write_csv``).  Reads of existing CSV rows only use path-free keys
+(``/opt/projects/<lang>/<name>``). Candidates and the scan cache keep local
+checkout paths; ``write_csv`` is the only container-path conversion boundary.
+Reads of existing CSV rows only use path-free keys
 (project_name, file, begin_line), so both path formats round-trip cleanly.
 
 Candidate generation mirrors the detector logic exactly (same thresholds,

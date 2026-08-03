@@ -864,18 +864,6 @@ def _clone_call_graph(value: Any) -> dict[str, set[str]]:
     return graph
 
 
-def _clone_graph_reachable(graph: Mapping[str, set[str]], start: str) -> set[str]:
-    reached: set[str] = set()
-    pending = list(graph.get(start, set()))
-    while pending:
-        key = pending.pop()
-        if key == start or key in reached:
-            continue
-        reached.add(key)
-        pending.extend(graph.get(key, set()))
-    return reached
-
-
 def _clone_catalog_entries(value: Any) -> dict[str, set[str]]:
     if not isinstance(value, list):
         return {}

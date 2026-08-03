@@ -1,11 +1,7 @@
 defaults:
-  step_limit: 150
   shell_timeout: 600
-  no_progress_timeout: 480
-  model_retry_attempts: 2
   run_build: true
   run_tests: true
-  output_root: runs
 generic_smells: &generic_smells
   long_method:
     instruction: Extract cohesive helpers or introduce guard clauses to reduce the target function while preserving behavior.

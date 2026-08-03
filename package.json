@@ -12,7 +12,8 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "check:bridge": "python3 -m py_compile runtime/python/bridge/smell_bridge.py",
+    "check:bridge": "python3 -m py_compile runtime/python/bridge/smell_bridge.py && python3 scripts/self_check_bridge_surface.py",
+    "check:config": "python3 scripts/self_check_config.py",
     "check:plugin": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node .opencode/plugins/smell.ts",
     "check:maven-offline-repo": "python3 scripts/self_check_maven_offline_repo.py",
     "check:image-dependencies": "python3 scripts/self_check_java_image_dependencies.py",
@@ -31,6 +32,6 @@
     "check:target-guard-v5": "python3 scripts/self_check_guard_dispatch.py && python3 scripts/self_check_guard_scope.py && python3 scripts/self_check_scoped_java_model.py && python3 scripts/self_check_target_guard_predicates.py && python3 scripts/self_check_target_relational_guards.py && python3 scripts/self_check_target_clone_guard.py && python3 scripts/self_check_target_relation_scope.py && python3 scripts/self_check_target_feature_envy_scope.py && python3 scripts/self_check_target_semantic_guards.py && python3 scripts/self_check_dead_code_reference_resolution.py && python3 scripts/self_check_java_target_guard_v5.py",
     "check:target-baseline-audit": "python3 scripts/self_check_java_target_guard_baseline_audit.py",
     "check:self": "node scripts/self_check_smell_verify.mjs",
-    "check": "npm run check:bridge && npm run check:plugin && npm run check:maven-offline-repo && npm run check:image-dependencies && npm run check:target-guard-v5 && npm run check:target-baseline-audit && npm run check:checkpoint-contract && npm run check:test-change-contract && npm run check:improvement-gate && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:runner-closure && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner && npm run check:focused-guards && npm run check:self"
+    "check": "npm run check:bridge && npm run check:config && npm run check:plugin && npm run check:maven-offline-repo && npm run check:image-dependencies && npm run check:target-guard-v5 && npm run check:target-baseline-audit && npm run check:audit-provenance && npm run check:checkpoint-contract && npm run check:test-change-contract && npm run check:improvement-gate && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:runner-closure && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner && npm run check:focused-guards && npm run check:self"
   }
 }

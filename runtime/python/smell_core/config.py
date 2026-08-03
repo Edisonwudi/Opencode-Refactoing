@@ -18,30 +18,6 @@ from .location import LocationTarget, parse_locations
 SUPPORTED_LANGUAGES = {"java", "python", "c", "cpp"}
 VERIFICATION_MODES = {"local", "auto", "sample_optimized", "project_full"}
 JAVA_VERIFICATION_MODES = {"sample_optimized", "project_full"}
-LLM_MODEL_ALIAS_ENVS = {
-    "openai": "OPENAI_MODEL",
-    "glm": "ZHIPU_MODEL",
-    "anthropic": "ANTHROPIC_MODEL",
-    "deepseek": "DEEPSEEK_MODEL",
-    "gemini": "GEMINI_MODEL",
-    "openrouter": "OPENROUTER_MODEL",
-}
-LLM_BASE_URL_ENVS = {
-    "openai": ("OPENAI_API_BASE", "OPENAI_BASE_URL"),
-    "glm": ("ZHIPU_API_BASE", "ZHIPU_BASE_URL"),
-    "anthropic": ("ANTHROPIC_BASE_URL",),
-    "deepseek": ("DEEPSEEK_BASE_URL",),
-    "gemini": ("GEMINI_BASE_URL",),
-    "openrouter": ("OPENROUTER_BASE_URL",),
-}
-LLM_API_KEY_ENVS = {
-    "openai": "OPENAI_API_KEY",
-    "glm": "ZHIPU_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-}
 
 
 @dataclass
@@ -63,98 +39,18 @@ class CommandConfig:
 
 @dataclass
 class DefaultsConfig:
-    step_limit: int = 100
     shell_timeout: int = 600
-    no_progress_timeout: int = 480
-    model_retry_attempts: int = 2
     run_build: bool = True
     run_tests: bool = True
-    output_root: str = "runs"
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "DefaultsConfig":
         data = data or {}
         return cls(
-            step_limit=int(data.get("step_limit", 100)),
             shell_timeout=int(data.get("shell_timeout", 600)),
-            no_progress_timeout=int(data.get("no_progress_timeout", 480)),
-            model_retry_attempts=int(data.get("model_retry_attempts", 2)),
             run_build=bool(data.get("run_build", True)),
             run_tests=bool(data.get("run_tests", True)),
-            output_root=str(data.get("output_root", "runs")),
         )
-
-
-@dataclass
-class LLMConfig:
-    provider: str = ""
-    model: str = ""
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
-    api_key_env: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    context_window: Optional[int] = None
-    top_p: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    request_timeout: Optional[int] = None
-    recursion_limit: Optional[int] = None
-    max_history_messages: Optional[int] = None
-    auto_condense_percent: Optional[int] = None
-    model_kwargs: Dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: Optional[Dict[str, Any]]) -> Optional["LLMConfig"]:
-        data = data or {}
-        if not data:
-            return None
-        return cls(
-            provider=str(data.get("provider", "")).strip().lower(),
-            model=str(data.get("model", "")).strip(),
-            base_url=_clean_optional_string(data.get("base_url")),
-            api_key=_clean_optional_string(data.get("api_key")),
-            api_key_env=_clean_optional_string(data.get("api_key_env")),
-            temperature=_coerce_optional_float(data.get("temperature")),
-            max_tokens=_coerce_optional_int(data.get("max_tokens")),
-            context_window=_coerce_optional_int(data.get("context_window")),
-            top_p=_coerce_optional_float(data.get("top_p")),
-            frequency_penalty=_coerce_optional_float(data.get("frequency_penalty")),
-            presence_penalty=_coerce_optional_float(data.get("presence_penalty")),
-            request_timeout=_coerce_optional_int(data.get("request_timeout")),
-            recursion_limit=_coerce_optional_int(data.get("recursion_limit")),
-            max_history_messages=_coerce_optional_int(data.get("max_history_messages")),
-            auto_condense_percent=_coerce_optional_int(data.get("auto_condense_percent")),
-            model_kwargs=dict(data.get("model_kwargs", {}) or {}),
-        )
-
-    def resolved_api_key(self, env: Optional[Dict[str, str]] = None) -> Optional[str]:
-        if self.api_key:
-            return self.api_key
-        if not self.api_key_env:
-            return None
-        merged_env = env if env is not None else {}
-        return merged_env.get(self.api_key_env) or os.environ.get(self.api_key_env)
-
-    def to_public_dict(self) -> Dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "model": self.model,
-            "base_url": self.base_url,
-            "api_key_env": self.api_key_env,
-            "api_key_configured": bool(self.api_key or (self.api_key_env and os.environ.get(self.api_key_env))),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "context_window": self.context_window,
-            "top_p": self.top_p,
-            "frequency_penalty": self.frequency_penalty,
-            "presence_penalty": self.presence_penalty,
-            "request_timeout": self.request_timeout,
-            "recursion_limit": self.recursion_limit,
-            "max_history_messages": self.max_history_messages,
-            "auto_condense_percent": self.auto_condense_percent,
-            "model_kwargs": dict(self.model_kwargs),
-        }
 
 
 @dataclass
@@ -254,7 +150,6 @@ class ProjectOverride:
 @dataclass
 class RefactorConfig:
     defaults: DefaultsConfig
-    llm: Optional[LLMConfig]
     languages: Dict[str, LanguageConfig]
 
 
@@ -270,7 +165,6 @@ class ResolvedRunConfig:
     defaults: DefaultsConfig
     build: CommandConfig
     test: CommandConfig
-    llm: Optional[LLMConfig]
     env: Dict[str, str]
     cwd: Path
     profile: SmellProfile
@@ -315,7 +209,6 @@ class ResolvedRunConfig:
             "defaults": asdict(self.defaults),
             "build": self.build.to_dict(),
             "test": self.test.to_dict(),
-            "llm": self.llm.to_public_dict() if self.llm else None,
             "env": dict(self.env),
             "cwd": str(self.cwd),
             "profile": asdict(self.profile),
@@ -362,14 +255,13 @@ def load_refactor_config(path: Optional[str]) -> RefactorConfig:
     source = Path(path).expanduser().resolve() if path else bundled_refactor_config_path()
     data = _load_yaml(source)
     defaults = _apply_defaults_env_overrides(DefaultsConfig.from_dict(data.get("defaults")))
-    llm = _apply_llm_env_overrides(LLMConfig.from_dict(data.get("llm")))
     languages = {
         _normalize_language(name) or name: LanguageConfig.from_dict(cfg or {})
         for name, cfg in (data.get("languages", {}) or {}).items()
     }
     if not languages:
         raise ValueError("refactor.yaml must define at least one language.")
-    return RefactorConfig(defaults=defaults, llm=llm, languages=languages)
+    return RefactorConfig(defaults=defaults, languages=languages)
 
 
 def _apply_defaults_env_overrides(defaults: DefaultsConfig) -> DefaultsConfig:
@@ -377,84 +269,6 @@ def _apply_defaults_env_overrides(defaults: DefaultsConfig) -> DefaultsConfig:
     if not shell_timeout:
         return defaults
     return replace(defaults, shell_timeout=int(shell_timeout))
-
-
-def _apply_llm_env_overrides(llm: Optional[LLMConfig]) -> Optional[LLMConfig]:
-    if not _llm_env_override_requested():
-        return llm
-
-    base = llm or LLMConfig()
-    alias_provider, alias_model = _single_llm_model_alias()
-    explicit_provider = _normalize_llm_provider(os.environ.get("LLM_PROVIDER"))
-    provider = explicit_provider or alias_provider or _provider_from_base_url_env() or base.provider
-    provider = _normalize_llm_provider(provider)
-
-    model = _clean_optional_string(os.environ.get("LLM_MODEL")) or alias_model or base.model
-    base_url = _clean_optional_string(os.environ.get("LLM_BASE_URL")) or _base_url_from_env(provider) or base.base_url
-    api_key_env = _clean_optional_string(os.environ.get("LLM_API_KEY_ENV")) or LLM_API_KEY_ENVS.get(provider) or base.api_key_env
-    request_timeout = (
-        _coerce_optional_int(os.environ.get("LLM_REQUEST_TIMEOUT"))
-        if _clean_optional_string(os.environ.get("LLM_REQUEST_TIMEOUT"))
-        else base.request_timeout
-    )
-
-    return replace(
-        base,
-        provider=provider,
-        model=model,
-        base_url=base_url,
-        api_key_env=api_key_env,
-        request_timeout=request_timeout,
-    )
-
-
-def _llm_env_override_requested() -> bool:
-    env_names = [
-        "LLM_PROVIDER",
-        "LLM_MODEL",
-        "LLM_BASE_URL",
-        "LLM_API_KEY_ENV",
-        "LLM_REQUEST_TIMEOUT",
-        *LLM_MODEL_ALIAS_ENVS.values(),
-        *(name for names in LLM_BASE_URL_ENVS.values() for name in names),
-    ]
-    return any(_clean_optional_string(os.environ.get(name)) for name in env_names)
-
-
-def _single_llm_model_alias() -> tuple[str, str]:
-    matches = [
-        (provider, os.environ[env_name].strip())
-        for provider, env_name in LLM_MODEL_ALIAS_ENVS.items()
-        if _clean_optional_string(os.environ.get(env_name))
-    ]
-    if len(matches) > 1:
-        names = ", ".join(LLM_MODEL_ALIAS_ENVS.values())
-        raise ValueError(f"Only one provider model alias may be set: {names}.")
-    return matches[0] if matches else ("", "")
-
-
-def _provider_from_base_url_env() -> str:
-    for provider, env_names in LLM_BASE_URL_ENVS.items():
-        if any(_clean_optional_string(os.environ.get(name)) for name in env_names):
-            return provider
-    return ""
-
-
-def _base_url_from_env(provider: str) -> Optional[str]:
-    for env_name in LLM_BASE_URL_ENVS.get(provider, ()):
-        value = _clean_optional_string(os.environ.get(env_name))
-        if value:
-            return value
-    return None
-
-
-def _normalize_llm_provider(provider: Optional[str]) -> str:
-    normalized = str(provider or "").strip().lower()
-    if normalized in {"zhipu", "zhipuai"}:
-        return "glm"
-    if normalized == "google":
-        return "gemini"
-    return normalized
 
 
 def load_project_overrides(path: Optional[str]) -> List[ProjectOverride]:
@@ -552,7 +366,6 @@ def resolve_run_config(
         defaults=copy.deepcopy(refactor_config.defaults),
         build=build,
         test=test,
-        llm=copy.deepcopy(refactor_config.llm),
         env=resolved_env,
         cwd=cwd,
         profile=merged_profile,
@@ -782,15 +595,3 @@ def _clean_optional_string(value: Any) -> Optional[str]:
         return None
     text = str(value)
     return text if text.strip() else None
-
-
-def _coerce_optional_int(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    return int(value)
-
-
-def _coerce_optional_float(value: Any) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    return float(value)

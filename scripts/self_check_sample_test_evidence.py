@@ -170,7 +170,11 @@ echo ":demo:test"
                 dataset_root=root,
                 cwd=root,
                 env={"SELF_CHECK_PYTHON": sys.executable},
-                defaults=SimpleNamespace(run_build=False, run_tests=True),
+                defaults=SimpleNamespace(
+                    shell_timeout=600,
+                    run_build=False,
+                    run_tests=True,
+                ),
                 build=CommandConfig(),
                 test=CommandConfig(
                     command="./gradlew :demo:test --no-build-cache"

@@ -60,11 +60,52 @@ type LoopPolicy = {
   sample_deadline_seconds: number
 }
 
+type VerificationMode = "local" | "auto" | "sample_optimized" | "project_full"
+
+type CommandTaskIdentity = {
+  project_root: string
+  project_override_root: string
+  language: string
+  smell: string
+  location: string
+  target_context_json: string
+  verification_mode: VerificationMode
+  sample_test_location: string
+  sample_test_command: string
+}
+
 type CommandPolicy = {
   task: string
-  verification_mode: "local" | "auto" | "sample_optimized" | "project_full"
+  verification_mode: VerificationMode
   allow_test_changes: boolean
   loop: LoopPolicy
+  identity: CommandTaskIdentity
+  checkpoint_required: boolean
+}
+
+type ControllerIdentity = {
+  projectRoot: string
+  projectOverrideRoot?: string
+  language?: string
+  smell: string
+  location: string
+  targetContextJson?: string
+  verificationMode: VerificationMode
+  sampleTestLocation?: string
+  sampleTestCommand?: string
+  checkpointRequired: boolean
+}
+
+type CommandIdentityBinding = {
+  project_root: string
+  project_override_root: string
+  language: string
+  smell: string
+  location: string
+  target_context_json: string
+  verification_mode: string
+  sample_test_location: string
+  sample_test_command: string
 }
 
 type CommandLoopState = {
@@ -76,7 +117,7 @@ type CommandLoopState = {
   lastFailureFingerprint: string
 }
 
-const COMMAND_LOOP_STATE_VERSION = 2
+const COMMAND_LOOP_STATE_VERSION = 3
 const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
 
 const pluginFile = fileURLToPath(import.meta.url)
@@ -85,32 +126,6 @@ const bridgeFile = path.resolve(
   process.env.SMELL_BRIDGE_FILE || path.join(pluginRoot, "runtime", "python", "bridge", "smell_bridge.py"),
 )
 const bundledIdeaRefactorCli = path.resolve(pluginRoot, "bin", "idea-refactor")
-const checkpointSmells = new Set([
-  "long_method",
-  "nested_complexity",
-  "long_parameter_list",
-  "feature_envy",
-  "data_clumps",
-  "code_clone_type1",
-  "god_class",
-  "refused_bequest",
-  "switch_statements",
-  "mysterious_name",
-  "dead_code",
-])
-const checkpointObjectiveHints: Record<string, string> = {
-  long_method: "Reduce the frozen target method's AST-NCSS below the Guard boundary; moving or renaming unrelated code does not count.",
-  nested_complexity: "Reduce the frozen target method's cognitive complexity below the Guard boundary; cosmetic edits do not count.",
-  long_parameter_list: "Reduce the frozen target declaration's parameter count, migrate callers covered by build/test, and remove the old long signature.",
-  feature_envy: "Resolve Feature Envy on the frozen target and every method introduced or changed by its refactoring diff.",
-  data_clumps: "Reduce occurrences of the frozen exact parameter group in its bounded occurrence scope; test references never define the smell.",
-  code_clone_type1: "Eliminate the frozen exact-clone pair and reject copies relocated into changed methods.",
-  god_class: "Reduce the frozen target class profile (NOM, NOF, WMC, LOC, or ATFD) without moving the same smell into changed recipient classes.",
-  refused_bequest: "Eliminate the frozen rejecting override while preserving behavior and rejecting relocation inside the changed hierarchy scope.",
-  switch_statements: "Remove every switch from the frozen target method; case count and density are progress metrics only.",
-  mysterious_name: "Meaningfully rename the frozen target symbol and update its scope; unrelated renames do not count.",
-  dead_code: "Remove the frozen unused private declaration safely; editing unrelated declarations does not count.",
-}
 function addOptional(args: string[], flag: string, value?: string) {
   if (value && value.trim()) {
     args.push(flag, value)
@@ -156,6 +171,7 @@ function withBatchDefaults(input: {
     verificationMode: hasBatchIdentity ? envVerificationMode : (input.verificationMode || envVerificationMode),
     sampleTestLocation: envSampleTestLocation,
     sampleTestCommand: envSampleTestCommand,
+    checkpointRequired: input.checkpointRequired === true,
   }
 }
 
@@ -191,49 +207,74 @@ function commonArgs(input: {
   return args
 }
 
-function taskField(task: string, label: string): string | undefined {
-  const prefix = `${label.toLowerCase()}:`
-  for (const rawLine of String(task || "").split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (line.toLowerCase().startsWith(prefix)) {
-      const value = line.slice(prefix.length).trim()
-      return value || undefined
-    }
+function controllerIdentityFromPolicy(policy: CommandPolicy): ControllerIdentity {
+  const identity = policy.identity
+  return {
+    projectRoot: identity.project_root,
+    projectOverrideRoot: identity.project_override_root || undefined,
+    language: identity.language || undefined,
+    smell: identity.smell,
+    location: identity.location,
+    targetContextJson: identity.target_context_json || undefined,
+    verificationMode: identity.verification_mode,
+    sampleTestLocation: identity.sample_test_location || undefined,
+    sampleTestCommand: identity.sample_test_command || undefined,
+    checkpointRequired: policy.checkpoint_required,
   }
-  return undefined
 }
 
-function commandTaskIdentity(task: string) {
-  return withBatchDefaults({
-    projectRoot: taskField(task, "Project root"),
-    language: taskField(task, "Language"),
-    smell: taskField(task, "Smell type"),
-    location: taskField(task, "Target location"),
-    targetContextJson: taskField(task, "Target context"),
-    verificationMode: taskField(task, "Verification mode"),
-    sampleTestLocation: taskField(task, "Sample test location"),
-    sampleTestCommand: taskField(task, "Sample test command"),
-  })
+function batchCommandIdentityBinding(): CommandIdentityBinding | undefined {
+  const projectRoot = envDefault("SMELL_PROJECT_ROOT")
+  const smell = envDefault("SMELL_SMELL")
+  const location = envDefault("SMELL_LOCATION")
+  const verificationMode = envDefault("SMELL_VERIFICATION_MODE")
+  if (!projectRoot || !smell || !location || !verificationMode) return undefined
+  return {
+    project_root: projectRoot,
+    project_override_root: envDefault("SMELL_CANONICAL_PROJECT_ROOT") || "",
+    language: envDefault("SMELL_LANGUAGE") || "",
+    smell,
+    location,
+    target_context_json: envDefault("SMELL_TARGET_CONTEXT_JSON") || "",
+    verification_mode: verificationMode,
+    sample_test_location: envDefault("SMELL_SAMPLE_TEST_LOCATION") || "",
+    sample_test_command: envDefault("SMELL_SAMPLE_TEST_COMMAND") || "",
+  }
+}
+
+function assertRestoredCommandIdentity(policy: CommandPolicy): void {
+  const binding = batchCommandIdentityBinding()
+  if (!binding) {
+    throw new Error(
+      "COMMAND_POLICY_STATE_CONTROLLER_IDENTITY_MISSING: restored state requires "
+      + "SMELL_PROJECT_ROOT, SMELL_SMELL, SMELL_LOCATION, and SMELL_VERIFICATION_MODE",
+    )
+  }
+  const mismatches = (Object.keys(binding) as Array<keyof CommandIdentityBinding>)
+    .filter((key) => policy.identity[key] !== binding[key])
+  if (mismatches.length) {
+    throw new Error(
+      `COMMAND_POLICY_STATE_IDENTITY_MISMATCH: restored state differs from controller fields: ${mismatches.join(", ")}`,
+    )
+  }
 }
 
 function isJavaCheckpointIdentity(input: {
+  checkpointRequired?: unknown
   language?: unknown
   smell?: unknown
   location?: unknown
 }): boolean {
-  const smell = String(input.smell || "").trim()
-  if (!checkpointSmells.has(smell)) return false
+  if (input.checkpointRequired !== true || !String(input.smell || "").trim()) return false
   const language = String(input.language || "").trim().toLowerCase()
   const location = String(input.location || "").trim().toLowerCase()
   return language === "java" || /\.java(?::|\b)/.test(location)
 }
 
-function batchControllerIdentity() {
-  const projectRoot = envDefault("SMELL_PROJECT_ROOT")
-  const smell = envDefault("SMELL_SMELL")
-  const location = envDefault("SMELL_LOCATION")
-  if (!projectRoot || !smell || !location) return undefined
-  return commandTaskIdentity("")
+function isJavaSourceIdentity(input: { language?: unknown; location?: unknown }): boolean {
+  const language = String(input.language || "").trim().toLowerCase()
+  const location = String(input.location || "").trim().toLowerCase()
+  return language === "java" || /\.java(?::|\b)/.test(location)
 }
 
 const MAX_STDOUT_STDERR_LEN = 4000
@@ -249,25 +290,7 @@ const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
 const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
 const DIRECT_BUILD_COMMAND_RE =
   /(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:\.\/)?(?:mvnw|mvn|gradlew|gradle)\b/
-// Conservative allowlist of repairable failure categories. These are the
-// category strings the Python bridge actually emits from
-// `_classify_failure_pack`. BUILD_FAILED is intentionally NOT listed: only an
-// explicit BUILD_COMPILE_ERROR classification from failure_pack is treated as
-// repairable compile trouble. Test regressions come back as
-// TEST_BEHAVIOR_REGRESSION or TEST_REFLECTION_ENTRY_STALE, so those (not the
-// never-emitted literal "TEST_FAILED") are what we allow.
-// Dependency / offline / auth / provider / config / tool / infrastructure /
-// timeout / unknown failures are never continued.
-const REPAIRABLE_CATEGORIES = new Set([
-  "SMELL_GUARD_FAILED",
-  "BUILD_COMPILE_ERROR",
-  "TEST_BEHAVIOR_REGRESSION",
-  "TEST_REFLECTION_ENTRY_STALE",
-  "SAMPLE_TEST_FAILED",
-])
-
 type FailureClassification = {
-  ok: boolean
   category: string
   verifyStatus: string
   highlights: string[]
@@ -388,7 +411,6 @@ function redactSecrets(input: string): string {
 
 function classifyFailureForContinue(failurePack: unknown): FailureClassification {
   const empty: FailureClassification = {
-    ok: false,
     category: "",
     verifyStatus: "",
     highlights: [],
@@ -405,7 +427,6 @@ function classifyFailureForContinue(failurePack: unknown): FailureClassification
   const artifactPaths = artifactPathsFrom(pack.artifact_paths)
   const nextAction = typeof pack.next_action === "string" ? pack.next_action.trim() : ""
   return {
-    ok: REPAIRABLE_CATEGORIES.has(category),
     category,
     verifyStatus,
     highlights,
@@ -1691,18 +1712,112 @@ function createIdleContinueRuntime(options: {
   }
 }
 
+function parseCommandPolicyPayload(value: unknown): CommandPolicy {
+  const payload = recordValue(value)
+  const loop = recordValue(payload?.loop)
+  const identity = recordValue(payload?.identity)
+  const verificationMode = payload?.verification_mode
+  const allowedModes: VerificationMode[] = ["local", "auto", "sample_optimized", "project_full"]
+  const allowedFailureGroups = new Set(["smell", "compile", "test"])
+  const requiredIdentityStrings = ["project_root", "smell", "location"] as const
+  const optionalIdentityStrings = [
+    "project_override_root",
+    "language",
+    "target_context_json",
+    "sample_test_location",
+    "sample_test_command",
+  ] as const
+  if (!payload || typeof payload.task !== "string" || !payload.task.trim()) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned no task text")
+  }
+  if (typeof verificationMode !== "string" || !allowedModes.includes(verificationMode as VerificationMode)) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an unsupported verification mode")
+  }
+  if (typeof payload.allow_test_changes !== "boolean") {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned no test-change policy")
+  }
+  if (payload.allow_test_changes && verificationMode !== "project_full") {
+    throw new Error("TEST_CHANGE_REQUIRES_PROJECT_FULL: restored policy is inconsistent")
+  }
+  if (!identity) {
+    throw new Error("INVALID_COMMAND_TASK_IDENTITY: resolver returned no structured identity")
+  }
+  for (const key of requiredIdentityStrings) {
+    if (typeof identity[key] !== "string" || !identity[key].trim()) {
+      throw new Error(`INVALID_COMMAND_TASK_IDENTITY: resolver returned no ${key}`)
+    }
+  }
+  for (const key of optionalIdentityStrings) {
+    if (typeof identity[key] !== "string") {
+      throw new Error(`INVALID_COMMAND_TASK_IDENTITY: resolver returned invalid ${key}`)
+    }
+  }
+  if (identity.verification_mode !== verificationMode) {
+    throw new Error("COMMAND_TASK_VERIFICATION_MODE_MISMATCH: identity and policy differ")
+  }
+  if (typeof payload.checkpoint_required !== "boolean") {
+    throw new Error("INVALID_COMMAND_TASK_IDENTITY: resolver returned no checkpoint requirement")
+  }
+  if (!loop || !["off", "verify-failure"].includes(String(loop.mode || ""))) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid loop mode")
+  }
+  if (!Number.isInteger(loop.max_continuations) || Number(loop.max_continuations) < 0 || Number(loop.max_continuations) > 5) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid continuation limit")
+  }
+  if (!Number.isInteger(loop.no_progress_limit) || Number(loop.no_progress_limit) < 1 || Number(loop.no_progress_limit) > 5) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid no-progress limit")
+  }
+  if (
+    !Array.isArray(loop.allowed_failure_groups)
+    || !loop.allowed_failure_groups.every((item) => typeof item === "string" && allowedFailureGroups.has(item))
+    || (loop.mode !== "off" && Number(loop.max_continuations) > 0 && loop.allowed_failure_groups.length === 0)
+  ) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned invalid failure groups")
+  }
+  if (typeof loop.instruction !== "string" || !loop.instruction.trim()) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned no continuation instruction")
+  }
+  if (
+    !Number.isFinite(loop.sample_deadline_seconds)
+    || Number(loop.sample_deadline_seconds) < 60
+    || Number(loop.sample_deadline_seconds) > 7200
+  ) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid sample deadline")
+  }
+  return {
+    task: payload.task,
+    verification_mode: verificationMode as VerificationMode,
+    allow_test_changes: payload.allow_test_changes,
+    checkpoint_required: payload.checkpoint_required,
+    identity: {
+      project_root: identity.project_root as string,
+      project_override_root: identity.project_override_root as string,
+      language: identity.language as string,
+      smell: identity.smell as string,
+      location: identity.location as string,
+      target_context_json: identity.target_context_json as string,
+      verification_mode: identity.verification_mode as VerificationMode,
+      sample_test_location: identity.sample_test_location as string,
+      sample_test_command: identity.sample_test_command as string,
+    },
+    loop: {
+      mode: loop.mode as LoopPolicy["mode"],
+      max_continuations: Number(loop.max_continuations),
+      no_progress_limit: Number(loop.no_progress_limit),
+      allowed_failure_groups: [...loop.allowed_failure_groups] as string[],
+      instruction: loop.instruction,
+      sample_deadline_seconds: Number(loop.sample_deadline_seconds),
+    },
+  }
+}
+
 function parseCommandPolicyResult(result: BridgeResult): CommandPolicy {
   if (result.exitCode !== 0 || !result.json || typeof result.json !== "object" || Array.isArray(result.json)) {
     const parsed = result.json as { error?: unknown } | null
     const detail = typeof parsed?.error === "string" ? parsed.error : (result.stderr || "command policy could not be resolved")
     throw new Error(detail)
   }
-  const payload = result.json as Record<string, unknown>
-  const loop = payload.loop
-  if (!loop || typeof loop !== "object" || Array.isArray(loop)) {
-    throw new Error("INVALID_LOOP_POLICY: resolver returned no loop policy")
-  }
-  return payload as unknown as CommandPolicy
+  return parseCommandPolicyPayload(result.json)
 }
 
 function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, unknown> | null): string {
@@ -1766,36 +1881,16 @@ function commandPolicyPrompt(policy: CommandPolicy, targetIdentityPrompt: string
       ? "The controller allows test-source migration for this task. Every changed test is audited and the frozen build/test command must still pass."
       : "Test sources are immutable for this task; TEST_SOURCE_MODIFIED is a verification failure.",
   )
-  const smell = String(taskField(policy.task, "Smell type") || "")
-  if (checkpointSmells.has(smell)) {
+  if (policy.checkpoint_required) {
     lines.push(
       "",
       "Target Guard checkpoint contract:",
       "- Baseline capture must uniquely confirm the requested smell at the supplied target; context selects the entity but never supplies a verdict.",
       "- An unchanged baseline can never pass; make a substantive production-Java refactoring.",
       "- A decreased metric is IMPROVED only. PASS requires the frozen target smell to disappear plus structural and build/test preservation.",
-      `- Adapter objective: ${checkpointObjectiveHints[smell]}`,
     )
   }
   return `${lines.join("\n")}${targetIdentityPrompt}`
-}
-
-function defaultCommandPolicy(
-  verificationMode: CommandPolicy["verification_mode"] = "project_full",
-): CommandPolicy {
-  return {
-    task: "Complete the current smell refactoring task.",
-    verification_mode: verificationMode,
-    allow_test_changes: false,
-    loop: {
-      mode: "verify-failure",
-      max_continuations: 2,
-      no_progress_limit: 1,
-      allowed_failure_groups: ["smell", "compile", "test"],
-      instruction: "Read the latest failure_pack, make one narrow corrective edit, and call smell_verify again. Respect the test-change policy frozen in c000.",
-      sample_deadline_seconds: 1800,
-    },
-  }
 }
 
 function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
@@ -1830,28 +1925,10 @@ function commandLoopStateSnapshot(state: CommandLoopState): Record<string, unkno
 function restoreCommandLoopState(raw: string | undefined): CommandLoopState | undefined {
   if (!raw) return undefined
   try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    if (parsed.schema_version !== COMMAND_LOOP_STATE_VERSION) return undefined
-    const policy = parsed.policy as CommandPolicy | undefined
-    const loop = policy?.loop
-    if (
-      !policy
-      || !["local", "auto", "sample_optimized", "project_full"].includes(policy.verification_mode)
-      || typeof policy.allow_test_changes !== "boolean"
-      || (policy.allow_test_changes && policy.verification_mode !== "project_full")
-      || !loop
-      || !["off", "verify-failure"].includes(loop.mode)
-      || !Number.isInteger(loop.max_continuations)
-      || loop.max_continuations < 0
-      || loop.max_continuations > 5
-      || !Number.isInteger(loop.no_progress_limit)
-      || loop.no_progress_limit < 0
-      || !Array.isArray(loop.allowed_failure_groups)
-      || !loop.allowed_failure_groups.every((item) => typeof item === "string")
-      || typeof loop.instruction !== "string"
-      || !Number.isFinite(loop.sample_deadline_seconds)
-      || loop.sample_deadline_seconds <= 0
-    ) return undefined
+    const parsed = recordValue(JSON.parse(raw))
+    if (!parsed || parsed.schema_version !== COMMAND_LOOP_STATE_VERSION) return undefined
+    const policy = parseCommandPolicyPayload(parsed.policy)
+    const loop = policy.loop
     const startedAt = Number(parsed.started_at)
     const continuationCount = Number(parsed.continuation_count)
     const noProgressCount = Number(parsed.no_progress_count)
@@ -1862,17 +1939,16 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
       || continuationCount > loop.max_continuations
       || !Number.isInteger(noProgressCount)
       || noProgressCount < 0
+      || typeof parsed.cap_recovery_used !== "boolean"
+      || typeof parsed.last_failure_fingerprint !== "string"
     ) return undefined
     return {
       policy,
       startedAt,
       continuationCount,
-      capRecoveryUsed: parsed.cap_recovery_used === true,
+      capRecoveryUsed: parsed.cap_recovery_used,
       noProgressCount,
-      lastFailureFingerprint:
-        typeof parsed.last_failure_fingerprint === "string"
-          ? parsed.last_failure_fingerprint
-          : "",
+      lastFailureFingerprint: parsed.last_failure_fingerprint,
     }
   } catch {
     return undefined
@@ -2048,7 +2124,6 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
 export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const idleRuntime = createIdleContinueRuntime({ client })
   const commandLoopStates = new Map<string, CommandLoopState>()
-  const commandTaskIdentities = new Map<string, ReturnType<typeof commandTaskIdentity>>()
   const commandBaselineSeals = new Map<string, string>()
   const commonShape = {
     projectRoot: tool.schema.string().describe("Absolute path to the source project root."),
@@ -2088,8 +2163,26 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       async execute(args, context) {
         const resolved = withBatchDefaults(args)
         const sessionID = context?.sessionID || ""
-        const controllerIdentity = commandTaskIdentities.get(sessionID) || batchControllerIdentity()
-        if (isJavaCheckpointIdentity(resolved) && !controllerIdentity) {
+        let commandState = commandLoopStates.get(sessionID)
+        if (!commandState && sessionID) {
+          const serializedState = process.env[COMMAND_LOOP_STATE_ENV]
+          if (!serializedState) {
+            throw new Error(
+              "COMMAND_POLICY_STATE_MISSING: smell_verify requires command-owned state or "
+              + `${COMMAND_LOOP_STATE_ENV} from the controller`,
+            )
+          }
+          commandState = restoreCommandLoopState(serializedState)
+          if (!commandState) {
+            throw new Error(`COMMAND_POLICY_STATE_INVALID: ${COMMAND_LOOP_STATE_ENV} failed schema validation`)
+          }
+          assertRestoredCommandIdentity(commandState.policy)
+          commandLoopStates.set(sessionID, commandState)
+        }
+        const controllerIdentity = commandState
+          ? controllerIdentityFromPolicy(commandState.policy)
+          : undefined
+        if (isJavaSourceIdentity(resolved) && !controllerIdentity) {
           throw new Error("CHECKPOINT_CONTROLLER_IDENTITY_MISSING: Java checkpoint verification requires command-owned or batch-owned identity")
         }
         if (controllerIdentity) {
@@ -2105,15 +2198,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           resolved.verificationMode = controllerIdentity.verificationMode
           resolved.sampleTestLocation = controllerIdentity.sampleTestLocation
           resolved.sampleTestCommand = controllerIdentity.sampleTestCommand
+          resolved.checkpointRequired = controllerIdentity.checkpointRequired
         }
         const javaCheckpoint = isJavaCheckpointIdentity(resolved)
-        let commandState = commandLoopStates.get(sessionID)
-        if (!commandState && sessionID) {
-          const requestedMode = String(resolved.verificationMode || "project_full") as CommandPolicy["verification_mode"]
-          commandState = restoreCommandLoopState(process.env[COMMAND_LOOP_STATE_ENV])
-            || newCommandLoopState(defaultCommandPolicy(requestedMode))
-          commandLoopStates.set(sessionID, commandState)
-        }
         if (commandState) {
           resolved.verificationMode = commandState.policy.verification_mode
         }
@@ -2365,12 +2452,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       ) return
       const result = await runBridge(worktree, ["resolve-command", "--arguments", input.arguments])
       const policy = parseCommandPolicyResult(result)
-      const identity = commandTaskIdentity(policy.task)
+      const identity = controllerIdentityFromPolicy(policy)
       let targetIdentityPrompt = ""
-      if (identity.smell && checkpointSmells.has(identity.smell)) {
-        if (!identity.projectRoot || !identity.location) {
-          throw new Error("CHECKPOINT_BASELINE_CAPTURE_FAILED: command task identity is incomplete")
-        }
+      if (policy.checkpoint_required) {
         const baselineResult = await runBridge(worktree, [
           "capture-baseline",
           ...commonArgs({
@@ -2402,7 +2486,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         targetIdentityPrompt = checkpointTargetIdentityPrompt(identity.smell, baselinePayload)
       }
       commandLoopStates.set(input.sessionID, newCommandLoopState(policy))
-      commandTaskIdentities.set(input.sessionID, identity)
       idleRuntime.clearSession(input.sessionID)
       idleRuntime.armInitialVerification({
         sessionID: input.sessionID,
@@ -2433,7 +2516,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           if (typeof sessionID === "string" && sessionID) {
             idleRuntime.handleSessionDeleted(sessionID)
             commandLoopStates.delete(sessionID)
-            commandTaskIdentities.delete(sessionID)
             commandBaselineSeals.delete(sessionID)
           }
           return
@@ -2486,7 +2568,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   parseCommandPolicyResult,
   checkpointTargetIdentityPrompt,
   commandPolicyPrompt,
-  defaultCommandPolicy,
   newCommandLoopState,
   commandLoopStateSnapshot,
   restoreCommandLoopState,
@@ -2504,7 +2585,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   createIdleContinueRuntime,
   SMELL_IDLE_CONTINUE_PREFIX,
   IDLE_CONTINUE_STATE_TTL_MS,
-  REPAIRABLE_CATEGORIES,
 }
 
 export default SmellPlugin
