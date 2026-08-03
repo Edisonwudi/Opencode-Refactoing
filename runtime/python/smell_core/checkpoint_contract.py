@@ -1,18 +1,25 @@
 """Generic checkpoint acceptance contract.
 
 Adapters expose continuous, threshold-independent metrics.  This module owns
-the policy shared by every migrated smell: an unchanged production tree never
-passes, and at least one measurable objective must strictly decrease from the
-immutable baseline.  The ordinary smell guard and build/test guard remain the
-final acceptance gates.
+the single smell verdict shared by every migrated Java smell: an unchanged
+production tree never passes, at least one objective must strictly decrease,
+and the frozen target-Guard finding must disappear. Build/test is the only
+separate final gate.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
+
+from .java.catalog_identity import (
+    clone_catalog_additions_in_impact_cone,
+    feature_envy_catalog_additions_in_impact_cone,
+    refused_bequest_catalog_additions_in_impact_cone,
+)
+from .resolution_plan import resolution_plan_next_action
 
 
-CHECKPOINT_CONTRACT_VERSION = 1
+CHECKPOINT_CONTRACT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,7 @@ def evaluate_checkpoint_contract(
     *,
     has_production_diff: bool,
     smell: str = "",
+    changed_production_source_files: Iterable[str] | None = None,
 ) -> ContractEvaluation:
     """Compare adapter snapshots using the shared strict-decrease contract."""
     before = _numeric_objectives(baseline.get("objectives"))
@@ -61,20 +69,30 @@ def evaluate_checkpoint_contract(
         for name in shared
     }
     available = bool(baseline.get("ok")) and bool(shared) and any(before[name] > 0 for name in shared)
-    # When the adapter can no longer locate the target entity, its objectives
-    # are recorded as zero — that is a measurement failure, not a reduction.
-    # Only smells whose goal is the target's absence (dead_code deletion,
-    # mysterious_name rename) may treat target_missing as progress; every
-    # other smell must be measured on a located target or fail closed. Legit
-    # removals (e.g. an LPL signature genuinely replaced) still pass through
-    # the strict guard, which verifies the original signature is gone.
-    absence_goal = smell in ("dead_code", "mysterious_name")
-    target_unlocated = current.get("target_missing") is True and not absence_goal
-    semantic_contract = _semantic_contract_delta(baseline, current, smell=smell)
+    # A missing target is never inferred to be success. An adapter may mark an
+    # absence transition valid only after its smell-specific closure has
+    # resolved the frozen finding (for example a rename, safe deletion, or
+    # Feature Envy move). There is no second guard fallback.
+    target_unlocated = (
+        current.get("target_missing") is True
+        and current.get("target_absence_allowed") is not True
+    )
+    semantic_contract = _semantic_contract_delta(
+        baseline,
+        current,
+        smell=smell,
+        changed_production_source_files=(
+            tuple(str(path) for path in changed_production_source_files)
+            if changed_production_source_files is not None
+            else None
+        ),
+    )
     semantic_contract_preserved = not bool(semantic_contract.get("regressions"))
+    current_detector_failure = _current_detector_failure(current)
     progress = bool(
         has_production_diff
         and available
+        and not current_detector_failure
         and not target_unlocated
         and semantic_contract_preserved
         and any(item["absolute_reduction"] > 0 for item in deltas.values())
@@ -83,6 +101,8 @@ def evaluate_checkpoint_contract(
         reason = "EDIT_REQUIRED"
     elif not available:
         reason = "BASELINE_METRIC_UNAVAILABLE"
+    elif current_detector_failure:
+        reason = current_detector_failure
     elif target_unlocated:
         reason = "TARGET_NOT_LOCATED"
     elif not semantic_contract_preserved:
@@ -105,37 +125,73 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
     """Return a guard failure when the shared contract blocks acceptance."""
     delta = dict(checkpoint.get("delta") or {})
     current_metrics = checkpoint.get("current_metrics")
+    current_detector_failure = ""
+    if checkpoint.get("required") is True:
+        if not isinstance(current_metrics, Mapping):
+            current_detector_failure = "CURRENT_DETECTOR_UNAVAILABLE"
+        else:
+            current_detector_failure = _current_detector_failure(
+                current_metrics,
+                require_candidate_count=True,
+            )
     finding_remains = bool(
         isinstance(current_metrics, Mapping)
-        and current_metrics.get("finding_present") is True
+        and current_metrics.get(
+            "target_smell_present", current_metrics.get("finding_present")
+        )
+        is True
     )
-    if delta.get("metric_progress") is True and not finding_remains:
+    if (
+        not current_detector_failure
+        and delta.get("metric_progress") is True
+        and not finding_remains
+    ):
         return None
     checkpoint_reason = str(checkpoint.get("reason") or "").strip()
     if checkpoint.get("required") is False and checkpoint_reason:
         reason = checkpoint_reason.upper()
+    elif current_detector_failure:
+        reason = current_detector_failure
     elif finding_remains and delta.get("metric_progress") is True:
         reason = "FINDING_REMAINS"
     else:
         reason = str(delta.get("reason") or "NO_STRUCTURAL_PROGRESS")
-    if reason == "TARGET_NOT_LOCATED":
-        # target_missing means the adapter could not measure the target; it is
-        # not a smell verdict. Arbitrating "genuinely removed" vs "made
-        # unreachable" belongs to the strict guard (which rescans for the
-        # original signature), so the contract stays silent here.
-        return None
     messages = {
         "EDIT_REQUIRED": "the unchanged production baseline is not an accepted repair",
         "BASELINE_CHECKPOINT_MISSING": (
             "the immutable baseline checkpoint is missing; verification cannot "
-            "fall back to the threshold detector"
+            "fall back to an unfrozen threshold"
         ),
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",
+        "CURRENT_DETECTOR_UNAVAILABLE": (
+            "the target Guard could not produce a valid current snapshot"
+        ),
+        "CURRENT_DETECTOR_RESULT_INVALID": (
+            "the target Guard returned an invalid current match count"
+        ),
+        "TARGET_AMBIGUOUS": (
+            "the current source matches multiple candidates for the frozen finding"
+        ),
         "DETECTOR_PROFILE_MISMATCH": (
-            "the detector implementation or profile changed; recapture the immutable baseline"
+            "the Guard implementation or profile changed; recapture the immutable baseline"
+        ),
+        "CHECKPOINT_RECAPTURE_REQUIRED": (
+            "the checkpoint predates schema v4; recapture c000 before editing"
+        ),
+        "BASELINE_CONTROLLER_SEAL_MISSING": (
+            "the controller-owned c000 integrity seal is missing"
+        ),
+        "BASELINE_CONTROLLER_SEAL_MISMATCH": (
+            "c000 no longer matches the integrity seal retained by the controller"
+        ),
+        "VERIFICATION_CONTRACT_MISMATCH": (
+            "the live build/test execution identity differs from the contract frozen in c000"
+        ),
+        "CHECKPOINT_SELECTION_CONTEXT_MISMATCH": (
+            "the live target selector differs from the selection_context frozen in c000"
         ),
         "FINDING_REMAINS": (
-            "the same detector finding improved but is still present; record this result as IMPROVED, not PASS"
+            "the same frozen target improved but its smell is still present; record this result as IMPROVED, not PASS"
         ),
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
         "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
@@ -156,6 +212,34 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
             "reason": reason,
         },
     }
+
+
+def _current_detector_failure(
+    current: Mapping[str, Any],
+    *,
+    require_candidate_count: bool = False,
+) -> str:
+    """Validate the authoritative current target-Guard result without guessing.
+
+    Product snapshots always include an integer candidate count.  Metric-only
+    unit fixtures may omit it when calling the evaluator directly, but the
+    guard boundary requires the complete snapshot and fails closed.
+    """
+    if current.get("ok") is not True:
+        return "CURRENT_DETECTOR_UNAVAILABLE"
+    raw_count = current.get("target_match_count", current.get("candidate_count"))
+    if raw_count is None:
+        return "CURRENT_DETECTOR_RESULT_INVALID" if require_candidate_count else ""
+    if (
+        isinstance(raw_count, bool)
+        or not isinstance(raw_count, (int, float))
+        or not float(raw_count).is_integer()
+        or float(raw_count) < 0
+    ):
+        return "CURRENT_DETECTOR_RESULT_INVALID"
+    if int(raw_count) > 1:
+        return "TARGET_AMBIGUOUS"
+    return ""
 
 
 def checkpoint_feedback_highlights(checkpoint: Mapping[str, Any] | None) -> list[str]:
@@ -204,7 +288,7 @@ def checkpoint_feedback_highlights(checkpoint: Mapping[str, Any] | None) -> list
         )
     if rendered:
         objective_line = "CHECKPOINT_OBJECTIVES " + "; ".join(rendered)
-        action = _adapter_next_action(checkpoint)
+        action = resolution_plan_next_action(checkpoint.get("resolution_plan"))
         if action:
             objective_line += "; NEXT " + action
         best_partial = _best_partial_feedback(checkpoint)
@@ -212,54 +296,6 @@ def checkpoint_feedback_highlights(checkpoint: Mapping[str, Any] | None) -> list
             objective_line += "; " + best_partial
         highlights.append(objective_line)
     return highlights
-
-
-def _adapter_next_action(checkpoint: Mapping[str, Any]) -> str:
-    adapter = str(checkpoint.get("adapter") or "")
-    current = checkpoint.get("current_metrics")
-    if not isinstance(current, Mapping):
-        return ""
-    if adapter == "feature_envy":
-        delta = checkpoint.get("delta")
-        semantic = delta.get("semantic_contract") if isinstance(delta, Mapping) else None
-        regressions = semantic.get("regressions") if isinstance(semantic, Mapping) else None
-        if isinstance(regressions, list) and any(
-            str(item).startswith("same_owner_receiver_finding_relocated:")
-            for item in regressions
-        ):
-            return (
-                "move the relocated receiver-heavy helper out of the original source class; "
-                "use a receiver-owned operation when that boundary can execute it, otherwise "
-                "use an independent workflow that preserves the existing receiver API and mock "
-                "interactions; do not retain a same-class fallback"
-            )
-        receiver = str(current.get("expected_receiver_type") or "").strip()
-        count = _integer(current.get("expected_receiver_access"))
-        if receiver and count is not None and count > 0:
-            return (
-                f"receiver={receiver} still has {count} accesses; move one cohesive receiver-heavy "
-                f"slice to {receiver}; edits toward other collaborators do not count"
-            )
-    if adapter == "data_clumps":
-        passing_max = _integer(current.get("passing_max"))
-        remaining = _integer(current.get("remaining_reductions"))
-        occurrences = current.get("occurrences")
-        worklist: list[str] = []
-        if isinstance(occurrences, list):
-            for item in occurrences[:2]:
-                if not isinstance(item, Mapping):
-                    continue
-                file_name = str(item.get("file") or "").rsplit("/", 1)[-1]
-                method = str(item.get("method") or "").split("(", 1)[0]
-                if file_name or method:
-                    worklist.append(f"{file_name}#{method}".rstrip("#"))
-        if passing_max is not None and remaining is not None and remaining > 0:
-            suffix = f"; inspect {', '.join(worklist)}" if worklist else ""
-            return (
-                f"reduce {remaining} more occurrence(s) to <={passing_max}{suffix}; "
-                "prefer ordinary helpers over annotated/codegen-sensitive entrypoints"
-            )
-    return ""
 
 
 def _best_partial_feedback(checkpoint: Mapping[str, Any]) -> str:
@@ -313,6 +349,7 @@ def _semantic_contract_delta(
     current: Mapping[str, Any],
     *,
     smell: str,
+    changed_production_source_files: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Compare route-independent semantic contracts captured by adapters.
 
@@ -323,6 +360,20 @@ def _semantic_contract_delta(
     shedding an unwanted inherited capability is the purpose of this smell.
     No project, class, method, or sample name is encoded in this policy.
     """
+    guard_violations = current.get("guard_violations")
+    if isinstance(guard_violations, list):
+        regressions = [
+            str(item.get("code") or item.get("message") or item)
+            if isinstance(item, Mapping)
+            else str(item)
+            for item in guard_violations
+            if str(item)
+        ]
+        return {
+            "applicable": True,
+            "scope": "target_plus_changed_production_files",
+            "regressions": regressions,
+        }
     if smell == "feature_envy":
         if current.get("finding_present") is True:
             return {"applicable": False, "regressions": []}
@@ -333,43 +384,54 @@ def _semantic_contract_delta(
             and isinstance(current_profile, Mapping)
             and baseline_profile.get("language") == "java"
             and current_profile.get("language") == "java"
-            and baseline_profile.get("reject_same_owner_receiver_relocation") is True
-            and current_profile.get("reject_same_owner_receiver_relocation") is True
+            and baseline_profile.get("reject_finding_relocation_in_impact_cone") is True
+            and current_profile.get("reject_finding_relocation_in_impact_cone") is True
         )
         if not relocation_contract_enabled:
             return {"applicable": False, "regressions": []}
-        before_ok = baseline.get("owner_receiver_analysis_ok") is True
-        after_ok = current.get("owner_receiver_analysis_ok") is True
-        before = _feature_envy_owner_receiver_entries(baseline.get("owner_receiver_findings"))
-        after = _feature_envy_owner_receiver_entries(current.get("owner_receiver_findings"))
-        if not before_ok or not after_ok:
+        before_catalog = baseline.get("project_finding_catalog")
+        after_catalog = current.get("project_finding_catalog")
+        if not isinstance(before_catalog, list) or not isinstance(after_catalog, list):
             return {
                 "applicable": True,
-                "regressions": ["same_owner_receiver_analysis_unavailable"],
+                "regressions": ["feature_envy_project_catalog_unavailable"],
             }
-        additions = [after[key] for key in sorted(set(after).difference(before))]
+        additions = (
+            feature_envy_catalog_additions_in_impact_cone(
+                before_catalog,
+                after_catalog,
+                changed_files=changed_production_source_files,
+            )
+            if changed_production_source_files is not None
+            else _finding_catalog_additions(
+                before_catalog,
+                after_catalog,
+                fields=("file", "class_name", "method", "rule_id"),
+            )
+        )
         return {
             "applicable": True,
-            "new_same_owner_receiver_findings": additions,
+            "new_feature_envy_findings": additions,
             "regressions": [
-                "same_owner_receiver_finding_relocated:"
-                f"{item.get('file', '')}#{item.get('method', '')}"
+                "feature_envy_finding_relocated:"
+                f"{item.get('file', '')}#{item.get('class_name', '')}#"
+                f"{item.get('method', '')}"
                 for item in additions
             ],
         }
     if smell == "data_clumps":
         if current.get("finding_present") is True:
             return {"applicable": False, "regressions": []}
-        continuity_ok = current.get("legacy_type_continuity_ok") is True
-        count = _integer(current.get("legacy_type_occurrence_count"))
+        continuity_ok = current.get("continuity_ok") is True
+        count = _integer(current.get("continuity_occurrence_count"))
         passing_max = _integer(current.get("passing_max"))
-        occurrences = current.get("legacy_type_occurrences")
+        occurrences = current.get("continuity_occurrences")
         inline_copy_ok = current.get("inline_copy_analysis_ok") is True
         inline_copy_expansions = current.get("inline_copy_expansions")
         if not continuity_ok or count is None or passing_max is None:
             return {
                 "applicable": True,
-                "regressions": ["legacy_type_signature_continuity_unavailable"],
+                "regressions": ["parameter_group_continuity_unavailable"],
             }
         surviving: list[str] = []
         if isinstance(occurrences, list):
@@ -380,12 +442,12 @@ def _semantic_contract_delta(
                 method = str(item.get("method") or "")
                 surviving.append(f"{file_name}#{method}".rstrip("#"))
         regressions = (
-            [f"legacy_type_signature_group_remains:{item}" for item in surviving]
+            [f"parameter_group_remains:{item}" for item in surviving]
             if count > passing_max
             else []
         )
         if count > passing_max and not regressions:
-            regressions = [f"legacy_type_signature_group_remains:{count}"]
+            regressions = [f"parameter_group_remains:{count}"]
         if not inline_copy_ok:
             regressions.append("inline_copy_analysis_unavailable")
         expanded_windows: list[dict[str, Any]] = []
@@ -404,13 +466,95 @@ def _semantic_contract_delta(
                 )
         return {
             "applicable": True,
-            "legacy_type_occurrence_count": count,
+            "continuity_occurrence_count": count,
             "passing_max": passing_max,
             "surviving_signatures": surviving,
             "inline_copy_contract_available": bool(
                 current.get("inline_copy_contract_available")
             ),
             "expanded_body_windows": expanded_windows,
+            "regressions": regressions,
+        }
+    if smell == "code_clone_type1":
+        if current.get("finding_present") is True:
+            return {"applicable": False, "regressions": []}
+        before = baseline.get("clone_structure")
+        after = current.get("clone_structure")
+        if not isinstance(before, Mapping) or before.get("ok") is not True:
+            return {
+                "applicable": False,
+                "regressions": [],
+                "reason": "baseline_clone_structure_unavailable",
+            }
+        if not isinstance(after, Mapping) or after.get("ok") is not True:
+            return {
+                "applicable": True,
+                "regressions": ["clone_structure_analysis_unavailable"],
+            }
+        route_proof = _clone_strict_deduplication(before, after)
+        carrier = str(route_proof.get("carrier") or "")
+        shared_implementation = str(after.get("shared_implementation") or "")
+        inherited_deduplication = bool(route_proof.get("inherited_deduplication"))
+        introduced_common = (
+            [] if inherited_deduplication or not carrier else [carrier]
+        )
+        catalog_additions = (
+            clone_catalog_additions_in_impact_cone(
+                before.get("clone_catalog"),
+                after.get("clone_catalog"),
+                changed_files=changed_production_source_files,
+                affected_methods=introduced_common,
+            )
+            if changed_production_source_files is not None
+            else _clone_catalog_additions(
+                before.get("clone_catalog"),
+                after.get("clone_catalog"),
+            )
+        )
+        # A legal extraction leaves one shared carrier, which cannot form an
+        # exact-clone group. Any new catalog member therefore remains a
+        # relocation/parallelization regression even when the global count
+        # happened to decrease from three copies to two.
+        catalog_regressions = list(catalog_additions)
+        retained_endpoints = _clone_endpoints_retaining_baseline_body(
+            before.get("endpoints"),
+            after.get("endpoints"),
+        )
+        after_endpoints = _clone_endpoint_list(after.get("endpoints"))
+        retained_endpoints = [
+            index for index in retained_endpoints
+            if index >= len(after_endpoints)
+            or str(
+                after_endpoints[index].get("declared_method")
+                or after_endpoints[index].get("effective_method")
+                or ""
+            ) not in introduced_common
+        ]
+        regressions: list[str] = list(route_proof.get("regressions") or [])
+        if catalog_regressions:
+            regressions.extend(
+                "clone_relocated_or_parallelized:"
+                f"{item.get('fingerprint', '')[:12]}:{','.join(item.get('new_methods', [])[:3])}"
+                for item in catalog_regressions[:8]
+            )
+        regressions.extend(
+            f"delegating_fallback_retains_clone_body:endpoint_{index + 1}"
+            for index in retained_endpoints
+        )
+        return {
+            "applicable": True,
+            "introduced_shared_callees": introduced_common,
+            "implementation_carriers": [carrier] if carrier else [],
+            "carrier_overlap_tokens": int(route_proof.get("overlap_tokens") or 0),
+            "carrier_overlap_ratio": float(route_proof.get("overlap_ratio") or 0.0),
+            "deduplication_routes": list(route_proof.get("routes") or []),
+            "redirected_endpoint_callers": list(
+                route_proof.get("redirected_endpoint_callers") or []
+            ),
+            "shared_implementation": shared_implementation,
+            "inherited_deduplication": inherited_deduplication,
+            "clone_catalog_additions": catalog_additions,
+            "endpoints_retaining_baseline_body": retained_endpoints,
             "regressions": regressions,
         }
     if smell != "refused_bequest":
@@ -436,6 +580,29 @@ def _semantic_contract_delta(
     before_constructors = _api_entries(before.get("declared_visible_constructors"))
     after_constructors = _api_entries(after.get("declared_visible_constructors"))
     regressions: list[str] = []
+    relocated_findings = (
+        refused_bequest_catalog_additions_in_impact_cone(
+            baseline.get("project_finding_catalog"),
+            current.get("project_finding_catalog"),
+            changed_files=changed_production_source_files,
+            affected_classes=_refused_bequest_affected_classes(
+                baseline,
+                current,
+                changed_production_source_files,
+            ),
+        )
+        if changed_production_source_files is not None
+        else _finding_catalog_additions(
+            baseline.get("project_finding_catalog"),
+            current.get("project_finding_catalog"),
+            fields=("file", "class_name", "method", "rule_id", "parent"),
+        )
+    )
+    regressions.extend(
+        "rejecting_override_relocated:"
+        f"{item.get('file', '')}#{item.get('method', '')}"
+        for item in relocated_findings[:8]
+    )
     missing_methods = sorted(set(before_methods).difference(after_methods))
     missing_constructors = sorted(set(before_constructors).difference(after_constructors))
     review_signals: list[str] = []
@@ -478,8 +645,360 @@ def _semantic_contract_delta(
         "missing_constructors": missing_constructors,
         "regressions": regressions,
         "review_signals": review_signals,
+        "new_rejecting_findings": relocated_findings,
         "policy": before.get("comparison_policy") or {},
     }
+
+
+def _clone_strict_deduplication(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    before_graph = _clone_call_graph(before.get("call_graph"))
+    before_endpoints = _clone_endpoint_list(before.get("endpoints"))
+    after_endpoints = _clone_endpoint_list(after.get("endpoints"))
+    profiles = {
+        str(item.get("method") or ""): item
+        for item in _clone_implementation_catalog(after.get("implementation_catalog"))
+    }
+    if len(before_endpoints) != 2 or len(after_endpoints) != 2 or not profiles:
+        return {
+            "carrier": "",
+            "routes": [],
+            "redirected_endpoint_callers": [],
+            "regressions": ["clone_call_graph_unavailable"],
+        }
+    side_carriers: list[str] = []
+    routes: list[dict[str, Any]] = []
+    redirected: list[dict[str, Any]] = []
+    regressions: list[str] = []
+    for index in range(2):
+        baseline_key = str(before_endpoints[index].get("declared_method") or "")
+        current_key = str(
+            after_endpoints[index].get("declared_method")
+            or after_endpoints[index].get("effective_method")
+            or ""
+        )
+        if not baseline_key:
+            regressions.append(f"baseline_clone_endpoint_missing:endpoint_{index + 1}")
+            continue
+        starts: list[str]
+        if current_key:
+            starts = [current_key]
+        else:
+            callers = sorted(
+                caller
+                for caller, callees in before_graph.items()
+                if caller != baseline_key and baseline_key in callees
+            )
+            missing_callers = [caller for caller in callers if caller not in profiles]
+            if not callers:
+                regressions.append(
+                    f"removed_clone_endpoint_has_no_frozen_callers:endpoint_{index + 1}"
+                )
+                continue
+            if missing_callers:
+                regressions.append(
+                    f"removed_clone_endpoint_callers_missing:endpoint_{index + 1}:"
+                    + ",".join(missing_callers[:3])
+                )
+                continue
+            starts = callers
+            redirected.append({
+                "endpoint": index + 1,
+                "baseline_callers": callers,
+            })
+        traces = [
+            _clone_forwarder_route(start, profiles)
+            for start in starts
+        ]
+        trace_errors = [str(item.get("error") or "") for item in traces if item.get("error")]
+        if trace_errors:
+            regressions.append(
+                f"clone_forwarder_route_unproven:endpoint_{index + 1}:"
+                + ",".join(sorted(set(trace_errors))[:3])
+            )
+            continue
+        carriers = {str(item.get("carrier") or "") for item in traces}
+        carriers.discard("")
+        if len(carriers) != 1:
+            regressions.append(
+                f"clone_endpoint_routes_diverge:endpoint_{index + 1}"
+            )
+            continue
+        carrier = next(iter(carriers))
+        side_carriers.append(carrier)
+        for trace in traces:
+            routes.append({
+                "endpoint": index + 1,
+                "start": str(trace.get("start") or ""),
+                "path": list(trace.get("path") or []),
+                "carrier": carrier,
+            })
+    carrier = ""
+    if len(side_carriers) == 2 and side_carriers[0] == side_carriers[1]:
+        carrier = side_carriers[0]
+    elif not regressions:
+        regressions.append("clone_endpoint_routes_do_not_converge")
+    overlap_tokens = 0
+    overlap_ratio = 0.0
+    if carrier:
+        baseline_tokens = _clone_endpoint_body_tokens(before_endpoints)
+        carrier_tokens = _trim_clone_body_tokens(
+            list(profiles.get(carrier, {}).get("body_tokens") or [])
+        )
+        overlap_tokens = _longest_common_token_window(
+            baseline_tokens,
+            carrier_tokens,
+        )
+        overlap_ratio = (
+            overlap_tokens / len(baseline_tokens)
+            if baseline_tokens
+            else 0.0
+        )
+        # Keep overlap as diagnostic context only. Convergence of both frozen
+        # endpoints on one statically proven carrier is the structural contract;
+        # legitimate rewrites are not required to retain an arbitrary fraction
+        # of the baseline token sequence.
+    if not carrier:
+        regressions.append("clone_deduplication_proof_missing")
+    shared_implementation = str(after.get("shared_implementation") or "")
+    return {
+        "carrier": carrier,
+        "routes": routes,
+        "redirected_endpoint_callers": redirected,
+        "overlap_tokens": overlap_tokens,
+        "overlap_ratio": overlap_ratio,
+        "inherited_deduplication": bool(
+            carrier and shared_implementation == carrier
+        ),
+        "regressions": list(dict.fromkeys(regressions)),
+    }
+
+
+def _clone_forwarder_route(
+    start: str,
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    current = start
+    path: list[str] = []
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            return {"start": start, "path": path, "error": "cycle"}
+        seen.add(current)
+        path.append(current)
+        profile = profiles.get(current)
+        if not isinstance(profile, Mapping):
+            return {"start": start, "path": path, "error": "method_missing"}
+        if profile.get("thin_forwarder") is not True:
+            return {"start": start, "path": path, "carrier": current}
+        if int(profile.get("unresolved_call_count") or 0) != 0:
+            return {"start": start, "path": path, "error": "unresolved_dispatch"}
+        callees = [str(item) for item in (profile.get("callees") or []) if str(item)]
+        if len(callees) != 1:
+            return {"start": start, "path": path, "error": "not_single_forwarder"}
+        current = callees[0]
+    return {"start": start, "path": path, "error": "route_missing"}
+
+
+def _clone_endpoint_body_tokens(
+    endpoints: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    for endpoint in endpoints:
+        tokens = endpoint.get("body_tokens")
+        if isinstance(tokens, list) and tokens:
+            return _trim_clone_body_tokens([str(token) for token in tokens])
+    return []
+
+
+def _trim_clone_body_tokens(tokens: list[str]) -> list[str]:
+    if len(tokens) >= 2 and tokens[0] == "{" and tokens[-1] == "}":
+        return tokens[1:-1]
+    return tokens
+
+
+def _longest_common_token_window(left: Sequence[str], right: Sequence[str]) -> int:
+    if not left or not right:
+        return 0
+    previous = [0] * (len(right) + 1)
+    longest = 0
+    for left_token in left:
+        current = [0] * (len(right) + 1)
+        for index, right_token in enumerate(right, start=1):
+            if left_token == right_token:
+                current[index] = previous[index - 1] + 1
+                longest = max(longest, current[index])
+        previous = current
+    return longest
+
+
+def _clone_endpoint_list(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)][:2]
+
+
+def _clone_implementation_catalog(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, Mapping)
+        and str(item.get("method") or "")
+    ]
+
+
+def _clone_call_graph(value: Any) -> dict[str, set[str]]:
+    if not isinstance(value, list):
+        return {}
+    graph: dict[str, set[str]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        caller = str(item.get("caller") or "")
+        callees = item.get("callees")
+        if caller and isinstance(callees, list):
+            graph[caller] = {str(callee) for callee in callees if str(callee)}
+    return graph
+
+
+def _clone_graph_reachable(graph: Mapping[str, set[str]], start: str) -> set[str]:
+    reached: set[str] = set()
+    pending = list(graph.get(start, set()))
+    while pending:
+        key = pending.pop()
+        if key == start or key in reached:
+            continue
+        reached.add(key)
+        pending.extend(graph.get(key, set()))
+    return reached
+
+
+def _clone_catalog_entries(value: Any) -> dict[str, set[str]]:
+    if not isinstance(value, list):
+        return {}
+    entries: dict[str, set[str]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        fingerprint = str(item.get("fingerprint") or "")
+        methods = item.get("methods")
+        if fingerprint and isinstance(methods, list):
+            entries[fingerprint] = {str(method) for method in methods if str(method)}
+    return entries
+
+
+def _clone_catalog_additions(before_value: Any, after_value: Any) -> list[dict[str, Any]]:
+    before = _clone_catalog_entries(before_value)
+    after = _clone_catalog_entries(after_value)
+    additions: list[dict[str, Any]] = []
+    for fingerprint in sorted(after):
+        new_methods = sorted(after[fingerprint].difference(before.get(fingerprint, set())))
+        if fingerprint not in before or new_methods:
+            additions.append({
+                "fingerprint": fingerprint,
+                "new_methods": new_methods or sorted(after[fingerprint]),
+                "before_count": len(before.get(fingerprint, set())),
+                "after_count": len(after[fingerprint]),
+            })
+    return additions
+
+
+def _clone_endpoints_retaining_baseline_body(
+    before_value: Any,
+    after_value: Any,
+) -> list[int]:
+    if not isinstance(before_value, list) or not isinstance(after_value, list):
+        return []
+    baseline_tokens: list[str] = []
+    for item in before_value:
+        if not isinstance(item, Mapping) or not isinstance(item.get("body_tokens"), list):
+            continue
+        baseline_tokens = [str(token) for token in item["body_tokens"]]
+        if len(baseline_tokens) >= 2 and baseline_tokens[0] == "{" and baseline_tokens[-1] == "}":
+            baseline_tokens = baseline_tokens[1:-1]
+        if baseline_tokens:
+            break
+    if not baseline_tokens:
+        return []
+    retained: list[int] = []
+    for index, item in enumerate(after_value[:2]):
+        if not isinstance(item, Mapping) or not isinstance(item.get("body_tokens"), list):
+            continue
+        current_tokens = [str(token) for token in item["body_tokens"]]
+        if _contains_token_window(current_tokens, baseline_tokens):
+            retained.append(index)
+    return retained
+
+
+def _contains_token_window(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    width = len(needle)
+    return any(
+        haystack[index : index + width] == needle
+        for index in range(len(haystack) - width + 1)
+    )
+
+
+def _finding_catalog_additions(
+    before_value: Any,
+    after_value: Any,
+    *,
+    fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    def entries(value: Any) -> dict[tuple[str, ...], dict[str, Any]]:
+        if not isinstance(value, list):
+            return {}
+        result: dict[tuple[str, ...], dict[str, Any]] = {}
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                continue
+            item = {field: str(raw.get(field) or "") for field in fields}
+            key = tuple(item[field] for field in fields)
+            if any(key):
+                result[key] = item
+        return result
+
+    before = entries(before_value)
+    after = entries(after_value)
+    return [after[key] for key in sorted(set(after).difference(before))]
+
+
+def _refused_bequest_affected_classes(
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    changed_files: tuple[str, ...],
+) -> set[str]:
+    """Expand to descendants only when a frozen contract declaration changed."""
+    changed = {str(path).replace("\\", "/").lstrip("./") for path in changed_files}
+    names: set[str] = set()
+    for snapshot in (baseline, current):
+        impact = snapshot.get("migration_impact_map")
+        if not isinstance(impact, Mapping):
+            continue
+        declarations = impact.get("contract_declarations")
+        declaration_changed = bool(
+            isinstance(declarations, list)
+            and any(
+                isinstance(item, Mapping)
+                and str(item.get("file") or "").replace("\\", "/").lstrip("./") in changed
+                for item in declarations
+            )
+        )
+        implementers = impact.get("implementers")
+        if not isinstance(implementers, list):
+            continue
+        for item in implementers:
+            if not isinstance(item, Mapping):
+                continue
+            file_name = str(item.get("file") or "").replace("\\", "/").lstrip("./")
+            class_name = str(item.get("class") or "").strip()
+            if class_name and (declaration_changed or file_name in changed):
+                names.add(class_name)
+    return names
 
 
 def _api_entries(value: Any) -> dict[str, Mapping[str, Any]]:
@@ -491,29 +1010,6 @@ def _api_entries(value: Any) -> dict[str, Mapping[str, Any]]:
             continue
         key = str(item.get("api_key") or "").strip()
         if key:
-            entries[key] = item
-    return entries
-
-
-def _feature_envy_owner_receiver_entries(value: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, list):
-        return {}
-    entries: dict[str, dict[str, Any]] = {}
-    for raw in value:
-        if not isinstance(raw, Mapping):
-            continue
-        item = {
-            "file": str(raw.get("file") or ""),
-            "class": str(raw.get("class") or ""),
-            "method": str(raw.get("method") or ""),
-            "envied_field": str(raw.get("envied_field") or ""),
-            "envied_type": str(raw.get("envied_type") or ""),
-        }
-        key = "#".join(
-            item[name]
-            for name in ("file", "class", "method", "envied_field", "envied_type")
-        )
-        if key.strip("#"):
             entries[key] = item
     return entries
 

@@ -141,7 +141,7 @@ class SmellGuideBuilder:
             "IDEA refactoring hints for refused_bequest:",
             "",
             "- Identify overrides that reject, ignore, or duplicate parent behavior.",
-            "- Treat the supplied sample test as an immutable project-behavior regression oracle; never edit or weaken it.",
+            "- Obey the controller-frozen test-change policy; when migration is allowed, update only necessary test API callers and never weaken assertions.",
             "- Derive the parent contract, sibling implementations, and caller impact from source before choosing a route.",
             "- Do not guess `safe-delete`; this route does not expose a `safe-delete` IDEA CLI operation.",
             "- For pure super-delegation or delete-legal useless overrides, prefer `inline:method` with `keepMethodDeclaration=false`.",

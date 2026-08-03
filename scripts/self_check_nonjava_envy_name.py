@@ -51,6 +51,8 @@ def _bridge(
         sys.executable,
         str(BRIDGE),
         command,
+        "--output-detail",
+        "audit",
         "--config",
         str(CONFIG),
         "--project-root",
@@ -106,7 +108,7 @@ def _case(
         assert baseline["success"] is True, baseline
         if smell == "feature_envy" and language != "java":
             profile = baseline["metrics"]["detector_profile"]
-            assert profile["reject_same_owner_receiver_relocation"] is False, profile
+            assert profile["reject_finding_relocation_in_impact_cone"] is False, profile
         before_value = float(baseline["metrics"]["objectives"][objective])
         assert before_value > 0, baseline
         unchanged = _bridge(project, "verify", language, smell, location, evidence)

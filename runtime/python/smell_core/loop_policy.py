@@ -24,7 +24,10 @@ class LoopPolicy:
     max_continuations: int = 2
     no_progress_limit: int = 1
     allowed_failure_groups: tuple[str, ...] = ("smell", "compile", "test")
-    instruction: str = "Read the latest failure_pack, make one narrow corrective edit, and call smell_verify again. Do not modify or weaken tests."
+    instruction: str = (
+        "Read the latest failure_pack, make one narrow corrective edit, and call "
+        "smell_verify again. Respect the test-change policy frozen in c000."
+    )
     sample_deadline_seconds: int = 1800
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,12 +46,14 @@ class LoopPolicy:
 class ResolvedCommandPolicy:
     task: str
     verification_mode: str
+    allow_test_changes: bool
     loop: LoopPolicy
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "task": self.task,
             "verification_mode": self.verification_mode,
+            "allow_test_changes": self.allow_test_changes,
             "loop": self.loop.to_dict(),
         }
 
@@ -103,8 +108,15 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
     parser = _PolicyParser(add_help=False, allow_abbrev=False)
     parser.add_argument(
         "--verification-mode",
+        # The shared command parser still serves the non-Java agent. The Java
+        # plugin surface exposes only the two strict modes below.
         choices=("local", "auto", "sample_optimized", "project_full"),
-        default="local",
+        default="project_full",
+    )
+    parser.add_argument(
+        "--allow-test-changes",
+        action="store_true",
+        help="controller-owned opt-in; frozen into c000 before the repair starts",
     )
     parser.add_argument("--loop-mode", choices=sorted(LOOP_MODES), default="verify-failure")
     parser.add_argument("--loop-max", type=int, default=3)
@@ -125,11 +137,17 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
         raise ValueError(f"INVALID_LOOP_POLICY: unsupported --loop-on groups: {', '.join(unknown)}")
     if not groups and parsed.loop_mode != "off" and parsed.loop_max > 0:
         raise ValueError("INVALID_LOOP_POLICY: --loop-on must contain at least one failure group")
+    if parsed.allow_test_changes and parsed.verification_mode != "project_full":
+        raise ValueError(
+            "TEST_CHANGE_REQUIRES_PROJECT_FULL: --allow-test-changes requires "
+            "--verification-mode=project_full"
+        )
     mode = "off" if parsed.loop_max == 0 else parsed.loop_mode
 
     return ResolvedCommandPolicy(
         task=task,
         verification_mode=parsed.verification_mode,
+        allow_test_changes=bool(parsed.allow_test_changes),
         loop=LoopPolicy(
             mode=mode,
             max_continuations=parsed.loop_max,

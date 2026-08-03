@@ -4,7 +4,7 @@ Use this file only when a route mentions a source operation and the plain edit m
 
 | Source operation | Plain OpenCode edit mechanic |
 | --- | --- |
-| `idea_edit` | Use one exact oldString/newString replacement for a declaration, block, or insertion anchor after reading the file. |
+| `direct:edit` | Use one exact oldString/newString replacement for a declaration, block, or insertion anchor after reading the file. |
 | `extract:method` | Create the helper manually, pass outer-scope values explicitly, return needed results, and replace the selected block. |
 | `introduce:parameter-object` | Create or reuse a holder, change the signature, and update callers to pass the holder. |
 | `move:method` | Recreate behavior on the target owner, then rewrite the source/call sites to delegate to that owner. |

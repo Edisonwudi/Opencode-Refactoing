@@ -14,7 +14,10 @@ RUNTIME_PYTHON = ROOT / "runtime" / "python"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.java.semantic_detector import run_java_semantic_detector  # noqa: E402
+from smell_core.java.semantic_detector import (  # noqa: E402
+    analyze_feature_envy_target,
+    run_java_semantic_detector,
+)
 
 
 FIXTURE = """\
@@ -27,6 +30,7 @@ class Other {
 class Subject {
   private Collaborator collaborator;
   private Other other;
+  private int a, b, c;
 
   void direct() {
     collaborator.a();
@@ -152,6 +156,33 @@ def main() -> int:
             raise AssertionError(f"Unexpected dominant field/type: {direct}")
         if dominant[3] != "collaborator":
             raise AssertionError(f"Strongest field was not selected deterministically: {dominant}")
+
+        assert result.project_model is not None, result
+        direct_profile = analyze_feature_envy_target(
+            root,
+            target_file=root / "Fixture.java",
+            method=findings["direct"].method,
+            expected_receiver_type=direct[2],
+            project_model=result.project_model,
+        )
+        direct_worklist = direct_profile["receiver_access_worklist"]
+        assert len(direct_worklist) == direct_profile["envy_access_count"] == 4, direct_profile
+        assert {item["field"] for item in direct_worklist} == {"collaborator"}, direct_worklist
+        assert all(item["receiver"] == "collaborator" for item in direct_worklist), direct_worklist
+        assert all(item["receiver_type"].endswith("Collaborator") for item in direct_worklist), direct_worklist
+        assert {item["member"] for item in direct_worklist} == {"a", "b", "c", "d"}, direct_worklist
+
+        alias_profile = analyze_feature_envy_target(
+            root,
+            target_file=root / "Fixture.java",
+            method=findings["aliased"].method,
+            expected_receiver_type=direct[2],
+            project_model=result.project_model,
+        )
+        alias_worklist = alias_profile["receiver_access_worklist"]
+        assert len(alias_worklist) == 4, alias_worklist
+        assert {item["receiver"] for item in alias_worklist} == {"local"}, alias_worklist
+        assert {item["field"] for item in alias_worklist} == {"collaborator"}, alias_worklist
 
         print(
             "feature-envy-self-check PASS "

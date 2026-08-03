@@ -9,7 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
-from smell_core.java.semantic_detector import build_refused_bequest_impact_map  # noqa: E402
+from smell_core.java.semantic_detector import (  # noqa: E402
+    build_refused_bequest_impact_map,
+    run_java_semantic_detector,
+)
+from smell_core.checkpoint_adapters import (  # noqa: E402
+    _compact_refused_bequest_impact_map,
+)
 
 
 SOURCE = """\
@@ -70,6 +76,8 @@ def main() -> int:
         source = project / "src" / "main" / "java" / "Hierarchy.java"
         source.parent.mkdir(parents=True)
         source.write_text(SOURCE, encoding="utf-8")
+        detection = run_java_semantic_detector(project)
+        assert detection.ok and detection.project_model is not None, detection
         payload = build_refused_bequest_impact_map(
             project,
             target_file=source,
@@ -78,6 +86,7 @@ def main() -> int:
             reported_parent="Page",
             target_parameter_count=1,
             target_class_name="Leaf",
+            project_model=detection.project_model,
         )
 
     assert payload["ok"] is True, payload
@@ -117,6 +126,15 @@ def main() -> int:
         not item["api_key"].startswith("setChild(")
         for item in contract["visible_non_target_methods"]
     ), contract
+    compact = _compact_refused_bequest_impact_map(payload)
+    assert compact["analysis_ok"] is True, compact
+    assert len(compact["contract_declarations"]) == len(declarations), compact
+    assert len(compact["implementers"]) == len(payload["implementers"]), compact
+    assert len(compact["production_call_sites"]) == len(call_sites), compact
+    assert compact["remaining_work_count"] == (
+        len(declarations) + len(payload["implementers"]) + len(call_sites)
+    ), compact
+    assert "target_contract" not in compact, compact
     print("refused bequest plan self-check: PASS")
     return 0
 

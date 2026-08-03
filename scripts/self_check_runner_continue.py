@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inline self-test for command-owned loop policy and runner helpers.
 
-Does NOT run subprocesses or hit models. Validates the pure decision helpers
+Does NOT hit models. Validates the pure decision helpers
 (_compute_status, command policy parsing, session-id parsing, and task shaping).
 
 Run: python3 scripts/self_check_runner_continue.py
@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import argparse
 import io
+import inspect
 import json
 import os
 import subprocess
@@ -43,7 +44,14 @@ def check_true(name: str, cond: bool) -> None:
 def make_payload(status: str, category: str = "", **extra) -> dict:
     pack = {"failure_category": category, "verify_status": status}
     pack.update(extra.get("pack_extra", {}))
-    return {"success": status == "PASS", "status": status, "failure_pack": pack, **{k: v for k, v in extra.items() if k != "pack_extra"}}
+    return {
+        "success": status == "PASS",
+        "accepted": status == "PASS",
+        "status": status,
+        "resolution": "resolved" if status == "PASS" else ("improved" if status == "IMPROVED" else "failed"),
+        "failure_pack": pack,
+        **{k: v for k, v in extra.items() if k != "pack_extra"},
+    }
 
 
 print("== _failure_category_from_verify_payload ==")
@@ -54,19 +62,23 @@ check("non-dict pack", R._failure_category_from_verify_payload({"failure_pack": 
 
 print("== _compute_status ==")
 check("pass", R._compute_status(0, 0, make_payload("PASS")), "PASS")
+check("pass_nonzero_bridge_rc_fails_closed", R._compute_status(0, 1, make_payload("PASS")), "VERIFY_FAILED")
+check("pass_missing_resolution_fails_closed", R._compute_status(0, 0, {"status": "PASS", "success": True, "accepted": True}), "VERIFY_FAILED")
+check("pass_missing_accepted_fails_closed", R._compute_status(0, 0, {"status": "PASS", "success": True, "resolution": "resolved"}), "VERIFY_FAILED")
+check("pass_false_success_fails_closed", R._compute_status(0, 0, {"status": "PASS", "success": False, "accepted": True, "resolution": "resolved"}), "VERIFY_FAILED")
 check("verify_fail_rc", R._compute_status(0, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
 check("verify_fail_nostatus", R._compute_status(0, 1, {"status": ""}), "VERIFY_FAILED")
-check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
-check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
-check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS_AFTER_OPENCODE_TIMEOUT")
-check("opencode_timeout_verify_fail", R._compute_status(124, 0, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
+check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "PASS")
+check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS")
+check("opencode_timeout_verify_fail", R._compute_status(124, 1, make_payload("SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
 check("improved_not_accepted", R._compute_status(0, 1, make_payload("IMPROVED")), "IMPROVED")
 check("timeout_preserves_improved", R._compute_status(124, 1, make_payload("IMPROVED")), "IMPROVED")
 check("improved_status_not_accepted", R._is_accepted_status("IMPROVED"), False)
 check(
-    "provider_quota_overrides_verify",
+    "provider_quota_is_metadata_when_final_verify_passes",
     R._compute_status(R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, 0, make_payload("PASS")),
-    "PROVIDER_QUOTA_FAILED",
+    "PASS",
 )
 
 print("== fatal provider error ==")
@@ -85,11 +97,7 @@ check("ordinary_model_error_not_fatal", R._fatal_provider_error("tool call faile
 
 print("== dataset evidence identity ==")
 god_row = {"smell_type": "god_class", "class": "Configuration", "evidence": "nom=143;wmc=162"}
-check(
-    "god_class_appends_class",
-    R._dataset_evidence(god_row),
-    "nom=143;wmc=162;class=Configuration",
-)
+check("god_class_evidence_is_audit_only", R._dataset_evidence(god_row), "nom=143;wmc=162")
 check(
     "god_class_preserves_existing_class",
     R._dataset_evidence({**god_row, "evidence": "nom=143;class=Configuration"}),
@@ -101,84 +109,82 @@ check(
     "far=8",
 )
 check(
-    "dataset_method_anchor_promoted",
-    R._dataset_location(
-        {
-            "smell_type": "long_parameter_list",
-            "location": "src/Foo.java:42",
-            "group_occurrences": json.dumps(
-                {
-                    "file": "src/Foo.java",
-                    "class": "Foo",
-                    "method": "target",
-                    "begin_line": "42",
-                }
-            ),
-        }
-    ),
-    "src/Foo.java:method=target|line=42",
+    "explicit_target_context_loaded",
+    R._dataset_target_context({
+        "smell_type": "mysterious_name",
+        "target_context_json": json.dumps({
+            "symbol_kind": "local",
+            "symbol_name": "tmp",
+            "container_method": "work()",
+            "target_class": "Fixture",
+        }),
+        "evidence": "local=forged",
+    }),
+    {
+        "symbol_kind": "local",
+        "symbol_name": "tmp",
+        "container_method": "work()",
+        "target_class": "Fixture",
+    },
 )
 check(
-    "explicit_method_anchor_preserved",
-    R._dataset_location(
-        {
-            "smell_type": "long_parameter_list",
-            "location": "src/Foo.java:method=target|line=42",
-            "group_occurrences": json.dumps(
-                {
-                    "file": "src/Foo.java",
-                    "method": "other",
-                    "begin_line": "7",
-                }
-            ),
-        }
-    ),
-    "src/Foo.java:method=target|line=42",
+    "evidence_never_constructs_target_context",
+    R._dataset_target_context({
+        "smell_type": "data_clumps",
+        "evidence": "group=int:a|int:b|int:c",
+    }),
+    {},
 )
-check(
-    "non_lpl_method_anchor_unchanged",
-    R._dataset_location(
-        {
-            "smell_type": "mysterious_name",
-            "location": "src/Foo.java:42",
-            "group_occurrences": json.dumps(
-                {
-                    "file": "src/Foo.java",
-                    "method": 'SyntheticOwner("value")',
-                    "begin_line": "42",
-                }
-            ),
-        }
-    ),
-    "src/Foo.java:42",
-)
-for smell in ("long_method", "nested_complexity", "switch_statements"):
+try:
+    R._dataset_target_context({"target_context_json": '{"score":99}'})
+except ValueError:
+    pass
+else:
+    raise AssertionError("forbidden target_context_json verdict field was accepted")
+with tempfile.TemporaryDirectory() as tmp:
+    dataset = Path(tmp) / "samples.csv"
+    header = (
+        "sample_id,language,smell_type,project_name,project_path,location,"
+        "group_occurrences,target_context_json\n"
+    )
+    dataset.write_text(
+        header
+        + '1,java,long_method,p,/tmp/p,src/Foo.java:method=target|line=42,'
+        + '"{\""method\"":\""forged\""}","{}"\n',
+        encoding="utf-8",
+    )
+    loaded = R._load_samples(dataset)
     check(
-        f"{smell}_method_anchor_promoted",
-        R._dataset_location(
-            {
-                "smell_type": smell,
-                "location": "src/Foo.java:42",
-                "group_occurrences": json.dumps(
-                    {
-                        "file": "src/Foo.java",
-                        "method": "target",
-                        "begin_line": "42",
-                    }
-                ),
-            }
-        ),
+        "explicit_location_is_not_rewritten_from_group_occurrences",
+        loaded[0].location,
         "src/Foo.java:method=target|line=42",
     )
+    dataset.write_text(
+        header + '1,java,long_method,p,/tmp/p,src/Foo.java:42,,"{}"\n',
+        encoding="utf-8",
+    )
+    try:
+        R._load_samples(dataset)
+    except ValueError as exc:
+        check_true("missing_method_selector_fails_fast", "explicit method selector" in str(exc))
+    else:
+        failures.append("missing_method_selector_fails_fast: invalid row was accepted")
 
 print("== single time budget ==")
 check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)
 check("pass_is_accepted", R._is_accepted_status("PASS"), True)
-check("timeout_pass_is_accepted", R._is_accepted_status("PASS_AFTER_OPENCODE_TIMEOUT"), True)
+check("removed_timeout_pass_is_not_accepted", R._is_accepted_status("PASS_AFTER_OPENCODE_TIMEOUT"), False)
 check("opencode_failure_not_accepted", R._is_accepted_status("OPENCODE_FAILED"), False)
 parser = R.build_parser()
 parsed = parser.parse_args(["--dataset", "/tmp/input.csv", "--sample-deadline", "2400"])
 check("sample_deadline_public_entry", parsed.sample_deadline, 2400)
+check("project_full_is_default", parsed.verification_mode, "project_full")
+check("test_changes_default_forbidden", parsed.allow_test_changes, False)
+check(
+    "test_changes_explicit_opt_in",
+    parser.parse_args(["--dataset", "/tmp/input.csv", "--allow-test-changes"]).allow_test_changes,
+    True,
+)
 for removed_flag in ("--timeout", "--verify-timeout", "--opencode-log-idle-timeout"):
     try:
         with contextlib.redirect_stderr(io.StringIO()):
@@ -187,6 +193,27 @@ for removed_flag in ("--timeout", "--verify-timeout", "--opencode-log-idle-timeo
         pass
     else:
         raise AssertionError(f"removed flag still accepted: {removed_flag}")
+for removed_idea_args in (
+    ["--idea"],
+    ["--no-idea"],
+    ["--idea-refactor-cli", "/tmp/idea-refactor"],
+    ["--agent", "java-refactor-agent-idea"],
+):
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["--dataset", "/tmp/input.csv", *removed_idea_args])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError(f"removed IDEA runner entry still accepted: {removed_idea_args}")
+for removed_mode in ("local", "auto"):
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["--dataset", "/tmp/input.csv", "--verification-mode", removed_mode])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError(f"removed verification mode still accepted: {removed_mode}")
 
 print("== command policy parser ==")
 resolved = parse_command_policy('--verification-mode=sample_optimized --loop-max=2 --loop-on=smell,test --loop-instruction="Use the pack" -- Project root: /tmp/p')
@@ -212,6 +239,16 @@ for name, raw in [
         failures.append(f"{name}: expected ValueError")
     except ValueError as exc:
         check_true(name, str(exc).startswith("INVALID_LOOP_POLICY:"))
+try:
+    parse_command_policy(
+        "--verification-mode=sample_optimized --allow-test-changes -- task"
+    )
+    failures.append("test_changes_require_project_full: expected ValueError")
+except ValueError as exc:
+    check_true(
+        "test_changes_require_project_full",
+        str(exc).startswith("TEST_CHANGE_REQUIRES_PROJECT_FULL:"),
+    )
 
 print("== _parse_session_id_from_json_events ==")
 # Real --format json event format: sessionID is a TOP-LEVEL field.
@@ -309,16 +346,7 @@ check(
 )
 check("trace_keeps_last_payload", pass_trace["last_payload"]["status"], "PASS")
 check("trace_no_tools_after_final_verify", pass_trace["tools_after_last_verify"], 0)
-check(
-    "normal_exit_reuses_final_verify",
-    R._reusable_verify_payload(pass_trace, opencode_returncode=0)["status"],
-    "PASS",
-)
-check(
-    "timeout_requires_runner_fallback",
-    R._reusable_verify_payload(pass_trace, opencode_returncode=124),
-    None,
-)
+check("agent_verify_is_not_reused", hasattr(R, "_reusable_verify_payload"), False)
 post_verify_tool = json.dumps({
     "type": "tool_use",
     "part": {
@@ -332,24 +360,10 @@ edited_after_verify = R._verification_trace(
     + post_verify_tool
 )
 check("trace_counts_tools_after_verify", edited_after_verify["tools_after_last_verify"], 1)
-check(
-    "post_verify_tool_requires_runner_fallback",
-    R._reusable_verify_payload(edited_after_verify, opencode_returncode=0),
-    None,
-)
-check(
-    "parsed_but_incomplete_verify_requires_fallback",
-    R._reusable_verify_payload(
-        R._verification_trace(verify_event({"status": "PASS"})),
-        opencode_returncode=0,
-    ),
-    None,
-)
 malformed = json.dumps({"type": "tool_use", "part": {"tool": "smell_verify", "state": {"status": "completed", "output": "truncated"}}})
 malformed_trace = R._verification_trace(malformed)
 check("malformed_still_counts_verify", malformed_trace["smell_verify_calls"], 1)
 check("malformed_has_no_decision", malformed_trace["last_loop_decision"], "")
-check("malformed_verify_not_reusable", R._reusable_verify_payload(malformed_trace, opencode_returncode=0), None)
 truncated_with_metadata = json.dumps({
     "type": "tool_use",
     "part": {
@@ -438,9 +452,128 @@ with tempfile.TemporaryDirectory() as tmp:
         "artifacts": {"diff": str(source_diff)},
     }
     R._persist_verify_payload(sample_dir, persisted)
-    check_true("reused_verify_json_persisted", (sample_dir / "verify.json").is_file())
-    check("reused_verify_status", json.loads((sample_dir / "verify.json").read_text())["status"], "PASS")
-    check("reused_verify_diff_copied", (sample_dir / "diff.patch").read_text(), source_diff.read_text())
+    check_true("final_verify_json_persisted", (sample_dir / "verify.json").is_file())
+    check("final_verify_status", json.loads((sample_dir / "verify.json").read_text())["status"], "PASS")
+    check("final_verify_diff_copied", (sample_dir / "diff.patch").read_text(), source_diff.read_text())
+
+with tempfile.TemporaryDirectory() as tmp:
+    captured: dict[str, object] = {}
+    original_run = R._run
+
+    def fake_run(cmd, cwd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return subprocess.CompletedProcess(cmd, 0, '{"success":true,"status":"PASS"}', "")
+
+    R._run = fake_run
+    try:
+        sample = R.Sample(
+            sample_id="1",
+            language="java",
+            smell="data_clumps",
+            project_name="p",
+            project_root=Path(tmp),
+            location="src/Foo.java:method=target",
+            evidence="oracle_score=99;group=int:a|int:b|int:c",
+            raw={},
+            target_context={"group": "int:a|int:b|int:c"},
+            test_location="src/test/FooTest.java",
+            test_command="mvn -Dtest=FooTest test",
+        )
+        R._run_capture_baseline(
+            sample,
+            Path(tmp),
+            argparse.Namespace(projects="", sample_deadline=1),
+            "sample_optimized",
+        )
+        baseline_cmd = captured["cmd"]
+        baseline_env = captured["env"]
+        check_true("runner_explicitly_captures_baseline", "capture-baseline" in baseline_cmd)
+        check_true(
+            "baseline_requests_compact_decision",
+            "--output-detail" in baseline_cmd
+            and baseline_cmd[baseline_cmd.index("--output-detail") + 1] == "decision",
+        )
+        check("baseline_excludes_smell_evidence", "--smell-evidence" in baseline_cmd, False)
+        check_true("baseline_keeps_target_context", "--target-context-json" in baseline_cmd)
+        check_true("baseline_keeps_test_location", "--sample-test-location" in baseline_cmd)
+        check_true("baseline_keeps_test_command", "--sample-test-command" in baseline_cmd)
+        check("baseline_disallows_test_changes_cli", "--allow-test-changes" in baseline_cmd, False)
+        check("baseline_disallows_test_changes_env", baseline_env.get("SMELL_ALLOW_TEST_CHANGES"), "0")
+        R._run_verify(
+            sample,
+            Path(tmp),
+            argparse.Namespace(projects="", sample_deadline=1),
+            "sample_optimized",
+            baseline_seal="controller-seal",
+        )
+    finally:
+        R._run = original_run
+    final_cmd = captured["cmd"]
+    final_env = captured["env"]
+    check("final_verify_excludes_smell_evidence", "--smell-evidence" in final_cmd, False)
+    check_true(
+        "final_verify_requests_compact_decision",
+        "--output-detail" in final_cmd
+        and final_cmd[final_cmd.index("--output-detail") + 1] == "decision",
+    )
+    check_true("final_verify_keeps_target_context", "--target-context-json" in final_cmd)
+    check_true("final_verify_uses_controller_seal", "--baseline-seal" in final_cmd and "controller-seal" in final_cmd)
+    check("dataset_runner_freezes_tests", final_env.get("SMELL_ALLOW_TEST_CHANGES"), "0")
+    check("final_verify_requires_build_test", final_env.get("SMELL_REQUIRE_BUILD_TEST"), "1")
+
+    R._run = fake_run
+    try:
+        R._run_capture_baseline(
+            sample,
+            Path(tmp),
+            argparse.Namespace(projects="", sample_deadline=1, allow_test_changes=True),
+            "sample_optimized",
+        )
+        allowed_baseline_cmd = captured["cmd"]
+        allowed_baseline_env = captured["env"]
+        check_true("baseline_allows_test_changes_cli", "--allow-test-changes" in allowed_baseline_cmd)
+        check("baseline_allows_test_changes_env", allowed_baseline_env.get("SMELL_ALLOW_TEST_CHANGES"), "1")
+        R._run_verify(
+            sample,
+            Path(tmp),
+            argparse.Namespace(projects="", sample_deadline=1, allow_test_changes=True),
+            "sample_optimized",
+            baseline_seal="controller-seal",
+        )
+        allowed_final_cmd = captured["cmd"]
+        allowed_final_env = captured["env"]
+        # verify reads the frozen policy from c000; its parser intentionally
+        # has no policy-mutating CLI flag. The controller repeats the value in
+        # the child environment for audit consistency.
+        check("final_verify_has_no_policy_mutation_cli", "--allow-test-changes" in allowed_final_cmd, False)
+        check("final_verify_allows_test_changes_env", allowed_final_env.get("SMELL_ALLOW_TEST_CHANGES"), "1")
+    finally:
+        R._run = original_run
+
+check(
+    "baseline_not_found_status_is_exact",
+    R._baseline_failure_status(1, {"success": False, "error": "BASELINE_FINDING_NOT_FOUND"}),
+    "BASELINE_FINDING_NOT_FOUND",
+)
+check(
+    "baseline_ambiguity_status_is_exact",
+    R._baseline_failure_status(1, {"success": False, "error": "TARGET_AMBIGUOUS: 2"}),
+    "TARGET_AMBIGUOUS",
+)
+check(
+    "baseline_success_has_no_failure_status",
+    R._baseline_failure_status(0, {"success": True, "status": "BASELINE_CAPTURED"}),
+    "",
+)
+
+run_sample_source = inspect.getsource(R._run_sample)
+check("run_sample_has_one_final_verify_call", run_sample_source.count("_run_verify("), 1)
+check("run_sample_has_no_verify_reuse", "reusable_verify" in run_sample_source, False)
+check_true(
+    "baseline_capture_precedes_model",
+    run_sample_source.index("_run_capture_baseline(") < run_sample_source.index("_run_opencode("),
+)
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
@@ -513,22 +646,29 @@ print("== _task_prompt ==")
 from run_smell_dataset import Sample
 sample = Sample(
     sample_id="1", language="java", smell="long_method", project_name="p",
-    project_root=Path("/tmp/p"), location="Foo.java:1", evidence="", raw={},
+    project_root=Path("/tmp/p"), location="Foo.java:1", evidence="oracle_score=99", raw={},
 )
 args = argparse.Namespace(
-    idea_refactor_cli="",
     loop_mode="verify-failure",
     loop_max=2,
     loop_no_progress_limit=1,
     loop_on="smell,compile,test",
     loop_instruction="Repair from the latest failure pack",
     sample_deadline=1800,
+    allow_test_changes=False,
 )
-prompt_plain = R._task_prompt(sample, args, "local", "java-refactor-agent")
+prompt_plain = R._task_prompt(sample, args, "project_full")
 check_true("prompt_has_base", "Repair this one java smell" in prompt_plain)
-roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "local"))
+check("prompt_excludes_raw_dataset_evidence", "oracle_score=99" in prompt_plain, False)
+roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "project_full"))
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
+check_true("prompt_freezes_test_policy", "Test changes: forbidden" in prompt_plain)
+allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
+allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")
+allowed_roundtrip = parse_command_policy(R._command_arguments(allowed_prompt, allowed_args, "project_full"))
+check_true("prompt_allows_sha_audited_tests", "explicitly allowed" in allowed_prompt and "SHA-audited" in allowed_prompt)
+check("command_roundtrip_allows_test_changes", allowed_roundtrip.allow_test_changes, True)
 
 refused = Sample(
     sample_id="2",
@@ -543,7 +683,7 @@ refused = Sample(
     ),
     raw={},
 )
-refused_prompt = R._task_prompt(refused, args, "project_full", "java-refactor-agent")
+refused_prompt = R._task_prompt(refused, args, "project_full")
 check("runner_prompt_has_no_smell_protocol", "Refused Bequest structural protocol:" in refused_prompt, False)
 refused_skill = (
     ROOT
@@ -601,10 +741,17 @@ check_true(
     and "bulk snapshot" in feature_envy_skill,
 )
 check_true(
-    "feature_envy_skill_handles_mocked_receiver_boundary",
+    "feature_envy_skill_uses_architecture_boundary_and_frozen_test_policy",
     "extract-collaboration-workflow-preserve-receiver-api" in feature_envy_skill
-    and "Mockito-style `wanted but not invoked`" in feature_envy_skill
-    and "same-source-class fallback" in feature_envy_skill,
+    and "ordered application workflow" in feature_envy_skill
+    and "external or stable protocol/port" in feature_envy_skill
+    and "same-source-class fallback" in feature_envy_skill
+    and "controller-frozen `allow_test_changes`" in feature_envy_skill
+    and "frozen `project_full`" in feature_envy_skill
+    and all(
+        term not in feature_envy_skill.lower()
+        for term in ("mock", "spy", "test double", "test-visible", "wanted but not invoked")
+    ),
 )
 data_clumps_skill = (
     ROOT
@@ -621,14 +768,15 @@ check_true(
     and "call expressions are compile-repair sites" in data_clumps_skill,
 )
 check_true(
-    "data_clumps_skill_accounts_for_holder_occurrence",
-    "constructor or factory for a new holder" in data_clumps_skill
-    and "migrating at least `N - 1` old declarations" in data_clumps_skill,
+    "data_clumps_skill_requires_real_holder",
+    "holder owns matching" in data_clumps_skill
+    and "empty or generic holder" in data_clumps_skill,
 )
 check_true(
-    "data_clumps_skill_preserves_api_without_gaming",
-    "keep at most one compatibility entry" in data_clumps_skill
-    and "do not disguise the group with `Object...`" in data_clumps_skill,
+    "data_clumps_skill_has_no_adapter_exemption",
+    "including deprecated one-statement delegates" in data_clumps_skill
+    and "Guard exemption" in data_clumps_skill
+    and "remove the old" in data_clumps_skill,
 )
 check_true(
     "data_clumps_skill_rejects_parameter_rename_bypass",
@@ -649,13 +797,98 @@ check_true(
     and "cross-domain bag" in data_clumps_skill,
 )
 
-idea_agent = (
-    ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md"
-).read_text(encoding="utf-8")
-check_true("idea_agent_loads_idea_skill", "Load `idea-refactor-cli`" in idea_agent)
+edit_patterns = (
+    ROOT
+    / ".opencode"
+    / "skills"
+    / "java-smell-edit-patterns"
+    / "references"
+    / "edit-patterns"
+)
+lpl_skill = (edit_patterns / "long_parameter_list.md").read_text(encoding="utf-8")
+check_true(
+    "lpl_skill_covers_complete_signature_shapes",
+    "Complete-signature migration protocol" in lpl_skill
+    and "constructor-parameters-to-value-object" in lpl_skill
+    and "instance-operation-parameters-to-request-object" in lpl_skill
+    and "override-family-parameters-to-request-object" in lpl_skill,
+)
+check_true(
+    "lpl_skill_removes_old_signature_without_fallback",
+    "delete the old long signature as one source-level transaction" in lpl_skill
+    and "do not restore the old" in lpl_skill
+    and "signature as a delegate" in lpl_skill
+    and "preserve an old abstract root as a fallback" in lpl_skill,
+)
+
+god_class_skill = (edit_patterns / "god_class.md").read_text(encoding="utf-8")
+check_true(
+    "god_class_skill_completes_profile_in_cohesive_stages",
+    "Profile-closure protocol" in god_class_skill
+    and "combined removal is projected to make the" in god_class_skill
+    and "complete target Guard profile false" in god_class_skill
+    and "If verification returns `IMPROVED`" in god_class_skill
+    and "next cohesive cluster" in god_class_skill,
+)
+
+long_method_skill = (edit_patterns / "long_method.md").read_text(encoding="utf-8")
+check_true(
+    "long_method_skill_has_ncss_fast_path",
+    "AST-NCSS fast-path closure" in long_method_skill
+    and "smallest cohesive set" in long_method_skill
+    and "`smell_verify` once" in long_method_skill,
+)
+switch_skill = (edit_patterns / "switch_statements.md").read_text(encoding="utf-8")
+check_true(
+    "switch_skill_has_zero_switch_fast_path",
+    "Zero-switch fast-path closure" in switch_skill
+    and "`switch_count == 0`" in switch_skill
+    and "call `smell_verify` once" in switch_skill,
+)
+
+residual_contracts = {
+    "feature_envy": ("returned", "residual finding identities as the exact next worklist"),
+    "data_clumps": ("returned declaration", "families to cross the target Guard boundary"),
+    "mysterious_name": ("complete residual", "set as the next exact worklist"),
+    "nested_complexity": ("returned residual", "deficit to choose the next hotspot"),
+    "code_clone_type1": ("returned endpoints as the exact next worklist",),
+    "refused_bequest": ("returned rejection set as the residual closure",),
+    "dead_code": ("residual", "declaration is returned, delete that exact entity"),
+}
+for smell_name, required_texts in residual_contracts.items():
+    skill_text = (edit_patterns / f"{smell_name}.md").read_text(encoding="utf-8")
+    check_true(
+        f"{smell_name}_skill_has_exact_residual_closure",
+        all(required_text in skill_text for required_text in required_texts),
+    )
+
+index_text = (edit_patterns / "index.md").read_text(encoding="utf-8")
+check_true(
+    "edit_pattern_index_matches_expanded_routes",
+    "[`code_clone_type1.md`](code_clone_type1.md) | 7" in index_text
+    and "[`feature_envy.md`](feature_envy.md) | 5" in index_text
+    and "[`long_parameter_list.md`](long_parameter_list.md) | 4" in index_text,
+)
+noidea_skill_text = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((ROOT / ".opencode" / "skills" / "java-smell-edit-patterns").rglob("*.md"))
+)
+check_true(
+    "noidea_skill_has_no_idea_operation_fallback",
+    "idea_edit" not in noidea_skill_text
+    and "idea-refactor-cli" not in noidea_skill_text
+    and "IDEA-enhanced agent" not in noidea_skill_text
+    and "`direct:edit`" in noidea_skill_text,
+)
+
 check(
-    "idea_agent_does_not_load_plain_skill",
-    "Load `java-smell-edit-patterns`" in idea_agent,
+    "legacy_idea_agent_removed",
+    (ROOT / ".opencode" / "agents" / "java-refactor-agent-idea.md").exists(),
+    False,
+)
+check(
+    "legacy_idea_command_removed",
+    (ROOT / ".opencode" / "commands" / "java-refactor-run-idea.md").exists(),
     False,
 )
 print()

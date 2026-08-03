@@ -6,6 +6,24 @@ Remove the reported exact clone pair through the topology that fits the two clon
 same-file extraction, inheritance normalization, shared helper, existing owner delegation,
 or shared core.
 
+## Frozen-pair closure protocol
+
+1. Re-anchor both frozen clone endpoints by owner and method/constructor identity after line
+   drift. Read both complete enclosing declarations and isolate the exact shared token block.
+2. Record the block's inputs, outputs, typed dispatch, state ownership, side effects, and
+   execution order. Then choose exactly one topology below; do not try several helper owners
+   in parallel.
+3. Build one edit closure containing both endpoints, the single shared owner/callee, required
+   imports or construction wiring, and every call changed by that topology. Replace both clone
+   blocks and delete superseded trial helpers before `smell_verify`.
+4. Search every changed declaration for the original shared block. If verification returns a
+   residual clone pair, use those returned endpoints as the exact next worklist and finish the
+   same topology. Do not perturb tokens, create a second helper, or refactor unrelated
+   methods as a fallback.
+5. If a structural diagnostic names methods outside the production diff and outside both
+   frozen endpoint closures, do not edit those unrelated methods. Preserve the candidate and
+   report the guard mismatch for framework repair.
+
 ## Common verification fit
 
 - Prefer the smallest production diff that gives both reported clone sites one shared
@@ -31,9 +49,16 @@ or shared core.
   `==`, moving that object to a parent changes identity semantics. Keep one
   sentinel per original owner and pass both the observed value and that owner's
   sentinel to the shared helper.
-- The final pair must share a callee, delegate to an existing owner, or inherit one
-  parent implementation while preserving behavior and public signatures.
-- The smell Oracle proves clone removal and convergence only. Architecture and
+- The final pair must share one statically determined implementation while
+  preserving behavior and public signatures. Prefer a `private`, `static`, or
+  `final` helper (or a method on a final owner); an ordinary overridable virtual
+  call is not proof that both runtime paths execute the same implementation.
+- The shared implementation must carry the original exact clone body. Calling
+  one unrelated common method before branching into two copied helpers does not
+  establish deduplication. Keep exactly one carrier of the frozen clone body.
+- A shorter or altered pair that still forms the frozen exact clone is `IMPROVED` only; PASS
+  requires the target Guard to stop reporting that frozen pair in its caller-supplied scope.
+- The target Guard proves clone removal and convergence only. Architecture and
   implementation-quality concerns belong to existing project checks and final diff
   review; they must not be turned into sample-specific smell-guard vetoes.
 - Treat overload and override dispatch as behavior. If the original loop calls a
@@ -52,7 +77,7 @@ or shared core.
   implementation.
 - Creating a new abstraction when an existing owner or parent is the intended
   normalization point.
-- Changing literals or operators only to evade clone detection.
+- Changing literals or operators only to evade the clone Guard.
 - Adding a nullable owner dependency and retaining the original clone as a
   fallback. Either establish one reliable owner route and delete the superseded
   body, or choose a different topology.
@@ -129,7 +154,7 @@ Direct edit target: Keep each child field and override, extract one parameterize
 helper to the closest shared parent or package helper, and replace only the
 duplicated block with a call.
 
-Source operation shape: `idea_edit`. See
+Source operation shape: `direct:edit`. See
 [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Generic shape:
@@ -240,7 +265,7 @@ shared behavior should move to an external helper
 
 Direct edit target: Create an external helper because the clone sites have no good shared superclass owner.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -292,7 +317,7 @@ creating a new helper
 
 Direct edit target: Delegate to the existing semantic owner instead of creating a second helper.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -316,7 +341,7 @@ adapters
 
 Direct edit target: Keep public overloads and extract a private shared core for the common algorithm.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

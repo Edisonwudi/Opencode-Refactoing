@@ -1,13 +1,9 @@
-"""Lightweight Java smell detector based on text/regex scanning.
+"""Shared Java source model plus the remaining syntactic product detectors.
 
-Detects long_method, long_parameter_list, nested_complexity,
-switch_statements, code_clone_type1, and mysterious_name without
-requiring a full AST.  Suitable for fast pre-checks inside the guard
-pipeline where tree-sitter is overkill.
-
-For deeper semantic smells (feature_envy, data_clumps,
-refused_bequest) see ``java_semantic_detector`` which uses
-tree-sitter to build a full project model.
+Nested complexity, switch statements, and mysterious names are detected here.
+Long methods use ``ast_ncss``; long parameter lists use the semantic signature
+model; exact clones use ``clone_closure``.  Keeping those product definitions in
+one place avoids subtly different shadow findings in this fast source scanner.
 """
 from __future__ import annotations
 
@@ -16,16 +12,22 @@ import re
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from tree_sitter_language_pack import get_parser
+
 from ..analysis import java_cognitive_complexity_from_text
+from .source_layout import (
+    JavaSourceLayoutError,
+    discover_java_source_layout,
+    standard_test_root,
+)
 from .detector_utils import (
-    normalize_group as _normalize_group,
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
-    parse_group_from_evidence as _parse_group_from_evidence,
 )
 
 
@@ -113,12 +115,7 @@ VAR_DECL_RE = re.compile(
 )
 
 DEFAULT_THRESHOLDS = {
-    "long_method_ncss": 60,
-    "long_parameter_list": 5,
     "cognitive_complexity": 20,
-    "switch_density": 10.0,
-    "switch_case_count": 8,
-    "code_clone_min_tokens": 30,
     "mysterious_name_min_len": 2,
     "mysterious_name_profile": "strict",
 }
@@ -167,7 +164,9 @@ class JavaMethodInfo:
     signature: str
     begin_line: int
     end_line: int
+    body_begin_line: int
     body_text: str
+    is_constructor: bool
     parameter_names: List[str]
     parameter_tokens: List[str]
 
@@ -193,6 +192,12 @@ class JavaSyntacticFinding:
     score: float
     rule_id: str
     evidence: str
+    symbol_kind: str = ""
+    symbol_name: str = ""
+    scope_starts: Tuple[int, ...] = ()
+    switch_count: int = 0
+    switch_case_count: int = 0
+    switch_density: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,15 +205,15 @@ class JavaSyntacticDetectionResult:
     ok: bool
     findings: Dict[str, List[JavaSyntacticFinding]]
     error: str = ""
+    unavailable: Optional[Dict[str, object]] = None
 
 
 def run_java_syntactic_detector(
     project_root: Path,
     *,
-    include_tests: bool = True,
+    include_tests: bool = False,
     target_files: Optional[Sequence[Path]] = None,
     thresholds: Optional[Dict[str, object]] = None,
-    include_code_clone: bool = True,
     include_mysterious_name: bool = True,
 ) -> JavaSyntacticDetectionResult:
     config = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
@@ -240,170 +245,143 @@ def run_java_syntactic_detector(
                 )
             )
         findings = {
-            "long_method": _detect_long_method(methods, int(config["long_method_ncss"])),
-            "long_parameter_list": _detect_long_parameter_list(methods, int(config["long_parameter_list"])),
             "nested_complexity": _detect_nested_complexity(methods, int(config["cognitive_complexity"])),
-            "switch_statements": _detect_switch_statements(
-                methods,
-                float(config["switch_density"]),
-                int(config["switch_case_count"]),
-            ),
-            "code_clone_type1": _detect_code_clone(methods, int(config["code_clone_min_tokens"])) if include_code_clone else [],
+            "switch_statements": _detect_switch_statements(methods),
             "mysterious_name": mysterious_findings,
         }
         return JavaSyntacticDetectionResult(ok=True, findings={k: _sort_findings(v) for k, v in findings.items()})
+    except JavaSourceLayoutError as exc:
+        return JavaSyntacticDetectionResult(
+            ok=False,
+            findings=_empty_findings(),
+            error="DETECTOR_UNAVAILABLE",
+            unavailable=exc.to_unavailable(),
+        )
     except Exception as exc:
         return JavaSyntacticDetectionResult(ok=False, findings=_empty_findings(), error=str(exc))
 
 
-def find_matching_syntactic_finding(
+def find_matching_syntactic_findings(
     findings: Sequence[JavaSyntacticFinding],
     *,
     target_file: Path,
     project_root: Path,
     method: Optional[str],
     line: Optional[int],
-    original_start_line: Optional[int] = None,
-    original_param_count: Optional[int] = None,
+    class_name: Optional[str] = None,
     original_param_type_fingerprint: Optional[str] = None,
-    evidence: str = "",
-) -> Optional[JavaSyntacticFinding]:
+) -> List[JavaSyntacticFinding]:
+    """Return every detector finding compatible with the stable target.
+
+    File, class, method name, and parameter types are identity filters.  A
+    containing source line may disambiguate otherwise identical candidates,
+    but a stale line never overrides an already-unique stable identity.  In
+    particular, this function deliberately has no nearest/first fallback.
+    """
     target_rel = _normalize_rel_path(target_file, project_root)
     target_method = _normalize_method(method)
-    evidence_kind_name = parse_mysterious_evidence(evidence)
-    evidence_group = _parse_group_from_evidence(evidence)
-    has_strong_anchor = bool(target_method or evidence_group or evidence_kind_name != ("", ""))
+    target_class = _normalize_class_name(class_name)
+    has_identity_anchor = bool(target_method or target_class)
     candidates: List[JavaSyntacticFinding] = []
     for finding in findings:
         if _normalize_path(finding.file) != target_rel:
             continue
+        if target_class and _normalize_class_name(finding.class_name) != target_class:
+            continue
         if target_method and _normalize_method(finding.method) != target_method:
             continue
-        if (
-            not has_strong_anchor
-            and line
-            and finding.begin_line
-            and not (
-                finding.begin_line <= line <= (finding.end_line or finding.begin_line)
-            )
-        ):
-            continue
-        if evidence_group and _normalize_group(_parse_group_from_evidence(finding.evidence)) != _normalize_group(evidence_group):
-            continue
-        if evidence_kind_name != ("", ""):
-            kind, name = parse_mysterious_evidence(finding.evidence)
-            target_kind, target_name = evidence_kind_name
-            if target_kind and kind and target_kind != kind:
-                continue
-            if target_name and name != target_name:
-                continue
         candidates.append(finding)
-    if original_param_type_fingerprint is not None:
+
+    signature_fingerprint = (
+        original_param_type_fingerprint
+        if original_param_type_fingerprint is not None
+        else method_parameter_type_fingerprint(method)
+    )
+    if signature_fingerprint is not None:
         same_signature = [
             finding
             for finding in candidates
-            if _finding_parameter_type_fingerprint(finding) == original_param_type_fingerprint
+            if _finding_parameter_type_fingerprint(finding) == signature_fingerprint
         ]
         if not same_signature:
-            return None
+            return []
         candidates = same_signature
-    elif original_param_count is not None:
-        same_arity = [
-            finding
-            for finding in candidates
-            if _finding_parameter_count(finding) == original_param_count
-        ]
-        if not same_arity:
-            return None
-        candidates = same_arity
     if not candidates:
-        return None
-    if original_start_line is not None:
-        return min(
-            candidates,
-            key=lambda item: (
-                abs((item.begin_line or 0) - original_start_line),
-                abs((item.begin_line or 0) - (line or original_start_line)),
-            ),
-        )
-    if line:
-        return min(candidates, key=lambda item: abs((item.begin_line or 0) - line))
-    return candidates[0]
+        return []
 
+    line_matched = False
+    if len(candidates) > 1 or not has_identity_anchor:
+        for anchor_line in _distinct_positive_lines(line):
+            containing = [
+                finding
+                for finding in candidates
+                if finding.begin_line
+                and finding.begin_line
+                <= anchor_line
+                <= (finding.end_line or finding.begin_line)
+            ]
+            if containing:
+                candidates = containing
+                line_matched = True
+                break
+    if not has_identity_anchor and line and not line_matched:
+        return []
+    return sorted(
+        candidates,
+        key=lambda item: (
+            _normalize_path(item.file),
+            _normalize_class_name(item.class_name),
+            _normalize_method_signature(item.method),
+            item.begin_line,
+            item.end_line,
+            item.rule_id,
+        ),
+    )
 
-def _finding_parameter_count(finding: JavaSyntacticFinding) -> Optional[int]:
-    evidence_match = re.search(r"param_count=(\d+)", str(finding.evidence or ""))
-    if evidence_match:
-        return int(evidence_match.group(1))
-    score = finding.score
-    if isinstance(score, (int, float)) and float(score).is_integer():
-        return int(score)
-    return None
-
-
-def _finding_parameter_type_fingerprint(finding: JavaSyntacticFinding) -> Optional[str]:
-    signature = str(finding.method or "")
+def method_parameter_type_fingerprint(method: Optional[str]) -> Optional[str]:
+    """Canonical Java parameter types from a declaration-like signature."""
+    signature = str(method or "")
     if "(" not in signature or ")" not in signature:
         return None
     inner = signature.split("(", 1)[1].rsplit(")", 1)[0].strip()
     if not inner:
         return ""
-    parts = _split_top_level_commas(inner)
     normalized: List[str] = []
-    for raw in parts:
+    for raw in _split_top_level_commas(inner):
         part = re.sub(r"@\w+(?:\([^)]*\))?", " ", raw.strip())
         part = re.sub(r"\b(?:final|volatile|transient)\b", " ", part)
         part = re.sub(r"\s+", " ", part).strip()
         if not part:
             continue
         chunks = part.split(" ")
-        type_text = " ".join(chunks[:-1]).strip()
+        # Detector findings contain declaration parameter names.  A caller may
+        # also provide a Java-style type-only signature such as ``run(int)``.
+        type_text = part if len(chunks) == 1 else " ".join(chunks[:-1]).strip()
         normalized.append(_normalize_type_name(type_text))
     return ",".join(normalized)
 
 
-def find_matching_clone_pair(
-    findings: Sequence[JavaSyntacticFinding],
-    *,
-    left_file: Path,
-    right_file: Path,
-    project_root: Path,
-    left_method: Optional[str],
-    right_method: Optional[str],
-    left_line: Optional[int],
-    right_line: Optional[int],
-) -> Optional[Tuple[JavaSyntacticFinding, JavaSyntacticFinding]]:
-    left = find_matching_syntactic_finding(
-        findings,
-        target_file=left_file,
-        project_root=project_root,
-        method=left_method,
-        line=left_line,
-    )
-    right = find_matching_syntactic_finding(
-        findings,
-        target_file=right_file,
-        project_root=project_root,
-        method=right_method,
-        line=right_line,
-    )
-    if left is None or right is None:
-        return None
-    if left.rule_id != right.rule_id:
-        return None
-    return left, right
+def _normalize_method_signature(method: Optional[str]) -> str:
+    name = _normalize_method(method)
+    fingerprint = method_parameter_type_fingerprint(method)
+    return name if fingerprint is None else f"{name}({fingerprint})"
 
 
-def parse_mysterious_evidence(evidence: str) -> Tuple[str, str]:
-    text = str(evidence or "")
-    strict = re.search(r"kind=([^;]+);\s*name=([^;]+)", text)
-    if strict:
-        return strict.group(1).strip(), strict.group(2).strip()
-    for key, kind in (("param", "param"), ("local", "local"), ("name", "method")):
-        match = re.search(rf"(?:^|;\s*){key}=([^;,\s]+)", text)
-        if match:
-            return kind, match.group(1).strip()
-    return "", ""
+def _normalize_class_name(value: Optional[str]) -> str:
+    return str(value or "").strip().rsplit(".", 1)[-1].lower()
+
+
+def _distinct_positive_lines(*values: Optional[int]) -> List[int]:
+    lines: List[int] = []
+    for value in values:
+        if value is None or int(value) <= 0 or int(value) in lines:
+            continue
+        lines.append(int(value))
+    return lines
+
+
+def _finding_parameter_type_fingerprint(finding: JavaSyntacticFinding) -> Optional[str]:
+    return method_parameter_type_fingerprint(finding.method)
 
 
 def load_project_model(project_root: Path, java_files: Sequence[Path]) -> Tuple[List[JavaClassInfo], List[JavaMethodInfo]]:
@@ -432,26 +410,6 @@ def load_java_source_model(
     return classes, methods
 
 
-def _detect_long_method(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
-    rows = []
-    for method in methods:
-        ncss = count_non_comment_loc(method.body_text)
-        if ncss <= threshold:
-            continue
-        rows.append(_finding("long_method", method, float(ncss), "custom:long_method_ncss", f"ncss={ncss}; threshold={threshold}"))
-    return rows
-
-
-def _detect_long_parameter_list(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
-    rows = []
-    for method in methods:
-        count = len(method.parameter_names)
-        if count <= threshold:
-            continue
-        rows.append(_finding("long_parameter_list", method, float(count), "custom:long_parameter_list", f"param_count={count}; threshold={threshold}"))
-    return rows
-
-
 def _detect_nested_complexity(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
     rows = []
     for method in methods:
@@ -464,8 +422,6 @@ def _detect_nested_complexity(methods: Sequence[JavaMethodInfo], threshold: int)
 
 def _detect_switch_statements(
     methods: Sequence[JavaMethodInfo],
-    density_threshold: float,
-    case_threshold: int,
 ) -> List[JavaSyntacticFinding]:
     rows = []
     for method in methods:
@@ -478,45 +434,17 @@ def _detect_switch_statements(
                 "switch_statements",
                 method,
                 score,
-                "custom:switch_density_or_case_count",
+                "custom:target_method_contains_switch",
                 f"switch_count={switch_count}; case_count={case_count}; density={density:.2f}",
+                switch_count=switch_count,
+                switch_case_count=case_count,
+                switch_density=density,
             )
         )
     return rows
 
 
-def _detect_code_clone(methods: Sequence[JavaMethodInfo], min_tokens: int) -> List[JavaSyntacticFinding]:
-    groups: Dict[str, List[Tuple[JavaMethodInfo, int]]] = defaultdict(list)
-    for method in methods:
-        body_tokens = tokenize_clone(method.body_text)
-        if _is_thin_forwarder(method.body_text):
-            continue
-        declaration_tokens = tokenize_clone(method.signature)
-        token_count = len(body_tokens) + len(declaration_tokens)
-        if token_count < min_tokens:
-            continue
-        digest = hashlib.sha1(" ".join(body_tokens).encode("utf-8")).hexdigest()
-        groups[digest].append((method, token_count))
-
-    rows = []
-    for digest, occurrences in groups.items():
-        if len(occurrences) < 2:
-            continue
-        group_id = digest[:12]
-        for method, token_count in occurrences:
-            rows.append(
-                _finding(
-                    "code_clone_type1",
-                    method,
-                    float(token_count),
-                    f"custom:code_clone:{group_id}",
-                    f"group_size={len(occurrences)}; token_count={token_count}; min_tokens={min_tokens}",
-                )
-            )
-    return rows
-
-
-def _is_thin_forwarder(body_text: str) -> bool:
+def is_thin_forwarder(body_text: str) -> bool:
     """Exclude one-statement delegation shells from type-1 clone findings."""
     compact = re.sub(r"\s+", " ", mask_comments_and_strings(body_text)).strip()
     return bool(
@@ -526,6 +454,9 @@ def _is_thin_forwarder(body_text: str) -> bool:
             compact,
         )
     )
+
+
+_is_thin_forwarder = is_thin_forwarder
 
 
 def _detect_mysterious_name(
@@ -543,7 +474,7 @@ def _detect_mysterious_name(
     for method in methods:
         if _should_exclude_mysterious_path(method.rel_path, profile, exclude_tests, exclude_generated):
             continue
-        if _is_valid_java_identifier(method.method_name):
+        if not method.is_constructor and _is_valid_java_identifier(method.method_name):
             reason = _suspicious_name_reason(method.method_name, min_len, low_info, allow_too_short=True)
             if reason:
                 evidence = _mysterious_evidence("method", method.method_name, reason) if strict_mode else f"name={method.method_name}; reason={reason}"
@@ -556,6 +487,8 @@ def _detect_mysterious_name(
                         evidence,
                         begin_line=method.begin_line,
                         end_line=method.begin_line,
+                        symbol_kind="method",
+                        symbol_name=method.method_name,
                     )
                 )
         for pname in method.parameter_names:
@@ -573,6 +506,8 @@ def _detect_mysterious_name(
                         evidence,
                         begin_line=method.begin_line,
                         end_line=method.begin_line,
+                        symbol_kind="param",
+                        symbol_name=pname,
                     )
                 )
         masked_body = mask_comments_and_strings(method.body_text)
@@ -591,7 +526,7 @@ def _detect_mysterious_name(
                     if strict_mode
                     else f"local={var}; reason={reason}"
                 )
-                declaration_line = method.begin_line + masked_body.count(
+                declaration_line = method.body_begin_line + masked_body.count(
                     "\n", 0, declaration.start(1)
                 )
                 rows.append(
@@ -603,6 +538,8 @@ def _detect_mysterious_name(
                         evidence,
                         begin_line=declaration_line,
                         end_line=declaration_line,
+                        symbol_kind="local",
+                        symbol_name=var,
                     )
                 )
     return rows
@@ -675,6 +612,20 @@ def _detect_mysterious_names_outside_methods(
                 if strict_mode
                 else f"local={name}; reason={reason}"
             )
+            if strict_mode:
+                structural_scopes = sorted(
+                    containing,
+                    key=lambda item: item[1] - item[0],
+                )[:3]
+                structural_starts = sorted({
+                    _idx_to_line(line_starts, item[0])
+                    for item in containing
+                })
+                evidence += (
+                    f"; scope_begin={min(_idx_to_line(line_starts, item[0]) for item in structural_scopes)}"
+                    f"; scope_end={max(_idx_to_line(line_starts, item[1]) for item in structural_scopes)}"
+                    f"; scope_starts={'|'.join(str(item) for item in structural_starts)}"
+                )
             rows.append(
                 JavaSyntacticFinding(
                     smell_type="mysterious_name",
@@ -686,6 +637,9 @@ def _detect_mysterious_names_outside_methods(
                     score=1.0,
                     rule_id="custom:mysterious_initializer_local_name",
                     evidence=evidence,
+                    symbol_kind=kind,
+                    symbol_name=name,
+                    scope_starts=tuple(structural_starts) if strict_mode else (),
                 )
             )
     return rows
@@ -720,6 +674,11 @@ def _finding(
     *,
     begin_line: Optional[int] = None,
     end_line: Optional[int] = None,
+    symbol_kind: str = "",
+    symbol_name: str = "",
+    switch_count: int = 0,
+    switch_case_count: int = 0,
+    switch_density: float = 0.0,
 ) -> JavaSyntacticFinding:
     return JavaSyntacticFinding(
         smell_type=smell_type,
@@ -731,6 +690,11 @@ def _finding(
         score=score,
         rule_id=rule_id,
         evidence=evidence,
+        symbol_kind=symbol_kind,
+        symbol_name=symbol_name,
+        switch_count=switch_count,
+        switch_case_count=switch_case_count,
+        switch_density=switch_density,
     )
 
 
@@ -776,9 +740,62 @@ def compute_switch_metrics(block_text: str) -> Tuple[int, int, float]:
 
 
 def tokenize_clone(block_text: str) -> List[str]:
+    """Return Java Type-1 clone tokens.
+
+    Type-1 equality ignores only layout and comments. Identifier names,
+    literal values, and every Java operator remain part of the fingerprint.
+    Tree-sitter leaf ranges provide the lexer contract, avoiding a second,
+    incomplete regular-expression implementation of Java tokens.
+    """
+    return list(_tokenize_clone_cached(str(block_text or "")))
+
+
+def tokenize_clone_node(
+    node: object,
+    *,
+    exclude_nodes: Sequence[object] = (),
+) -> List[str]:
+    """Return Type-1 tokens from an existing Java tree-sitter node."""
+    excluded = {
+        (
+            str(getattr(item, "type", "")),
+            int(getattr(item, "start_byte", -1)),
+            int(getattr(item, "end_byte", -1)),
+        )
+        for item in exclude_nodes
+    }
+    tokens: List[str] = []
+
+    def visit(current: object) -> None:
+        identity = (
+            str(getattr(current, "type", "")),
+            int(getattr(current, "start_byte", -1)),
+            int(getattr(current, "end_byte", -1)),
+        )
+        if identity in excluded or "comment" in identity[0]:
+            return
+        children = list(getattr(current, "children", ()) or ())
+        if children:
+            for child in children:
+                visit(child)
+            return
+        raw = getattr(current, "text", None)
+        if isinstance(raw, bytes) and raw:
+            tokens.append(raw.decode("utf-8", errors="strict"))
+
+    visit(node)
+    return tokens
+
+
+def tokenize_structural_window(block_text: str) -> List[str]:
+    """Return the versioned normalized stream used by Data Clumps windows."""
     masked = mask_comments_and_strings(block_text)
-    raw_tokens = re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*|\d+|==|!=|<=|>=|&&|\|\||::|[{}()\[\];,.+\-*/%<>?:=]", masked)
-    normalized = []
+    raw_tokens = re.findall(
+        r"[A-Za-z_$][A-Za-z0-9_$]*|\d+|==|!=|<=|>=|&&|\|\||::|"
+        r"[{}()\[\];,.+\-*/%<>?:=]",
+        masked,
+    )
+    normalized: List[str] = []
     for token in raw_tokens:
         if re.fullmatch(r"\d+", token):
             normalized.append("NUM")
@@ -787,6 +804,37 @@ def tokenize_clone(block_text: str) -> List[str]:
         else:
             normalized.append(token)
     return normalized
+
+
+@lru_cache(maxsize=8192)
+def _tokenize_clone_cached(block_text: str) -> Tuple[str, ...]:
+    prefix = "class __CloneLex { void __cloneLex() {\n"
+    suffix = "\n} }"
+    snippet = block_text.encode("utf-8")
+    prefix_bytes = prefix.encode("utf-8")
+    source = prefix_bytes + snippet + suffix.encode("utf-8")
+    root = get_parser("java").parse(source).root_node
+    start = len(prefix_bytes)
+    end = start + len(snippet)
+    tokens: List[str] = []
+
+    def visit(node: object) -> None:
+        node_type = str(getattr(node, "type", ""))
+        if "comment" in node_type:
+            return
+        children = list(getattr(node, "children", ()) or ())
+        if children:
+            for child in children:
+                visit(child)
+            return
+        node_start = int(getattr(node, "start_byte", 0))
+        node_end = int(getattr(node, "end_byte", 0))
+        if node_end <= node_start or node_start < start or node_end > end:
+            return
+        tokens.append(source[node_start:node_end].decode("utf-8", errors="strict"))
+
+    visit(root)
+    return tuple(tokens)
 
 
 def mask_comments_and_strings(text: str) -> str:
@@ -880,6 +928,7 @@ def _scan_java_methods(
     classes: Sequence[JavaClassInfo],
 ) -> List[JavaMethodInfo]:
     methods = []
+    callable_kinds = _java_callable_kinds(text)
     idx = 0
     while idx < len(text):
         method_name, paren_idx = _scan_find_method_paren(text, idx, max_chars=None)
@@ -897,7 +946,19 @@ def _scan_java_methods(
         if body_end is None:
             idx = paren_end + 1
             continue
-        begin_line = _idx_to_line(line_starts, paren_idx)
+        name_index = text.rfind(method_name, 0, paren_idx)
+        begin_line = _idx_to_line(
+            line_starts,
+            name_index if name_index >= 0 else paren_idx,
+        )
+        # Annotations are part of a Java method declaration's stable source
+        # span. Including them lets a reviewed annotation-line anchor select
+        # an overload without a nearest-line fallback.
+        source_lines = text.splitlines()
+        preceding = begin_line - 2
+        while preceding >= 0 and source_lines[preceding].strip().startswith("@"):
+            begin_line = preceding + 1
+            preceding -= 1
         end_line = _idx_to_line(line_starts, body_end)
         param_list = _normalize_param_list(text[paren_idx : paren_end + 1])
         signature = f"{method_name}{param_list}"
@@ -913,13 +974,55 @@ def _scan_java_methods(
                 signature=signature,
                 begin_line=begin_line,
                 end_line=end_line,
+                body_begin_line=_idx_to_line(line_starts, body_start),
                 body_text=body_text,
+                is_constructor=callable_kinds.get(name_index) == "constructor",
                 parameter_names=param_names,
                 parameter_tokens=param_tokens,
             )
         )
         idx = body_end + 1
     return methods
+
+
+def _java_callable_kinds(text: str) -> Dict[int, str]:
+    """Map callable declaration-name offsets to grammar-defined kinds.
+
+    Constructor identity is a syntactic property: a constructor declaration
+    has no return type. Comparing its name with the enclosing class would
+    misclassify a legal method that has an explicit return type and happens to
+    share the class name. Tree-sitter already distinguishes those declarations,
+    including generic and enum constructors, so the source model preserves that
+    distinction directly.
+    """
+    source = text.encode("utf-8")
+    root = get_parser("java").parse(source).root_node
+    byte_to_char: Dict[int, int] = {}
+    byte_offset = 0
+    for char_offset, char in enumerate(text):
+        byte_to_char[byte_offset] = char_offset
+        byte_offset += len(char.encode("utf-8"))
+    byte_to_char[byte_offset] = len(text)
+
+    kinds: Dict[int, str] = {}
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if node.type in {
+            "compact_constructor_declaration",
+            "constructor_declaration",
+            "method_declaration",
+        }:
+            name_node = node.child_by_field_name("name")
+            if name_node is not None and name_node.start_byte in byte_to_char:
+                kinds[byte_to_char[name_node.start_byte]] = (
+                    "constructor"
+                    if node.type
+                    in {"compact_constructor_declaration", "constructor_declaration"}
+                    else "method"
+                )
+        pending.extend(node.children)
+    return kinds
 
 
 def _extract_class_ranges(
@@ -1032,11 +1135,20 @@ def _resolve_java_files(
     include_tests: bool,
     target_files: Optional[Sequence[Path]],
 ) -> List[Path]:
+    source_layout = None if include_tests else discover_java_source_layout(project_root)
     if target_files:
         resolved = []
         for path in target_files:
             candidate = path if path.is_absolute() else project_root / path
-            if candidate.exists() and candidate.suffix == ".java":
+            if (
+                candidate.exists()
+                and candidate.suffix == ".java"
+                and (
+                    include_tests
+                    or source_layout is None
+                    or not source_layout.is_test_path(candidate)
+                )
+            ):
                 resolved.append(candidate.resolve())
         return sorted(set(resolved))
     exclude = set(DEFAULT_EXCLUDE_PATHS)
@@ -1045,7 +1157,7 @@ def _resolve_java_files(
         if not path.is_file() or exclude & set(path.parts):
             continue
         rel_path = str(path.relative_to(project_root)).replace("\\", "/")
-        if not include_tests and _is_test_like_path(rel_path):
+        if not include_tests and source_layout is not None and source_layout.is_test_path(rel_path):
             continue
         files.append(path)
     return sorted(files)
@@ -1319,7 +1431,7 @@ def _mysterious_evidence(kind: str, name: str, reason: str) -> str:
 
 
 def _is_test_like_path(rel_path: str) -> bool:
-    return bool(re.search(r"(?:^|/)(?:test|tests)(?:/|$)", rel_path.replace("\\", "/").lower()))
+    return standard_test_root(rel_path) is not None
 
 
 def _is_generated_like_path(rel_path: str) -> bool:
@@ -1333,10 +1445,7 @@ def _sort_findings(findings: Sequence[JavaSyntacticFinding]) -> List[JavaSyntact
 
 def _empty_findings() -> Dict[str, List[JavaSyntacticFinding]]:
     return {
-        "long_method": [],
-        "long_parameter_list": [],
         "nested_complexity": [],
         "switch_statements": [],
-        "code_clone_type1": [],
         "mysterious_name": [],
     }

@@ -61,7 +61,7 @@ generic_smells: &generic_smells
   data_clumps:
     instruction: Replace the recurring labeled parameter group with a cohesive language-appropriate abstraction.
     constraints:
-    - Update the repeated production call sites without modifying tests.
+    - Update all production call sites and obey the controller-frozen test-change policy; when test migration is allowed, update only callers affected by the API change and preserve their assertions.
     verification:
     - Reduce occurrences of the labeled group and pass configured project tests.
     guards:
@@ -104,7 +104,7 @@ generic_smells: &generic_smells
     - The reported identifier no longer appears at the target and configured tests pass.
     guards:
     - type: mysterious_name
-    retry_hint_template: Rename the unclear identifier reported by the smell evidence before retrying.
+    retry_hint_template: Rename the unclear identifier frozen in the target Guard contract before retrying.
 languages:
   java:
     detect_extensions:
@@ -124,7 +124,6 @@ languages:
         - Confirm the target method is shorter and easier to read.
         guards:
         - type: long_method
-          max_lines: 60
         retry_hint_template: Address the reported long-method issue before submitting
           again.
       long_parameter_list:
@@ -136,7 +135,6 @@ languages:
         - Ensure callers still behave the same after the refactor.
         guards:
         - type: long_parameter_list
-          max_params: 5
         retry_hint_template: Reduce the effective parameter count of the target method
           before retrying.
       nested_complexity:
@@ -148,7 +146,6 @@ languages:
         - Ensure the method remains behaviorally equivalent.
         guards:
         - type: nested_complexity
-          max_complexity: 20
         retry_hint_template: Flatten the control flow further before retrying.
       switch_statements:
         instruction: Refactor switch-heavy branching into clearer control flow while
@@ -171,7 +168,6 @@ languages:
           locations.
         guards:
         - type: code_clone_type1
-          min_tokens: 30
         retry_hint_template: The two target blocks still look like a type-1 clone.
           Remove or centralize the duplication.
       feature_envy:
@@ -212,16 +208,8 @@ languages:
         constraints:
         - Keep the change focused on the reported class and one coherent responsibility
           cluster.
-        - Prefer IDEA-backed class and member refactorings over broad text rewrites.
-        - Prefer native extract-class for clear field/state clusters, and migrate the
-          fields together with the methods that maintain them.
-        - Use move-method only when the behavior already belongs on a real existing
-          owner or collaborator.
-        - Use insert-type plus member-level migration only when native extract-class
-          is unavailable or cannot migrate the needed members.
-        - Delete private wrappers left after extraction; wrapper-only helper extraction
-          is not complete while the original class remains above the god_class guard
-          threshold.
+        - Migrate a cohesive field/state cluster together with the methods that maintain
+          it; delete private wrappers that merely preserve the original class size.
         - Preserve public behavior, callers, and existing serialization or framework
           contracts.
         verification:
@@ -236,12 +224,10 @@ languages:
           behavior.
         constraints:
         - Keep the change focused on the reported private method or member.
-        - Prefer IDEA Safe Delete operations such as delete:method so references are
-          checked before removal.
         - Do not delete public APIs, framework entrypoints, annotated methods, lifecycle
           hooks, serialization hooks, or reflection/config-driven members.
-        - If Safe Delete reports real references, stop and report the blocker instead
-          of forcing deletion.
+        - If product-source analysis reports real references, stop and report the blocker
+          instead of forcing deletion.
         verification:
         - Confirm the unused private member is no longer reported by the dead_code
           detector.
@@ -254,16 +240,15 @@ languages:
         instruction: Rename the unclear Java identifier at the target location to
           a descriptive name while preserving behavior.
         constraints:
-        - Prefer IntelliJ rename refactoring so references are updated consistently.
         - Keep the rename focused on the suspicious parameter, local variable, method,
           or class name.
         verification:
-        - Confirm the unclear identifier from the smell evidence no longer appears
-          at the target declaration or body.
+        - Confirm the frozen target smell no longer appears at the target
+          declaration or body.
         - Ensure existing callers still compile and tests pass.
         guards:
         - type: mysterious_name
-        retry_hint_template: Rename the unclear identifier reported by the smell evidence
+        retry_hint_template: Rename the unclear identifier frozen in the checkpoint finding
           before retrying.
       refused_bequest:
         instruction: Refactor the refused bequest hierarchy by removing useless overrides,
@@ -273,8 +258,6 @@ languages:
         constraints:
         - Keep the hierarchy change narrow and focused on the reported class.
         - Preserve public behavior and existing subtype contracts.
-        - Treat the dataset test as an immutable project-behavior regression oracle; never
-          edit, delete, skip, or weaken it to make the refactoring pass.
         - Inspect the source-derived parent contract, sibling implementers, and production
           callers before choosing implementation, delegation, or a capability split.
         - A log statement, comment, swallowed exception, or placeholder constant is not an
@@ -282,12 +265,12 @@ languages:
         verification:
         - Confirm suspicious no-op or rejecting overrides have been reduced or removed.
         - Confirm the refused_bequest guard no longer reports the target.
-        - Ensure the unchanged project-behavior regression test still passes.
+        - Ensure the controller-selected build/test contract passes.
         guards:
         - type: refused_bequest
         retry_hint_template: The rejecting or empty inheritance pattern remains. Change
-          production structure or behavior; do not edit
-          the regression test or replace the body with logging or a placeholder.
+          production structure or behavior; do not replace the body with logging or
+          a placeholder.
   c:
     detect_extensions:
     - .c

@@ -5,10 +5,24 @@
 Replace a large branch dispatcher with the dispatch structure that matches the source shape:
 table, handler, registry, classifier, or state-owned behavior.
 
+## Zero-switch fast-path closure
+
+1. Re-anchor the frozen method after line drift and list every switch statement or expression
+   inside that method. Product resolution requires `switch_count == 0`; case count and density
+   are progress diagnostics only.
+2. Classify each listed switch by source shape and choose the matching route below. When the
+   target has one obvious switch, replace it completely and call `smell_verify` once.
+3. When the target contains multiple switches, plan all replacements before editing and
+   remove every listed switch before the first verification when their behavior boundaries
+   are independent and clear.
+4. If verification reports a residual switch, use its returned target location as the exact
+   next worklist. Do not convert a different method or add an if/else fallback around the
+   remaining switch.
+
 ## Common verification fit
 
-- The reported method should no longer contain the same large switch-style branch
-  structure.
+- The frozen method must contain no switch statement or expression. Removing only the largest
+  case list is `IMPROVED` while another switch remains.
 - An equally large if/else chain is not a compatible repair.
 
 ## Common avoid
@@ -25,7 +39,7 @@ but be collapsed into a lookup table instead of staying as many terminal cases
 
 Direct edit target: Replace key-to-result cases with a map from key to supplier/function.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -45,7 +59,7 @@ dedicated handler strategies
 
 Direct edit target: Move each packet branch workflow into a dedicated handler strategy.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -65,7 +79,7 @@ registry
 
 Direct edit target: Replace stable wire/file type-code cases with an explicit reader registry.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -85,7 +99,7 @@ semantics
 
 Direct edit target: Replace parser-character branching with a classifier table or predicate set.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -104,7 +118,7 @@ should delegate to the state object instead of repeating the per-state branches
 
 Direct edit target: Move state-specific behavior onto the state object/type.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

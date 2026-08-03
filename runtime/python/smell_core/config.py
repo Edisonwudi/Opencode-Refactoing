@@ -17,6 +17,7 @@ from .location import LocationTarget, parse_locations
 
 SUPPORTED_LANGUAGES = {"java", "python", "c", "cpp"}
 VERIFICATION_MODES = {"local", "auto", "sample_optimized", "project_full"}
+JAVA_VERIFICATION_MODES = {"sample_optimized", "project_full"}
 LLM_MODEL_ALIAS_ENVS = {
     "openai": "OPENAI_MODEL",
     "glm": "ZHIPU_MODEL",
@@ -41,21 +42,6 @@ LLM_API_KEY_ENVS = {
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
-
-
-def select_dataset_test_command(
-    *,
-    verification_mode: object,
-    test_command: object,
-    focused_test_command: object,
-) -> str:
-    """Select the dataset command that matches the declared verification path."""
-    mode = str(verification_mode or "").strip()
-    primary = str(test_command or "").strip()
-    focused = str(focused_test_command or "").strip()
-    if mode == "sample_optimized" and focused:
-        return focused
-    return primary
 
 
 @dataclass
@@ -291,13 +277,17 @@ class ResolvedRunConfig:
     project_override: Optional[ProjectOverride] = None
     idea_refactor_cli: Optional[str] = None
     idea_refactor_ready: bool = False
-    verification_mode: str = "local"
+    verification_mode: str = "project_full"
     build_source: str = "projects.yaml"
     test_source: str = "projects.yaml"
     sample_test_location: str = ""
     sample_test_command: str = ""
     target_context: Dict[str, Any] = field(default_factory=dict)
     finding_contract: Dict[str, Any] = field(default_factory=dict)
+    # Java Guard v5 freezes a target predicate, not a project finding catalog.
+    # ``finding_contract`` remains only for non-Java checkpoint compatibility.
+    guard_contract: Dict[str, Any] = field(default_factory=dict)
+    guard_scope: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -339,6 +329,19 @@ class ResolvedRunConfig:
             "sample_test_command": self.sample_test_command,
             "target_context": copy.deepcopy(self.target_context),
             "finding_contract": copy.deepcopy(self.finding_contract),
+            "guard_contract": copy.deepcopy(self.guard_contract),
+            "guard_scope": (
+                {
+                    "changed_files": list(self.guard_scope.changed_files),
+                    "changed_production_files": list(
+                        self.guard_scope.changed_production_files
+                    ),
+                    "target_files": list(self.guard_scope.target_files),
+                    "analysis_files": list(self.guard_scope.analysis_files),
+                }
+                if self.guard_scope is not None
+                else None
+            ),
         }
 
 
@@ -469,11 +472,13 @@ def resolve_run_config(
     smell: str,
     location: str,
     cli_language: Optional[str] = None,
-    verification_mode: str = "local",
+    verification_mode: str = "",
     sample_test_location: str = "",
     sample_test_command: str = "",
     target_context: Optional[Dict[str, Any]] = None,
 ) -> ResolvedRunConfig:
+    from .target_context import validate_target_context
+
     project_root_path = Path(project_root).expanduser().resolve()
     override_lookup_root = (
         Path(project_override_root).expanduser().resolve()
@@ -508,6 +513,7 @@ def resolve_run_config(
         project_test = _rebase_command_config(project_test, override.root.resolve(), project_root_path)
     normalized_verification_mode = _resolve_verification_mode(
         verification_mode,
+        language=language,
         sample_test_command=sample_test_command,
     )
     if normalized_verification_mode == "sample_optimized" and _clean_optional_string(sample_test_command):
@@ -556,15 +562,26 @@ def resolve_run_config(
         test_source=test_source,
         sample_test_location=str(sample_test_location or ""),
         sample_test_command=str(sample_test_command or ""),
-        target_context=copy.deepcopy(target_context or {}),
+        target_context=copy.deepcopy(validate_target_context(target_context)),
     )
 
 
-def _resolve_verification_mode(value: str, *, sample_test_command: str = "") -> str:
-    mode = str(value or "local").strip()
+def _resolve_verification_mode(
+    value: str,
+    *,
+    language: str,
+    sample_test_command: str = "",
+) -> str:
+    default_mode = "project_full" if language == "java" else "local"
+    mode = str(value or default_mode).strip()
     if mode not in VERIFICATION_MODES:
         raise ValueError(
             f"Unsupported verification_mode '{mode}'. Expected one of: {', '.join(sorted(VERIFICATION_MODES))}."
+        )
+    if language == "java" and mode not in JAVA_VERIFICATION_MODES:
+        raise ValueError(
+            "Java verification_mode must be 'sample_optimized' or 'project_full'; "
+            "every Java PASS requires configured build/test verification."
         )
     if mode == "auto":
         return "sample_optimized" if _clean_optional_string(sample_test_command) else "project_full"

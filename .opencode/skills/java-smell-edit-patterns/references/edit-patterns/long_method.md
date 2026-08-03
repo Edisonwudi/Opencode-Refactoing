@@ -5,10 +5,26 @@
 Shrink the reported method by extracting the dominant cohesive slice while preserving the
 original method as readable orchestration.
 
+## AST-NCSS fast-path closure
+
+1. Re-anchor the frozen method after line drift and read its current target Guard
+   AST-NCSS. Do not estimate length from physical lines.
+2. Mark the few contiguous loops, branches, or calculations that contribute most of the
+   executable statements. Select the smallest cohesive set whose removal is projected to put
+   the target method below the Guard boundary.
+3. When one route clearly supplies the required reduction, complete that extraction and call
+   `smell_verify` once. Do not spend a continuation on a tiny preliminary helper.
+4. When several independent slices are required, extract the preselected slices before the
+   first verification when their inputs and effects are clear. If verification returns
+   `IMPROVED`, use the returned current AST-NCSS and residual deficit as the exact next
+   worklist; do not repeat the previous extraction shape blindly.
+
 ## Common verification fit
 
-- The reported method itself should become materially shorter.
-- If it still reports, extract another cohesive slice instead of repeating the same edit.
+- The frozen method itself must fall below the target Guard AST-NCSS boundary. A material
+  reduction that leaves the finding present is `IMPROVED`, not PASS.
+- If it still reports, extract the next preselected cohesive slice that covers the returned
+  residual deficit instead of repeating the same edit.
 
 ## Common avoid
 

@@ -18,7 +18,7 @@ You repair one Java code smell from the task input provided by the user or a
 batch runner.
 
 Treat the task input as the source of truth for the project root, language,
-smell type, target location, evidence, and verification mode. Do not assume
+smell type, target location, frozen finding identity, and verification mode. Do not assume
 hidden task context or hidden tool contracts.
 
 Workflow:
@@ -28,17 +28,14 @@ Workflow:
 2. Load `java-smell-edit-patterns`, then read only the edit-pattern reference
    matching the smell type.
 3. Inspect the target Java code and form a concise behavior-preserving repair
-   plan from the user-provided smell evidence and the actual source.
+   plan from the frozen target Guard contract and the actual source.
 4. Execute the plan with OpenCode read/search/edit tools. Do not rewrite Java
    files with shell text commands.
 5. Call `smell_verify` as the acceptance gate.
    Do not run Maven or Gradle directly during this command. `smell_verify` owns
    the pinned offline build/test invocation and avoids duplicate validation.
-   Default verification is `verificationMode="local"`, which runs the local
-   Python smell guard and records a diff/status snapshot without requiring
-   project build or test commands. Use `verificationMode="auto"`,
-   `"sample_optimized"`, or `"project_full"` only when the task explicitly asks
-   for strict build/test verification.
+   Verification is either `sample_optimized` or `project_full`; every PASS and
+   every recorded IMPROVED result requires the configured build/test command.
 6. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. If the smell guard fails, continue repairing the smell. If
    strict build/test verification fails, repair the compile/test regression or
@@ -53,7 +50,9 @@ Loop policy:
 - When `loop.decision` is `stop`, stop and report `loop.termination_reason` and
   the remaining blocker. Dependency, auth/provider, timeout, and infrastructure
   failures are not made repairable by prompt instructions.
-- Never modify or weaken dataset test files to pass verification.
+- Obey the controller-owned `allow_test_changes` policy. It is false by default;
+  when true, test-source migrations are audited, baseline test files must remain,
+  declared tests must execute, and project-full build/tests must pass.
 
 Acceptance:
 

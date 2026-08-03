@@ -2,9 +2,9 @@
 """Regression checks for the contract improvement outcome in bridge verify.
 
 Semantics under test: a real production diff that reduces any valid target
-metric vs baseline is recorded as IMPROVED, never PASS, while the
-product detector still reports the smell. Without a diff or metric
-reduction the ordinary failure semantics remain unchanged.
+metric vs baseline is recorded as IMPROVED, never PASS, while the target
+Guard still reports the smell. Without a diff or metric reduction the
+ordinary failure semantics remain unchanged.
 """
 
 from __future__ import annotations
@@ -20,7 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = REPO_ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
 sys.path.insert(0, str(BRIDGE.parent))
 
-from smell_bridge import _requires_structural_resolution, _verified_improvement  # noqa: E402
+from smell_bridge import _verified_improvement  # noqa: E402
+
+
+_BASELINE_SEALS: dict[str, str] = {}
 
 
 def _method(index: int, controls: int) -> str:
@@ -47,22 +50,35 @@ def _bridge(
         sys.executable,
         str(BRIDGE),
         subcommand,
+        "--output-detail",
+        "audit",
         "--project-root",
         str(project),
         "--smell",
         smell,
         "--location",
         location,
-        "--smell-evidence",
-        evidence,
+        "--language",
+        "java",
+        "--projects",
+        str(project / "projects.yaml"),
+        "--verification-mode",
+        "project_full",
     ]
     if target_context:
         cmd += ["--target-context-json", json.dumps(target_context, sort_keys=True)]
     if subcommand == "verify":
-        cmd += ["--skip-build-test", "--no-snapshot"]
+        seal = _BASELINE_SEALS.get(str(project.resolve()), "")
+        assert seal, "controller baseline seal was not captured before verify"
+        cmd += ["--baseline-seal", seal, "--no-snapshot"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, f"bridge failed: {proc.stderr[-500:]}"
-    return json.loads(proc.stdout)
+    payload = json.loads(proc.stdout)
+    if subcommand == "capture-baseline":
+        seal = str(payload.get("baseline_seal") or "").strip()
+        assert seal, payload
+        _BASELINE_SEALS[str(project.resolve())] = seal
+    return payload
 
 
 REFUSED_BASELINE = """\
@@ -102,6 +118,16 @@ def _refused_bequest_baseline_delta_case() -> None:
         root = Path(tmp)
         source = root / "Fixture.java"
         source.write_text(REFUSED_BASELINE, encoding="utf-8")
+        (root / "projects.yaml").write_text(
+            "projects:\n"
+            f"- root: {json.dumps(str(root))}\n"
+            "  language: java\n"
+            "  build:\n"
+            "    command: \"true\"\n"
+            "  test:\n"
+            "    command: \"true\"\n",
+            encoding="utf-8",
+        )
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "."], cwd=root, check=True)
         subprocess.run(
@@ -132,7 +158,19 @@ def _refused_bequest_baseline_delta_case() -> None:
         assert relocated.get("status") == "SMELL_GUARD_FAILED", relocated
         assert relocated.get("resolution") == "unresolved", relocated
         results = (relocated.get("smell_guard") or {}).get("results") or []
-        assert any("moved to another type" in str(item.get("message") or "") for item in results), results
+        regressions = [
+            str(regression)
+            for item in results
+            for regression in (
+                ((item.get("details") or {}).get("metric_delta") or {})
+                .get("semantic_contract", {})
+                .get("regressions", [])
+            )
+        ]
+        assert any(
+            value.startswith("REFUSED_BEQUEST_RELOCATED:")
+            for value in regressions
+        ), results
 
 
 def main() -> int:
@@ -141,27 +179,19 @@ def main() -> int:
         "metric progress with failing build/tests must remain unresolved"
     )
     assert not _verified_improvement(False, True)
-    assert _requires_structural_resolution(
-        "refused_bequest",
-        "parents=Parent; structural_expectation=capability_split",
-    )
-    assert _requires_structural_resolution(
-        "refused_bequest",
-        "parents=Parent; structural_expectation=rejecting_override_removed",
-    )
-    assert _requires_structural_resolution(
-        "refused_bequest",
-        "parents=Parent",
-    )
-    assert _requires_structural_resolution("code_clone_type1", "")
-    assert not _requires_structural_resolution(
-        "god_class",
-        "structural_expectation=capability_split",
-    )
-
     with tempfile.TemporaryDirectory(prefix="improvement-gate-") as tmp:
         root = Path(tmp)
         (root / "Smelly.java").write_text(_class_source(12, 3, 60), encoding="utf-8")
+        (root / "projects.yaml").write_text(
+            "projects:\n"
+            f"- root: {json.dumps(str(root))}\n"
+            "  language: java\n"
+            "  build:\n"
+            "    command: \"true\"\n"
+            "  test:\n"
+            "    command: \"true\"\n",
+            encoding="utf-8",
+        )
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "."], cwd=root, check=True)
         subprocess.run(
@@ -192,7 +222,9 @@ def main() -> int:
         assert second.get("resolution") == "improved", second.get("resolution")
         checkpoint = second.get("checkpoint") or {}
         assert checkpoint.get("accepted") is False, checkpoint
-        assert checkpoint.get("best_partial_eligible") is False, checkpoint
+        assert checkpoint.get("build_test_success") is True, checkpoint
+        assert checkpoint.get("best_partial_eligible") is True, checkpoint
+        assert checkpoint.get("restorable") is True, checkpoint
 
         # 3) Cosmetic-only edit on the ORIGINAL baseline class (comment change
         # only): production diff exists but every metric is back at baseline,

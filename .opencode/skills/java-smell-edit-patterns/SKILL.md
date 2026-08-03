@@ -9,14 +9,20 @@ Use this skill only for the plain Java refactor agent, or when the task
 explicitly disables IDEA CLI enhancement.
 
 The task input remains the source of truth for project root, smell type, target
-location, evidence, and verification mode. These references provide direct-edit
+location, frozen finding identity, and verification mode. These references provide direct-edit
 repair patterns; they do not add hidden context and do not replace
 `smell_verify`.
 
-The reference files are the OpenCode read/search/edit counterparts of the
-`idea-refactor-cli` refactor path examples. They keep the same route ids and
-`when` conditions, then translate operation shapes such as `extract:method`,
-`move:method`, and `introduce:parameter-object` into plain OpenCode edit steps.
+`smell_verify` applies a caller-supplied target Guard to the frozen target and
+its explicit analysis/change scope. It does not scan every smell or construct a
+project-wide finding catalog. Dataset rows, historical metrics, and free-form
+evidence may help locate or explain the target, but they never define the Guard
+predicate or verdict.
+
+The reference files are the product's source-edit route library. Route ids and
+`when` conditions select one source shape, then operations such as
+`extract:method`, `move:method`, and `introduce:parameter-object` are executed
+with plain OpenCode read/search/edit steps.
 
 ## Loading
 
@@ -28,10 +34,9 @@ After reading the complete task input and identifying the smell type:
 4. Read `references/edit-patterns/operation-translations.md` only if the route's
    operation shape is unclear.
 5. Use the `Verification fit` section only to avoid routes that cannot satisfy
-   `smell_verify`; do not make detector-only edits.
-6. For `refused_bequest` evidence with a structural expectation, follow the
-   hierarchy migration protocol in `refused_bequest.md` before choosing a route.
-   This protocol applies equally to interactive UI and batch execution.
+   the target Guard returned by `smell_verify`; do not make metric-only edits.
+6. For `refused_bequest`, follow the source-derived hierarchy migration protocol
+   in `refused_bequest.md` before choosing a route.
 
 ## OpenCode Edit Contract
 
@@ -39,15 +44,18 @@ After reading the complete task input and identifying the smell type:
 - Edit Java source with OpenCode edit tools using exact, narrow replacements.
 - Do not rewrite Java files with shell text commands.
 - After edits, call `smell_verify`. If it fails, read `failure_pack` and the
-  failed smell guard details before choosing the next narrow edit.
+  frozen finding/checkpoint details before choosing the next narrow edit.
+- Obey the controller-owned `allow_test_changes` policy. Test edits are blocked
+  by default; when explicitly allowed they are fully audited, baseline test files
+  may not be deleted, declared tests must actually execute, and the frozen
+  project-full build/test command must pass.
 
 ## Reference Shape
 
 Each smell reference has:
 
 - `Refactoring intent`: the code-quality goal.
-- `Strategy variants`: the same route ids and feature conditions as the IDEA
-  path library.
+- `Strategy variants`: product route ids and source-derived feature conditions.
 - `Routes`: route-specific `When`, `Direct edit target`, edit steps,
   verification delta, and avoid guidance.
 - `operation-translations.md`: shared mechanics for operation shapes, kept

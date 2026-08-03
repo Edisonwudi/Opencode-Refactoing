@@ -49,6 +49,22 @@ def normalize_group(value: str) -> str:
     return "|".join(sorted(pieces))
 
 
+def normalize_qualified_group(value: str) -> str:
+    """Canonicalize a Java data-clump group without erasing type identity."""
+    pieces: list[str] = []
+    for item in _split_group_members(str(value or "")):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            type_name, name = item.rsplit(":", 1)
+            compact_type = type_name.replace(" ", "").replace("|", "or").lower()
+            pieces.append(f"{compact_type}:{name.replace(' ', '').lower()}")
+        else:
+            pieces.append(item.replace(" ", "").lower())
+    return "|".join(sorted(pieces))
+
+
 def _split_group_members(value: str) -> list[str]:
     return [item for item in re.split(r"(?<!\s)\|(?!\s)", value) if item.strip()]
 
@@ -63,42 +79,3 @@ def _normalize_group_type(value: str) -> str:
         compact = compact[:-2]
     compact = compact.replace("|", "or")
     return compact.rsplit(".", 1)[-1].lower() + suffix
-
-
-def parse_parent_from_evidence(evidence: str) -> str:
-    """Extract the primary parent from ``parent=`` or dataset ``parents=`` evidence."""
-    match = re.search(r"(?:^|;\s*)parents?=([^;]+)", evidence, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    value = re.split(r"[|,]", match.group(1), maxsplit=1)[0]
-    return value.strip().lower()
-
-
-def parse_structural_expectation(evidence: str) -> str:
-    """Extract an explicit structural acceptance contract from dataset evidence."""
-    match = re.search(
-        r"(?:^|;\s*)structural_expectation=([^;]+)",
-        evidence,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).strip().lower() if match else ""
-
-
-def parse_target_parameter_count(evidence: str) -> Optional[int]:
-    """Extract a pinned target-method arity used to distinguish Java overloads."""
-    matches = re.findall(
-        r"(?:^|;\s*)target_parameter_count=(\d+)",
-        evidence,
-        flags=re.IGNORECASE,
-    )
-    return int(matches[-1]) if matches else None
-
-
-def parse_target_class(evidence: str) -> str:
-    """Extract a pinned target class; the final field overrides group defaults."""
-    matches = re.findall(
-        r"(?:^|;\s*)target_class=([^;]+)",
-        evidence,
-        flags=re.IGNORECASE,
-    )
-    return matches[-1].strip() if matches else ""

@@ -200,12 +200,10 @@ if [[ $# -gt 0 ]]; then
   if [[ "$(id -u)" == "0" && "$RUN_AS_USER" != "root" ]]; then
     exec runuser -u "$RUN_AS_USER" -- python3 /opt/opencode-refactor/scripts/run_smell_dataset.py \
       --runs-root "$RUNS_ROOT" \
-      --idea-refactor-cli "${IDEA_REFACTOR_CLI:-/opt/idea-refactoring/bin/idea-refactor}" \
       "$@"
   fi
   exec python3 /opt/opencode-refactor/scripts/run_smell_dataset.py \
     --runs-root "$RUNS_ROOT" \
-    --idea-refactor-cli "${IDEA_REFACTOR_CLI:-/opt/idea-refactoring/bin/idea-refactor}" \
     "$@"
 fi
 

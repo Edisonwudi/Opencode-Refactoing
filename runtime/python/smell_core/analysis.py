@@ -409,7 +409,17 @@ def iter_function_signatures(project_root: Path, language: str) -> list[Function
                 continue
             snippet = _build_source_snippet(node, source_bytes, language)
             if snippet is None:
-                continue
+                # Java interface/abstract declarations have no body but are
+                # still product-visible method signatures (notably for LPL).
+                if language != "java":
+                    continue
+                body_node = node.child_by_field_name("body")
+                signature_end = body_node.start_byte if body_node is not None else node.end_byte
+                signature_text = _decode(
+                    source_bytes[node.start_byte:signature_end]
+                ).rstrip().removesuffix(";")
+            else:
+                signature_text = snippet.signature_text
             name = _extract_declared_name(node, language, source_bytes) or ""
             fingerprints = _parameter_fingerprints_from_node(node, language, source_bytes)
             signatures.append(
@@ -418,7 +428,7 @@ def iter_function_signatures(project_root: Path, language: str) -> list[Function
                     start_line=_node_start_line(node),
                     end_line=_node_end_line(node),
                     name=name,
-                    signature_text=snippet.signature_text,
+                    signature_text=signature_text,
                     parameter_fingerprints=fingerprints,
                 )
             )

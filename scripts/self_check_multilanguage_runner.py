@@ -49,7 +49,7 @@ def main() -> int:
         assert (
             runner._effective_verification_mode(
                 sample,
-                argparse.Namespace(verification_mode="auto"),
+                argparse.Namespace(verification_mode="project_full"),
             )
             == "project_full"
         )
@@ -66,7 +66,6 @@ def main() -> int:
                     "location",
                     "test_file",
                     "test_command",
-                    "focused_test_command",
                     "verification_mode",
                 ],
             )
@@ -80,15 +79,15 @@ def main() -> int:
                     "project_path": str(project),
                     "location": f"{source}:method=f|line=1",
                     "test_file": "FocusedTest.java",
-                    "test_command": "mvn test",
-                    "focused_test_command": "mvn -Dtest=FocusedTest test",
+                    "test_command": "mvn -Dtest=FocusedTest test",
                     "verification_mode": "sample_optimized",
                 }
             )
         focused_sample = runner._load_samples(focused_dataset)[0]
         assert focused_sample.test_command == "mvn -Dtest=FocusedTest test"
-        assert focused_sample.raw["test_command"] == "mvn test"
-        print("  ok   sample_optimized selects focused_test_command")
+        assert focused_sample.test_location == "FocusedTest.java"
+        assert focused_sample.raw["test_command"] == "mvn -Dtest=FocusedTest test"
+        print("  ok   sample_optimized uses materialized test_command and test_file")
         auth_args = SimpleNamespace(
             dry_run=False,
             checkout_only=False,
@@ -113,11 +112,12 @@ def main() -> int:
             evidence="parents=Parent; structural_expectation=capability_split",
             test_location="src/test/java/ExampleTest.java",
             test_command="mvn test",
+            verification_mode="sample_optimized",
         )
         assert (
             runner._effective_verification_mode(
                 strict_oracle,
-                argparse.Namespace(verification_mode="auto"),
+                argparse.Namespace(verification_mode="project_full"),
             )
             == "sample_optimized"
         )
@@ -129,7 +129,7 @@ def main() -> int:
         assert (
             runner._effective_verification_mode(
                 project_full_command,
-                argparse.Namespace(verification_mode="auto"),
+                argparse.Namespace(verification_mode="project_full"),
             )
             == "project_full"
         )
@@ -140,38 +140,43 @@ def main() -> int:
         try:
             runner._effective_verification_mode(
                 invalid_sample_oracle,
-                argparse.Namespace(verification_mode="auto"),
+                argparse.Namespace(verification_mode="project_full"),
             )
         except ValueError as exc:
             assert "SAMPLE_ORACLE_TEST_FILE_MISSING" in str(exc)
         else:
             raise AssertionError("sample_optimized verification must require a pinned test file")
         missing_strict_test = replace(strict_oracle, test_location="")
-        assert (
+        try:
             runner._effective_verification_mode(
                 missing_strict_test,
-                argparse.Namespace(verification_mode="auto"),
+                argparse.Namespace(verification_mode="project_full"),
             )
-            == "project_full"
-        )
-        assert (
+        except ValueError as exc:
+            assert "SAMPLE_ORACLE_TEST_FILE_MISSING" in str(exc)
+        else:
+            raise AssertionError("materialized sample_optimized mode must fail closed")
+        try:
             runner._effective_verification_mode(
                 strict_oracle,
                 argparse.Namespace(verification_mode="local"),
             )
-            == "local"
-        )
+        except ValueError as exc:
+            assert "Unsupported verification mode" in str(exc)
+        else:
+            raise AssertionError("legacy local mode must be rejected")
         prompt = runner._task_prompt(
             sample,
-            argparse.Namespace(idea_refactor_cli=""),
-            "local",
-            "java-refactor-agent",
+            argparse.Namespace(allow_test_changes=False),
+            "project_full",
         )
         assert "Repair this one python smell" in prompt
         assert "Repair this one Java smell" not in prompt
+        assert "IDEA preference" not in prompt
 
-        args = argparse.Namespace(agent="", idea=False, opencode_bin="opencode", model="test/model")
+        args = argparse.Namespace(agent="", opencode_bin="opencode", model="test/model")
         assert runner._select_agent(sample, args) == "smell-refactor-agent"
+        assert runner._select_agent(focused_sample, args) == "java-refactor-agent"
         command = runner._opencode_run_command(args, "smell-refactor-agent")
         assert command[command.index("--command") + 1] == "smell-refactor-run"
         rebased = _rebase_command_config(
@@ -182,17 +187,30 @@ def main() -> int:
         assert str(root / "execution-worktree") in str(rebased.script)
         assert str(project) not in str(rebased.script)
 
-        proc = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "run_smell_dataset.py"), "--dataset", str(dataset), "--idea", "--dry-run"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert proc.returncode == 2, proc
-        assert "IDEA_UNSUPPORTED_LANGUAGE" in proc.stderr
+        for removed_args in (
+            ["--idea"],
+            ["--no-idea"],
+            ["--idea-refactor-cli", "/tmp/idea-refactor"],
+            ["--agent", "java-refactor-agent-idea"],
+        ):
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "run_smell_dataset.py"),
+                    "--dataset",
+                    str(dataset),
+                    *removed_args,
+                    "--dry-run",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert rejected.returncode == 2, rejected
+            assert "unrecognized arguments" in rejected.stderr or "invalid choice" in rejected.stderr
 
         direct = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "run_smell_dataset.py"), "--dataset", str(dataset), "--no-idea", "--dry-run"],
+            [sys.executable, str(ROOT / "scripts" / "run_smell_dataset.py"), "--dataset", str(dataset), "--dry-run"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
 from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
-from smell_core.java.semantic_detector import build_refused_bequest_impact_map  # noqa: E402
+from smell_core.java.semantic_detector import (  # noqa: E402
+    build_refused_bequest_impact_map,
+    run_java_semantic_detector,
+)
 
 
 BASELINE = """\
@@ -157,6 +160,8 @@ def contract_snapshot(project: Path, source_text: str) -> dict:
     source = project / "src" / "main" / "java" / "Hierarchy.java"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text(source_text, encoding="utf-8")
+    detection = run_java_semantic_detector(project)
+    assert detection.ok and detection.project_model is not None, detection
     impact = build_refused_bequest_impact_map(
         project,
         target_file=source,
@@ -165,6 +170,7 @@ def contract_snapshot(project: Path, source_text: str) -> dict:
         reported_parent="CapabilityRoot",
         target_parameter_count=0,
         target_class_name="RejectingLeaf",
+        project_model=detection.project_model,
     )
     assert impact["ok"] is True, impact
     contract = impact["target_contract"]

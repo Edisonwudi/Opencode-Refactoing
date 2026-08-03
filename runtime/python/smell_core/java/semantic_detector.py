@@ -10,16 +10,19 @@ imports) via tree-sitter and then analyses it for four semantic smells:
 * **god_class** — large classes with excessive foreign data access.
 * **dead_code** — unused private methods with no project-local call/reference.
 
-This is the "Python semantic detector" referenced in guard messages,
-so-named because it is implemented in Python (vs. the legacy
-SemanticSmellSolver.java oracle).
+This is the versioned Java product detector used by checkpoint capture and
+post-edit verification.
 """
 from __future__ import annotations
 
 import itertools
+import hashlib
+import os
 import re
+import zipfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -27,29 +30,90 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 from ..analysis import count_meaningful_lines
+from .source_layout import (
+    JavaSourceLayoutError,
+    discover_java_source_layout,
+    standard_test_root,
+)
 from .detector_utils import (
-    normalize_group as _normalize_group,
+    normalize_qualified_group as _normalize_qualified_group,
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
-    parse_group_from_evidence as _parse_group_from_evidence,
-    parse_parent_from_evidence as _parse_parent_from_evidence,
 )
-from .syntactic_detector import tokenize_clone
+from .catalog_identity import (
+    split_top_level_java_types,
+    stable_java_method_signature,
+    stable_method_record_signature,
+)
+from .syntactic_detector import tokenize_structural_window
+
+
+JAVA_SYMBOL_RESOLVER_ID = "readonly-main-classpath-symbols-v4"
+JAVA_SYMBOL_SNAPSHOT_SCHEMA = 1
+
+# Target-parameter descriptors for the JDK functional interfaces whose
+# source-level generic arguments completely determine a bound method
+# reference's input types. Integer entries address generic arguments; string
+# entries are primitive types. Return types are irrelevant to Java overloads
+# because methods cannot differ by return type alone.
+JAVA_SAM_PARAMETER_TEMPLATES: Mapping[str, Tuple[int | str, ...]] = {
+    "BiConsumer": (0, 1),
+    "BiFunction": (0, 1),
+    "BinaryOperator": (0, 0),
+    "BiPredicate": (0, 1),
+    "BooleanSupplier": (),
+    "Consumer": (0,),
+    "DoubleBinaryOperator": ("double", "double"),
+    "DoubleConsumer": ("double",),
+    "DoubleFunction": ("double",),
+    "DoublePredicate": ("double",),
+    "DoubleSupplier": (),
+    "DoubleToIntFunction": ("double",),
+    "DoubleToLongFunction": ("double",),
+    "DoubleUnaryOperator": ("double",),
+    "Function": (0,),
+    "IntBinaryOperator": ("int", "int"),
+    "IntConsumer": ("int",),
+    "IntFunction": ("int",),
+    "IntPredicate": ("int",),
+    "IntSupplier": (),
+    "IntToDoubleFunction": ("int",),
+    "IntToLongFunction": ("int",),
+    "IntUnaryOperator": ("int",),
+    "LongBinaryOperator": ("long", "long"),
+    "LongConsumer": ("long",),
+    "LongFunction": ("long",),
+    "LongPredicate": ("long",),
+    "LongSupplier": (),
+    "LongToDoubleFunction": ("long",),
+    "LongToIntFunction": ("long",),
+    "LongUnaryOperator": ("long",),
+    "ObjDoubleConsumer": (0, "double"),
+    "ObjIntConsumer": (0, "int"),
+    "ObjLongConsumer": (0, "long"),
+    "Predicate": (0,),
+    "Supplier": (),
+    "ToDoubleBiFunction": (0, 1),
+    "ToDoubleFunction": (0,),
+    "ToIntBiFunction": (0, 1),
+    "ToIntFunction": (0,),
+    "ToLongBiFunction": (0, 1),
+    "ToLongFunction": (0,),
+    "UnaryOperator": (0,),
+    # Other widely used JDK single-abstract-method interfaces.
+    "Callable": (),
+    "Comparator": (0, 0),
+    "Runnable": (),
+}
 
 
 DEFAULT_THRESHOLDS = {
-    "feature_envy_foreign_ratio": 0.6,
-    "feature_envy_foreign_access": 4,
-    "feature_envy_min_loc": 5,
-    "refused_bequest_score": 0.7,
     "data_clumps_param_group_size": 3,
     "data_clumps_occurrences": 3,
-    "data_clumps_min_classes": 2,
-    # Keep these values and the predicate in ``_detect_god_class`` aligned
-    # with smell_datasets/scripts/collect_god_class.py.  The delivery rows were
-    # selected with that detector; using a second threshold family here makes
-    # the post-refactoring oracle measure a different smell from the baseline.
+    "data_clumps_min_classes": 3,
+    # Versioned God Class product profile. Capture and verification use this
+    # same predicate; dataset metadata never supplies these values at runtime.
     "god_class_min_nom": 5,
     "god_class_min_wmc": 20,
     "god_class_nom": 10,
@@ -60,6 +124,104 @@ DEFAULT_THRESHOLDS = {
     "god_class_strong_wmc": 50,
     "god_class_min_signals": 2,
 }
+
+GOD_CLASS_PROFILE_ID = "java-product/god-class/multi-metric-v1"
+GOD_CLASS_RESPONSIBILITY_CLUSTER_SCHEMA = 1
+GOD_CLASS_RESPONSIBILITY_CLUSTER_LIMIT = 12
+GOD_CLASS_RESPONSIBILITY_MEMBER_LIMIT = 16
+
+
+def god_class_product_profile(
+    metrics: Optional[Mapping[str, Any]] = None,
+    *,
+    responsibility_clusters: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Return the versioned God Class predicate and its current trigger state.
+
+    The detector and checkpoint adapter read the same constants.  This is a
+    descriptive view of the product predicate, not an alternate detector.
+    """
+    values = {
+        name: int((metrics or {}).get(name) or 0)
+        for name in ("nom", "nof", "wmc", "loc", "atfd")
+    }
+    mandatory = [
+        {
+            "name": "nom",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_min_nom"]),
+            "value": values["nom"],
+            "matched": values["nom"] >= int(DEFAULT_THRESHOLDS["god_class_min_nom"]),
+        },
+        {
+            "name": "wmc",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_min_wmc"]),
+            "value": values["wmc"],
+            "matched": values["wmc"] >= int(DEFAULT_THRESHOLDS["god_class_min_wmc"]),
+        },
+    ]
+    signals = [
+        {
+            "name": "nom",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_nom"]),
+            "value": values["nom"],
+            "matched": values["nom"] >= int(DEFAULT_THRESHOLDS["god_class_nom"]),
+        },
+        {
+            "name": "wmc",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_wmc"]),
+            "value": values["wmc"],
+            "matched": values["wmc"] >= int(DEFAULT_THRESHOLDS["god_class_wmc"]),
+        },
+        {
+            "name": "loc",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_loc"]),
+            "value": values["loc"],
+            "matched": values["loc"] >= int(DEFAULT_THRESHOLDS["god_class_loc"]),
+        },
+        {
+            "name": "atfd",
+            "operator": ">=",
+            "boundary": int(DEFAULT_THRESHOLDS["god_class_atfd"]),
+            "value": values["atfd"],
+            "matched": values["atfd"] >= int(DEFAULT_THRESHOLDS["god_class_atfd"]),
+        },
+        {
+            "name": "strong_nom_wmc",
+            "operator": "nom>= and wmc>=",
+            "boundaries": {
+                "nom": int(DEFAULT_THRESHOLDS["god_class_strong_nom"]),
+                "wmc": int(DEFAULT_THRESHOLDS["god_class_strong_wmc"]),
+            },
+            "values": {"nom": values["nom"], "wmc": values["wmc"]},
+            "matched": (
+                values["nom"] >= int(DEFAULT_THRESHOLDS["god_class_strong_nom"])
+                and values["wmc"] >= int(DEFAULT_THRESHOLDS["god_class_strong_wmc"])
+            ),
+        },
+    ]
+    triggered = [str(item["name"]) for item in signals if item["matched"]]
+    profile = {
+        "id": GOD_CLASS_PROFILE_ID,
+        "mandatory": mandatory,
+        "signals": signals,
+        "min_signals": int(DEFAULT_THRESHOLDS["god_class_min_signals"]),
+        "triggered_signals": triggered,
+        "finding_present": bool(
+            all(item["matched"] for item in mandatory)
+            and len(triggered) >= int(DEFAULT_THRESHOLDS["god_class_min_signals"])
+        ),
+    }
+    if responsibility_clusters is not None:
+        profile["responsibility_cluster_schema"] = GOD_CLASS_RESPONSIBILITY_CLUSTER_SCHEMA
+        profile["responsibility_clusters"] = [
+            dict(item) for item in responsibility_clusters
+        ]
+    return profile
 
 DEFAULT_EXCLUDE_PATHS = [
     ".git",
@@ -76,45 +238,6 @@ DEFAULT_EXCLUDE_PATHS = [
 
 DATA_CLUMP_INLINE_WINDOW_TOKENS = 24
 DATA_CLUMP_INLINE_WINDOWS_PER_METHOD = 4
-
-DATA_CLUMP_COORD_STEMS = {
-    "x",
-    "y",
-    "z",
-    "w",
-    "h",
-    "x1",
-    "x2",
-    "y1",
-    "y2",
-    "z1",
-    "z2",
-    "startx",
-    "starty",
-    "endx",
-    "endy",
-    "width",
-    "height",
-    "left",
-    "right",
-    "top",
-    "bottom",
-    "rotation",
-    "angle",
-    "originx",
-    "originy",
-    "alpha",
-    "opacity",
-    "radius",
-    "margin",
-    "pointer",
-}
-
-DATA_CLUMP_FRAMEWORK_TYPES = {
-    "java.util.Locale",
-    "java.util.TimeZone",
-    "java.lang.StringBuffer",
-}
 
 JAVA_LANG_TYPES = {
     "Appendable",
@@ -144,8 +267,19 @@ JAVA_LANG_TYPES = {
 }
 
 PRIMITIVE_TYPES = {"boolean", "byte", "char", "double", "float", "int", "long", "short", "void"}
-METHOD_NODE_TYPES = {"method_declaration", "constructor_declaration"}
-CLASS_NODE_TYPES = {"class_declaration", "interface_declaration", "enum_declaration"}
+AMBIGUOUS_TYPE_PREFIX = "__ambiguous_java_type__"
+METHOD_NODE_TYPES = {
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+}
+CLASS_NODE_TYPES = {
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+}
+ENUM_MEMBER_CONTAINER_TYPE = "enum_body_declarations"
 DECLARATION_TYPES = {
     "annotation",
     "class",
@@ -232,6 +366,7 @@ class SemanticFinding:
     score: float
     rule_id: str
     evidence: str
+    attributes: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -239,6 +374,27 @@ class SemanticDetectionResult:
     ok: bool
     findings: Dict[str, List[SemanticFinding]]
     error: str = ""
+    project_model: Optional["ProjectModel"] = None
+    unavailable: Optional[Dict[str, object]] = None
+
+
+class JavaSymbolClasspathError(RuntimeError):
+    """An explicitly supplied symbol archive cannot be inspected safely."""
+
+    def __init__(self, reason: str, message: str, *, path: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.path = path
+
+    def to_unavailable(self) -> Dict[str, object]:
+        return {
+            "status": "DETECTOR_UNAVAILABLE",
+            "component": "java_external_symbols",
+            "reason": self.reason,
+            "message": self.message,
+            "details": {"path": self.path},
+        }
 
 
 @dataclass
@@ -250,6 +406,7 @@ class JavaFileModel:
     package: str = ""
     imports: Dict[str, str] = field(default_factory=dict)
     wildcard_imports: List[str] = field(default_factory=list)
+    static_wildcard_imports: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -260,11 +417,15 @@ class ClassRecord:
     begin_line: int
     end_line: int
     kind: str
+    source_superclass_name: str = ""
+    source_interface_names: List[str] = field(default_factory=list)
     superclass_name: str = ""
     interface_names: List[str] = field(default_factory=list)
     modifiers: Set[str] = field(default_factory=set)
     type_parameters: Dict[str, str] = field(default_factory=dict)
     fields: Dict[str, str] = field(default_factory=dict)
+    field_modifiers: Dict[str, Set[str]] = field(default_factory=dict)
+    record_components: Dict[str, str] = field(default_factory=dict)
     methods: List["MethodRecord"] = field(default_factory=list)
     declared_method_names: Set[str] = field(default_factory=set)
     bodyless_method_declarations: List[str] = field(default_factory=list)
@@ -293,6 +454,7 @@ class MethodRecord:
     annotations: Set[str]
     is_constructor: bool
     super_access_count: int
+    is_varargs: bool = False
 
 
 @dataclass(frozen=True)
@@ -340,13 +502,12 @@ class ProjectModel:
 def run_java_semantic_detector(
     project_root: Path,
     *,
-    include_tests: bool = True,
     classpath: str = "",
     timeout_seconds: int = 300,
 ) -> SemanticDetectionResult:
-    del classpath, timeout_seconds
+    del timeout_seconds
     try:
-        model = _build_project_model(project_root, include_tests=include_tests)
+        model = _build_project_model(project_root, classpath=classpath)
         feature_envy = _detect_feature_envy(model)
         refused_bequest = _detect_refused_bequest(model)
         data_clumps = _detect_data_clumps(model)
@@ -359,7 +520,15 @@ def run_java_semantic_detector(
             "god_class": _sort_findings(god_class),
             "dead_code": _sort_findings(dead_code),
         }
-        return SemanticDetectionResult(ok=True, findings=findings)
+        return SemanticDetectionResult(
+            ok=True,
+            findings=findings,
+            project_model=model,
+        )
+    except JavaSourceLayoutError as exc:
+        return _failed("DETECTOR_UNAVAILABLE", unavailable=exc.to_unavailable())
+    except JavaSymbolClasspathError as exc:
+        return _failed("DETECTOR_UNAVAILABLE", unavailable=exc.to_unavailable())
     except Exception as exc:
         return _failed(f"Python semantic detector failed: {exc}")
 
@@ -369,6 +538,7 @@ def analyze_data_clump_type_continuity(
     *,
     group: str,
     baseline_occurrences: Sequence[Mapping[str, Any]],
+    project_model: ProjectModel,
 ) -> Dict[str, Any]:
     """Track baseline declarations and business-body dispersion.
 
@@ -379,8 +549,8 @@ def analyze_data_clump_type_continuity(
     does not discover a second dataset-defined finding.
     """
     try:
-        model = _build_project_model(project_root, include_tests=False)
-        normalized_group = _normalize_group(group)
+        model = project_model
+        normalized_group = _normalize_qualified_group(group)
         group_types = Counter(
             token.rsplit(":", 1)[0]
             for token in normalized_group.split("|")
@@ -522,7 +692,7 @@ def _freeze_data_clump_parameter_positions(
                 "data_clump_baseline_declaration_unavailable:"
                 f"{occurrence.get('file', '')}#{occurrence.get('method', '')}"
             )
-        descriptors = [_normalize_group(item) for item in method.parameter_descriptors]
+        descriptors = [_normalize_qualified_group(item) for item in method.parameter_descriptors]
         unused = set(range(len(descriptors)))
         positions: List[Dict[str, Any]] = []
         for member in group_members:
@@ -561,12 +731,37 @@ def _method_retains_data_clump_positions(
             return False
         if index < 0 or index >= len(method.parameter_types):
             return False
-        current_type = _normalize_group(
+        current_type = _normalize_qualified_group(
             f"{method.parameter_types[index]}:value"
         ).rsplit(":", 1)[0]
         if current_type != str(item.get("type") or ""):
             return False
     return True
+
+
+def _data_clump_group_positions(
+    method: MethodRecord,
+    group_key: str,
+) -> List[Dict[str, Any]]:
+    """Return the current parameter slots occupied by one detector group."""
+    members = [item for item in _normalize_qualified_group(group_key).split("|") if item]
+    descriptors = [_normalize_qualified_group(item) for item in method.parameter_descriptors]
+    unused = set(range(len(descriptors)))
+    positions: List[Dict[str, Any]] = []
+    for member in members:
+        index = next(
+            (candidate for candidate in sorted(unused) if descriptors[candidate] == member),
+            None,
+        )
+        if index is None:
+            return []
+        unused.remove(index)
+        positions.append({
+            "index": index,
+            "type": member.rsplit(":", 1)[0],
+            "descriptor": member,
+        })
+    return sorted(positions, key=lambda item: int(item["index"]))
 
 
 def _data_clump_method_token_streams(
@@ -575,7 +770,7 @@ def _data_clump_method_token_streams(
     streams: List[Tuple[MethodRecord, List[str], str]] = []
     separator = "\x1f"
     for method in model.methods:
-        tokens = tokenize_clone(method.body_text)
+        tokens = tokenize_structural_window(method.body_text)
         if len(tokens) < DATA_CLUMP_INLINE_WINDOW_TOKENS:
             continue
         encoded = separator + separator.join(tokens) + separator
@@ -641,7 +836,7 @@ def _method_contains_data_clump_types(
     group_types: Counter[str],
 ) -> bool:
     current_types = Counter(
-        _normalize_group(f"{type_name}:value").rsplit(":", 1)[0]
+        _normalize_qualified_group(f"{type_name}:value").rsplit(":", 1)[0]
         for type_name in method.parameter_types
     )
     return all(
@@ -725,31 +920,54 @@ def analyze_feature_envy_target(
     method: Optional[str] = None,
     line: Optional[int] = None,
     expected_receiver_type: str = "",
-    project_model: Optional[ProjectModel] = None,
+    project_model: ProjectModel,
 ) -> Dict[str, Any]:
     """Return threshold-independent Feature Envy metrics for one method.
 
-    Delivery rows may be trusted review candidates even when they do not cross
-    the strict detector threshold.  This profile exposes the continuous values
-    used by the detector so a verifier can compare the immutable baseline with
-    the edited source instead of treating an initial non-finding as a repair.
+    The caller must reuse the model returned by ``run_java_semantic_detector``;
+    closure evaluation never rescans the project or uses dataset evidence.
     """
     root = project_root.expanduser().resolve()
-    model = project_model or _build_project_model(root, include_tests=False)
+    model = project_model
     target_rel = _normalize_rel_path(target_file, root)
-    target_method = _normalize_method(method)
+    raw_method = str(method or "").strip()
+    target_method = _normalize_method(raw_method)
     candidates = [item for item in model.methods if _normalize_path(item.file) == target_rel]
-    if target_method:
+    if raw_method and "(" in raw_method:
+        stable_target = stable_java_method_signature(
+            raw_method,
+            preserve_source_qualification=True,
+        )
+        candidates = [
+            item for item in candidates
+            if stable_method_record_signature(item) == stable_target
+        ]
+    elif target_method:
         candidates = [item for item in candidates if _normalize_method(item.method_name) == target_method]
     elif line is not None:
         candidates = [item for item in candidates if item.begin_line <= line <= item.end_line]
     if not candidates:
         return {
-            "ok": False,
-            "error": "target_method_not_found",
+            "ok": True,
             "file": target_rel,
-            "method": str(method or ""),
+            "method": raw_method,
             "line": line,
+            "target_missing": True,
+            "expected_receiver_type": expected_receiver_type,
+            "expected_receiver_access": 0,
+            "dominant_receiver_type": "",
+            "dominant_receiver_access": 0,
+            "envied_field": "",
+            "envied_type": "",
+            "envy_access_count": 0,
+            "self_access_count": 0,
+            "envy_access_excess": 0,
+            "direct_field_count": 0,
+            "field_member_count": 0,
+            "fields_without_member_access": 0,
+            "same_class_method_calls": 0,
+            "receiver_access_worklist": [],
+            "strict_detector_hit": False,
         }
     target = min(candidates, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
     profiles = _designite_feature_envy_profiles(model, target)
@@ -768,6 +986,11 @@ def analyze_feature_envy_target(
         or _erase_type(profile.envied_type).rsplit(".", 1)[-1] == expected_simple
     )
     strict_hit = profile.envy_access_diff > 1 and receiver_matches
+    receiver_access_worklist = _feature_envy_receiver_access_worklist(
+        model,
+        target,
+        envied_field=profile.envied_field if receiver_matches else "",
+    )
     return {
         "ok": True,
         "file": target.file,
@@ -777,6 +1000,7 @@ def analyze_feature_envy_target(
         "begin_line": target.begin_line,
         "end_line": target.end_line,
         "method_loc": target.loc,
+        "target_missing": False,
         "expected_receiver_type": expected_receiver_type,
         "expected_receiver_access": profile.envy_access_count if receiver_matches else 0,
         "dominant_receiver_type": profile.envied_type,
@@ -790,8 +1014,57 @@ def analyze_feature_envy_target(
         "field_member_count": profile.field_member_count,
         "fields_without_member_access": profile.fields_without_member_access,
         "same_class_method_calls": profile.same_class_method_calls,
+        "receiver_access_worklist": receiver_access_worklist,
         "strict_detector_hit": strict_hit,
     }
+
+
+def _feature_envy_receiver_access_worklist(
+    model: ProjectModel,
+    method: MethodRecord,
+    *,
+    envied_field: str,
+) -> List[Dict[str, Any]]:
+    """Describe the exact member accesses counted for one detector finding."""
+    if method.body is None or not envied_field:
+        return []
+    owner = model.classes.get(method.owner_qualified_name)
+    if owner is None:
+        return []
+    owner = _feature_envy_owner_view(model, owner)
+    if envied_field not in owner.fields:
+        return []
+    shadowed_names = set(method.parameters).union(method.local_variables)
+    aliases = _stable_owner_field_aliases(method, owner)
+    receiver_type = _normalized_receiver_type(model, owner.fields[envied_field])
+    worklist: List[Dict[str, Any]] = []
+    for node, receiver_node in _member_access_receiver_nodes(method.body):
+        receiver = _node_text_from_node(receiver_node).strip()
+        field_name = _owner_field_for_receiver_expression(
+            receiver,
+            owner,
+            shadowed_names=shadowed_names,
+            aliases=aliases,
+        )
+        if field_name != envied_field:
+            continue
+        name_node = node.child_by_field_name("name") or node.child_by_field_name("field")
+        member = _node_text_from_node(name_node).strip() if name_node is not None else ""
+        worklist.append(
+            {
+                "file": method.file,
+                "class": method.owner_qualified_name,
+                "method": method.method_signature,
+                "line": _node_start_line(node),
+                "expression": _node_text_from_node(node).strip(),
+                "receiver": receiver,
+                "field": envied_field,
+                "receiver_type": receiver_type,
+                "member": member,
+                "access_kind": node.type,
+            }
+        )
+    return worklist
 
 
 def _designite_feature_envy_profile(
@@ -806,24 +1079,21 @@ def _designite_feature_envy_profiles(
     model: ProjectModel,
     method: MethodRecord,
 ) -> List[FeatureEnvyProfile]:
-    """Mirror Designite 2.8.6's field/member based Feature Envy metric."""
-    if method.body is None or "abstract" in method.modifiers:
+    """Mirror Designite 2.8.6's ordinary-method Feature Envy metric."""
+    if method.is_constructor or method.body is None or "abstract" in method.modifiers:
         return []
     owner = model.classes.get(method.owner_qualified_name)
     if owner is None:
         return []
+    owner = _feature_envy_owner_view(model, owner)
 
-    body_identifiers = {
-        _node_text_from_node(node).strip()
-        for node in _iter_nodes(method.body)
-        if node.type == "identifier"
-    }
     shadowed_names = set(method.parameters).union(method.local_variables)
     aliases = _stable_owner_field_aliases(method, owner)
-    direct_fields = {
-        name for name in owner.fields
-        if name in body_identifiers and name not in shadowed_names
-    }
+    direct_fields = _feature_envy_direct_owner_fields(
+        method,
+        owner,
+        shadowed_names=shadowed_names,
+    )
     direct_fields.update(aliases.values())
 
     member_counts: Dict[str, int] = {}
@@ -852,6 +1122,8 @@ def _designite_feature_envy_profiles(
     profiles: List[FeatureEnvyProfile] = []
     for field_name in sorted(direct_fields):
         field_type = owner.fields.get(field_name, "")
+        if _model_type_is_ambiguous(model, field_type):
+            continue
         if _is_primitive(field_type):
             continue
         if _resolve_model_type(model, field_type) == _resolve_model_type(model, method.owner_qualified_name):
@@ -876,6 +1148,195 @@ def _designite_feature_envy_profiles(
     return sorted(
         profiles,
         key=lambda item: (-item.envy_access_diff, -item.envy_access_count, item.envied_field),
+    )
+
+
+def _feature_envy_owner_view(
+    model: ProjectModel,
+    owner: ClassRecord,
+) -> ClassRecord:
+    """Return the owner with fields inherited from already-loaded ancestors.
+
+    Scope construction decides which exact source ancestors are available.
+    This projection never discovers another file: it follows only uniquely
+    resolved ``ClassRecord`` relations already present in ``model``.  Declared
+    child fields hide every ancestor declaration with the same name.
+    """
+    inherited = _feature_envy_inherited_fields(model, owner)
+    if not inherited:
+        return owner
+    return replace(owner, fields={**inherited, **owner.fields})
+
+
+def _feature_envy_inherited_fields(
+    model: ProjectModel,
+    owner: ClassRecord,
+) -> Dict[str, str]:
+    inherited: Dict[str, str] = {}
+    hidden_names = set(owner.fields)
+    interface_roots: List[Tuple[str, int]] = [
+        (name, 1) for name in owner.interface_names if name
+    ]
+
+    # Java class fields take precedence over interface fields. Walk the single
+    # superclass chain nearest-first, retaining inaccessible declarations as
+    # name blockers so a farther declaration cannot leak through it.
+    seen_classes = {owner.qualified_name}
+    parent_name = owner.superclass_name
+    class_depth = 1
+    while parent_name:
+        parent = _class_record_for_type(model, parent_name)
+        if parent is None or parent.qualified_name in seen_classes:
+            break
+        seen_classes.add(parent.qualified_name)
+        for field_name, field_type in parent.fields.items():
+            if field_name in hidden_names:
+                continue
+            hidden_names.add(field_name)
+            if _field_is_inheritable(model, owner, parent, field_name):
+                inherited[field_name] = field_type
+        interface_roots.extend(
+            (name, class_depth + 1)
+            for name in parent.interface_names
+            if name
+        )
+        parent_name = parent.superclass_name
+        class_depth += 1
+
+    # Interface diamonds can expose the same declaration through several
+    # paths. Deduplicate that case, while excluding genuinely competing field
+    # declarations at the same nearest depth (an unqualified Java use would be
+    # ambiguous and must not become a detector input).
+    candidates: Dict[str, Tuple[int, Dict[str, str]]] = {}
+    pending = list(interface_roots)
+    seen_interfaces: Set[str] = set()
+    while pending:
+        type_name, depth = pending.pop(0)
+        interface = _class_record_for_type(model, type_name)
+        if interface is None or interface.qualified_name in seen_interfaces:
+            continue
+        seen_interfaces.add(interface.qualified_name)
+        for field_name, field_type in interface.fields.items():
+            if field_name in hidden_names:
+                continue
+            if not _field_is_inheritable(model, owner, interface, field_name):
+                continue
+            current = candidates.get(field_name)
+            declaration = {interface.qualified_name: field_type}
+            if current is None or depth < current[0]:
+                candidates[field_name] = (depth, declaration)
+            elif depth == current[0]:
+                current[1].update(declaration)
+        pending.extend(
+            (name, depth + 1)
+            for name in interface.interface_names
+            if name
+        )
+
+    for field_name, (_, declarations) in candidates.items():
+        if len(declarations) == 1:
+            inherited[field_name] = next(iter(declarations.values()))
+    return inherited
+
+
+def _field_is_inheritable(
+    model: ProjectModel,
+    descendant: ClassRecord,
+    declaring: ClassRecord,
+    field_name: str,
+) -> bool:
+    modifiers = declaring.field_modifiers.get(field_name, set())
+    if "private" in modifiers:
+        return False
+    if "public" in modifiers or "protected" in modifiers:
+        return True
+    return _class_source_package(model, descendant) == _class_source_package(
+        model,
+        declaring,
+    )
+
+
+def _class_source_package(model: ProjectModel, record: ClassRecord) -> str:
+    for file_model in model.files:
+        if file_model.rel_path == record.file:
+            return file_model.package
+    return _package_of(record.qualified_name)
+
+
+def _feature_envy_direct_owner_fields(
+    method: MethodRecord,
+    owner: ClassRecord,
+    *,
+    shadowed_names: Set[str],
+) -> Set[str]:
+    """Return owner fields referenced as fields, not same-spelled selectors."""
+    if method.body is None:
+        return set()
+    direct: Set[str] = set()
+    selector_parents = {
+        "field_access",
+        "method_invocation",
+        "method_reference",
+    }
+    declaration_parents = {
+        "catch_formal_parameter",
+        "enhanced_for_statement",
+        "formal_parameter",
+        "inferred_parameters",
+        "lambda_expression",
+        "spread_parameter",
+        "variable_declarator",
+    }
+    for node in _iter_nodes(method.body):
+        if node.type != "identifier":
+            continue
+        name = _node_text_from_node(node).strip()
+        if name not in owner.fields or name in shadowed_names:
+            continue
+        parent = node.parent
+        if parent is not None:
+            if parent.type in declaration_parents:
+                continue
+            if parent.type in selector_parents:
+                selector = (
+                    parent.child_by_field_name("name")
+                    or parent.child_by_field_name("field")
+                )
+                if selector is not None and _same_source_node(selector, node):
+                    continue
+        direct.add(name)
+
+    # Explicit self access is a selector syntactically, but still denotes an
+    # owner field. Foreign member selectors are deliberately excluded above.
+    for node in _iter_nodes(method.body):
+        if node.type != "field_access":
+            continue
+        receiver = node.child_by_field_name("object")
+        field_node = (
+            node.child_by_field_name("field")
+            or node.child_by_field_name("name")
+        )
+        if receiver is None or field_node is None:
+            continue
+        receiver_text = _node_text_from_node(receiver).strip()
+        field_name = _node_text_from_node(field_node).strip()
+        if field_name not in owner.fields or field_name in shadowed_names:
+            continue
+        if receiver_text == "this" or receiver_text in {
+            owner.class_name,
+            owner.qualified_name,
+            f"{owner.class_name}.this",
+            f"{owner.qualified_name}.this",
+        }:
+            direct.add(field_name)
+    return direct
+
+
+def _same_source_node(left: Node, right: Node) -> bool:
+    return (
+        left.type == right.type
+        and left.start_byte == right.start_byte
+        and left.end_byte == right.end_byte
     )
 
 
@@ -999,6 +1460,642 @@ def _owner_field_for_receiver_expression(
     return ""
 
 
+def build_long_parameter_list_migration_closure(
+    project_root: Path,
+    *,
+    target_file: Path,
+    method: str,
+    parameter_types: Sequence[str],
+    target_class_name: str = "",
+    target_line: Optional[int] = None,
+    project_model: ProjectModel,
+) -> Dict[str, Any]:
+    """Build the source-derived migration closure for one long signature.
+
+    This is a projection of the product detector's existing semantic model.
+    It resolves the frozen declaration, its override family, constructor-chain
+    uses, production calls, and method references.  A potentially relevant
+    use that cannot be bound uniquely makes ``analysis_ok`` false; no
+    name-only fallback is used.
+    """
+    try:
+        root = project_root.expanduser().resolve()
+        model = project_model
+        target_rel = _normalize_rel_path(target_file, root)
+        target_name = _normalize_method(method)
+        frozen_types = tuple(_lpl_type_identity(item) for item in parameter_types)
+        declarations = [*model.methods, *_bodyless_method_records(model)]
+        candidates = [
+            item
+            for item in declarations
+            if _normalize_path(item.file) == target_rel
+            and _normalize_method(item.method_name) == target_name
+            and (
+                not frozen_types
+                or tuple(_lpl_type_identity(value) for value in item.parameter_types)
+                == frozen_types
+            )
+            and (
+                not target_class_name
+                or _simple_type_name(item.owner_qualified_name)
+                == _simple_type_name(target_class_name)
+            )
+            and (
+                target_class_name
+                or target_line is None
+                or item.begin_line == int(target_line)
+            )
+        ]
+        if len(candidates) != 1:
+            return {
+                "analysis_ok": False,
+                "error": (
+                    "target_declaration_not_found"
+                    if not candidates
+                    else "target_declaration_ambiguous"
+                ),
+                "target_candidate_count": len(candidates),
+                "target": {
+                    "file": target_rel,
+                    "class": target_class_name,
+                    "method": method,
+                    "parameter_types": list(parameter_types),
+                    "line": target_line,
+                },
+                "declarations": [],
+                "constructor_chain": [],
+                "production_call_sites": [],
+                "method_references": [],
+                "unresolved_sites": [],
+            }
+        target = candidates[0]
+        target_owner = model.classes.get(target.owner_qualified_name)
+        if target_owner is None:
+            return {
+                "analysis_ok": False,
+                "error": "target_owner_not_resolved",
+                "target_candidate_count": 1,
+                "target": _lpl_method_payload(target, relationship="target"),
+                "declarations": [],
+                "constructor_chain": [],
+                "production_call_sites": [],
+                "method_references": [],
+                "unresolved_sites": [],
+            }
+        if any(_model_type_is_ambiguous(model, item) for item in target.parameter_types):
+            return {
+                "analysis_ok": False,
+                "error": "target_parameter_type_ambiguous",
+                "target_candidate_count": 1,
+                "target": _lpl_method_payload(target, relationship="target"),
+                "declarations": [],
+                "constructor_chain": [],
+                "production_call_sites": [],
+                "method_references": [],
+                "unresolved_sites": [],
+            }
+
+        ancestor_names = _all_parent_type_names(model, target_owner)
+        descendant_names = {
+            item.qualified_name
+            for item in model.classes.values()
+            if target_owner.qualified_name in _all_parent_type_names(model, item)
+        }
+        family_owner_names = {
+            target_owner.qualified_name,
+            *ancestor_names,
+            *descendant_names,
+        }
+        if target.is_constructor:
+            family = [target]
+        else:
+            family = [
+                item
+                for item in declarations
+                if item.owner_qualified_name in family_owner_names
+                and not item.is_constructor
+                and _normalize_method(item.method_name) == target_name
+                and tuple(_lpl_resolved_type_identity(value) for value in item.parameter_types)
+                == tuple(_lpl_resolved_type_identity(value) for value in target.parameter_types)
+            ]
+        family.sort(key=lambda item: (item.file, item.begin_line, item.owner_qualified_name))
+        family_keys = {_lpl_method_key(item) for item in family}
+        declaration_payloads = [
+            _lpl_method_payload(
+                item,
+                relationship=(
+                    "target"
+                    if _lpl_method_key(item) == _lpl_method_key(target)
+                    else "ancestor_contract"
+                    if item.owner_qualified_name in ancestor_names
+                    else "descendant_override"
+                ),
+            )
+            for item in family
+        ]
+
+        candidates_by_owner_name: Dict[Tuple[str, str], List[MethodRecord]] = {}
+        for item in declarations:
+            candidates_by_owner_name.setdefault(
+                (item.owner_qualified_name, item.method_name), []
+            ).append(item)
+        methods_by_file: Dict[str, List[MethodRecord]] = {}
+        classes_by_file: Dict[str, List[ClassRecord]] = {}
+        for item in model.methods:
+            methods_by_file.setdefault(item.file, []).append(item)
+        for item in model.classes.values():
+            if item.file != "<classpath>":
+                classes_by_file.setdefault(item.file, []).append(item)
+        for items in methods_by_file.values():
+            items.sort(key=lambda value: (value.end_line - value.begin_line, value.begin_line))
+        for items in classes_by_file.values():
+            items.sort(key=lambda value: (value.end_line - value.begin_line, value.begin_line))
+
+        production_calls: List[Dict[str, Any]] = []
+        method_references: List[Dict[str, Any]] = []
+        constructor_chain: List[Dict[str, Any]] = []
+        unresolved: List[Dict[str, Any]] = []
+        files_by_path = {item.rel_path: item for item in model.files}
+        for file_model in model.files:
+            for node in _iter_nodes(file_model.root):
+                line = _node_start_line(node)
+                enclosing_method = next(
+                    (
+                        item
+                        for item in methods_by_file.get(file_model.rel_path, [])
+                        if item.begin_line <= line <= item.end_line
+                    ),
+                    None,
+                )
+                enclosing_classes = [
+                    item
+                    for item in classes_by_file.get(file_model.rel_path, [])
+                    if item.begin_line <= line <= item.end_line
+                ]
+                if target.is_constructor:
+                    _collect_lpl_constructor_usage(
+                        model,
+                        file_model,
+                        node,
+                        target=target,
+                        family_keys=family_keys,
+                        candidates_by_owner_name=candidates_by_owner_name,
+                        enclosing_method=enclosing_method,
+                        production_calls=production_calls,
+                        method_references=method_references,
+                        constructor_chain=constructor_chain,
+                        unresolved=unresolved,
+                    )
+                    continue
+                if node.type not in {"method_invocation", "method_reference"}:
+                    continue
+                if _normalize_method(_method_usage_name(file_model.source, node)) != target_name:
+                    continue
+                receiver = _method_usage_receiver(file_model.source, node)
+                owner_names = _private_usage_owner_names(
+                    model,
+                    file_model,
+                    enclosing_method,
+                    enclosing_classes,
+                    receiver,
+                )
+                owner_candidates: List[MethodRecord] = []
+                for owner_name in owner_names:
+                    owner_candidates = _usage_method_candidates_for_owner(
+                        model,
+                        candidates_by_owner_name,
+                        owner_name,
+                        target.method_name,
+                    )
+                    if owner_candidates:
+                        break
+                relevant_candidates = [
+                    item
+                    for item in owner_candidates
+                    if _lpl_method_key(item) in family_keys
+                    and _lpl_usage_may_target(
+                        model,
+                        file_model,
+                        enclosing_method,
+                        node,
+                        item,
+                    )
+                ]
+                owner_is_related = bool(
+                    enclosing_method is not None
+                    and enclosing_method.owner_qualified_name in family_owner_names
+                )
+                if not owner_candidates:
+                    static_type, receiver_resolution = _receiver_static_type(
+                        model,
+                        enclosing_method,
+                        receiver,
+                    )
+                    resolved_receiver = _class_record_for_type(model, static_type)
+                    receiver_binding_unreliable = bool(receiver) and (
+                        receiver_resolution == "unresolved"
+                        or resolved_receiver is None
+                        or resolved_receiver.kind == "external"
+                    )
+                    imported = str(file_model.imports.get(target.method_name) or "")
+                    statically_imported_target = bool(
+                        not receiver
+                        and imported.rsplit(".", 1)[0]
+                        == target.owner_qualified_name
+                    )
+                    wildcard_imported_target = bool(
+                        not receiver
+                        and target.owner_qualified_name
+                        in file_model.static_wildcard_imports
+                    )
+                    if _lpl_usage_may_target(
+                        model,
+                        file_model,
+                        enclosing_method,
+                        node,
+                        target,
+                    ) and (
+                        owner_is_related
+                        or receiver_binding_unreliable
+                        or statically_imported_target
+                        or wildcard_imported_target
+                    ):
+                        unresolved.append(
+                            _lpl_usage_payload(
+                                file_model,
+                                node,
+                                enclosing_method,
+                                receiver=receiver,
+                                reason="receiver_or_overload_set_unresolved",
+                            )
+                        )
+                    continue
+                resolved = _resolve_private_method_usage(
+                    model,
+                    files_by_path[file_model.rel_path],
+                    enclosing_method,
+                    node,
+                    owner_candidates,
+                )
+                if resolved is not None and _lpl_method_key(resolved) in family_keys:
+                    payload = _lpl_usage_payload(
+                        file_model,
+                        node,
+                        enclosing_method,
+                        receiver=receiver,
+                        resolved_owner=resolved.owner_qualified_name,
+                        resolved_signature=resolved.method_signature,
+                    )
+                    if node.type == "method_reference":
+                        method_references.append(payload)
+                    else:
+                        production_calls.append(payload)
+                elif resolved is None and relevant_candidates:
+                    unresolved.append(
+                        _lpl_usage_payload(
+                            file_model,
+                            node,
+                            enclosing_method,
+                            receiver=receiver,
+                            reason="target_overload_or_method_reference_ambiguous",
+                            candidate_signatures=[
+                                item.method_signature for item in relevant_candidates
+                            ],
+                        )
+                    )
+
+        production_calls.sort(key=_lpl_usage_sort_key)
+        method_references.sort(key=_lpl_usage_sort_key)
+        constructor_chain.sort(key=_lpl_usage_sort_key)
+        unresolved.sort(key=_lpl_usage_sort_key)
+        analysis_ok = not unresolved
+        return {
+            "analysis_ok": analysis_ok,
+            "error": "" if analysis_ok else "unresolved_migration_sites",
+            "target_candidate_count": 1,
+            "target": _lpl_method_payload(target, relationship="target"),
+            "declarations": declaration_payloads,
+            "constructor_chain": constructor_chain,
+            "production_call_sites": production_calls,
+            "method_references": method_references,
+            "unresolved_sites": unresolved,
+            "remaining_work_count": (
+                len(declaration_payloads)
+                + len(constructor_chain)
+                + len(production_calls)
+                + len(method_references)
+                + len(unresolved)
+            ),
+            "authority": "java_product_semantic_model",
+        }
+    except Exception as exc:
+        return {
+            "analysis_ok": False,
+            "error": f"long_parameter_list_migration_closure_failed: {exc}",
+            "target_candidate_count": 0,
+            "target": {},
+            "declarations": [],
+            "constructor_chain": [],
+            "production_call_sites": [],
+            "method_references": [],
+            "unresolved_sites": [],
+        }
+
+
+def _bodyless_method_records(model: ProjectModel) -> List[MethodRecord]:
+    records: List[MethodRecord] = []
+    classes_by_file: Dict[str, List[ClassRecord]] = {}
+    for item in model.classes.values():
+        if item.file != "<classpath>":
+            classes_by_file.setdefault(item.file, []).append(item)
+    for file_model in model.files:
+        for node in _iter_nodes(file_model.root):
+            if node.type != "method_declaration" or node.child_by_field_name("body") is not None:
+                continue
+            line = _node_start_line(node)
+            owners = [
+                item
+                for item in classes_by_file.get(file_model.rel_path, [])
+                if item.begin_line <= line <= item.end_line
+            ]
+            if not owners:
+                continue
+            owner = min(owners, key=lambda item: (item.end_line - item.begin_line, item.begin_line))
+            name = _declared_name(file_model.source, node)
+            if not name:
+                continue
+            type_parameters = {
+                **owner.type_parameters,
+                **_type_parameters(file_model, node, model.classes_by_simple),
+            }
+            parameters = _parameter_map(
+                file_model,
+                node,
+                model.classes_by_simple,
+                type_parameters,
+            )
+            parameter_names = [item[0] for item in parameters]
+            parameter_types = [item[1] for item in parameters]
+            return_type_node = node.child_by_field_name("type")
+            return_type = (
+                _resolve_type_name(
+                    file_model,
+                    _node_text(file_model.source, return_type_node),
+                    model.classes_by_simple,
+                    type_parameters,
+                )
+                if return_type_node is not None
+                else ""
+            )
+            records.append(
+                MethodRecord(
+                    file=file_model.rel_path,
+                    class_name=owner.class_name,
+                    owner_qualified_name=owner.qualified_name,
+                    method_name=name,
+                    method_signature=f"{name}({', '.join(f'{type_name} {parameter}' for parameter, type_name in parameters)})",
+                    begin_line=_node_start_line(node),
+                    end_line=_node_end_line(node),
+                    body=None,
+                    body_text="",
+                    declaration_text=_node_text(file_model.source, node),
+                    loc=0,
+                    return_type=return_type,
+                    parameter_descriptors=[
+                        f"{type_name}:{_stem_name(parameter)}"
+                        for parameter, type_name in zip(parameter_names, parameter_types)
+                    ],
+                    parameter_types=parameter_types,
+                    parameters=dict(parameters),
+                    local_variables={},
+                    enhanced_for_variables=set(),
+                    modifiers=_modifiers(file_model.source, node),
+                    annotations=_annotations(file_model.source, node),
+                    is_constructor=False,
+                    super_access_count=0,
+                    is_varargs=_declaration_has_varargs(node),
+                )
+            )
+    return records
+
+
+def _lpl_usage_may_target(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    enclosing_method: Optional[MethodRecord],
+    node: Node,
+    target: MethodRecord,
+) -> bool:
+    if node.type == "method_reference":
+        return True
+    arguments = node.child_by_field_name("arguments")
+    argument_nodes = list(arguments.named_children) if arguments is not None else []
+    if not _private_method_accepts_arity(target, len(argument_nodes)):
+        return False
+    argument_types = [
+        _java_expression_static_type(
+            model,
+            file_model,
+            enclosing_method,
+            argument,
+        )
+        for argument in argument_nodes
+    ]
+    return bool(
+        (
+            len(target.parameter_types) == len(argument_types)
+            and _private_call_types_compatible(
+                model,
+                target,
+                argument_types,
+                variable_arity=False,
+            )
+        )
+        or (
+            target.is_varargs
+            and _private_call_types_compatible(
+                model,
+                target,
+                argument_types,
+                variable_arity=True,
+            )
+        )
+    )
+
+
+def _collect_lpl_constructor_usage(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    node: Node,
+    *,
+    target: MethodRecord,
+    family_keys: Set[Tuple[str, int, str, Tuple[str, ...]]],
+    candidates_by_owner_name: Mapping[Tuple[str, str], Sequence[MethodRecord]],
+    enclosing_method: Optional[MethodRecord],
+    production_calls: List[Dict[str, Any]],
+    method_references: List[Dict[str, Any]],
+    constructor_chain: List[Dict[str, Any]],
+    unresolved: List[Dict[str, Any]],
+) -> None:
+    called_owner = ""
+    destination: Optional[List[Dict[str, Any]]] = None
+    if node.type == "object_creation_expression":
+        type_node = node.child_by_field_name("type")
+        called_owner = _resolve_model_type(
+            model,
+            _resolve_type_name(
+                file_model,
+                _node_text(file_model.source, type_node),
+                model.classes_by_simple,
+            ),
+        )
+        destination = production_calls
+    elif node.type == "explicit_constructor_invocation":
+        constructor_node = node.child_by_field_name("constructor")
+        constructor_kind = _node_text(file_model.source, constructor_node).strip()
+        if enclosing_method is None or not enclosing_method.is_constructor:
+            return
+        owner = model.classes.get(enclosing_method.owner_qualified_name)
+        called_owner = (
+            enclosing_method.owner_qualified_name
+            if constructor_kind == "this"
+            else owner.superclass_name if owner is not None and constructor_kind == "super"
+            else ""
+        )
+        called_owner = _resolve_model_type(model, called_owner)
+        destination = constructor_chain
+    elif node.type == "method_reference" and _node_text(file_model.source, node).strip().endswith("::new"):
+        receiver = _node_text(file_model.source, node).strip().rsplit("::", 1)[0]
+        called_owner = _resolve_model_type(
+            model,
+            _resolve_type_name(file_model, receiver, model.classes_by_simple),
+        )
+        destination = method_references
+    else:
+        return
+    if called_owner != target.owner_qualified_name or destination is None:
+        return
+    owner_candidates = list(
+        candidates_by_owner_name.get((called_owner, target.method_name), [])
+    )
+    relevant = [item for item in owner_candidates if _lpl_method_key(item) in family_keys]
+    if node.type == "method_reference":
+        resolved = owner_candidates[0] if len(owner_candidates) == 1 else None
+    else:
+        resolved = _resolve_private_method_usage(
+            model,
+            file_model,
+            enclosing_method,
+            node,
+            owner_candidates,
+        )
+    if resolved is not None and _lpl_method_key(resolved) in family_keys:
+        destination.append(
+            _lpl_usage_payload(
+                file_model,
+                node,
+                enclosing_method,
+                receiver=called_owner,
+                resolved_owner=resolved.owner_qualified_name,
+                resolved_signature=resolved.method_signature,
+            )
+        )
+    elif relevant:
+        unresolved.append(
+            _lpl_usage_payload(
+                file_model,
+                node,
+                enclosing_method,
+                receiver=called_owner,
+                reason="target_constructor_overload_or_reference_ambiguous",
+                candidate_signatures=[item.method_signature for item in relevant],
+            )
+        )
+
+
+def _lpl_type_identity(value: str) -> str:
+    erased = _erase_type(value)
+    suffix = ""
+    while erased.endswith("[]"):
+        suffix += "[]"
+        erased = erased[:-2]
+    return f"{erased.rsplit('.', 1)[-1].lower()}{suffix}"
+
+
+def _lpl_resolved_type_identity(value: str) -> str:
+    return _erase_type(value).lower()
+
+
+def _simple_type_name(value: str) -> str:
+    return _erase_type(value).rsplit(".", 1)[-1].lower()
+
+
+def _lpl_method_key(method: MethodRecord) -> Tuple[str, int, str, Tuple[str, ...]]:
+    return (
+        _normalize_path(method.file),
+        int(method.begin_line),
+        method.owner_qualified_name,
+        tuple(_lpl_resolved_type_identity(item) for item in method.parameter_types),
+    )
+
+
+def _lpl_method_payload(
+    method: MethodRecord,
+    *,
+    relationship: str,
+) -> Dict[str, Any]:
+    return {
+        "file": method.file,
+        "line": method.begin_line,
+        "class": method.owner_qualified_name,
+        "method": method.method_name,
+        "signature": method.method_signature,
+        "parameter_types": list(method.parameter_types),
+        "relationship": relationship,
+        "body_kind": "bodyless" if method.body is None else "source_body",
+    }
+
+
+def _lpl_usage_payload(
+    file_model: JavaFileModel,
+    node: Node,
+    enclosing_method: Optional[MethodRecord],
+    *,
+    receiver: str,
+    resolved_owner: str = "",
+    resolved_signature: str = "",
+    reason: str = "",
+    candidate_signatures: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "file": file_model.rel_path,
+        "line": _node_start_line(node),
+        "enclosing_method": (
+            enclosing_method.method_signature if enclosing_method is not None else ""
+        ),
+        "receiver": receiver or "<implicit-this>",
+        "expression": _node_text(file_model.source, node).strip(),
+        "usage_kind": node.type,
+    }
+    if resolved_owner:
+        payload["resolved_owner"] = resolved_owner
+    if resolved_signature:
+        payload["resolved_signature"] = resolved_signature
+    if reason:
+        payload["reason"] = reason
+    if candidate_signatures:
+        payload["candidate_signatures"] = sorted(set(candidate_signatures))
+    return payload
+
+
+def _lpl_usage_sort_key(item: Mapping[str, Any]) -> Tuple[str, int, str]:
+    return (
+        str(item.get("file") or ""),
+        int(item.get("line") or 0),
+        str(item.get("expression") or ""),
+    )
+
+
 def _method_overrides_any_parent(
     model: ProjectModel,
     method: MethodRecord,
@@ -1023,11 +2120,11 @@ def analyze_refused_bequest_target(
     reported_parent: str,
     target_parameter_count: Optional[int] = None,
     target_class_name: str = "",
-    project_model: Optional[ProjectModel] = None,
+    project_model: ProjectModel,
 ) -> Dict[str, Any]:
     """Return the positive hierarchy contract for one Refused Bequest target."""
     root = project_root.expanduser().resolve()
-    model = project_model or _build_project_model(root, include_tests=False)
+    model = project_model
     target_rel = _normalize_rel_path(target_file, root)
     target_method = _normalize_method(method)
     parent_name = str(reported_parent or "").strip()
@@ -1103,10 +2200,31 @@ def analyze_refused_bequest_target(
     parent_candidates = [
         item
         for item in model.classes.values()
-        if item.class_name.lower() == parent_simple
-        or item.qualified_name.lower() == parent_name.lower()
+        if item.qualified_name.lower() == parent_name.lower()
+        or item.class_name.lower() == parent_simple
     ]
-    parent_record = parent_candidates[0] if parent_candidates else None
+    if len(parent_candidates) > 1:
+        inherited_parent_candidates = [
+            item for item in parent_candidates
+            if item.qualified_name in inherited_names
+        ]
+        if len(inherited_parent_candidates) == 1:
+            parent_candidates = inherited_parent_candidates
+    if len(parent_candidates) != 1:
+        return {
+            "ok": False,
+            "error": (
+                "reported_parent_ambiguous"
+                if len(parent_candidates) > 1
+                else "reported_parent_not_resolved"
+            ),
+            "file": target_rel,
+            "method": target_method,
+            "target_class": target_class.qualified_name,
+            "reported_parent": parent_name,
+            "parent_candidate_count": len(parent_candidates),
+        }
+    parent_record = parent_candidates[0]
 
     def declares_target(record: Optional[ClassRecord]) -> bool:
         if record is None:
@@ -1137,18 +2255,7 @@ def analyze_refused_bequest_target(
     parent_declares_target = declares_target(parent_record)
     inherited_rejecting_owners: List[str] = []
     for inherited_name in sorted(inherited_names):
-        inherited_record = model.classes.get(inherited_name)
-        if inherited_record is None:
-            simple_name = inherited_name.rsplit(".", 1)[-1].lower()
-            inherited_record = next(
-                (
-                    item
-                    for item in model.classes.values()
-                    if item.class_name.lower() == simple_name
-                    or item.qualified_name.lower() == inherited_name.lower()
-                ),
-                None,
-            )
+        inherited_record = _class_record_for_type(model, inherited_name)
         if inherited_record is None:
             continue
         rejecting_target = any(
@@ -1180,7 +2287,7 @@ def analyze_refused_bequest_target(
         if rejecting_target:
             descendant_rejecting_owners.append(candidate.qualified_name)
     orphaned_real_implementers: List[str] = []
-    family_root = model.classes.get(target_class.superclass_name)
+    family_root = _class_record_for_type(model, target_class.superclass_name)
     if family_root is not None:
         for candidate in model.classes.values():
             if candidate.qualified_name == target_class.qualified_name:
@@ -1234,6 +2341,7 @@ def analyze_refused_bequest_target(
         "pinned_target_class": target_class_name,
         "target_class": target_class.qualified_name,
         "reported_parent": parent_name,
+        "resolved_parent": parent_record.qualified_name,
         "parent_resolved": parent_record is not None,
         "inherited_types": sorted(inherited_names),
         "inherits_reported_parent": inherits_parent,
@@ -1256,6 +2364,7 @@ def build_refused_bequest_impact_map(
     reported_parent: str,
     target_parameter_count: Optional[int] = None,
     target_class_name: str = "",
+    project_model: ProjectModel,
 ) -> Dict[str, Any]:
     """Build a read-only capability migration worklist from the semantic model.
 
@@ -1264,7 +2373,7 @@ def build_refused_bequest_impact_map(
     boundary it must inspect before changing an inheritance contract.
     """
     root = project_root.expanduser().resolve()
-    model = _build_project_model(root, include_tests=False)
+    model = project_model
     profile = analyze_refused_bequest_target(
         root,
         target_file=target_file,
@@ -1285,7 +2394,7 @@ def build_refused_bequest_impact_map(
     target_method = _normalize_method(method)
     arity = target_parameter_count
     parent_name = str(reported_parent or "").strip()
-    parent_simple = parent_name.rsplit(".", 1)[-1].lower()
+    resolved_parent = str(profile.get("resolved_parent") or "")
     target_qualified = str(profile.get("target_class") or "")
 
     def method_matches(item: MethodRecord) -> bool:
@@ -1295,23 +2404,24 @@ def build_refused_bequest_impact_map(
         )
 
     def class_matches_parent(item: ClassRecord) -> bool:
-        return bool(
-            item.class_name.lower() == parent_simple
-            or item.qualified_name.lower() == parent_name.lower()
-        )
+        return bool(resolved_parent and item.qualified_name == resolved_parent)
 
-    parent_record = next(
-        (item for item in model.classes.values() if class_matches_parent(item)),
-        None,
-    )
+    parent_candidates = [
+        item for item in model.classes.values() if class_matches_parent(item)
+    ]
+    if len(parent_candidates) != 1:
+        return {
+            "ok": False,
+            "error": "resolved_parent_identity_not_unique",
+            "parent_candidate_count": len(parent_candidates),
+            "profile": profile,
+        }
+    parent_record = parent_candidates[0]
     related_classes = [
         item
         for item in model.classes.values()
         if class_matches_parent(item)
-        or any(
-            inherited.rsplit(".", 1)[-1].lower() == parent_simple
-            for inherited in _all_parent_type_names(model, item)
-        )
+        or resolved_parent in _all_parent_type_names(model, item)
     ]
     if target_qualified and all(item.qualified_name != target_qualified for item in related_classes):
         target_record = model.classes.get(target_qualified)
@@ -1758,8 +2868,10 @@ def _receiver_static_type(
                 for item in base_record.methods
                 if item.method_name == invoked_name and item.return_type
             ]
-            if candidates:
+            if len(candidates) == 1:
                 return candidates[0].return_type, "method_return"
+            if len(candidates) > 1:
+                return "", "unresolved"
     if re.fullmatch(r"[A-Za-z_$][\w$]*", receiver):
         if receiver in owner_method.local_variables:
             return owner_method.local_variables[receiver], "local_variable"
@@ -1768,7 +2880,9 @@ def _receiver_static_type(
         if owner is not None and receiver in owner.fields:
             return owner.fields[receiver], "field"
         if receiver in model.classes_by_simple:
-            return receiver, "type_name"
+            record = _class_record_for_type(model, receiver)
+            if record is not None:
+                return record.qualified_name, "type_name"
     return "", "unresolved"
 
 
@@ -1777,69 +2891,186 @@ def _class_record_for_type(
     type_name: str,
 ) -> Optional[ClassRecord]:
     erased = _erase_type(type_name)
-    if erased in model.classes:
-        return model.classes[erased]
     simple = erased.rsplit(".", 1)[-1]
     candidates = model.classes_by_simple.get(simple, [])
-    return candidates[0] if candidates else None
-
-
-def find_matching_semantic_finding(
-    findings: List[SemanticFinding],
-    *,
-    target_file: Path,
-    project_root: Path,
-    method: Optional[str],
-    line: Optional[int],
-    evidence_group: str = "",
-    evidence_parent: str = "",
-) -> Optional[SemanticFinding]:
-    target_rel = _normalize_rel_path(target_file, project_root)
-    target_method = _normalize_method(method)
-    target_group = _normalize_group(evidence_group)
-    target_parent = str(evidence_parent or "").strip().lower()
-    has_strong_anchor = bool(target_method or target_group or target_parent)
-    candidates: List[SemanticFinding] = []
-    for finding in findings:
-        if _normalize_path(finding.file) != target_rel:
-            continue
-        if target_method and _normalize_method(finding.method) != target_method:
-            continue
-        if not has_strong_anchor and line and finding.begin_line and abs(finding.begin_line - line) > 3:
-            continue
-        if target_group and _normalize_group(_parse_group_from_evidence(finding.evidence)) != target_group:
-            continue
-        if target_parent:
-            finding_parent = _parse_parent_from_evidence(finding.evidence)
-            if finding_parent and finding_parent != target_parent:
-                continue
-        candidates.append(finding)
-    if not candidates:
-        return None
-    if line:
-        return min(candidates, key=lambda item: abs((item.begin_line or 0) - line))
-    return candidates[0]
+    if "." in erased:
+        candidates = [item for item in candidates if item.qualified_name == erased]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def find_data_clump_group_occurrences(
     project_root: Path,
     *,
     group: str,
-    include_tests: bool = True,
 ) -> List[SemanticFinding]:
     """Filter one group from the ordinary full-project product detector."""
-    target_group = _normalize_group(group)
+    target_group = _normalize_qualified_group(group)
     if not target_group:
         return []
-    model = _build_project_model(project_root, include_tests=include_tests)
+    model = _build_project_model(project_root)
     return [
         item
         for item in _detect_data_clumps(model)
-        if _normalize_group(_parse_group_from_evidence(item.evidence)) == target_group
+        if _normalize_qualified_group(str(item.attributes.get("group") or ""))
+        == target_group
     ]
 
 
-def _build_project_model(project_root: Path, *, include_tests: bool) -> ProjectModel:
+def build_scoped_project_model(
+    project_root: Path,
+    source_files: Iterable[str | Path],
+    classpath: str = "",
+) -> ProjectModel:
+    """Build a semantic model from an explicit production-source scope.
+
+    Unlike :func:`run_java_semantic_detector` and ``_build_project_model``, this
+    entry point never discovers Java source files and never runs a smell
+    detector.  Callers must supply the files needed by their frozen guard
+    contract.  Paths may be absolute or relative to ``project_root``; paths
+    outside the root and non-Java/non-file inputs are rejected, while test,
+    generated/build-output, and duplicate inputs are excluded.
+    """
+    root = project_root.expanduser().resolve()
+    selected: Set[Path] = set()
+    for raw_path in source_files:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"SCOPED_SOURCE_OUTSIDE_PROJECT: {resolved} is outside {root}"
+            ) from exc
+        if resolved.suffix.casefold() != ".java" or not resolved.is_file():
+            raise ValueError(
+                f"SCOPED_SOURCE_NOT_JAVA_FILE: {relative.as_posix()}"
+            )
+        if _contains_excluded_part(relative, DEFAULT_EXCLUDE_PATHS):
+            continue
+        # A target Guard receives explicit files.  Applying the shared standard
+        # test-root rule is sufficient here and avoids walking the repository
+        # to discover every build descriptor before parsing two files.
+        if standard_test_root(relative) is not None:
+            continue
+        selected.add(resolved)
+
+    parser = get_parser("java")
+    files: List[JavaFileModel] = []
+    classes: Dict[str, ClassRecord] = {}
+    classes_by_simple: Dict[str, List[ClassRecord]] = {}
+    methods: List[MethodRecord] = []
+
+    for path in sorted(selected):
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        file_model = JavaFileModel(
+            path=path,
+            rel_path=_relative_unix(root, path),
+            source=source,
+            root=tree.root_node,
+        )
+        _read_file_header(file_model)
+        files.append(file_model)
+
+    for file_model in files:
+        for class_node in _iter_top_level_class_nodes(file_model.root):
+            _collect_class_records(
+                file_model,
+                class_node,
+                [],
+                classes,
+                classes_by_simple,
+            )
+
+    wildcard_packages = tuple(sorted({
+        package
+        for file_model in files
+        for package in (
+            *file_model.wildcard_imports,
+            *file_model.static_wildcard_imports,
+        )
+    }))
+    for qualified_name in _external_type_names(classpath, wildcard_packages):
+        if qualified_name in classes:
+            continue
+        simple = qualified_name.rsplit(".", 1)[-1]
+        classes_by_simple.setdefault(simple, []).append(
+            ClassRecord(
+                file="<classpath>",
+                class_name=simple,
+                qualified_name=qualified_name,
+                begin_line=0,
+                end_line=0,
+                kind="external",
+            )
+        )
+
+    qualified_counts = Counter(
+        item.qualified_name
+        for records in classes_by_simple.values()
+        for item in records
+    )
+    for qualified_name, count in qualified_counts.items():
+        if count > 1:
+            classes.pop(qualified_name, None)
+
+    for file_model in files:
+        for class_node in _iter_top_level_class_nodes(file_model.root):
+            _resolve_class_records(
+                file_model,
+                class_node,
+                [],
+                classes,
+                classes_by_simple,
+            )
+
+    for file_model in files:
+        for class_node in _iter_top_level_class_nodes(file_model.root):
+            _collect_method_records(
+                file_model,
+                class_node,
+                [],
+                classes,
+                classes_by_simple,
+                methods,
+            )
+
+    return ProjectModel(
+        root=root,
+        files=files,
+        classes=classes,
+        classes_by_simple=classes_by_simple,
+        methods=methods,
+    )
+
+
+def evaluate_scoped_guard_findings(
+    model: ProjectModel,
+    smell: str,
+) -> List[SemanticFinding]:
+    """Evaluate exactly one smell rule inside an explicit guard scope.
+
+    This is deliberately not a discovery API: callers must first construct a
+    :func:`build_scoped_project_model` from the frozen target and production
+    diff.  No source files are discovered here and no unrelated smell rule is
+    evaluated.  Data Clumps uses its own exact-group streaming query and is
+    therefore intentionally excluded from this dispatcher.
+    """
+    evaluators = {
+        "feature_envy": _detect_feature_envy,
+        "refused_bequest": _detect_refused_bequest,
+        "god_class": _detect_god_class,
+        "dead_code": _detect_dead_code,
+    }
+    evaluator = evaluators.get(str(smell))
+    if evaluator is None:
+        raise ValueError(f"UNSUPPORTED_SCOPED_GUARD_RULE: {smell}")
+    return _sort_findings(evaluator(model))
+
+
+def _build_project_model(project_root: Path, *, classpath: str = "") -> ProjectModel:
     root = project_root.expanduser().resolve()
     parser = get_parser("java")
     files: List[JavaFileModel] = []
@@ -1847,7 +3078,7 @@ def _build_project_model(project_root: Path, *, include_tests: bool) -> ProjectM
     classes_by_simple: Dict[str, List[ClassRecord]] = {}
     methods: List[MethodRecord] = []
 
-    for path in _list_java_files(root, include_tests=include_tests):
+    for path in _list_java_files(root):
         source = path.read_bytes()
         tree = parser.parse(source)
         file_model = JavaFileModel(
@@ -1862,6 +3093,58 @@ def _build_project_model(project_root: Path, *, include_tests: bool) -> ProjectM
     for file_model in files:
         for class_node in _iter_top_level_class_nodes(file_model.root):
             _collect_class_records(file_model, class_node, [], classes, classes_by_simple)
+
+    # Build dependencies and generated main outputs contribute identities only;
+    # they are never scanned as smell-bearing source. This lets wildcard imports
+    # resolve to a real FQCN without coupling findings to tests or dataset rows.
+    wildcard_packages = tuple(sorted({
+        package
+        for file_model in files
+        for package in (
+            *file_model.wildcard_imports,
+            *file_model.static_wildcard_imports,
+        )
+    }))
+    for qualified_name in _external_type_names(classpath, wildcard_packages):
+        if qualified_name in classes:
+            continue
+        simple = qualified_name.rsplit(".", 1)[-1]
+        classes_by_simple.setdefault(simple, []).append(
+            ClassRecord(
+                file="<classpath>",
+                class_name=simple,
+                qualified_name=qualified_name,
+                begin_line=0,
+                end_line=0,
+                kind="external",
+            )
+        )
+
+    # More than one source root can contain the same fully-qualified class.
+    # Retaining the last dict assignment would make semantic findings depend on
+    # filesystem order, so duplicate identities are excluded from the model.
+    qualified_counts = Counter(
+        item.qualified_name
+        for records in classes_by_simple.values()
+        for item in records
+    )
+    for qualified_name, count in qualified_counts.items():
+        if count > 1:
+            classes.pop(qualified_name, None)
+
+    # Phase two resolves every relation and declared type against the complete
+    # project symbol index. Resolving while files are still being discovered
+    # makes results depend on traversal order and turns later same-package
+    # classes into false wildcard ambiguities.
+    for file_model in files:
+        for class_node in _iter_top_level_class_nodes(file_model.root):
+            _resolve_class_records(
+                file_model,
+                class_node,
+                [],
+                classes,
+                classes_by_simple,
+            )
 
     for file_model in files:
         for class_node in _iter_top_level_class_nodes(file_model.root):
@@ -1879,11 +3162,17 @@ def _read_file_header(file_model: JavaFileModel) -> None:
                     break
         elif child.type == "import_declaration":
             text = _node_text(file_model.source, child)
+            is_static = bool(re.match(r"\s*import\s+static\b", text))
             cleaned = text.replace("import", "", 1).replace("static", "", 1).strip().rstrip(";").strip()
             if not cleaned:
                 continue
             if cleaned.endswith(".*"):
-                file_model.wildcard_imports.append(cleaned[:-2])
+                target = (
+                    file_model.static_wildcard_imports
+                    if is_static
+                    else file_model.wildcard_imports
+                )
+                target.append(cleaned[:-2])
             else:
                 file_model.imports[cleaned.rsplit(".", 1)[-1]] = cleaned
 
@@ -1892,6 +3181,276 @@ def _iter_top_level_class_nodes(root: Node) -> Iterable[Node]:
     for child in root.children:
         if child.type in CLASS_NODE_TYPES:
             yield child
+
+
+@lru_cache(maxsize=32)
+def _external_type_names(
+    classpath: str,
+    wildcard_packages: tuple[str, ...],
+) -> frozenset[str]:
+    """Read type identities from dependency JARs and generated main outputs."""
+    names: Set[str] = set()
+    reachable_packages = frozenset(wildcard_packages)
+    entries = _explicit_classpath_entries(classpath)
+    explicit_archives = validate_explicit_symbol_archives(classpath)
+    dependency_jars: Set[Path] = set()
+    for entry in entries:
+        if entry.is_file() and entry.suffix.casefold() in {".jar", ".jmod"}:
+            dependency_jars.add(entry)
+            continue
+        if not entry.is_dir():
+            continue
+        dependency_roots = {
+            entry / "caches" / "modules-2" / "files-2.1",
+            entry / "repository",
+            entry / "offline-home" / ".gradle" / "caches" / "modules-2" / "files-2.1",
+            entry / "offline-home" / ".m2" / "repository",
+        }
+        for dependency_root in dependency_roots:
+            if dependency_root.is_dir():
+                dependency_jars.update(dependency_root.rglob("*.jar"))
+        jmods = entry / "jmods"
+        if jmods.is_dir():
+            dependency_jars.update(jmods.glob("*.jmod"))
+        if _looks_like_java_project(entry):
+            for output_root in _main_symbol_output_roots(entry):
+                for path in output_root.rglob("*.class"):
+                    relative = path.relative_to(output_root).as_posix()
+                    qualified, package = _class_entry_symbol(relative)
+                    if qualified and _symbol_is_reachable(
+                        qualified,
+                        package,
+                        reachable_packages,
+                    ):
+                        names.add(qualified)
+                for path in output_root.rglob("*.java"):
+                    names.update(
+                        qualified
+                        for qualified in _declared_generated_types(path)
+                        if _symbol_is_reachable(
+                            qualified,
+                            qualified.rsplit(".", 1)[0] if "." in qualified else "",
+                            reachable_packages,
+                        )
+                    )
+
+    for jar_path in sorted(dependency_jars):
+        try:
+            with zipfile.ZipFile(jar_path) as archive:
+                for entry_name in archive.namelist():
+                    qualified, package = _class_entry_symbol(entry_name)
+                    if qualified and _symbol_is_reachable(
+                        qualified,
+                        package,
+                        reachable_packages,
+                    ):
+                        names.add(qualified)
+        except (OSError, zipfile.BadZipFile) as exc:
+            if jar_path in explicit_archives:
+                raise _classpath_archive_error(jar_path, exc) from exc
+            continue
+    return frozenset(names)
+
+
+def _explicit_classpath_entries(classpath: str) -> Set[Path]:
+    entries: Set[Path] = set()
+    for raw in str(classpath or "").split(os.pathsep):
+        if not raw.strip():
+            continue
+        try:
+            entries.add(Path(raw).expanduser().resolve())
+        except OSError as exc:
+            path = str(Path(raw).expanduser())
+            if Path(raw).suffix.casefold() in {".jar", ".jmod"}:
+                raise JavaSymbolClasspathError(
+                    "EXPLICIT_CLASSPATH_ARCHIVE_UNREADABLE",
+                    f"cannot resolve explicit Java symbol archive {path}: {exc}",
+                    path=path,
+                ) from exc
+    return entries
+
+
+def validate_explicit_symbol_archives(classpath: str) -> Set[Path]:
+    """Validate only archive entries named directly by the caller.
+
+    Archives discovered underneath a dependency cache are best-effort inputs:
+    an unrelated broken cache artifact must not disable an otherwise complete
+    detector. A directly supplied ``.jar``/``.jmod`` is different—it is an
+    explicit part of the symbol contract and therefore fails closed.
+    """
+    archives = {
+        entry
+        for entry in _explicit_classpath_entries(classpath)
+        if entry.suffix.casefold() in {".jar", ".jmod"}
+    }
+    for archive_path in sorted(archives):
+        if not archive_path.is_file():
+            raise JavaSymbolClasspathError(
+                "EXPLICIT_CLASSPATH_ARCHIVE_UNREADABLE",
+                f"explicit Java symbol archive is not a readable file: {archive_path}",
+                path=str(archive_path),
+            )
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.infolist()
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise _classpath_archive_error(archive_path, exc) from exc
+    return archives
+
+
+def _classpath_archive_error(
+    archive_path: Path,
+    exc: BaseException,
+) -> JavaSymbolClasspathError:
+    return JavaSymbolClasspathError(
+        "EXPLICIT_CLASSPATH_ARCHIVE_UNREADABLE",
+        f"cannot read explicit Java symbol archive {archive_path}: {exc}",
+        path=str(archive_path),
+    )
+
+
+def external_symbol_snapshot(project_root: Path, classpath: str) -> dict[str, object]:
+    """Describe the resolver inputs observed for this detector invocation.
+
+    This inventory is mutable project state: builds may create generated main
+    outputs or populate dependency caches.  It is useful for diagnostics, but
+    it must never be used as the immutable detector-profile identity.
+    """
+    packages = _project_wildcard_imports(str(Path(project_root).resolve()))
+    names = _external_type_names(str(classpath or ""), packages)
+    digest = hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
+    return {
+        "snapshot_schema": JAVA_SYMBOL_SNAPSHOT_SCHEMA,
+        "resolver": JAVA_SYMBOL_RESOLVER_ID,
+        "available": True,
+        "type_count": len(names),
+        "type_names_sha256": digest,
+        "wildcard_packages_sha256": hashlib.sha256(
+            "\n".join(packages).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+@lru_cache(maxsize=32)
+def _project_wildcard_imports(project_root: str) -> tuple[str, ...]:
+    packages: Set[str] = set()
+    for path in _list_java_files(Path(project_root)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        packages.update(
+            match.group(1)
+            for match in re.finditer(
+                r"(?m)^\s*import\s+(?:static\s+)?"
+                r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.\*\s*;",
+                text,
+            )
+        )
+    return tuple(sorted(packages))
+
+
+def _symbol_is_reachable(
+    qualified_name: str,
+    package: str,
+    wildcard_packages: frozenset[str],
+) -> bool:
+    if package in wildcard_packages:
+        return True
+
+    # A wildcard may name an owning type (including a static import), so walk
+    # the qualified owner chain without scanning every project import for every
+    # classpath entry.
+    owner = qualified_name.rsplit(".", 1)[0] if "." in qualified_name else ""
+    while owner:
+        if owner in wildcard_packages:
+            return True
+        if owner == package or "." not in owner:
+            break
+        owner = owner.rsplit(".", 1)[0]
+    return False
+
+
+def _looks_like_java_project(path: Path) -> bool:
+    return any(
+        (path / name).is_file()
+        for name in ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")
+    ) or (path / ".git").exists()
+
+
+def _main_symbol_output_roots(project_root: Path) -> Set[Path]:
+    outputs: Set[Path] = set()
+    ignored = {".git", ".gradle", ".idea", "node_modules", "out"}
+    for directory, directory_names, _ in os.walk(project_root, topdown=True, followlinks=False):
+        current = Path(directory)
+        directory_names[:] = [
+            name for name in directory_names
+            if name.casefold() not in ignored
+        ]
+        if current.name == "build":
+            for relative in (
+                "classes/java/main",
+                "classes/kotlin/main",
+                "generated/source/kapt/main",
+                "generated/sources/annotationProcessor/java/main",
+            ):
+                candidate = current / relative
+                if candidate.is_dir():
+                    outputs.add(candidate)
+            directory_names[:] = []
+        elif current.name == "target":
+            for relative in ("classes", "generated-sources/annotations"):
+                candidate = current / relative
+                if candidate.is_dir():
+                    outputs.add(candidate)
+            directory_names[:] = []
+    return outputs
+
+
+def _class_entry_symbol(value: str) -> tuple[str, str]:
+    normalized = str(value).replace("\\", "/").strip("/")
+    if normalized.startswith("classes/"):
+        normalized = normalized[len("classes/"):]
+    if (
+        not normalized.endswith(".class")
+        or normalized.endswith("module-info.class")
+        or normalized.endswith("package-info.class")
+        or normalized.startswith("META-INF/versions/")
+    ):
+        return "", ""
+    path_parts = normalized[:-6].split("/")
+    binary_name = path_parts[-1]
+    nested_parts = binary_name.split("$")
+    if any(
+        not part
+        or not part.isidentifier()
+        or part[0].isdigit()
+        or part.startswith("Lambda")
+        for part in nested_parts
+    ):
+        return "", ""
+    package = ".".join(path_parts[:-1])
+    class_name = ".".join(nested_parts)
+    qualified = f"{package}.{class_name}" if package else class_name
+    return qualified, package
+
+
+def _declared_generated_types(path: Path) -> Set[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return set()
+    package_match = re.search(r"(?m)^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;", text)
+    package = package_match.group(1) if package_match else ""
+    declared = {
+        match.group(1)
+        for match in re.finditer(
+            r"(?m)^\s*(?:(?:public|protected|private|abstract|final|sealed|non-sealed|static)\s+)*"
+            r"(?:class|interface|enum|record|@interface)\s+([A-Za-z_$][\w$]*)\b",
+            text,
+        )
+    }
+    return {f"{package}.{name}" if package else name for name in declared}
 
 
 def _collect_class_records(
@@ -1912,29 +3471,98 @@ def _collect_class_records(
         begin_line=_node_start_line(class_node),
         end_line=_node_end_line(class_node),
         kind=class_node.type.replace("_declaration", ""),
-        superclass_name=_resolve_type_name(file_model, _superclass_text(file_model.source, class_node), classes_by_simple),
-        interface_names=[
-            _resolve_type_name(file_model, item, classes_by_simple)
-            for item in _interface_texts(file_model.source, class_node)
-        ],
+        source_superclass_name=_superclass_text(file_model.source, class_node),
+        source_interface_names=_interface_texts(file_model.source, class_node),
         modifiers=_modifiers(file_model.source, class_node),
-        type_parameters=_type_parameters(file_model, class_node, classes_by_simple),
-        fields={},
     )
-    rec.fields = _collect_fields(file_model, class_node, classes_by_simple, rec.type_parameters)
     classes[qualified_name] = rec
     classes_by_simple.setdefault(class_name, []).append(rec)
 
     body = class_node.child_by_field_name("body") or _first_child(class_node, "class_body") or _first_child(class_node, "enum_body")
     if body is None:
         return
-    for child in body.children:
+    for child in _declared_type_members(body):
         if child.type in METHOD_NODE_TYPES:
             method_name = _declared_name(file_model.source, child)
             if method_name:
                 rec.declared_method_names.add(method_name)
         if child.type in CLASS_NODE_TYPES:
             _collect_class_records(file_model, child, owners + [class_name], classes, classes_by_simple)
+
+
+def _resolve_class_records(
+    file_model: JavaFileModel,
+    class_node: Node,
+    owners: List[str],
+    classes: Dict[str, ClassRecord],
+    classes_by_simple: Dict[str, List[ClassRecord]],
+) -> None:
+    """Populate class types only after the complete identity index exists."""
+    class_name = _declared_name(file_model.source, class_node)
+    if not class_name:
+        return
+    qualified_name = _qualified_class_name(file_model.package, owners, class_name)
+    record = classes.get(qualified_name)
+    if record is not None:
+        record.superclass_name = _resolve_type_name(
+            file_model,
+            _superclass_text(file_model.source, class_node),
+            classes_by_simple,
+        )
+        record.interface_names = [
+            _resolve_type_name(file_model, item, classes_by_simple)
+            for item in _interface_texts(file_model.source, class_node)
+        ]
+        record.type_parameters = _type_parameters(
+            file_model,
+            class_node,
+            classes_by_simple,
+        )
+        record.record_components = (
+            dict(
+                _parameter_map(
+                    file_model,
+                    class_node,
+                    classes_by_simple,
+                    record.type_parameters,
+                )
+            )
+            if class_node.type == "record_declaration"
+            else {}
+        )
+        declared_field_modifiers: Dict[str, Set[str]] = {}
+        record.fields = _collect_fields(
+            file_model,
+            class_node,
+            classes_by_simple,
+            record.type_parameters,
+            field_modifiers=declared_field_modifiers,
+        )
+        record.fields = {**record.record_components, **record.fields}
+        record.field_modifiers = {
+            **{
+                name: {"private", "final"}
+                for name in record.record_components
+            },
+            **declared_field_modifiers,
+        }
+
+    body = (
+        class_node.child_by_field_name("body")
+        or _first_child(class_node, "class_body")
+        or _first_child(class_node, "enum_body")
+    )
+    if body is None:
+        return
+    for child in _declared_type_members(body):
+        if child.type in CLASS_NODE_TYPES:
+            _resolve_class_records(
+                file_model,
+                child,
+                owners + [class_name],
+                classes,
+                classes_by_simple,
+            )
 
 
 def _collect_method_records(
@@ -1956,7 +3584,7 @@ def _collect_method_records(
     body = class_node.child_by_field_name("body") or _first_child(class_node, "class_body") or _first_child(class_node, "enum_body")
     if body is None:
         return
-    for child in body.children:
+    for child in _declared_type_members(body):
         if child.type in METHOD_NODE_TYPES:
             record = _build_method_record(file_model, child, class_record, classes_by_simple)
             if record:
@@ -1970,6 +3598,21 @@ def _collect_method_records(
             _collect_method_records(file_model, child, owners + [class_name], classes, classes_by_simple, methods)
 
 
+def _declared_type_members(body: Node) -> Iterable[Node]:
+    """Yield declarations from class/interface/enum bodies uniformly.
+
+    Tree-sitter exposes class members directly, but Java enum members after
+    the constant list are wrapped in ``enum_body_declarations``. Treating that
+    grammar container as a declaration would silently drop every enum field,
+    constructor, method, and nested type from the product semantic model.
+    """
+    for child in body.children:
+        if child.type == ENUM_MEMBER_CONTAINER_TYPE:
+            yield from child.children
+        else:
+            yield child
+
+
 def _build_method_record(
     file_model: JavaFileModel,
     method_node: Node,
@@ -1979,12 +3622,24 @@ def _build_method_record(
     body = method_node.child_by_field_name("body")
     if body is None:
         return None
-    is_constructor = method_node.type == "constructor_declaration"
+    is_constructor = method_node.type in {
+        "constructor_declaration",
+        "compact_constructor_declaration",
+    }
     name = _declared_name(file_model.source, method_node) or (owner.class_name if is_constructor else "")
     if not name:
         return None
     type_parameters = {**owner.type_parameters, **_type_parameters(file_model, method_node, classes_by_simple)}
-    parameters = _parameter_map(file_model, method_node, classes_by_simple, type_parameters)
+    parameters = (
+        list(owner.record_components.items())
+        if method_node.type == "compact_constructor_declaration"
+        else _parameter_map(
+            file_model,
+            method_node,
+            classes_by_simple,
+            type_parameters,
+        )
+    )
     parameter_types = [item[1] for item in parameters]
     parameter_names = [item[0] for item in parameters]
     parameter_dict = dict(parameters)
@@ -2023,6 +3678,7 @@ def _build_method_record(
         annotations=_annotations(file_model.source, method_node),
         is_constructor=is_constructor,
         super_access_count=_count_super_accesses(file_model.source, body),
+        is_varargs=_declaration_has_varargs(method_node),
     )
 
 
@@ -2055,6 +3711,17 @@ def _detect_feature_envy(model: ProjectModel) -> List[SemanticFinding]:
                     f"fields_without_member_access={profile.fields_without_member_access}; "
                     f"same_class_method_calls={profile.same_class_method_calls}"
                 ),
+                attributes={
+                    "envied_field": profile.envied_field,
+                    "envied_type": profile.envied_type,
+                    "envy_access": profile.envy_access_count,
+                    "self_access": profile.self_access_count,
+                    "envy_access_diff": profile.envy_access_diff,
+                    "direct_fields": profile.direct_field_count,
+                    "field_members": profile.field_member_count,
+                    "fields_without_member_access": profile.fields_without_member_access,
+                    "same_class_method_calls": profile.same_class_method_calls,
+                },
             )
         )
     return findings
@@ -2083,14 +3750,36 @@ def _detect_refused_bequest(model: ProjectModel) -> List[SemanticFinding]:
                     score=1.0,
                     rule_id="symbol_solver:refused_bequest_method",
                     evidence=(
-                        f"parent={parent.class_name}; target_class={cls.class_name}; "
+                        f"parent={parent.qualified_name}; target_class={cls.class_name}; "
                         f"signature={method.method_signature}; "
                         f"parameter_count={len(method.parameter_descriptors)}; "
                         f"rejection_kind={rejection_kind}; super_calls={method.super_access_count}"
                     ),
+                    attributes={
+                        "parent": parent.qualified_name,
+                        "inheritance_source": _source_inheritance_identity(cls),
+                        "target_class": cls.class_name,
+                        "signature": method.method_signature,
+                        "parameter_count": len(method.parameter_descriptors),
+                        "rejection_kind": rejection_kind,
+                        "super_calls": method.super_access_count,
+                    },
                 )
             )
     return findings
+
+
+def _source_inheritance_identity(cls: ClassRecord) -> List[str]:
+    """Return a resolver-independent identity for the direct source relation."""
+    parts: List[str] = []
+    if cls.source_superclass_name:
+        parts.append(f"extends:{cls.source_superclass_name}")
+    parts.extend(
+        f"implements:{name}"
+        for name in sorted(cls.source_interface_names)
+        if name
+    )
+    return parts
 
 
 def _parent_contract_owner(
@@ -2156,11 +3845,9 @@ def _rejection_kind(method: MethodRecord) -> str:
 def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
     minimum_group_size = int(DEFAULT_THRESHOLDS["data_clumps_param_group_size"])
     occurrences_threshold = int(DEFAULT_THRESHOLDS["data_clumps_occurrences"])
-    effective_min_classes = max(int(DEFAULT_THRESHOLDS["data_clumps_min_classes"]), 3)
+    effective_min_classes = int(DEFAULT_THRESHOLDS["data_clumps_min_classes"])
     eligible_methods: List[MethodRecord] = []
     for method in model.methods:
-        if _should_skip_data_clump_method(method):
-            continue
         if len(method.parameter_descriptors) < minimum_group_size:
             continue
         eligible_methods.append(method)
@@ -2181,6 +3868,14 @@ def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
             if len(descriptors) < group_size:
                 continue
             for combo in _parameter_combinations(descriptors, group_size):
+                # An unrelated unresolved parameter must not discard every
+                # well-resolved group in the method. Fail closed only for the
+                # candidate combination that contains the ambiguous type.
+                if any(
+                    _model_type_is_ambiguous(model, item.rsplit(":", 1)[0])
+                    for item in combo.split("|")
+                ):
+                    continue
                 if group_size > minimum_group_size:
                     items = frozenset(combo.split("|"))
                     if any(
@@ -2201,8 +3896,8 @@ def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
             method_names = {method.method_name or "" for method in methods}
             if len(method_names) < 2:
                 continue
-            class_names = {method.class_name for method in methods}
-            if len(class_names) < effective_min_classes:
+            owner_names = {method.owner_qualified_name for method in methods}
+            if len(owner_names) < effective_min_classes:
                 continue
             frequent.add(frozenset(group_key.split("|")))
             rule_id = f"symbol_solver:data_clumps:{_java_hex_hash(group_key)}"
@@ -2217,7 +3912,12 @@ def _detect_data_clumps(model: ProjectModel) -> List[SemanticFinding]:
                         end_line=method.end_line,
                         score=float(len(methods)),
                         rule_id=rule_id,
-                        evidence=f"group={group_key}; occurrences={len(methods)}; classes={len(class_names)}",
+                        evidence=f"group={group_key}; occurrences={len(methods)}; classes={len(owner_names)}",
+                        attributes={
+                            "group": group_key,
+                            "occurrences": len(methods),
+                            "classes": len(owner_names),
+                        },
                     )
                 )
         if not frequent:
@@ -2238,7 +3938,7 @@ def _detect_god_class(model: ProjectModel) -> List[SemanticFinding]:
     min_signals = int(DEFAULT_THRESHOLDS["god_class_min_signals"])
     findings: List[SemanticFinding] = []
     for cls in model.classes.values():
-        if cls.kind != "class" or _is_test_like_rel_path(cls.file):
+        if cls.kind != "class":
             continue
         # Dataset NOM/WMC include constructors, so the guard must do the same.
         methods = list(cls.methods)
@@ -2283,13 +3983,299 @@ def _detect_god_class(model: ProjectModel) -> List[SemanticFinding]:
                     f"loc>={loc_threshold}|atfd>={atfd_threshold}|"
                     f"strong=nom>={strong_nom_threshold}&wmc>={strong_wmc_threshold}"
                 ),
+                attributes={
+                    "class": cls.class_name,
+                    "nom": nom,
+                    "nof": nof,
+                    "wmc": wmc,
+                    "loc": loc,
+                    "atfd": atfd,
+                    "signals": tuple(signals),
+                },
             )
         )
     return findings
 
 
+def god_class_responsibility_clusters(
+    model: ProjectModel,
+    cls: ClassRecord,
+) -> List[Dict[str, Any]]:
+    """Rank source-derived extraction candidates for one God Class.
+
+    This is an advisory repair worklist, not a second God Class detector.  It
+    connects concrete production methods through owner-field accesses and
+    uniquely resolved same-owner calls, then reports the resulting connected
+    components.  Constructors are omitted because moving initialization code
+    is normally a consequence of moving state, not a responsibility in its own
+    right.  Methods without state remain honest behavior-only components rather
+    than being assigned to a fabricated field cluster.
+    """
+    del model  # Reserved for future source-symbol refinements of this worklist.
+    methods = sorted(
+        (
+            method
+            for method in cls.methods
+            if method.body is not None and not method.is_constructor
+        ),
+        key=lambda item: (item.begin_line, item.method_signature),
+    )
+    if not methods:
+        return []
+
+    method_by_key = {
+        _god_class_method_key(method): method
+        for method in methods
+    }
+    accesses_by_key = {
+        key: _god_class_owner_field_accesses(method, cls)
+        for key, method in method_by_key.items()
+    }
+    methods_by_name_arity: Dict[Tuple[str, int], List[str]] = {}
+    for key, method in method_by_key.items():
+        methods_by_name_arity.setdefault(
+            (method.method_name, len(method.parameter_types)),
+            [],
+        ).append(key)
+
+    adjacency: Dict[str, Set[str]] = {key: set() for key in method_by_key}
+    field_users: Dict[str, List[str]] = {}
+    for key, fields in accesses_by_key.items():
+        for field_name in fields:
+            field_users.setdefault(field_name, []).append(key)
+    for users in field_users.values():
+        for left, right in itertools.combinations(sorted(set(users)), 2):
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+
+    directed_calls: Set[Tuple[str, str]] = set()
+    for caller_key, method in method_by_key.items():
+        for callee_key in _god_class_owner_method_calls(
+            method,
+            cls,
+            methods_by_name_arity,
+        ):
+            if callee_key == caller_key:
+                continue
+            adjacency[caller_key].add(callee_key)
+            adjacency[callee_key].add(caller_key)
+            directed_calls.add((caller_key, callee_key))
+
+    components: List[Set[str]] = []
+    unseen = set(method_by_key)
+    while unseen:
+        seed = min(unseen)
+        pending = [seed]
+        component: Set[str] = set()
+        while pending:
+            key = pending.pop()
+            if key in component:
+                continue
+            component.add(key)
+            pending.extend(sorted(adjacency[key] - component, reverse=True))
+        unseen.difference_update(component)
+        components.append(component)
+
+    candidates: List[Dict[str, Any]] = []
+    for component in components:
+        component_methods = [method_by_key[key] for key in component]
+        component_fields = sorted({
+            field_name
+            for key in component
+            for field_name in accesses_by_key[key]
+        })
+        complexities = {
+            key: _god_class_method_complexity(method_by_key[key])
+            for key in component
+        }
+        method_details = sorted(
+            (
+                {
+                    "signature": method_by_key[key].method_signature,
+                    "begin_line": method_by_key[key].begin_line,
+                    "wmc": complexities[key],
+                    "loc": method_by_key[key].loc,
+                    "accessed_fields": sorted(accesses_by_key[key]),
+                }
+                for key in component
+            ),
+            key=lambda item: (
+                -int(item["wmc"]),
+                -int(item["loc"]),
+                int(item["begin_line"]),
+                str(item["signature"]),
+            ),
+        )
+        field_details = sorted(
+            (
+                {
+                    "name": field_name,
+                    "type": str(cls.fields.get(field_name) or ""),
+                    "method_count": sum(
+                        1 for key in component if field_name in accesses_by_key[key]
+                    ),
+                }
+                for field_name in component_fields
+            ),
+            key=lambda item: (-int(item["method_count"]), str(item["name"])),
+        )
+        field_method_edges = sum(
+            len(accesses_by_key[key] & set(component_fields))
+            for key in component
+        )
+        internal_call_edges = {
+            tuple(sorted((caller, callee)))
+            for caller, callee in directed_calls
+            if caller in component and callee in component
+        }
+        possible_edges = (
+            len(component) * len(component_fields)
+            + (len(component) * (len(component) - 1) // 2)
+        )
+        wmc_reduction = sum(complexities.values())
+        loc_reduction = sum(method.loc for method in component_methods)
+        cluster_seed = "|".join((
+            cls.qualified_name,
+            *component_fields,
+            *(method_by_key[key].method_signature for key in sorted(component)),
+        ))
+        candidates.append({
+            "cluster_id": f"god-responsibility-{_java_hex_hash(cluster_seed)}",
+            "kind": "state_and_behavior" if component_fields else "behavior_only",
+            "method_count": len(component),
+            "field_count": len(component_fields),
+            "nom_reduction": len(component),
+            "nof_reduction": len(component_fields),
+            "wmc_reduction": wmc_reduction,
+            "loc_reduction": loc_reduction,
+            "field_method_edges": field_method_edges,
+            "internal_call_edges": len(internal_call_edges),
+            "cohesion": round(
+                (field_method_edges + len(internal_call_edges)) / max(possible_edges, 1),
+                3,
+            ),
+            "fields": field_details[:GOD_CLASS_RESPONSIBILITY_MEMBER_LIMIT],
+            "methods": method_details[:GOD_CLASS_RESPONSIBILITY_MEMBER_LIMIT],
+            "omitted_field_count": max(
+                0,
+                len(field_details) - GOD_CLASS_RESPONSIBILITY_MEMBER_LIMIT,
+            ),
+            "omitted_method_count": max(
+                0,
+                len(method_details) - GOD_CLASS_RESPONSIBILITY_MEMBER_LIMIT,
+            ),
+        })
+
+    candidates.sort(key=lambda item: (
+        -int(item["wmc_reduction"]),
+        -int(item["method_count"]),
+        -int(item["loc_reduction"]),
+        -int(item["field_count"]),
+        str(item["cluster_id"]),
+    ))
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate["rank"] = rank
+    return candidates[:GOD_CLASS_RESPONSIBILITY_CLUSTER_LIMIT]
+
+
+def _god_class_method_key(method: MethodRecord) -> str:
+    return f"{method.method_signature}@{method.begin_line}"
+
+
+def _god_class_owner_field_accesses(
+    method: MethodRecord,
+    owner: ClassRecord,
+) -> Set[str]:
+    if method.body is None or not owner.fields:
+        return set()
+    fields = set(owner.fields)
+    shadowed = set(method.parameters) | set(method.local_variables)
+    owner_names = {
+        "this",
+        owner.class_name,
+        owner.qualified_name,
+    }
+    accesses: Set[str] = set()
+    for node in _iter_nodes(method.body):
+        if node.type != "identifier":
+            continue
+        name = _node_text_from_node(node).strip()
+        if name not in fields:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        declared_name = parent.child_by_field_name("name")
+        if parent.type in {
+            "variable_declarator",
+            "formal_parameter",
+            "catch_formal_parameter",
+            "spread_parameter",
+        } and _same_source_node(node, declared_name):
+            continue
+        if parent.type in {"method_invocation", "method_reference"}:
+            method_name = parent.child_by_field_name("name")
+            if _same_source_node(node, method_name):
+                continue
+        if parent.type == "field_access":
+            field_node = parent.child_by_field_name("field")
+            object_node = parent.child_by_field_name("object")
+            if object_node is None and parent.children:
+                object_node = parent.children[0]
+            if _same_source_node(node, field_node):
+                receiver = _node_text_from_node(object_node).strip() if object_node is not None else ""
+                if receiver in owner_names:
+                    accesses.add(name)
+                continue
+        if name in shadowed:
+            continue
+        accesses.add(name)
+    return accesses
+
+
+def _god_class_owner_method_calls(
+    method: MethodRecord,
+    owner: ClassRecord,
+    methods_by_name_arity: Mapping[Tuple[str, int], Sequence[str]],
+) -> Set[str]:
+    if method.body is None:
+        return set()
+    owner_receivers = {"this", owner.class_name, owner.qualified_name}
+    calls: Set[str] = set()
+    for node in _iter_nodes(method.body):
+        if node.type != "method_invocation":
+            continue
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            continue
+        receiver_node = node.child_by_field_name("object")
+        if receiver_node is not None:
+            receiver = _node_text_from_node(receiver_node).strip()
+            if receiver not in owner_receivers:
+                continue
+        arguments = node.child_by_field_name("arguments")
+        arity = len(arguments.named_children) if arguments is not None else 0
+        candidates = methods_by_name_arity.get(
+            (_node_text_from_node(name_node).strip(), arity),
+            (),
+        )
+        if len(candidates) == 1:
+            calls.add(str(candidates[0]))
+    return calls
+
+
+def _same_source_node(left: Optional[Node], right: Optional[Node]) -> bool:
+    return bool(
+        left is not None
+        and right is not None
+        and left.start_byte == right.start_byte
+        and left.end_byte == right.end_byte
+        and left.type == right.type
+    )
+
+
 def _god_class_method_complexity(method: MethodRecord) -> int:
-    """Return the dataset detector's per-method cyclomatic proxy."""
+    """Return the product profile's per-method cyclomatic proxy."""
     if method.body is None:
         return 1
     controls = sum(1 for node in _iter_nodes(method.body) if node.type in GOD_CLASS_CONTROL_NODE_TYPES)
@@ -2300,11 +4286,10 @@ def _god_class_atfd(
     methods: Sequence[MethodRecord],
     bodyless_declarations: Sequence[str] = (),
 ) -> int:
-    """Return the distinct-access proxy used to create the delivery dataset.
+    """Return the versioned product profile's distinct-access proxy.
 
-    This intentionally mirrors the reviewed dataset collector instead of the
-    feature-envy access-count metric.  The latter counts individual accesses,
-    while the God Class dataset records distinct receiver/type tokens.
+    This uses distinct receiver/type tokens instead of the Feature Envy
+    metric, which counts individual accesses.
     """
     foreign_tokens: Set[str] = set()
     declarations = [method.declaration_text for method in methods]
@@ -2327,7 +4312,7 @@ def _detect_dead_code(model: ProjectModel) -> List[SemanticFinding]:
     for method in model.methods:
         if not _is_unused_private_method_candidate(method):
             continue
-        if reference_counts.get(method.method_name, 0) != 0:
+        if reference_counts.get(_method_identity(method), 0) != 0:
             continue
         findings.append(
             SemanticFinding(
@@ -2344,23 +4329,1021 @@ def _detect_dead_code(model: ProjectModel) -> List[SemanticFinding]:
                     f"class={method.class_name}; method={method.method_signature}; "
                     f"refs=0; loc={method.loc}"
                 ),
+                attributes={
+                    "kind": "unused_private_method",
+                    "class": method.class_name,
+                    "method": method.method_signature,
+                    "refs": 0,
+                    "loc": method.loc,
+                },
             )
         )
     return findings
 
 
-def _method_reference_counts(model: ProjectModel) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for file_model in model.files:
-        if _is_test_like_rel_path(file_model.rel_path):
+MethodIdentity = Tuple[str, str, Tuple[str, ...]]
+
+
+def _method_identity(method: MethodRecord) -> MethodIdentity:
+    return (
+        method.owner_qualified_name,
+        method.method_name,
+        tuple(_erase_type(item) for item in method.parameter_types),
+    )
+
+
+def _method_reference_counts(model: ProjectModel) -> Dict[MethodIdentity, int]:
+    """Resolve call sites to unique private declarations.
+
+    A bare method-name count makes an unused declaration appear live when an
+    unrelated owner happens to use the same name, and it cannot distinguish
+    overloads.  Dead-code findings are declaration-level, so every use must
+    resolve to one owner and one signature before it contributes a reference.
+    Ambiguous or unsupported expressions deliberately contribute nothing: an
+    uncertain call must not hide a product finding.
+
+    Direct self-recursion is excluded.  It does not make an otherwise
+    unreachable private method externally reachable.
+    """
+    candidates_by_owner_name: Dict[Tuple[str, str], List[MethodRecord]] = {}
+    for method in model.methods:
+        if method.is_constructor:
             continue
+        candidates_by_owner_name.setdefault(
+            (method.owner_qualified_name, method.method_name), []
+        ).append(method)
+
+    methods_by_file: Dict[str, List[MethodRecord]] = {}
+    classes_by_file: Dict[str, List[ClassRecord]] = {}
+    files_by_path = {item.rel_path: item for item in model.files}
+    for method in model.methods:
+        methods_by_file.setdefault(method.file, []).append(method)
+    for cls in model.classes.values():
+        if cls.file == "<classpath>":
+            continue
+        classes_by_file.setdefault(cls.file, []).append(cls)
+    for methods in methods_by_file.values():
+        methods.sort(key=lambda item: (item.end_line - item.begin_line, item.begin_line))
+    for classes in classes_by_file.values():
+        classes.sort(key=lambda item: (item.end_line - item.begin_line, item.begin_line))
+
+    counts: Dict[MethodIdentity, int] = {}
+    for file_model in model.files:
         for node in _iter_nodes(file_model.root):
             if node.type not in {"method_invocation", "method_reference"}:
                 continue
             name = _method_usage_name(file_model.source, node)
-            if name:
-                counts[name] = counts.get(name, 0) + 1
+            if not name:
+                continue
+            line = _node_start_line(node)
+            enclosing_method = next(
+                (
+                    item
+                    for item in methods_by_file.get(file_model.rel_path, [])
+                    if item.begin_line <= line <= item.end_line
+                ),
+                None,
+            )
+            enclosing_classes = [
+                item
+                for item in classes_by_file.get(file_model.rel_path, [])
+                if item.begin_line <= line <= item.end_line
+            ]
+            receiver = _method_usage_receiver(file_model.source, node)
+            owner_names = _private_usage_owner_names(
+                model,
+                file_model,
+                enclosing_method,
+                enclosing_classes,
+                receiver,
+            )
+            owner_candidates: List[MethodRecord] = []
+            for owner_name in owner_names:
+                owner_candidates = _usage_method_candidates_for_owner(
+                    model,
+                    candidates_by_owner_name,
+                    owner_name,
+                    name,
+                )
+                if owner_candidates:
+                    # Implicit lookup selects the nearest lexical owner. An
+                    # explicit receiver has only one resolved owner.
+                    break
+            if not owner_candidates:
+                continue
+            target = _resolve_private_method_usage(
+                model,
+                files_by_path[file_model.rel_path],
+                enclosing_method,
+                node,
+                owner_candidates,
+            )
+            if target is None:
+                continue
+            if "private" not in target.modifiers:
+                continue
+            target_identity = _method_identity(target)
+            if (
+                enclosing_method is not None
+                and _method_identity(enclosing_method) == target_identity
+            ):
+                continue
+            counts[target_identity] = counts.get(target_identity, 0) + 1
     return counts
+
+
+def _usage_method_candidates_for_owner(
+    model: ProjectModel,
+    candidates_by_owner_name: Mapping[Tuple[str, str], Sequence[MethodRecord]],
+    owner_name: str,
+    method_name: str,
+) -> List[MethodRecord]:
+    """Return the owner's Java overload set, including inherited API.
+
+    Parent private declarations are not inherited. Duplicate parent signatures
+    are suppressed after the nearest declaration so an ordinary override does
+    not make a call look ambiguous.
+    """
+    owner = model.classes.get(owner_name)
+    owner_names = [owner_name]
+    if owner is not None:
+        owner_names.extend(sorted(_all_parent_type_names(model, owner)))
+    out: List[MethodRecord] = []
+    seen_signatures: Set[Tuple[str, ...]] = set()
+    for candidate_owner in owner_names:
+        for candidate in candidates_by_owner_name.get(
+            (candidate_owner, method_name), []
+        ):
+            if candidate_owner != owner_name and "private" in candidate.modifiers:
+                continue
+            signature = tuple(_erase_type(item) for item in candidate.parameter_types)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            out.append(candidate)
+    return out
+
+
+def _method_usage_receiver(source: bytes, node: Node) -> str:
+    if node.type == "method_invocation":
+        return _node_text(source, node.child_by_field_name("object")).strip()
+    text = _node_text(source, node)
+    return text.rsplit("::", 1)[0].strip() if "::" in text else ""
+
+
+def _private_usage_owner_names(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    enclosing_method: Optional[MethodRecord],
+    enclosing_classes: Sequence[ClassRecord],
+    receiver: str,
+) -> List[str]:
+    lexical_owners = [item.qualified_name for item in enclosing_classes]
+    if enclosing_method is not None:
+        lexical_owners = [
+            enclosing_method.owner_qualified_name,
+            *(
+                item
+                for item in lexical_owners
+                if item != enclosing_method.owner_qualified_name
+            ),
+        ]
+    if not receiver:
+        return lexical_owners
+    if receiver == "this":
+        return lexical_owners[:1]
+    if receiver == "super":
+        return []
+
+    outer_this = re.fullmatch(
+        r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.this",
+        receiver,
+    )
+    if outer_this:
+        requested = outer_this.group(1)
+        matches = [
+            item
+            for item in lexical_owners
+            if item == requested or item.endswith(f".{requested}")
+        ]
+        return matches[:1] if len(matches) == 1 else []
+
+    created = re.match(
+        r"^new\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<[^>]*>)?\s*\(",
+        receiver,
+    )
+    if created:
+        resolved = _resolve_type_name(
+            file_model,
+            created.group(1),
+            model.classes_by_simple,
+        )
+        owner_name = _resolve_model_type(model, resolved)
+        return [owner_name] if owner_name in model.classes else []
+
+    static_type, resolution = _receiver_static_type(
+        model,
+        enclosing_method,
+        receiver,
+    )
+    owner_name = _resolve_model_type(model, static_type)
+    if resolution != "unresolved" and owner_name in model.classes:
+        return [owner_name]
+
+    # Exact and imported type-qualified static calls need no value receiver.
+    # Only try this after environment lookup, so an uppercase local variable
+    # is not mistaken for a class.
+    resolved = _resolve_type_name(file_model, receiver, model.classes_by_simple)
+    owner_name = _resolve_model_type(model, resolved)
+    return [owner_name] if owner_name in model.classes else []
+
+
+def _resolve_private_method_usage(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    enclosing_method: Optional[MethodRecord],
+    node: Node,
+    candidates: Sequence[MethodRecord],
+) -> Optional[MethodRecord]:
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _method_accessible_from(
+            model,
+            enclosing_method,
+            candidate,
+            receiver=_method_usage_receiver(file_model.source, node),
+        )
+    ]
+    if not candidates:
+        return None
+    if node.type == "method_reference":
+        if len(candidates) == 1:
+            return candidates[0]
+        return _resolve_bound_method_reference_usage(
+            model,
+            file_model,
+            enclosing_method,
+            node,
+            candidates,
+        )
+
+    arguments = node.child_by_field_name("arguments")
+    argument_nodes = list(arguments.named_children) if arguments is not None else []
+    argument_types = [
+        _java_expression_static_type(
+            model,
+            file_model,
+            enclosing_method,
+            argument,
+        )
+        for argument in argument_nodes
+    ]
+
+    # Phase 1: fixed-arity applicability. A varargs declaration participates
+    # here with its final parameter kept as the declared array type.
+    strict_fixed_candidates = [
+        item
+        for item in candidates
+        if len(item.parameter_types) == len(argument_nodes)
+        and _private_call_types_compatible(
+            model,
+            item,
+            argument_types,
+            variable_arity=False,
+            allow_boxing=False,
+        )
+    ]
+    if strict_fixed_candidates:
+        return _select_compatible_method(
+            model,
+            strict_fixed_candidates,
+            argument_types,
+            variable_arity=False,
+        )
+
+    # Phase 2 permits boxing/unboxing but still keeps fixed arity.
+    loose_fixed_candidates = [
+        item
+        for item in candidates
+        if len(item.parameter_types) == len(argument_nodes)
+        and _private_call_types_compatible(
+            model,
+            item,
+            argument_types,
+            variable_arity=False,
+            allow_boxing=True,
+        )
+    ]
+    if loose_fixed_candidates:
+        return _select_compatible_method(
+            model,
+            loose_fixed_candidates,
+            argument_types,
+            variable_arity=False,
+        )
+
+    # Phase 2: only when no fixed-arity declaration applies, expand varargs
+    # components and test variable-arity applicability.
+    variable_arity_candidates = [
+        item
+        for item in candidates
+        if item.is_varargs
+        and _private_method_accepts_arity(item, len(argument_nodes))
+        and _private_call_types_compatible(
+            model,
+            item,
+            argument_types,
+            variable_arity=True,
+            allow_boxing=True,
+        )
+    ]
+    return _select_compatible_method(
+        model,
+        variable_arity_candidates,
+        argument_types,
+        variable_arity=True,
+    )
+
+
+def _method_accessible_from(
+    model: ProjectModel,
+    caller: Optional[MethodRecord],
+    candidate: MethodRecord,
+    *,
+    receiver: str,
+) -> bool:
+    if "public" in candidate.modifiers:
+        return True
+    if caller is None:
+        return False
+    same_owner = caller.owner_qualified_name == candidate.owner_qualified_name
+    same_package = _package_of(caller.owner_qualified_name) == _package_of(
+        candidate.owner_qualified_name
+    )
+    if "private" in candidate.modifiers:
+        # Same-owner access is proven. Nested-class private access is legal in
+        # Java but needs a nest-host model; keep that uncommon case fail-closed.
+        return same_owner
+    if same_package:
+        return True
+    if "protected" not in candidate.modifiers:
+        return False
+    caller_owner = _resolve_model_type(model, caller.owner_qualified_name)
+    candidate_owner = _resolve_model_type(model, candidate.owner_qualified_name)
+    return bool(
+        caller_owner
+        and candidate_owner
+        and _is_subtype(model, caller_owner, candidate_owner)
+        and receiver in {"", "this", "super"}
+    )
+
+
+def _select_compatible_method(
+    model: ProjectModel,
+    compatible: Sequence[MethodRecord],
+    argument_types: Sequence[str],
+    *,
+    variable_arity: bool,
+) -> Optional[MethodRecord]:
+    if not compatible:
+        return None
+    # Partial exactness is not a Java overload rule. If even one argument's
+    # static type is outside this source model, multiple candidates remain
+    # unresolved and the route graph must fail closed.
+    if not all(argument_types):
+        return None
+
+    exact = [
+        item
+        for item in compatible
+        if _private_call_is_exact(
+            item,
+            argument_types,
+            variable_arity=variable_arity,
+        )
+    ]
+    if len(exact) == 1:
+        return exact[0]
+
+    # Do not rank a candidate whose applicability depends on an unavailable
+    # external type relation.  Unknown is deliberately distinct from false:
+    # the caller becomes an unresolved project edge and verification fails
+    # closed instead of silently selecting a broader overload.
+    states = {
+        id(item): _private_call_conversion_states(
+            model,
+            item,
+            argument_types,
+            variable_arity=variable_arity,
+        )
+        for item in compatible
+    }
+    proven = [
+        item
+        for item in compatible
+        if all(state == "compatible" for state in states[id(item)])
+    ]
+    if len(proven) == 1 and len(compatible) == 1:
+        return proven[0]
+    if len(proven) != len(compatible):
+        return None
+
+    # Ties such as helper(String) / helper(Object) with a null argument still
+    # have a unique target when parameter specificity is source-proven.
+    return _most_specific_compatible_method(
+        model,
+        proven,
+        len(argument_types),
+        variable_arity=variable_arity,
+    )
+
+
+def _most_specific_compatible_method(
+    model: ProjectModel,
+    candidates: Sequence[MethodRecord],
+    argument_count: int,
+    *,
+    variable_arity: bool,
+) -> Optional[MethodRecord]:
+    """Return the unique overload whose effective parameter types dominate."""
+    if len(candidates) < 2:
+        return candidates[0] if candidates else None
+
+    def dominates(left: MethodRecord, right: MethodRecord) -> bool:
+        left_types = _private_call_parameter_types(
+            left,
+            argument_count,
+            variable_arity=variable_arity,
+        )
+        right_types = _private_call_parameter_types(
+            right,
+            argument_count,
+            variable_arity=variable_arity,
+        )
+        if len(left_types) != len(right_types):
+            return False
+        weakly_more_specific = all(
+            _java_type_conversion_state(
+                model,
+                left_type,
+                right_type,
+                allow_boxing=False,
+            ) == "compatible"
+            for left_type, right_type in zip(left_types, right_types)
+        )
+        strictly_more_specific = any(
+            _erase_type(left_type) != _erase_type(right_type)
+            for left_type, right_type in zip(left_types, right_types)
+        )
+        return weakly_more_specific and strictly_more_specific
+
+    undominated = [
+        candidate
+        for candidate in candidates
+        if all(
+            other is candidate or dominates(candidate, other)
+            for other in candidates
+        )
+    ]
+    return undominated[0] if len(undominated) == 1 else None
+
+
+def _resolve_bound_method_reference_usage(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    enclosing_method: Optional[MethodRecord],
+    node: Node,
+    candidates: Sequence[MethodRecord],
+) -> Optional[MethodRecord]:
+    """Resolve an overloaded bound reference from its source target type."""
+    receiver = _method_usage_receiver(file_model.source, node)
+    _, receiver_resolution = _receiver_static_type(
+        model,
+        enclosing_method,
+        receiver,
+    )
+    is_bound_value = (
+        receiver in {"this", "super"}
+        or receiver_resolution
+        in {
+            "explicit_cast",
+            "field",
+            "local_variable",
+            "method_return",
+            "owner_type",
+            "parameter",
+            "super_type",
+        }
+        or receiver.lstrip().startswith("new ")
+    )
+    if not is_bound_value:
+        # Type::method can denote either a static reference or an unbound
+        # instance reference. Without a complete target descriptor, guessing
+        # between those modes would create a false route.
+        return None
+    target_type = _method_reference_target_type_text(file_model.source, node)
+    target_parameters = _jdk_functional_target_parameter_types(
+        file_model,
+        target_type,
+        model.classes_by_simple,
+    )
+    if target_parameters is None:
+        return None
+    strict_fixed_candidates = [
+        item
+        for item in candidates
+        if len(item.parameter_types) == len(target_parameters)
+        and _private_call_types_compatible(
+            model,
+            item,
+            target_parameters,
+            variable_arity=False,
+            allow_boxing=False,
+        )
+    ]
+    if strict_fixed_candidates:
+        return _select_compatible_method(
+            model,
+            strict_fixed_candidates,
+            target_parameters,
+            variable_arity=False,
+        )
+    loose_fixed_candidates = [
+        item
+        for item in candidates
+        if len(item.parameter_types) == len(target_parameters)
+        and _private_call_types_compatible(
+            model,
+            item,
+            target_parameters,
+            variable_arity=False,
+            allow_boxing=True,
+        )
+    ]
+    if loose_fixed_candidates:
+        return _select_compatible_method(
+            model,
+            loose_fixed_candidates,
+            target_parameters,
+            variable_arity=False,
+        )
+    variable_candidates = [
+        item
+        for item in candidates
+        if item.is_varargs
+        and _private_method_accepts_arity(item, len(target_parameters))
+        and _private_call_types_compatible(
+            model,
+            item,
+            target_parameters,
+            variable_arity=True,
+            allow_boxing=True,
+        )
+    ]
+    return _select_compatible_method(
+        model,
+        variable_candidates,
+        target_parameters,
+        variable_arity=True,
+    )
+
+
+def _method_reference_target_type_text(source: bytes, node: Node) -> str:
+    current = node.parent
+    while current is not None and current.type not in {
+        "constructor_declaration",
+        "lambda_expression",
+        "method_declaration",
+    }:
+        if current.type == "cast_expression":
+            type_node = current.child_by_field_name("type") or _first_type_child(
+                current
+            )
+            if type_node is not None:
+                return _node_text(source, type_node).strip()
+            return ""
+        if current.type in {"field_declaration", "local_variable_declaration"}:
+            type_node = current.child_by_field_name("type") or _first_type_child(
+                current
+            )
+            if type_node is not None:
+                return _node_text(source, type_node).strip()
+            return ""
+        if current.type not in {
+            "parenthesized_expression",
+            "variable_declarator",
+        }:
+            # Invocation arguments, conditional expressions, assignments and
+            # returns each impose their own target-typing rules.  An outer
+            # variable declaration must never leak through such a boundary.
+            return ""
+        current = current.parent
+    return ""
+
+
+def _jdk_functional_target_parameter_types(
+    file_model: JavaFileModel,
+    type_text: str,
+    classes_by_simple: Dict[str, List[ClassRecord]],
+) -> Optional[List[str]]:
+    text = str(type_text or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(
+        r"([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<(.*)>)?",
+        text,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return None
+    simple_name = match.group(1).rsplit(".", 1)[-1]
+    template = JAVA_SAM_PARAMETER_TEMPLATES.get(simple_name)
+    if template is None:
+        return None
+    resolved_interface = _resolve_type_name(
+        file_model,
+        match.group(1),
+        classes_by_simple,
+    )
+    expected_interface = (
+        f"java.util.function.{simple_name}"
+        if simple_name not in {"Callable", "Comparator", "Runnable"}
+        else "java.util.concurrent.Callable"
+        if simple_name == "Callable"
+        else "java.util.Comparator"
+        if simple_name == "Comparator"
+        else "java.lang.Runnable"
+    )
+    if _erase_type(resolved_interface) != expected_interface:
+        return None
+    generic_text = str(match.group(2) or "").strip()
+    generic_arguments = (
+        split_top_level_java_types(generic_text) if generic_text else []
+    )
+    if any("?" in argument for argument in generic_arguments):
+        return None
+    resolved_arguments = [
+        _resolve_type_name(file_model, argument, classes_by_simple)
+        for argument in generic_arguments
+    ]
+    parameters: List[str] = []
+    for item in template:
+        if isinstance(item, str):
+            parameters.append(item)
+            continue
+        if item < 0 or item >= len(resolved_arguments):
+            return None
+        parameters.append(resolved_arguments[item])
+    return parameters
+
+
+def resolve_project_method_invocation(
+    model: ProjectModel,
+    caller: MethodRecord,
+    node: Node,
+    *,
+    candidates_by_owner_name: Optional[
+        Mapping[Tuple[str, str], Sequence[MethodRecord]]
+    ] = None,
+) -> Tuple[Optional[MethodRecord], List[MethodRecord]]:
+    """Resolve one project-local invocation with Java overload compatibility.
+
+    The second result is the complete project candidate set.  Callers can
+    distinguish an external/unmodeled call (empty set) from an ambiguous
+    project-local edge (non-empty set with no unique resolution) and fail
+    closed only for the latter.
+    """
+    if node.type not in {"method_invocation", "method_reference"}:
+        return None, []
+    file_model = next(
+        (item for item in model.files if item.rel_path == caller.file),
+        None,
+    )
+    owner = model.classes.get(caller.owner_qualified_name)
+    if file_model is None or owner is None:
+        return None, []
+    method_name = _method_usage_name(file_model.source, node)
+    if not method_name:
+        return None, []
+    receiver = _method_usage_receiver(file_model.source, node)
+    if receiver == "super":
+        owner_names = sorted(_all_parent_type_names(model, owner))
+    else:
+        owner_names = _private_usage_owner_names(
+            model,
+            file_model,
+            caller,
+            [owner],
+            receiver,
+        )
+    if not owner_names:
+        return None, []
+    index = candidates_by_owner_name
+    if index is None:
+        built: Dict[Tuple[str, str], List[MethodRecord]] = {}
+        for method in model.methods:
+            built.setdefault(
+                (method.owner_qualified_name, method.method_name),
+                [],
+            ).append(method)
+        index = built
+    candidates: List[MethodRecord] = []
+    seen: Set[Tuple[str, int, str]] = set()
+    for owner_name in owner_names:
+        for candidate in _usage_method_candidates_for_owner(
+            model,
+            index,
+            owner_name,
+            method_name,
+        ):
+            key = (candidate.file, candidate.begin_line, candidate.method_signature)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+    if node.type == "method_reference":
+        relevant = list(candidates)
+    else:
+        arguments = node.child_by_field_name("arguments")
+        argument_count = len(arguments.named_children) if arguments is not None else 0
+        relevant = [
+            candidate
+            for candidate in candidates
+            if _private_method_accepts_arity(candidate, argument_count)
+        ]
+    return (
+        _resolve_private_method_usage(
+            model,
+            file_model,
+            caller,
+            node,
+            candidates,
+        ),
+        relevant,
+    )
+
+
+def _private_method_accepts_arity(method: MethodRecord, argument_count: int) -> bool:
+    parameter_count = len(method.parameter_types)
+    if not method.is_varargs:
+        return argument_count == parameter_count
+    return argument_count >= max(0, parameter_count - 1)
+
+
+def _private_call_parameter_types(
+    method: MethodRecord,
+    argument_count: int,
+    *,
+    variable_arity: bool,
+) -> List[str]:
+    parameter_types = list(method.parameter_types)
+    if (
+        not variable_arity
+        or not method.is_varargs
+        or not parameter_types
+    ):
+        return parameter_types
+    component = parameter_types[-1]
+    if component.endswith("[]"):
+        component = component[:-2]
+    return [
+        *parameter_types[:-1],
+        *([component] * max(0, argument_count - len(parameter_types) + 1)),
+    ]
+
+
+def _private_call_types_compatible(
+    model: ProjectModel,
+    method: MethodRecord,
+    argument_types: Sequence[str],
+    *,
+    variable_arity: bool,
+    allow_boxing: bool = True,
+) -> bool:
+    parameter_types = _private_call_parameter_types(
+        method,
+        len(argument_types),
+        variable_arity=variable_arity,
+    )
+    if len(parameter_types) != len(argument_types):
+        return False
+    return all(
+        _java_reference_type_compatible(
+            model,
+            argument,
+            parameter,
+            allow_boxing=allow_boxing,
+        )
+        for argument, parameter in zip(argument_types, parameter_types)
+    )
+
+
+def _private_call_is_exact(
+    method: MethodRecord,
+    argument_types: Sequence[str],
+    *,
+    variable_arity: bool,
+) -> bool:
+    parameter_types = _private_call_parameter_types(
+        method,
+        len(argument_types),
+        variable_arity=variable_arity,
+    )
+    return bool(
+        len(parameter_types) == len(argument_types)
+        and all(
+            argument
+            and argument != "<null>"
+            and _erase_type(argument) == _erase_type(parameter)
+            for argument, parameter in zip(argument_types, parameter_types)
+        )
+    )
+
+
+def _private_call_conversion_states(
+    model: ProjectModel,
+    method: MethodRecord,
+    argument_types: Sequence[str],
+    *,
+    variable_arity: bool,
+) -> List[str]:
+    parameter_types = _private_call_parameter_types(
+        method,
+        len(argument_types),
+        variable_arity=variable_arity,
+    )
+    return [
+        _java_type_conversion_state(model, argument, parameter)
+        for argument, parameter in zip(argument_types, parameter_types)
+    ]
+
+
+def _java_reference_type_compatible(
+    model: ProjectModel,
+    argument_type: str,
+    parameter_type: str,
+    *,
+    allow_boxing: bool = True,
+) -> bool:
+    return _java_type_conversion_state(
+        model,
+        argument_type,
+        parameter_type,
+        allow_boxing=allow_boxing,
+    ) != "incompatible"
+
+
+def _java_type_conversion_state(
+    model: ProjectModel,
+    argument_type: str,
+    parameter_type: str,
+    *,
+    allow_boxing: bool = True,
+) -> str:
+    """Return compatible, incompatible, or unknown for one Java conversion."""
+    if not argument_type:
+        return "unknown"
+    parameter = _erase_type(parameter_type)
+    if argument_type == "<null>":
+        return "compatible" if parameter not in PRIMITIVE_TYPES else "incompatible"
+    argument = _erase_type(argument_type)
+    if argument == parameter:
+        return "compatible"
+    primitive_widening = {
+        "byte": {"short", "int", "long", "float", "double"},
+        "short": {"int", "long", "float", "double"},
+        "char": {"int", "long", "float", "double"},
+        "int": {"long", "float", "double"},
+        "long": {"float", "double"},
+        "float": {"double"},
+    }
+    if parameter in primitive_widening.get(argument, set()):
+        return "compatible"
+    boxed = {
+        "boolean": "java.lang.Boolean",
+        "byte": "java.lang.Byte",
+        "char": "java.lang.Character",
+        "double": "java.lang.Double",
+        "float": "java.lang.Float",
+        "int": "java.lang.Integer",
+        "long": "java.lang.Long",
+        "short": "java.lang.Short",
+    }
+    if allow_boxing and (
+        boxed.get(argument) == parameter or boxed.get(parameter) == argument
+    ):
+        return "compatible"
+    if (
+        allow_boxing
+        and parameter == "java.lang.Object"
+        and argument in PRIMITIVE_TYPES
+    ):
+        return "compatible"
+    if argument in PRIMITIVE_TYPES or parameter in PRIMITIVE_TYPES:
+        return "incompatible"
+    argument_array = argument.endswith("[]")
+    parameter_array = parameter.endswith("[]")
+    if argument_array:
+        if parameter in {
+            "java.lang.Object",
+            "java.lang.Cloneable",
+            "java.io.Serializable",
+        }:
+            return "compatible"
+        if not parameter_array:
+            return "incompatible"
+        argument_component = argument[:-2]
+        parameter_component = parameter[:-2]
+        if (
+            argument_component in PRIMITIVE_TYPES
+            or parameter_component in PRIMITIVE_TYPES
+        ):
+            return (
+                "compatible"
+                if argument_component == parameter_component
+                else "incompatible"
+            )
+        return _java_type_conversion_state(
+            model,
+            argument_component,
+            parameter_component,
+            allow_boxing=False,
+        )
+    if parameter_array:
+        return "incompatible"
+    if parameter == "java.lang.Object" and argument not in PRIMITIVE_TYPES:
+        return "compatible"
+    resolved_argument = _resolve_model_type(model, argument)
+    resolved_parameter = _resolve_model_type(model, parameter)
+    if not resolved_argument or not resolved_parameter:
+        return "unknown"
+    if _is_subtype(model, resolved_argument, resolved_parameter):
+        return "compatible"
+    argument_record = _class_record_for_type(model, resolved_argument)
+    parameter_record = _class_record_for_type(model, resolved_parameter)
+    if argument_record is not None and parameter_record is not None:
+        return "incompatible"
+    return "unknown"
+
+
+def _java_expression_static_type(
+    model: ProjectModel,
+    file_model: JavaFileModel,
+    enclosing_method: Optional[MethodRecord],
+    node: Node,
+) -> str:
+    literal_types = {
+        "true": "boolean",
+        "false": "boolean",
+        "character_literal": "char",
+        "string_literal": "java.lang.String",
+    }
+    if node.type in literal_types:
+        return literal_types[node.type]
+    if node.type == "null_literal":
+        return "<null>"
+    text = _node_text(file_model.source, node).strip()
+    if node.type in {"decimal_integer_literal", "hex_integer_literal", "octal_integer_literal", "binary_integer_literal"}:
+        return "long" if re.search(r"[lL]$", text) else "int"
+    if node.type in {"decimal_floating_point_literal", "hex_floating_point_literal"}:
+        return "float" if re.search(r"[fF]$", text) else "double"
+    if node.type == "identifier" and enclosing_method is not None:
+        if text in enclosing_method.local_variables:
+            return enclosing_method.local_variables[text]
+        if text in enclosing_method.parameters:
+            return enclosing_method.parameters[text]
+        owner = model.classes.get(enclosing_method.owner_qualified_name)
+        if owner is not None and text in owner.fields:
+            return owner.fields[text]
+        return ""
+    if node.type in {"cast_expression", "object_creation_expression", "array_creation_expression"}:
+        type_node = node.child_by_field_name("type") or _first_type_child(node)
+        if type_node is not None:
+            resolved = _resolve_type_name(
+                file_model,
+                _node_text(file_model.source, type_node),
+                model.classes_by_simple,
+            )
+            return f"{resolved}[]" if node.type == "array_creation_expression" else resolved
+    if node.type == "parenthesized_expression":
+        nested = next((item for item in node.named_children), None)
+        if nested is not None:
+            return _java_expression_static_type(
+                model,
+                file_model,
+                enclosing_method,
+                nested,
+            )
+    if node.type == "method_invocation" and enclosing_method is not None:
+        return_type, resolution = _receiver_static_type(
+            model,
+            enclosing_method,
+            text,
+        )
+        if resolution != "unresolved":
+            return return_type
+    return ""
 
 
 def _method_usage_name(source: bytes, node: Node) -> str:
@@ -2375,8 +5358,6 @@ def _method_usage_name(source: bytes, node: Node) -> str:
 
 
 def _is_unused_private_method_candidate(method: MethodRecord) -> bool:
-    if _is_test_like_rel_path(method.file):
-        return False
     if method.is_constructor or "private" not in method.modifiers:
         return False
     if method.annotations:
@@ -2458,6 +5439,9 @@ def _record_member_access(
     *,
     feature_envy_semantics: bool = False,
 ) -> None:
+    if _model_type_is_ambiguous(model, receiver_info.type_name):
+        stats.unresolved += 1
+        return
     receiver_type = _normalized_receiver_type(model, receiver_info.type_name)
     if _should_ignore_feature_envy_receiver(
         receiver_info,
@@ -2507,12 +5491,18 @@ def _normalized_receiver_type(model: ProjectModel, type_name: str) -> str:
 def _owner_method_return_types(owner: Optional[ClassRecord]) -> Dict[str, str]:
     if owner is None:
         return {}
-    out: Dict[str, str] = {}
+    candidates: Dict[str, List[str]] = {}
     for method in owner.methods:
         if method.is_constructor or not method.return_type:
             continue
-        out.setdefault(method.method_name, method.return_type)
-    return out
+        candidates.setdefault(method.method_name, []).append(method.return_type)
+    # This lightweight resolver cannot distinguish overloads from receiver text
+    # alone. Exclude overloaded names instead of freezing the first declaration.
+    return {
+        name: returns[0]
+        for name, returns in candidates.items()
+        if len(returns) == 1 and not _is_ambiguous_type(returns[0])
+    }
 
 
 def _receiver_info_for_expression(
@@ -2723,7 +5713,7 @@ def _is_local_tool_type(type_name: str) -> bool:
     }
 
 
-def _member_access_receiver_expressions(body: Node) -> Iterable[str]:
+def _member_access_receiver_nodes(body: Node) -> Iterable[Tuple[Node, Node]]:
     for node in _iter_nodes(body):
         if node.type == "field_access":
             receiver = node.children[0] if node.children else None
@@ -2732,7 +5722,7 @@ def _member_access_receiver_expressions(body: Node) -> Iterable[str]:
                 if text in {"this", "super"} and _is_receiver_operand(node):
                     continue
                 if text:
-                    yield text
+                    yield node, receiver
         elif node.type == "method_invocation" and len(node.children) >= 3:
             if any(child.type == "." for child in node.children[:3]):
                 receiver = node.children[0]
@@ -2740,7 +5730,12 @@ def _member_access_receiver_expressions(body: Node) -> Iterable[str]:
                 if text in {"this", "super"} and _is_receiver_operand(node):
                     continue
                 if text:
-                    yield text
+                    yield node, receiver
+
+
+def _member_access_receiver_expressions(body: Node) -> Iterable[str]:
+    for _, receiver in _member_access_receiver_nodes(body):
+        yield _node_text_from_node(receiver).strip()
 
 
 def _member_access_receivers(body: Node) -> Iterable[str]:
@@ -2827,10 +5822,6 @@ def _should_skip_refused_bequest_class(cls: ClassRecord) -> bool:
     return (not cls.superclass_name and not cls.interface_names) or cls.kind == "enum"
 
 
-def _should_skip_data_clump_method(method: MethodRecord) -> bool:
-    return _is_test_like_rel_path(method.file)
-
-
 def _is_parameter_group_owner_constructor(
     model: ProjectModel,
     method: MethodRecord,
@@ -2847,15 +5838,15 @@ def _is_parameter_group_owner_constructor(
     owner = model.classes.get(method.owner_qualified_name)
     if owner is None:
         return False
-    group = set(str(group_key or "").split("|"))
+    group = set(_normalize_qualified_group(str(group_key or "")).split("|"))
     if not group:
         return False
     parameters = {
-        f"{type_name}:{_stem_name(name)}": name
+        _normalize_qualified_group(f"{type_name}:{_stem_name(name)}"): name
         for name, type_name in method.parameters.items()
     }
     fields = {
-        f"{type_name}:{_stem_name(name)}": name
+        _normalize_qualified_group(f"{type_name}:{_stem_name(name)}"): name
         for name, type_name in owner.fields.items()
     }
     if not group.issubset(parameters) or not group.issubset(fields):
@@ -2872,70 +5863,10 @@ def _is_parameter_group_owner_constructor(
     return True
 
 
-def _should_skip_data_clump_group(group_key: str) -> bool:
-    tokens = _parse_group_tokens(group_key)
-    if not tokens:
-        return True
-    unique_stems = set()
-    coord_hits = 0
-    framework_hits = 0
-    for type_name, stem in tokens:
-        unique_stems.add(stem)
-        if stem in DATA_CLUMP_COORD_STEMS:
-            coord_hits += 1
-        if _is_framework_like_type(type_name):
-            framework_hits += 1
-    if len(unique_stems) < len(tokens):
-        return True
-    if coord_hits >= 1:
-        return True
-    if framework_hits >= 2:
-        return True
-    if {"propertyname", "oldvalue", "newvalue"} <= unique_stems:
-        return True
-    if {"lhs", "rhs"} <= unique_stems:
-        return True
-    return False
-
-
-def _parse_group_tokens(group_key: str) -> List[Tuple[str, str]]:
-    tokens = []
-    for token in str(group_key or "").split("|"):
-        if ":" not in token:
-            continue
-        type_name, stem = token.split(":", 1)
-        type_name = type_name.strip()
-        stem = stem.strip().lower()
-        if type_name and stem:
-            tokens.append((type_name, stem))
-    return tokens
-
-
-def _is_framework_like_type(type_name: str) -> bool:
-    if not type_name:
-        return False
-    return (
-        type_name in DATA_CLUMP_FRAMEWORK_TYPES
-        or type_name.startswith("java.awt.")
-        or type_name.startswith("javax.servlet.")
-        or type_name.startswith("jakarta.servlet.")
-        or type_name.startswith("org.elasticsearch.")
-        or type_name.startswith("org.springframework.")
-        or type_name.startswith("org.eclipse.jetty.")
-        or type_name.endswith("HttpServletRequest")
-        or type_name.endswith("HttpServletResponse")
-        or type_name.endswith("InputEvent")
-        or type_name.endswith("Graphics")
-        or type_name.endswith("Component")
-        or type_name.endswith("Request")
-        or type_name.endswith("Response")
-    )
-
-
 def _parameter_combinations(values: Sequence[str], group_size: int) -> Iterable[str]:
     seen: Set[str] = set()
     for combo in itertools.combinations(values, group_size):
-        key = _normalize_group("|".join(combo))
+        key = _normalize_qualified_group("|".join(combo))
         if key in seen:
             continue
         seen.add(key)
@@ -2960,6 +5891,17 @@ def _parameter_map(
         if name and type_text:
             params.append((name, _resolve_type_name(file_model, type_text, classes_by_simple, type_parameters)))
     return params
+
+
+def _declaration_has_varargs(method_node: Node) -> bool:
+    parameters = method_node.child_by_field_name("parameters")
+    return bool(
+        parameters is not None
+        and any(
+            child.type == "spread_parameter"
+            for child in parameters.named_children
+        )
+    )
 
 
 def _local_variable_info(
@@ -3002,24 +5944,32 @@ def _collect_fields(
     class_node: Node,
     classes_by_simple: Dict[str, List[ClassRecord]],
     type_parameters: Dict[str, str],
+    *,
+    field_modifiers: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, str]:
     fields: Dict[str, str] = {}
     body = class_node.child_by_field_name("body") or _first_child(class_node, "class_body") or _first_child(class_node, "enum_body")
     if body is None:
         return fields
-    for child in body.children:
+    for child in _declared_type_members(body):
         if child.type != "field_declaration":
             continue
         type_node = child.child_by_field_name("type") or _first_type_child(child)
         if type_node is None:
             continue
         type_name = _resolve_type_name(file_model, _node_text(file_model.source, type_node), classes_by_simple, type_parameters)
+        modifiers = _modifiers(file_model.source, child)
+        if class_node.type == "interface_declaration":
+            modifiers.update({"public", "static", "final"})
         for item in child.children:
             if item.type != "variable_declarator":
                 continue
             name_node = item.child_by_field_name("name")
             if name_node is not None:
-                fields[_node_text(file_model.source, name_node)] = type_name
+                name = _node_text(file_model.source, name_node)
+                fields[name] = type_name
+                if field_modifiers is not None:
+                    field_modifiers[name] = set(modifiers)
     return fields
 
 
@@ -3040,18 +5990,53 @@ def _resolve_type_name(
     if base in PRIMITIVE_TYPES:
         return cleaned
     if "." in base:
+        first, remainder = base.split(".", 1)
+        if first[:1].isupper():
+            outer = _resolve_type_name(
+                file_model,
+                first,
+                classes_by_simple,
+                type_parameters,
+            )
+            if outer and not outer.startswith(AMBIGUOUS_TYPE_PREFIX) and outer != first:
+                return f"{outer}.{remainder}{suffix}"
         return cleaned
     if base in file_model.imports:
         return f"{file_model.imports[base]}{suffix}"
     if base in classes_by_simple:
         candidates = classes_by_simple[base]
-        same_package = [cls for cls in candidates if _package_of(cls.qualified_name) == file_model.package]
-        return f"{(same_package[0] if same_package else candidates[0]).qualified_name}{suffix}"
+        same_package = [
+            cls for cls in candidates
+            if _package_of(cls.qualified_name) == file_model.package
+        ]
+        if len(same_package) == 1:
+            return f"{same_package[0].qualified_name}{suffix}"
+        if len(same_package) > 1:
+            return f"{AMBIGUOUS_TYPE_PREFIX}{base}{suffix}"
+        if not file_model.package:
+            default_package = [
+                cls for cls in candidates if not _package_of(cls.qualified_name)
+            ]
+            if len(default_package) == 1:
+                return f"{default_package[0].qualified_name}{suffix}"
+            if len(default_package) > 1:
+                return f"{AMBIGUOUS_TYPE_PREFIX}{base}{suffix}"
     if base in JAVA_LANG_TYPES:
         return f"java.lang.{base}{suffix}"
-    for wildcard in file_model.wildcard_imports:
-        if wildcard.startswith("java."):
-            return f"{wildcard}.{base}{suffix}"
+    wildcard_candidates = [
+        cls
+        for cls in classes_by_simple.get(base, [])
+        if _package_of(cls.qualified_name) in {
+            *file_model.wildcard_imports,
+            *file_model.static_wildcard_imports,
+        }
+    ]
+    if len(wildcard_candidates) == 1:
+        return f"{wildcard_candidates[0].qualified_name}{suffix}"
+    if len(wildcard_candidates) > 1 or len(file_model.wildcard_imports) > 1:
+        return f"{AMBIGUOUS_TYPE_PREFIX}{base}{suffix}"
+    if len(file_model.wildcard_imports) == 1:
+        return f"{file_model.wildcard_imports[0]}.{base}{suffix}"
     if file_model.package:
         return f"{file_model.package}.{base}{suffix}"
     return cleaned
@@ -3196,14 +6181,15 @@ def _count_super_accesses(source: bytes, body: Node) -> int:
     return count
 
 
-def _list_java_files(root: Path, *, include_tests: bool) -> List[Path]:
+def _list_java_files(root: Path) -> List[Path]:
     files: List[Path] = []
+    source_layout = discover_java_source_layout(root)
     for path in root.rglob("*.java"):
         if not path.is_file():
             continue
         if _contains_excluded_part(path, DEFAULT_EXCLUDE_PATHS):
             continue
-        if not include_tests and _is_test_path(path):
+        if source_layout.is_test_path(path):
             continue
         files.append(path)
     return sorted(files)
@@ -3212,16 +6198,6 @@ def _list_java_files(root: Path, *, include_tests: bool) -> List[Path]:
 def _contains_excluded_part(path: Path, exclude_paths: Iterable[str]) -> bool:
     excluded = set(exclude_paths)
     return any(part in excluded for part in path.parts)
-
-
-def _is_test_path(path: Path) -> bool:
-    lowered = str(path).lower()
-    return "/test/" in lowered or "\\test\\" in lowered or "/tests/" in lowered or "\\tests\\" in lowered
-
-
-def _is_test_like_rel_path(rel_path: str) -> bool:
-    lowered = str(rel_path or "").lower().replace("\\", "/")
-    return "/test/" in lowered or "/tests/" in lowered
 
 
 def _sort_findings(findings: List[SemanticFinding]) -> List[SemanticFinding]:
@@ -3285,11 +6261,17 @@ def _looks_like_type_name(value: str, model: ProjectModel) -> bool:
 
 def _resolve_model_type(model: ProjectModel, type_name: str) -> str:
     erased = _erase_type(type_name)
-    if erased in model.classes:
-        return erased
+    if not erased or _is_ambiguous_type(erased):
+        return ""
     simple = erased.rsplit(".", 1)[-1]
     candidates = model.classes_by_simple.get(simple, [])
-    return candidates[0].qualified_name if candidates else erased
+    if "." in erased:
+        candidates = [item for item in candidates if item.qualified_name == erased]
+    if len(candidates) == 1:
+        return candidates[0].qualified_name
+    if len(candidates) > 1:
+        return ""
+    return erased
 
 
 def _all_parent_type_names(model: ProjectModel, child: ClassRecord) -> Set[str]:
@@ -3300,14 +6282,12 @@ def _all_parent_type_names(model: ProjectModel, child: ClassRecord) -> Set[str]:
     while pending:
         name = pending.pop()
         resolved = _resolve_model_type(model, name)
+        if not resolved:
+            continue
         if resolved in parents:
             continue
         parents.add(resolved)
-        record = model.classes.get(resolved)
-        if record is None:
-            simple = resolved.rsplit(".", 1)[-1]
-            candidates = model.classes_by_simple.get(simple, [])
-            record = candidates[0] if candidates else None
+        record = _class_record_for_type(model, resolved)
         if record is not None:
             pending.extend(
                 parent
@@ -3317,14 +6297,49 @@ def _all_parent_type_names(model: ProjectModel, child: ClassRecord) -> Set[str]:
     return parents
 
 
+def _is_ambiguous_type(type_name: str) -> bool:
+    return _erase_type(type_name).startswith(AMBIGUOUS_TYPE_PREFIX)
+
+
+def _model_type_is_ambiguous(model: ProjectModel, type_name: str) -> bool:
+    erased = _erase_type(type_name)
+    if _is_ambiguous_type(erased):
+        return True
+    simple = erased.rsplit(".", 1)[-1]
+    candidates = model.classes_by_simple.get(simple, [])
+    if "." in erased:
+        candidates = [item for item in candidates if item.qualified_name == erased]
+    return len(candidates) > 1
+
+
 def _is_subtype(model: ProjectModel, child_name: str, parent_name: str) -> bool:
-    current = model.classes.get(child_name)
+    child = _resolve_model_type(model, child_name)
+    parent = _resolve_model_type(model, parent_name)
+    if not child or not parent:
+        return False
+    if child == parent:
+        return True
     seen: Set[str] = set()
-    while current and current.superclass_name and current.superclass_name not in seen:
-        seen.add(current.superclass_name)
-        if current.superclass_name == parent_name:
-            return True
-        current = model.classes.get(current.superclass_name)
+    pending = [child]
+    while pending:
+        current_name = pending.pop(0)
+        if current_name in seen:
+            continue
+        seen.add(current_name)
+        current = _class_record_for_type(model, current_name)
+        if current is None:
+            continue
+        for declared_parent in [
+            current.superclass_name,
+            *current.interface_names,
+        ]:
+            resolved_parent = _resolve_model_type(model, declared_parent)
+            if not resolved_parent:
+                continue
+            if resolved_parent == parent:
+                return True
+            if resolved_parent not in seen:
+                pending.append(resolved_parent)
     return False
 
 
@@ -3354,9 +6369,14 @@ def _java_hex_hash(value: str) -> str:
     return f"{h:x}"
 
 
-def _failed(message: str) -> SemanticDetectionResult:
+def _failed(
+    message: str,
+    *,
+    unavailable: Optional[Dict[str, object]] = None,
+) -> SemanticDetectionResult:
     return SemanticDetectionResult(
         ok=False,
         findings={"feature_envy": [], "refused_bequest": [], "data_clumps": [], "god_class": [], "dead_code": []},
         error=message,
+        unavailable=unavailable,
     )

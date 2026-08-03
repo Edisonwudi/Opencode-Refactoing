@@ -9,9 +9,10 @@ contracts, delegating to real owners, splitting interfaces, or pushing behavior 
 
 - The reported child/parent contract mismatch should be gone.
 - Unsupported-operation throws, empty overrides, null stubs, and constant stubs reported
-  by the product detector must be deleted, implemented, or delegated.
-- The supplied sample test is an immutable project-behavior regression oracle. Keep it
-  unchanged and make production code satisfy both the smell guard and that behavior test.
+  by the target Guard must be deleted, implemented, or delegated.
+- Obey the controller-frozen test-change policy. When tests are immutable, keep them
+  unchanged. When migration is allowed, change only APIs/callers required by the production
+  refactoring, preserve or strengthen assertions, and pass the full project test command.
 - Derive the repair route from the source. Evidence may help locate a target, but it cannot
   require a particular route or make a non-finding pass/fail.
 
@@ -66,6 +67,11 @@ rewrites:
    closure worklist. Search for every occurrence of the unresolved or inaccessible symbol,
    repair all related sites in one pass, and only then verify again. Do not spend one
    continuation fixing one occurrence at a time.
+8. If verification reports a rejecting implementation on an ancestor, descendant, sibling,
+   default method, or compatibility shell in the changed hierarchy, treat the complete
+   returned rejection set as the residual closure of the same route. Remove or implement that
+   rejection before trying another route. Do not move the behavior again or edit unrelated
+   hierarchy findings as a fallback.
 
 The checkpoint verifier compares that compatibility inventory before and after the edit.
 Target-declared API and constructors are hard compatibility requirements; removed inherited
@@ -79,9 +85,12 @@ the visible API that remains part of the target's behavior.
 
 - Hiding refused behavior behind a rename.
 - Removing inheritance before checking parent-typed callers and sibling implementations.
-- Editing, deleting, skipping, or weakening the sample test.
+- Deleting, skipping, or weakening behavior assertions; editing test APIs when the frozen
+  policy forbids it.
 - Replacing an empty or rejecting override with logging, comments, swallowed exceptions,
   or a placeholder constant.
+- Treating disappearance of only the original declaration as PASS while the same rejecting
+  contract remains in the changed hierarchy.
 
 ## Routes
 
@@ -113,7 +122,7 @@ specifically
 Direct edit target: Fill an empty required override with behavior derived from the contract and nearby
 invariants.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -132,7 +141,7 @@ same class already implements the same operation with a richer or normalized arg
 
 Direct edit target: Delegate a required simple override to an existing richer overload.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -151,7 +160,7 @@ already owns the operation so the override should delegate to that helper
 
 Direct edit target: Delegate a required override to a helper or service that already owns the operation.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -170,7 +179,7 @@ implementations show the request/transport/handler pattern needed to complete it
 
 Direct edit target: Implement the required override by copying the established sibling protocol shape.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -190,7 +199,7 @@ operations
 
 Direct edit target: Separate collection-wrapper behavior from unsupported property-wrapper behavior.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -212,7 +221,7 @@ them, and a narrower closed-state guard or sentinel object can express the behav
 Direct edit target: Represent closed/sentinel behavior with a guard or sentinel object instead of inheriting
 runtime operations only to reject them.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -237,7 +246,7 @@ and wrapping should be modeled as a separate setup capability
 
 Direct edit target: Split setup/wrapping capability from executor runtime operations.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -256,7 +265,7 @@ nearby setter or update methods
 
 Direct edit target: Implement a refused getter from state already maintained by setters or update methods.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -275,7 +284,7 @@ interface, and packet direction can be represented by narrower inbound/outbound 
 
 Direct edit target: Split inbound parsing from outbound packet behavior.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -296,7 +305,7 @@ behavior
 Direct edit target: Replace incompatible formatter inheritance with composition or a narrower immutable
 formatting API.
 
-Source operation shape: `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

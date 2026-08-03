@@ -12,8 +12,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runtime" / "python"))
 
-from smell_core.java.semantic_detector import SemanticFinding, run_java_semantic_detector  # noqa: E402
-from smell_core.java.smell_guards import _find_matching_god_class_finding  # noqa: E402
+from smell_core.java.semantic_detector import (  # noqa: E402
+    GOD_CLASS_PROFILE_ID,
+    god_class_product_profile,
+    run_java_semantic_detector,
+)
 
 
 def _method(index: int, controls: int) -> str:
@@ -48,6 +51,19 @@ def main() -> int:
     assert _metric(evidence, "nom") == 10, evidence
     assert _metric(evidence, "wmc") == 20, evidence
     assert "signals=nom,loc" in evidence, evidence
+    profile = god_class_product_profile(
+        {name: _metric(evidence, name) for name in ("nom", "nof", "wmc", "loc", "atfd")}
+    )
+    assert profile["id"] == GOD_CLASS_PROFILE_ID, profile
+    assert profile["min_signals"] == 2, profile
+    assert profile["triggered_signals"] == ["nom", "loc"], profile
+    boundaries = {
+        item["name"]: item["boundary"]
+        for item in profile["signals"]
+        if "boundary" in item
+    }
+    assert boundaries == {"nom": 10, "wmc": 30, "loc": 100, "atfd": 3}, profile
+    assert profile["finding_present"] is True, profile
 
     # The previous runtime detector used method LOC as WMC and would report a
     # long class with trivial methods.  Dataset WMC is control-flow complexity,
@@ -61,31 +77,7 @@ def main() -> int:
     reduced = "class Candidate {\n" + "\n".join(_method(i, 4) for i in range(5)) + "\n}\n"
     assert _finding(reduced) == [], "reduced class must be below the dataset rule"
 
-    # A refactoring can move the original dataset line outside the class while
-    # leaving the same God Class in place. Missing class metadata must fail
-    # closed by choosing the nearest same-file finding instead of returning a
-    # false PASS solely because the stale line no longer overlaps the class.
-    shifted = SemanticFinding(
-        smell_type="god_class",
-        file="src/Candidate.java",
-        class_name="Candidate",
-        method="",
-        begin_line=1,
-        end_line=50,
-        score=1.0,
-        rule_id="god_class",
-        evidence="nom=20;wmc=80;loc=300;atfd=12;class=Candidate",
-    )
-    root = Path("/tmp/god-class-guard-root")
-    target_file = root / "src" / "Candidate.java"
-    assert _find_matching_god_class_finding(
-        [shifted], target_file=target_file, project_root=root, class_name="", line=100
-    ) == shifted
-    assert _find_matching_god_class_finding(
-        [shifted], target_file=target_file, project_root=root, class_name="Candidate", line=100
-    ) == shifted
-
-    print("god_class guard calibration self-check: PASS")
+    print("god_class target-Guard profile self-check: PASS")
     return 0
 
 

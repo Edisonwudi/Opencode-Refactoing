@@ -5,9 +5,24 @@
 Flatten the reported method by extracting named branches and using guard clauses where
 behavior allows it.
 
+## Complexity-deficit closure
+
+1. Re-anchor the frozen method and record its current target Guard complexity and passing
+   boundary. Rank nested branches, loops, catches, and boolean breaks by their contribution;
+   physical indentation alone is not the objective.
+2. Select the smallest behaviorally cohesive set of guard-clause and extraction steps whose
+   combined reduction is projected to put the frozen method below the boundary.
+3. Preserve branch effects, loop control, exceptions, resource cleanup, and state-write order
+   while completing that set. Do not verify after a cosmetic first extraction when the ledger
+   still projects the finding.
+4. If verification returns `IMPROVED`, use the current complexity and returned residual
+   deficit to choose the next hotspot. Do not rework an already flattened branch or switch to
+   an opaque compound condition.
+
 ## Common verification fit
 
-- The reported method should have shallower nesting or lower cognitive complexity.
+- The frozen method must fall below the target Guard complexity boundary. Lower complexity
+  while the same finding remains is `IMPROVED`, not PASS.
 - Cosmetic extraction without flattening the target method is not enough.
 
 ## Common avoid
@@ -44,7 +59,7 @@ remaining outer condition into a guard clause
 
 Direct edit target: Extract a valid branch, then invert the remaining outer condition into a guard clause.
 
-Source operation shape: `extract:method`, `idea_edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`, `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

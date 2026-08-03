@@ -24,13 +24,9 @@ RUNTIME_PYTHON = ROOT / "runtime" / "python"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.config import (  # noqa: E402
-    VERIFICATION_MODES,
-    select_dataset_test_command,
-)
 from smell_core.loop_policy import LoopPolicy, parse_command_policy  # noqa: E402
 from smell_core.location import split_location_descriptors  # noqa: E402
-from smell_core.java.data_clumps import data_clump_group_from_evidence  # noqa: E402
+from smell_core.target_context import parse_target_context_json  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
@@ -66,6 +62,8 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
         "status": "active",
     },
 }
+
+FINAL_VERIFICATION_MODES = {"sample_optimized", "project_full"}
 
 @dataclass(frozen=True)
 class Sample:
@@ -112,155 +110,14 @@ def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str
     return _run(["git", "-c", "safe.directory=*", *args], project_root)
 
 
-def _prepare_idea_service(project_root: Path, sample_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
-    cli = args.idea_refactor_cli or "idea-refactor"
-    proc = _run(
-        [
-            cli,
-            "ensure-service",
-            "--project-root",
-            str(project_root),
-            "--open",
-            "--timeout",
-            "120",
-            "--poll-interval",
-            "1",
-        ],
-        project_root,
-        timeout=180,
-    )
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        payload = {
-            "status": "failed",
-            "diagnostics": [{"code": "IDEA_PRECHECK_INVALID_JSON", "summary": proc.stderr or proc.stdout}],
-        }
-    payload["returncode"] = proc.returncode
-    payload["stderr"] = proc.stderr
-    (sample_dir / "idea-preflight.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
-    )
-    return payload
-
-
-def _close_idea_project(project_root: Path, sample_dir: Path, args: argparse.Namespace) -> None:
-    cli = args.idea_refactor_cli or "idea-refactor"
-    proc = _run(
-        [cli, "close-project", "--project-root", str(project_root)],
-        project_root,
-        timeout=60,
-    )
-    payload = {
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-    }
-    (sample_dir / "idea-close-project.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
-    )
-
-
 def _dataset_evidence(row: dict[str, str | None]) -> str:
-    """Carry stable dataset identity fields into detector evidence."""
-    evidence = str(row.get("evidence") or "").strip()
-    smell = str(row.get("smell_type") or "").strip()
-    class_name = str(row.get("class") or "").strip()
-    has_class = any(part.strip().lower().startswith("class=") for part in evidence.split(";"))
-    if smell == "god_class" and class_name and not has_class:
-        return f"{evidence};class={class_name}" if evidence else f"class={class_name}"
-    if smell == "refused_bequest" and str(row.get("group_occurrences") or "").strip():
-        try:
-            members = json.loads(str(row["group_occurrences"]))
-        except (json.JSONDecodeError, TypeError):
-            members = []
-        if isinstance(members, list) and members:
-            arities = [str(item.get("target_parameter_count", "")).strip() for item in members]
-            classes = [str(item.get("target_class", "")).strip() for item in members]
-            if all(arities):
-                evidence += "; target_parameter_counts=" + "|".join(arities)
-            if all(classes):
-                evidence += "; target_classes=" + "|".join(classes)
-    return evidence
+    """Preserve the dataset evidence verbatim as audit-only metadata."""
+    return str(row.get("evidence") or "").strip()
 
 
 def _dataset_target_context(row: dict[str, str | None]) -> dict[str, Any]:
-    """Translate oracle identity into selector-only runtime context.
-
-    This boundary deliberately admits no scores, thresholds, expected
-    structures, or refactoring routes. The product detector must independently
-    emit the selected finding.
-    """
-    smell = str(row.get("smell_type") or "").strip()
-    evidence = str(row.get("evidence") or "")
-    if smell == "data_clumps":
-        group = data_clump_group_from_evidence(evidence)
-        return {"group": group} if group else {}
-    if smell == "mysterious_name":
-        for field, kind in (
-            ("method", "method"),
-            ("param", "param"),
-            ("local", "local"),
-            ("name", ""),
-        ):
-            match = re.search(
-                rf"(?:^|;\s*){field}=([^;]+)",
-                evidence,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                continue
-            context: dict[str, Any] = {"symbol_name": match.group(1).strip()}
-            if kind:
-                context["symbol_kind"] = kind
-            return context
-    return {}
-
-
-def _dataset_location(row: dict[str, str | None]) -> str:
-    """Promote reviewed method anchors into the runtime location.
-
-    These four metrics are method-scoped. Their reviewed occurrence contains
-    the stable method identity that the guard needs after line drift.
-    Mysterious-name and feature-envy rows intentionally keep their dedicated
-    identifier/receiver anchors.
-    """
-    location = str(row.get("location") or "").strip()
-    if ":method=" in location or ":class=" in location:
-        return location
-    smell = str(row.get("smell_type") or "").strip()
-    method_scoped_smells = {
-        "long_method",
-        "long_parameter_list",
-        "nested_complexity",
-        "switch_statements",
-    }
-    if smell not in method_scoped_smells:
-        return location
-    raw_occurrences = str(row.get("group_occurrences") or "").strip()
-    if not raw_occurrences:
-        return location
-    try:
-        occurrence = json.loads(raw_occurrences)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(f"{smell} group_occurrences is not valid JSON") from exc
-    if not isinstance(occurrence, dict):
-        raise ValueError(f"{smell} group_occurrences must be a JSON object")
-    method = str(occurrence.get("method") or "").strip()
-    file_name = str(occurrence.get("file") or "").strip()
-    begin_line = str(occurrence.get("begin_line") or "").strip()
-    if not method or not file_name:
-        raise ValueError(f"{smell} group_occurrences must declare file and method")
-    location_file = location.rsplit(":", 1)[0].strip()
-    if location_file != file_name:
-        raise ValueError(
-            "group_occurrences file does not match location: "
-            f"{file_name!r} != {location_file!r}"
-        )
-    if begin_line and not begin_line.isdigit():
-        raise ValueError(f"group_occurrences begin_line is not numeric: {begin_line!r}")
-    line_suffix = f"|line={begin_line}" if begin_line else ""
-    return f"{file_name}:method={method}{line_suffix}"
+    """Load explicit selector identity without consulting oracle evidence."""
+    return parse_target_context_json(row.get("target_context_json"))
 
 
 def _load_samples(dataset: Path) -> list[Sample]:
@@ -272,24 +129,32 @@ def _load_samples(dataset: Path) -> list[Sample]:
             raise ValueError(f"{dataset} is missing columns: {', '.join(sorted(missing))}")
         samples: list[Sample] = []
         for row in reader:
-            verification_mode = str(row.get("verification_mode") or "")
+            smell = str(row["smell_type"] or "").strip()
+            location = str(row["location"] or "").strip()
+            if smell in {
+                "long_method",
+                "long_parameter_list",
+                "nested_complexity",
+                "switch_statements",
+            } and ":method=" not in location:
+                raise ValueError(
+                    f"{smell} dataset location must contain an explicit method selector: "
+                    f"{location!r}"
+                )
+            verification_mode = str(row.get("verification_mode") or "").strip()
             samples.append(
                 Sample(
                     sample_id=str(row["sample_id"]),
                     language=str(row["language"] or "java"),
-                    smell=str(row["smell_type"]),
+                    smell=smell,
                     project_name=str(row["project_name"]),
                     project_root=Path(row["project_path"]).expanduser().resolve(),
-                    location=_dataset_location(row),
+                    location=location,
                     evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
                     target_context=_dataset_target_context(row),
-                    test_location=str(row.get("test_location") or row.get("test_file") or ""),
-                    test_command=select_dataset_test_command(
-                        verification_mode=verification_mode,
-                        test_command=row.get("test_command"),
-                        focused_test_command=row.get("focused_test_command"),
-                    ),
+                    test_location=str(row.get("test_file") or "").strip(),
+                    test_command=str(row.get("test_command") or "").strip(),
                     verification_mode=verification_mode,
                 )
             )
@@ -316,29 +181,36 @@ def _filter_samples(samples: list[Sample], args: argparse.Namespace) -> list[Sam
 
 
 def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> str:
-    cli_mode = str(args.verification_mode or "auto").strip() or "auto"
-    sample_mode = str(sample.verification_mode or "").strip()
-    requested = "local" if cli_mode == "local" else (sample_mode or cli_mode)
-    if requested == "auto":
-        requested = (
-            "sample_optimized"
-            if sample.test_command.strip() and sample.test_location.strip()
-            else "project_full"
+    cli_mode = str(args.verification_mode or "project_full").strip() or "project_full"
+    if cli_mode not in FINAL_VERIFICATION_MODES:
+        raise ValueError(
+            f"Unsupported verification mode '{cli_mode}'. Expected one of: "
+            f"{', '.join(sorted(FINAL_VERIFICATION_MODES))}."
         )
+    sample_mode = str(sample.verification_mode or "").strip()
+    requested = sample_mode or cli_mode
+    # Once tests may change, a sample-only command can be edited together with
+    # the implementation and is no longer an independent behavior oracle.
+    # Use the project's complete frozen test command for every such task,
+    # regardless of the dataset row's ordinary optimization hint.
+    if getattr(args, "allow_test_changes", False):
+        requested = "project_full"
     if requested == "sample_optimized" and not sample.test_location.strip():
         raise ValueError(
             "SAMPLE_ORACLE_TEST_FILE_MISSING: sample_optimized verification requires "
             f"sample {sample.sample_id} to declare test_file"
         )
-    if requested not in VERIFICATION_MODES:
+    if requested == "sample_optimized" and not sample.test_command.strip():
         raise ValueError(
-            f"Unsupported verification mode '{requested}'. Expected one of: {', '.join(sorted(VERIFICATION_MODES))}."
+            "SAMPLE_ORACLE_TEST_COMMAND_MISSING: sample_optimized verification requires "
+            f"sample {sample.sample_id} to declare test_command"
+        )
+    if requested not in FINAL_VERIFICATION_MODES:
+        raise ValueError(
+            f"Unsupported verification mode '{requested}'. Expected one of: "
+            f"{', '.join(sorted(FINAL_VERIFICATION_MODES))}."
         )
     return requested
-
-
-def _strict_mode(mode: str) -> bool:
-    return mode != "local"
 
 
 def _sanitize(value: str) -> str:
@@ -738,22 +610,23 @@ def _failure_category_from_verify_payload(payload: dict[str, Any]) -> str:
 
 
 def _compute_status(opencode_returncode: int, verify_returncode: int, verify_payload: dict[str, Any]) -> str:
-    """Compute the sample status from the opencode/verify return codes and payload.
+    """Return the one authoritative status produced by the final bridge verify.
 
-    Mirrors the original _run_sample status logic. Extracted as a pure function
-    so the retry loop and self-tests can call it without running subprocesses.
+    The model process return code remains execution metadata. In particular, a
+    model timeout must not create a second PASS status when the final verifier
+    can independently accept the worktree.
     """
     verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
-    verify_success = bool(verify_payload.get("success")) if isinstance(verify_payload, dict) else False
-    if opencode_returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE:
-        return "PROVIDER_QUOTA_FAILED"
-    if opencode_returncode != 0:
-        if opencode_returncode == 124 and verify_returncode == 0 and verify_success and verify_status == "PASS":
-            return "PASS_AFTER_OPENCODE_TIMEOUT"
-        if opencode_returncode == 124 and verify_status == "IMPROVED":
-            return "IMPROVED"
-        return "OPENCODE_FAILED"
-    return verify_status if verify_returncode == 0 else (verify_status or "VERIFY_FAILED")
+    if verify_status == "PASS":
+        if (
+            verify_returncode == 0
+            and verify_payload.get("resolution") == "resolved"
+            and verify_payload.get("success") is True
+            and verify_payload.get("accepted") is True
+        ):
+            return "PASS"
+        return "VERIFY_FAILED"
+    return verify_status or "VERIFY_FAILED"
 
 
 OPENCODE_SHUTDOWN_GRACE_SECONDS = 60
@@ -781,7 +654,7 @@ def _opencode_timeout_seconds(sample_deadline: int) -> int:
 
 
 def _is_accepted_status(status: object) -> bool:
-    return status in {"PASS", "PASS_AFTER_OPENCODE_TIMEOUT"}
+    return status == "PASS"
 
 
 def _attempt_artifact_path(sample_dir: Path, name: str, attempt_suffix: str) -> Path:
@@ -793,9 +666,7 @@ def _task_prompt(
     sample: Sample,
     args: argparse.Namespace,
     verification_mode: str,
-    agent: str,
 ) -> str:
-    idea_enabled = agent == "java-refactor-agent-idea"
     target_count = len(split_location_descriptors(sample.location))
     lines = [
         f"Project root: {sample.project_root}",
@@ -803,16 +674,16 @@ def _task_prompt(
         f"Smell type: {sample.smell}",
         f"Target location: {sample.location}",
     ]
-    if sample.evidence:
-        lines.append(f"Smell evidence: {sample.evidence}")
     lines.extend(
         [
             f"Verification mode: {verification_mode}",
-            f"IDEA preference: {'enabled' if idea_enabled else 'disabled'}",
+            (
+                "Test changes: explicitly allowed; all changed test files are SHA-audited and the frozen build/test contract remains mandatory."
+                if getattr(args, "allow_test_changes", False)
+                else "Test changes: forbidden for this dataset run."
+            ),
         ]
     )
-    if idea_enabled and args.idea_refactor_cli:
-        lines.extend([f"IDEA project root: {sample.project_root}", f"IDEA refactor CLI: {args.idea_refactor_cli}"])
     lines.append("")
     if target_count > 1:
         lines.append(
@@ -836,8 +707,12 @@ def _command_arguments(task: str, args: argparse.Namespace, verification_mode: s
         f"--loop-no-progress-limit={args.loop_no_progress_limit}",
         f"--loop-on={args.loop_on}",
         f"--sample-deadline={args.sample_deadline}",
-        f"--loop-instruction={args.loop_instruction}",
     ]
+    if getattr(args, "allow_test_changes", False):
+        options.append("--allow-test-changes")
+    # The shared command parser intentionally consumes the free-form
+    # instruction as the final option, so no controller flag may follow it.
+    options.append(f"--loop-instruction={args.loop_instruction}")
     return " ".join(options) + " -- " + task
 
 
@@ -865,17 +740,110 @@ def _persist_verify_payload(
     _copy_verify_artifacts(sample_dir, verify_payload, attempt_suffix)
 
 
+def _baseline_failure_status(returncode: int, payload: dict[str, Any]) -> str:
+    """Return the precise setup status for a failed explicit c000 capture."""
+    if (
+        returncode == 0
+        and payload.get("success") is True
+        and payload.get("status") == "BASELINE_CAPTURED"
+    ):
+        return ""
+    detail = str(payload.get("error") or payload.get("status") or "").strip()
+    known = (
+        "BASELINE_FINDING_NOT_FOUND",
+        "TARGET_AMBIGUOUS",
+        "DETECTOR_PROFILE_MISMATCH",
+        "CHECKPOINT_RECAPTURE_REQUIRED",
+        "CHECKPOINT_POLICY_MISMATCH",
+        "CHECKPOINT_BASELINE_IDENTITY_MISMATCH",
+        "CHECKPOINT_BASELINE_CAPTURE_FAILED",
+        "CHECKPOINT_NOT_SUPPORTED",
+    )
+    for status in known:
+        if status in detail:
+            return status
+    return "BASELINE_CAPTURE_FAILED"
+
+
+def _run_capture_baseline(
+    sample: Sample,
+    sample_dir: Path,
+    args: argparse.Namespace,
+    verification_mode: str,
+) -> tuple[int, dict[str, Any]]:
+    """Freeze the Java product finding before the model can edit the checkout."""
+    cmd = [
+        sys.executable,
+        str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"),
+        "capture-baseline",
+        "--output-detail",
+        "decision",
+        "--project-root",
+        str(sample.project_root),
+        "--smell",
+        sample.smell,
+        "--location",
+        sample.location,
+        "--language",
+        sample.language,
+        "--verification-mode",
+        verification_mode,
+    ]
+    canonical = sample.canonical_project_root
+    if canonical and canonical != sample.project_root:
+        cmd.extend(["--project-override-root", str(canonical)])
+    if args.projects:
+        cmd.extend(["--projects", args.projects])
+    if sample.target_context:
+        cmd.extend([
+            "--target-context-json",
+            json.dumps(sample.target_context, separators=(",", ":"), sort_keys=True),
+        ])
+    if sample.test_location:
+        cmd.extend(["--sample-test-location", sample.test_location])
+    if sample.test_command:
+        cmd.extend(["--sample-test-command", sample.test_command])
+    if getattr(args, "allow_test_changes", False):
+        cmd.append("--allow-test-changes")
+
+    env = os.environ.copy()
+    env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
+    proc = _run(cmd, ROOT, env=env, timeout=args.sample_deadline)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        payload = {
+            "success": False,
+            "error": "BASELINE_OUTPUT_PARSE_FAILED",
+            "stdout": proc.stdout,
+        }
+    artifact = {
+        "returncode": proc.returncode,
+        "command": cmd,
+        "payload": payload,
+        "stderr": proc.stderr,
+    }
+    (sample_dir / "baseline-capture.json").write_text(
+        json.dumps(artifact, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    return proc.returncode, payload
+
+
 def _run_verify(
     sample: Sample,
     sample_dir: Path,
     args: argparse.Namespace,
     verification_mode: str,
     attempt_suffix: str = "",
+    baseline_seal: str = "",
 ) -> tuple[int, dict[str, Any]]:
     cmd = [
         sys.executable,
         str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"),
         "verify",
+        "--output-detail",
+        "decision",
         "--project-root",
         str(sample.project_root),
         "--smell",
@@ -894,8 +862,6 @@ def _run_verify(
         cmd.extend(["--project-override-root", str(canonical)])
     if args.projects:
         cmd.extend(["--projects", args.projects])
-    if sample.evidence:
-        cmd.extend(["--smell-evidence", sample.evidence])
     if sample.target_context:
         cmd.extend([
             "--target-context-json",
@@ -905,12 +871,12 @@ def _run_verify(
         cmd.extend(["--sample-test-location", sample.test_location])
     if sample.test_command:
         cmd.extend(["--sample-test-command", sample.test_command])
+    if baseline_seal:
+        cmd.extend(["--baseline-seal", baseline_seal])
 
     env = os.environ.copy()
-    if _strict_mode(verification_mode):
-        env["SMELL_REQUIRE_BUILD_TEST"] = "1"
-    else:
-        env.pop("SMELL_REQUIRE_BUILD_TEST", None)
+    env["SMELL_REQUIRE_BUILD_TEST"] = "1"
+    env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
     proc = _run(cmd, ROOT, env=env, timeout=args.sample_deadline)
     payload: dict[str, Any]
     try:
@@ -1046,34 +1012,28 @@ def _runner_closure_action(
     return "stop"
 
 
-def _reusable_verify_payload(
-    trace: dict[str, Any],
+def _runner_continuation_prompt(
+    action: str,
+    continuation: int,
+    max_continuations: int,
+    instruction: str,
     *,
-    opencode_returncode: int,
-) -> dict[str, Any] | None:
-    """Reuse the command's final authoritative verify when no later tool ran."""
-    if opencode_returncode != 0:
-        return None
-    payload = trace.get("last_payload")
-    if not isinstance(payload, dict):
-        return None
-    if not isinstance(payload.get("success"), bool):
-        return None
-    if not str(payload.get("status") or "").strip():
-        return None
-    if int(trace.get("tools_after_last_verify") or 0) != 0:
-        return None
-    return payload
-
-
-def _runner_continuation_prompt(action: str, continuation: int, max_continuations: int, instruction: str) -> str:
+    allow_test_changes: bool = False,
+) -> str:
+    test_policy = (
+        "Necessary test API migrations are allowed, but do not weaken or remove assertions; "
+        "the full project build/test contract must still pass."
+        if allow_test_changes
+        else "Do not modify or weaken tests."
+    )
     if action == "verify_required":
         return "\n".join(
             [
                 "[runner-verification-closure verify-required]",
                 "The previous turn ended without a completed smell_verify call.",
                 "Call smell_verify now on the current production-code changes.",
-                "Treat its loop.decision as authoritative and do not modify or weaken tests.",
+                "Treat its loop.decision as authoritative.",
+                test_policy,
             ]
         )
     return "\n".join(
@@ -1083,7 +1043,7 @@ def _runner_continuation_prompt(action: str, continuation: int, max_continuation
             instruction,
             "Continue the same task in this session, then call smell_verify again.",
             "Use the latest failure pack and remaining-occurrence evidence as the repair scope.",
-            "Do not modify or weaken tests.",
+            test_policy,
         ]
     )
 
@@ -1094,7 +1054,6 @@ def _opencode_run_command(args: argparse.Namespace, agent: str, session_id: str 
         cmd.extend(["--session", session_id])
     else:
         command = {
-            "java-refactor-agent-idea": "java-refactor-run-idea",
             "java-refactor-agent": "java-refactor-run",
             "smell-refactor-agent": "smell-refactor-run",
         }[agent]
@@ -1113,7 +1072,7 @@ def _select_agent(sample: Sample, args: argparse.Namespace) -> str:
     if args.agent:
         return args.agent
     if sample.language == "java":
-        return "java-refactor-agent-idea" if args.idea else "java-refactor-agent"
+        return "java-refactor-agent"
     return "smell-refactor-agent"
 
 
@@ -1129,10 +1088,11 @@ def _run_opencode(
     command_loop_state: dict[str, Any] | None = None,
     attempt_suffix: str = "",
     hard_timeout_seconds: int | None = None,
+    baseline_seal: str = "",
 ) -> tuple[int, str]:
     """Run one initial or same-session OpenCode turn."""
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
-    task = _task_prompt(sample, args, verification_mode, agent)
+    task = _task_prompt(sample, args, verification_mode)
     command_arguments = _command_arguments(task, args, verification_mode)
     stdin_payload = continuation_prompt if session_id else command_arguments
     task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
@@ -1152,8 +1112,6 @@ def _run_opencode(
         )
     else:
         env.pop("SMELL_COMMAND_LOOP_STATE_JSON", None)
-    if agent == "java-refactor-agent-idea":
-        env["SMELL_IDEA_PREPARED"] = "1"
     env["SMELL_BRIDGE_FILE"] = str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py")
     env["SMELL_PROJECT_ROOT"] = str(sample.project_root)
     if sample.canonical_project_root:
@@ -1161,7 +1119,7 @@ def _run_opencode(
     env["SMELL_LANGUAGE"] = sample.language
     env["SMELL_SMELL"] = sample.smell
     env["SMELL_LOCATION"] = sample.location
-    env["SMELL_EVIDENCE"] = sample.evidence
+    env.pop("SMELL_EVIDENCE", None)
     if sample.target_context:
         env["SMELL_TARGET_CONTEXT_JSON"] = json.dumps(
             sample.target_context, separators=(",", ":"), sort_keys=True
@@ -1171,20 +1129,19 @@ def _run_opencode(
     env["SMELL_VERIFICATION_MODE"] = verification_mode
     env["SMELL_SAMPLE_TEST_LOCATION"] = sample.test_location
     env["SMELL_SAMPLE_TEST_COMMAND"] = sample.test_command
-    # Keep the command-owned authoritative verify bundle inside this sample.
-    # The runner can then persist the final tool payload without rerunning the
-    # same guard/build/test sequence merely to obtain durable artifacts.
+    env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
+    if baseline_seal:
+        env["SMELL_BASELINE_SEAL"] = baseline_seal
+    else:
+        env.pop("SMELL_BASELINE_SEAL", None)
+    # Agent-triggered verifies are loop feedback. The runner performs a fresh
+    # final bridge verify after the model process exits.
     agent_artifact_root = sample_dir / "agent-artifacts"
     agent_artifact_root.mkdir(parents=True, exist_ok=True)
     env["SMELL_ARTIFACT_ROOT"] = str(agent_artifact_root)
     if args.projects:
         env["SMELL_PROJECTS"] = args.projects
-    if args.idea_refactor_cli:
-        env["SMELL_IDEA_REFACTOR_CLI"] = args.idea_refactor_cli
-    if _strict_mode(verification_mode):
-        env["SMELL_REQUIRE_BUILD_TEST"] = "1"
-    else:
-        env.pop("SMELL_REQUIRE_BUILD_TEST", None)
+    env["SMELL_REQUIRE_BUILD_TEST"] = "1"
 
     # --format json: raw JSON events on stdout (for session-id parsing).
     # --print-logs: human-readable logs on stderr (written to run.log).
@@ -1206,7 +1163,7 @@ def _run_opencode(
             "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_timeout_seconds": args.sample_deadline,
-            "final_verify_mode": "reuse_agent_tool_or_runner_fallback",
+            "final_verify_mode": "runner_final",
             "idle_watchdog_enabled": False,
         },
     }
@@ -1332,6 +1289,8 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         "progress",
         "termination_reason",
         "opencode_returncode",
+        "opencode_timed_out",
+        "opencode_failure_category",
         "verify_returncode",
         "duration_seconds",
         "sample_dir",
@@ -1421,6 +1380,10 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
 
 def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
+    dataset_audit = {
+        "evidence": sample.evidence,
+        "target_context": sample.target_context,
+    }
     sample_dir = run_dir / "samples" / f"sample-{_sanitize(sample.sample_id)}-{_sanitize(sample.project_name)}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     # Clean any stale opencode-home from a previous run of the same sample to
@@ -1430,10 +1393,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     if stale_home.exists():
         shutil.rmtree(stale_home, ignore_errors=True)
     agent = _select_agent(sample, args)
-    if sample.language != "java" and agent == "java-refactor-agent-idea":
-        raise ValueError(
-            f"IDEA_UNSUPPORTED_LANGUAGE: IDEA execution is Java-only; got {sample.language}"
-        )
     verification_mode = _effective_verification_mode(sample, args)
 
     # One isolated checkout is used for the complete command-owned native loop.
@@ -1504,7 +1463,12 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             "sample_dir": str(sample_dir),
             "note": f"project_revision_error: {exc.status}: {exc.message}",
         }
-        result_summary = {**row, "attempts": [], "revision_audit": revision_audit}
+        result_summary = {
+            **row,
+            "attempts": [],
+            "revision_audit": revision_audit,
+            "dataset_audit": dataset_audit,
+        }
         (sample_dir / "result.json").write_text(
             json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
         )
@@ -1514,9 +1478,25 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
 
-    if agent == "java-refactor-agent-idea":
-        idea_preflight = _prepare_idea_service(execution_sample.project_root, sample_dir, args)
-        if idea_preflight.get("status") != "ok" or idea_preflight.get("returncode") != 0:
+    baseline_capture: dict[str, Any] | None = None
+    baseline_seal = ""
+    if execution_sample.language == "java":
+        baseline_returncode, baseline_capture = _run_capture_baseline(
+            execution_sample,
+            sample_dir,
+            args,
+            verification_mode,
+        )
+        baseline_status = _baseline_failure_status(
+            baseline_returncode,
+            baseline_capture,
+        )
+        if baseline_status:
+            baseline_error = str(
+                baseline_capture.get("error")
+                or baseline_capture.get("status")
+                or "baseline capture failed"
+            )
             row = {
                 "sample_id": sample.sample_id,
                 "smell": sample.smell,
@@ -1526,15 +1506,51 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "location": execution_sample.location,
                 "verification_mode": verification_mode,
                 "agent": agent,
-                "status": "IDEA_PRECHECK_FAILED",
+                "status": baseline_status,
                 "opencode_returncode": -1,
                 "verify_returncode": -1,
                 "duration_seconds": f"{time.time() - started:.1f}",
                 "sample_dir": str(sample_dir),
-                "note": "IDEA service did not become ready; see idea-preflight.json",
+                "note": f"baseline_capture_failed: {baseline_error}",
             }
             (sample_dir / "result.json").write_text(
-                json.dumps({**row, "attempts": [], "revision_audit": revision_audit}, indent=2) + "\n",
+                json.dumps(
+                    {
+                        **row,
+                        "attempts": [],
+                        "controller_attempts": [],
+                        "revision_audit": revision_audit,
+                        "dataset_audit": dataset_audit,
+                        "baseline_capture": baseline_capture,
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return row
+        baseline_seal = str(baseline_capture.get("baseline_seal") or "").strip()
+        if not baseline_seal:
+            row = {
+                "sample_id": sample.sample_id,
+                "smell": sample.smell,
+                "project_name": sample.project_name,
+                "project_root": str(sample.project_root),
+                "execution_project_root": str(execution_sample.project_root),
+                "location": execution_sample.location,
+                "verification_mode": verification_mode,
+                "agent": agent,
+                "status": "BASELINE_SEAL_MISSING",
+                "opencode_returncode": -1,
+                "verify_returncode": -1,
+                "duration_seconds": f"{time.time() - started:.1f}",
+                "sample_dir": str(sample_dir),
+                "note": "baseline_capture_failed: controller baseline seal missing",
+            }
+            (sample_dir / "result.json").write_text(
+                json.dumps({**row, "attempts": [], "baseline_capture": baseline_capture}, indent=2)
+                + "\n",
                 encoding="utf-8",
             )
             return row
@@ -1556,7 +1572,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     reminder_used = False
     attempt_index = 0
     opencode_returncode = 0
-    final_trace: dict[str, Any] = {}
     while True:
         remaining = int(model_deadline - time.monotonic())
         if remaining <= 0:
@@ -1574,6 +1589,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             command_loop_state=command_loop_state,
             attempt_suffix=attempt_suffix,
             hard_timeout_seconds=remaining,
+            baseline_seal=baseline_seal,
         )
         if detected_session_id:
             session_id = detected_session_id
@@ -1582,7 +1598,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             trace = _verification_trace(events_path.read_text(encoding="utf-8"))
         except OSError:
             trace = _verification_trace("")
-        final_trace = trace
         trace_summary = {
             key: value
             for key, value in trace.items()
@@ -1621,45 +1636,27 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             continuations_dispatched,
             args.loop_max,
             args.loop_instruction,
+            allow_test_changes=bool(getattr(args, "allow_test_changes", False)),
         )
         attempt_index += 1
 
-    reusable_verify = _reusable_verify_payload(
-        final_trace,
-        opencode_returncode=opencode_returncode,
+    verify_returncode, verify_payload = _run_verify(
+        execution_sample,
+        sample_dir,
+        args,
+        verification_mode,
+        baseline_seal=baseline_seal,
     )
-    if reusable_verify is not None:
-        verify_payload = reusable_verify
-        verify_returncode = 0 if verify_payload.get("success") is True else 1
-        final_verify_source = "agent_tool"
-        _persist_verify_payload(sample_dir, verify_payload)
-    else:
-        verify_returncode, verify_payload = _run_verify(
-            execution_sample, sample_dir, args, verification_mode
+    final_verify_source = "runner_final"
+    opencode_failure_category = (
+        "PROVIDER_QUOTA_FAILED"
+        if opencode_returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE
+        else (
+            "OPENCODE_TIMEOUT"
+            if opencode_returncode == 124
+            else ("OPENCODE_FAILED" if opencode_returncode else "")
         )
-        final_verify_source = "runner_fallback"
-    try:
-        post_oracle_audit = verify_test_oracle(
-            execution_sample.project_root,
-            execution_sample.test_location,
-            sample.raw.get("test_oracle_sha256", ""),
-        )
-        revision_audit["post_refactor_test_oracle"] = post_oracle_audit
-    except ProjectRevisionError as exc:
-        revision_audit["post_refactor_test_oracle"] = {
-            "test_oracle_alignment": exc.status,
-            **{str(key): str(value) for key, value in exc.extra.items()},
-        }
-        verify_payload = {
-            "success": False,
-            "status": exc.status,
-            "message": exc.message,
-            "prior_verify": verify_payload,
-        }
-        verify_returncode = 1
-        final_verify_source = "post_oracle"
-    if agent == "java-refactor-agent-idea":
-        _close_idea_project(execution_sample.project_root, sample_dir, args)
+    )
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
     resolution = str(verify_payload.get("resolution") or "")
     accepted = _is_accepted_status(final_status)
@@ -1680,12 +1677,15 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "verify_source": final_verify_source,
         "session_id": session_id,
         "is_continuation": attempt_index > 0,
+        "opencode_timed_out": opencode_returncode == 124,
+        "opencode_failure_category": opencode_failure_category,
     }
     attempts = [last]
     note = (
         f"loop_policy={args.loop_mode}:{args.loop_max};"
         f"runner_continuations={continuations_dispatched};"
         f"verify_reminders={reminders_dispatched};"
+        f"opencode_timed_out={str(opencode_returncode == 124).lower()};"
         f"final_verify_source={final_verify_source}"
     )
 
@@ -1697,6 +1697,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "execution_project_root": str(execution_sample.project_root),
         "location": execution_sample.location,
         "verification_mode": verification_mode,
+        "allow_test_changes": bool(getattr(args, "allow_test_changes", False)),
         "agent": agent,
         "status": final_status,
         "resolution": resolution,
@@ -1704,6 +1705,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "progress": progress,
         "termination_reason": termination_reason,
         "opencode_returncode": last["opencode_returncode"],
+        "opencode_timed_out": opencode_returncode == 124,
+        "opencode_failure_category": opencode_failure_category,
         "verify_returncode": last["verify_returncode"],
         "duration_seconds": f"{time.time() - started:.1f}",
         "sample_dir": str(sample_dir),
@@ -1714,6 +1717,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "attempts": attempts,
         "controller_attempts": controller_attempts,
         "revision_audit": revision_audit,
+        "dataset_audit": dataset_audit,
+        "baseline_capture": baseline_capture,
     }
     (sample_dir / "result.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return row
@@ -1745,20 +1750,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-deadline",
         type=int,
         default=1800,
-        help="Single per-phase time budget for the command loop and any required runner fallback verify; "
+        help="Single per-phase time budget for the command loop and the required final bridge verify; "
         "the runner adds only a 60-second OpenCode shutdown grace.",
     )
-    parser.add_argument("--verification-mode", choices=sorted(VERIFICATION_MODES), default="auto")
+    parser.add_argument(
+        "--verification-mode",
+        choices=sorted(FINAL_VERIFICATION_MODES),
+        default="project_full",
+    )
+    parser.add_argument(
+        "--allow-test-changes",
+        action="store_true",
+        help="Explicitly allow model edits under test-source roots. The controller still freezes verification configuration and requires the full build/test contract.",
+    )
     parser.add_argument(
         "--agent",
-        choices=["smell-refactor-agent", "java-refactor-agent", "java-refactor-agent-idea"],
+        choices=["smell-refactor-agent", "java-refactor-agent"],
         default="",
     )
-    idea_group = parser.add_mutually_exclusive_group()
-    idea_group.add_argument("--idea", action="store_true", help="Use java-refactor-agent-idea for Java samples.")
-    idea_group.add_argument("--no-idea", dest="idea", action="store_false", help="Use direct editing without IDEA (required for C, C++, and Python).")
-    parser.set_defaults(idea=False)
-    parser.add_argument("--idea-refactor-cli", default=os.environ.get("IDEA_REFACTOR_CLI", ""))
     parser.add_argument("--no-worktree", dest="worktree", action="store_false", help="Mutate project_path directly. Default is one isolated Git checkout per sample.")
     parser.set_defaults(worktree=True)
     parser.add_argument("--dry-run", action="store_true")
@@ -1781,19 +1790,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # The runner owns normalization of dataset/CLI optimization hints. Once
+    # test migration is enabled, only the complete project verification
+    # contract is an independent behavior gate.
+    if args.allow_test_changes:
+        args.verification_mode = "project_full"
     # Validate the runner flags through the same parser used by the OpenCode
     # command hook, so batch and direct command invocations cannot drift.
     parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
     dataset = Path(args.dataset).expanduser().resolve()
     samples = _filter_samples(_load_samples(dataset), args)
-    if (args.idea or args.agent == "java-refactor-agent-idea") and any(
-        sample.language != "java" for sample in samples
-    ):
-        languages = ", ".join(sorted({sample.language for sample in samples if sample.language != "java"}))
-        parser.error(
-            "IDEA_UNSUPPORTED_LANGUAGE: --idea/java-refactor-agent-idea is Java-only; "
-            f"selected non-Java language(s): {languages}. Use --no-idea."
-        )
     try:
         _validate_model_auth(args)
     except ValueError as exc:
@@ -1818,7 +1824,7 @@ def main(argv: list[str] | None = None) -> int:
             "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_timeout_seconds": args.sample_deadline,
-            "final_verify_mode": "reuse_agent_tool_or_runner_fallback",
+            "final_verify_mode": "runner_final",
             "idle_watchdog_enabled": False,
         },
         "dry_run": args.dry_run,
@@ -1862,11 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
                 "execution_project_root": "",
                 "location": sample.location,
                 "verification_mode": args.verification_mode,
-                "agent": args.agent or (
-                    ("java-refactor-agent-idea" if args.idea else "java-refactor-agent")
-                    if samples and all(sample.language == "java" for sample in samples)
-                    else "smell-refactor-agent"
-                ),
+                "agent": _select_agent(sample, args),
                 "status": "RUNNER_FAILED",
                 "opencode_returncode": "",
                 "verify_returncode": "",

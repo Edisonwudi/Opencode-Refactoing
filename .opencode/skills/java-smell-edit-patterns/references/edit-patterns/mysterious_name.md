@@ -4,10 +4,25 @@
 
 Rename the reported low-information identifier at the correct Java scope.
 
+## Symbol-closure protocol
+
+1. Re-anchor the frozen symbol by kind, owner, and scope after line drift. Do not select a
+   same-spelled declaration in a neighboring scope.
+2. Build the complete reference closure before editing: declaration and lexical uses for a
+   local/parameter; callers, method references, overload/override declarations, and `super`
+   calls for a method; constructors, file name, imports, and type references for a class.
+3. Choose one meaningful name from behavior and project vocabulary, then migrate the complete
+   production closure in one pass. Update policy-permitted test references only as API
+   migration; do not change assertions or expected behavior.
+4. Search for the old symbol in its frozen scope before `smell_verify`. If the target Guard still
+   returns the finding or compilation returns missed references, use that complete residual
+   set as the next exact worklist instead of renaming another nearby symbol.
+
 ## Common verification fit
 
 - The exact reported identifier should be renamed at its declaration scope.
 - Method, type, and parameter renames require reference updates.
+- A rename elsewhere is no progress, and a partially migrated symbol closure is not PASS.
 
 ## Common avoid
 

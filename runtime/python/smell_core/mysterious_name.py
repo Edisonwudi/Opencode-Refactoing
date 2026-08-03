@@ -2,8 +2,8 @@
 
 Ports the Java heuristics (``java/syntactic_detector.py``) onto the
 tree-sitter facilities in ``analysis.py``.  Findings keep the strict
-``kind=...; name=...; reason=...; len=N`` evidence format so the shared
-``parse_mysterious_evidence`` can read them unchanged.
+``kind=...; name=...; reason=...; len=N`` diagnostic format. Java product
+selection uses typed finding fields and never parses this text as an input.
 """
 from __future__ import annotations
 

@@ -168,7 +168,7 @@ async function runDatasetSmokeSelfCheck(options) {
         "--model",
         options.model,
         "--verification-mode",
-        "local",
+        "project_full",
         "--runs-root",
         runsRoot,
         "--dry-run",
@@ -223,9 +223,23 @@ async function makeFixtureProject() {
     ].join("\n"),
     "utf8",
   )
+  await writeFile(
+    path.join(fixtureRoot, "projects.yaml"),
+    [
+      "projects:",
+      `- root: ${JSON.stringify(fixtureRoot)}`,
+      "  language: java",
+      "  build:",
+      "    command: \"true\"",
+      "  test:",
+      "    command: \"true\"",
+      "",
+    ].join("\n"),
+    "utf8",
+  )
   for (const args of [
     ["init", "-q"],
-    ["add", "src/main/java/SelfCheckSample.java"],
+    ["add", "src/main/java/SelfCheckSample.java", "projects.yaml"],
     ["-c", "user.name=smell-self-check", "-c", "user.email=self-check@example.invalid", "commit", "-qm", "baseline"],
   ]) {
     const result = await run("git", args, { cwd: fixtureRoot })
@@ -250,8 +264,10 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
     "long_method",
     "--location",
     "src/main/java/SelfCheckSample.java:2",
+    "--projects",
+    path.join(fixtureRoot, "projects.yaml"),
     "--verification-mode",
-    "local",
+    "project_full",
   ]
   const baseline = await run(
     "python3",
@@ -260,6 +276,16 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
   )
   if (baseline.exitCode !== 0) {
     throw new SelfCheckError("bridge_capture_baseline", "Unable to capture fixture baseline.", baseline)
+  }
+  const baselineSeal = String(
+    parseJson("bridge_capture_baseline", baseline.stdout).baseline_seal || "",
+  )
+  if (!baselineSeal) {
+    throw new SelfCheckError(
+      "bridge_capture_baseline",
+      "Fixture baseline did not return its controller seal.",
+      baseline,
+    )
   }
   await writeFile(
     sourceFile,
@@ -277,6 +303,8 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
       bridgeFile,
       "verify",
       ...identityArgs,
+      "--baseline-seal",
+      baselineSeal,
       "--no-snapshot",
     ],
     { cwd: fixtureRoot, env },
@@ -950,10 +978,12 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
 async function runPluginFailureIntegrationSelfCheck(smellVerify) {
   const failingArgs = {
     projectRoot: `/definitely/not/a/real/path/self-check-${Date.now()}`,
-    language: "java",
+    // Non-Java verification keeps the legacy direct-tool path; Java
+    // checkpoint verification is separately required to be controller-owned.
+    language: "python",
     smell: "long_method",
-    location: "src/main/java/Foo.java:1",
-    verificationMode: "local",
+    location: "src/Foo.py:1",
+    verificationMode: "project_full",
     noSnapshot: true,
   }
   const exitZeroResult = await smellVerify.execute(failingArgs)
@@ -1080,6 +1110,7 @@ function makeFailureOutput(status, category, extra = {}) {
       failure_category: category,
       verify_status: status,
       highlights: extra.highlights || ["cannot find symbol Foo"],
+      next_action: extra.next_action || "",
       // The Python bridge emits artifact_paths as an OBJECT (name -> path), not
       // a string array. The fixture must mirror the real contract.
       artifact_paths: extra.artifact_paths || { build_log: "/tmp/art/build.log", test_log: "/tmp/art/test.log" },
@@ -1173,8 +1204,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
   })
   assertEqual("structural_route_category_removed", removedStructuralFailure.ok, false, "ok")
 
-  function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED" } = {}) {
-    const payload = JSON.parse(makeFailureOutput(status, status))
+  function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED", nextAction = "" } = {}) {
+    const payload = JSON.parse(makeFailureOutput(status, status, { next_action: nextAction }))
     payload.loop = {
       decision,
       continuation,
@@ -1243,6 +1274,22 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("unified_budget_stop_dispatch", rt.handleIdle("s1"), false, "dispatch")
     await flush()
     assertEqual("unified_budget_stop_calls", calls.length, 3, "calls")
+  }
+
+  // The source-derived detector plan is rendered before compact highlights;
+  // it is not lost behind the three-highlight continuation cap.
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = hooks.createIdleContinueRuntime({ client })
+    const required = "extract cohesive blocks totaling at least 15 AST-NCSS from the frozen method"
+    record(rt, { sessionID: "precise-next", nextAction: required })
+    rt.handleIdle("precise-next")
+    await flush()
+    assertCond(
+      "unified_precise_next_action",
+      calls[0].body.parts[0].text.includes(`Required next action: ${required}`),
+      "source-derived next action missing from continuation prompt",
+    )
   }
 
   // A generation dispatches once; PASS or malformed output revokes pending.
@@ -1319,10 +1366,23 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertCond("command_decision_hook", typeof hooks?.applyCommandLoopDecision === "function", "missing applyCommandLoopDecision")
   assertCond("command_state_snapshot_hook", typeof hooks?.commandLoopStateSnapshot === "function", "missing commandLoopStateSnapshot")
   assertCond("command_state_restore_hook", typeof hooks?.restoreCommandLoopState === "function", "missing restoreCommandLoopState")
+  assertEqual(
+    "java_checkpoint_identity_detected",
+    hooks.isJavaCheckpointIdentity({ language: "java", smell: "long_method", location: "Foo.java:1" }),
+    true,
+    "identity",
+  )
+  assertEqual(
+    "non_java_identity_unchanged",
+    hooks.isJavaCheckpointIdentity({ language: "python", smell: "long_method", location: "foo.py:1" }),
+    false,
+    "identity",
+  )
   const state = {
     policy: {
       task: "task",
-      verification_mode: "local",
+      verification_mode: "project_full",
+      allow_test_changes: false,
       loop: {
         mode: "verify-failure",
         max_continuations: 2,
@@ -1367,7 +1427,8 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertCond(
     "command_prompt_ignores_dataset_route_lock",
     !routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
-      && routeLockedPrompt.includes("uniquely match a real product-detector finding"),
+      && routeLockedPrompt.includes("Baseline capture must uniquely confirm the requested smell at the supplied target")
+      && routeLockedPrompt.includes("context selects the entity but never supplies a verdict"),
     "dataset route metadata entered the command contract",
   )
   assertCond(
@@ -1376,6 +1437,16 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     "missing checkpointTargetIdentityPrompt",
   )
   const featureTargetIdentityPrompt = hooks.checkpointTargetIdentityPrompt("feature_envy", {
+    guard_contract: {
+      target_id: "feature-target",
+      entity_identity: { method: "render()", field: "document", envied_type: "example.Document" },
+    },
+    resolution_plan: {
+      route_family: "close-one-receiver-collaboration",
+      next_action: "close the complete document receiver collaboration",
+      worklist: [{ kind: "receiver_cluster", field: "document", envied_type: "example.Document" }],
+      forbidden: ["move the finding to another method in the same source owner"],
+    },
     metrics: {
       method: "render()",
       envied_field: "document",
@@ -1386,9 +1457,9 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertCond(
     "checkpoint_target_identity_exact_receiver",
     featureTargetIdentityPrompt.includes("field=document")
-      && featureTargetIdentityPrompt.includes("type=example.Document")
-      && featureTargetIdentityPrompt.includes("receiver-operation closure"),
-    "feature-envy detector identity missing from prompt",
+      && featureTargetIdentityPrompt.includes("envied_type=example.Document")
+      && featureTargetIdentityPrompt.includes("close-one-receiver-collaboration"),
+    "feature-envy Guard identity missing from prompt",
   )
   assertCond(
     "checkpoint_target_identity_has_no_metric_coaching",
@@ -1398,92 +1469,33 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && !featureTargetIdentityPrompt.includes("PASS target"),
     "feature-envy identity prompt leaked metric coaching",
   )
-  assertEqual(
-    "checkpoint_target_identity_other_smell_ignored",
-    hooks.checkpointTargetIdentityPrompt("data_clumps", { metrics: { group: "int:x|string:y|boolean:z" } }),
-    "",
-    "data-clumps prompt",
-  )
-  assertCond("test_source_path_hook", typeof hooks?.isTestSourcePath === "function", "missing isTestSourcePath")
-  assertCond("test_source_path_maven", hooks.isTestSourcePath("module/src/test/java/example/FooTest.java"), "Maven test path was not protected")
-  assertCond("test_source_path_gradle", hooks.isTestSourcePath("module/src/tests/java/example/FooTest.java"), "Gradle test path was not protected")
-  assertCond("test_source_path_top_level", hooks.isTestSourcePath("tests/example_test.py"), "top-level test path was not protected")
-  assertCond("test_source_path_production", !hooks.isTestSourcePath("src/main/java/example/Contest.java"), "production path was misclassified as test source")
-  assertCond("source_edit_paths_hook", typeof hooks?.sourceEditPaths === "function", "missing sourceEditPaths")
-  const directTestEdits = hooks.sourceEditPaths("edit", {
-    filePath: "/repo/src/test/java/example/FooTest.java",
-    oldString: "old",
-    newString: "new",
-  })
-  assertEqual("source_edit_paths_direct", directTestEdits[0], "/repo/src/test/java/example/FooTest.java", "direct edit path")
-  const patchTestEdits = hooks.sourceEditPaths("apply_patch", {
-    patchText: [
-      "*** Begin Patch",
-      "*** Update File: /repo/src/main/java/example/Foo.java",
-      "*** Update File: /repo/src/test/java/example/FooTest.java",
-      "*** End Patch",
-    ].join("\n"),
+  const dataClumpsContractPrompt = hooks.checkpointTargetIdentityPrompt("data_clumps", {
+    guard_contract: {
+      target_id: "clump-target",
+      entity_identity: { group: "int:x|string:y|boolean:z" },
+    },
+    resolution_plan: {
+      route_family: "migrate-semantic-occurrence-component",
+      next_action: "migrate the complete typed parameter group and remove every old-group wrapper",
+      worklist: [{ kind: "remaining_occurrence", file: "src/Tile.java", method: "setTile" }],
+      forbidden: ["retain the old parameter group in a wrapper"],
+    },
+    metrics: {
+      finding_identity: { group: "int:x|string:y|boolean:z" },
+    },
   })
   assertCond(
-    "source_edit_paths_patch",
-    patchTestEdits.includes("/repo/src/main/java/example/Foo.java")
-      && patchTestEdits.includes("/repo/src/test/java/example/FooTest.java"),
-    "apply_patch paths were not extracted",
-  )
-  assertEqual("source_edit_paths_read_ignored", hooks.sourceEditPaths("read", { filePath: "/repo/src/test/Foo.java" }).length, 0, "read path count")
-  assertCond(
-    "immutable_test_source_gate_hook",
-    typeof hooks?.applyImmutableTestSourceGate === "function",
-    "missing applyImmutableTestSourceGate",
-  )
-  const testModifiedVerify = {
-    output: JSON.stringify({
-      success: true,
-      accepted: true,
-      progress: true,
-      status: "PASS",
-      resolution: "resolved",
-      snapshot: {
-        changed_files: [
-          "src/main/java/example/Foo.java",
-          "src/test/java/example/FooTest.java",
-        ],
-      },
-    }),
-    metadata: {},
-  }
-  const blockedTestPaths = hooks.applyImmutableTestSourceGate(testModifiedVerify)
-  const testModifiedPayload = JSON.parse(testModifiedVerify.output)
-  assertEqual("immutable_test_source_gate_count", blockedTestPaths.length, 1, "blocked path count")
-  assertEqual("immutable_test_source_gate_status", testModifiedPayload.status, "SAMPLE_TEST_FAILED", "status")
-  assertEqual("immutable_test_source_gate_resolution", testModifiedPayload.resolution, "unresolved", "resolution")
-  assertEqual("immutable_test_source_gate_accepted", testModifiedPayload.accepted, false, "accepted")
-  assertEqual(
-    "immutable_test_source_gate_reason",
-    testModifiedPayload.build_test_guard.details.reason,
-    "TEST_SOURCE_MODIFIED",
-    "reason",
-  )
-  const productionOnlyVerify = {
-    output: JSON.stringify({
-      success: true,
-      accepted: true,
-      status: "PASS",
-      snapshot: { changed_files: ["src/main/java/example/Foo.java"] },
-    }),
-    metadata: {},
-  }
-  assertEqual(
-    "immutable_test_source_gate_production_only",
-    hooks.applyImmutableTestSourceGate(productionOnlyVerify).length,
-    0,
-    "blocked path count",
+    "checkpoint_target_identity_data_clumps_product_contract",
+    dataClumpsContractPrompt.includes("int:x|string:y|boolean:z")
+      && dataClumpsContractPrompt.includes("migrate-semantic-occurrence-component")
+      && dataClumpsContractPrompt.includes("remove every old-group wrapper"),
+    "data-clumps product contract missing from prompt",
   )
   assertEqual(
-    "immutable_test_source_gate_preserves_pass",
-    JSON.parse(productionOnlyVerify.output).status,
-    "PASS",
-    "status",
+    "plugin_has_no_posthoc_test_gate",
+    typeof hooks?.applyImmutableTestSourceGate,
+    "undefined",
+    "posthoc test gate",
   )
   const restoredAfterRestart = hooks.restoreCommandLoopState(
     JSON.stringify(hooks.commandLoopStateSnapshot(state)),
@@ -1550,12 +1562,29 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   )
   assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
 
-  const resolved = { success: true, status: "PASS", resolution: "resolved" }
+  const resolved = { success: true, accepted: true, status: "PASS", resolution: "resolved" }
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
   hooks.applyCommandLoopDecision(resolvedResult, improvedState)
   const resolvedPayload = JSON.parse(resolvedResult.output)
   assertEqual("resolved_decision_stop", resolvedPayload.loop.decision, "stop", "decision")
   assertEqual("resolved_termination", resolvedPayload.loop.termination_reason, "PASS", "termination")
+  for (const [name, inconsistent] of [
+    ["missing_accepted", { success: true, status: "PASS", resolution: "resolved" }],
+    ["missing_resolution", { success: true, accepted: true, status: "PASS" }],
+    ["false_success", { success: false, accepted: true, status: "PASS", resolution: "resolved" }],
+    ["legacy_success_only", { success: true }],
+  ]) {
+    const inconsistentState = {
+      ...improvedState,
+      continuationCount: 0,
+      noProgressCount: 0,
+      lastFailureFingerprint: "",
+    }
+    const result = { output: JSON.stringify(inconsistent), metadata: {} }
+    hooks.applyCommandLoopDecision(result, inconsistentState)
+    const payload = JSON.parse(result.output)
+    assertEqual(`inconsistent_pass_${name}`, payload.loop.termination_reason, "NON_REPAIRABLE_FAILURE", "termination")
+  }
 
   const capPolicy = {
     ...state.policy,
@@ -1616,11 +1645,11 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       verify_status: "BUILD_FAILED",
       highlights: ["compile repair remains"],
     },
-    snapshot: { diff_stat: { stdout: " Foo.java | 2 +-" } },
+    checkpoint: { delta: { has_production_diff: true } },
   }
   const compileRecovery = { output: JSON.stringify(compileAtCap), metadata: {} }
   hooks.applyCommandLoopDecision(compileRecovery, compileCapState)
-  assertEqual("compile_diff_recovers_at_cap", JSON.parse(compileRecovery.output).loop.decision, "continue", "decision")
+  assertEqual("compile_checkpoint_diff_recovers_at_cap", JSON.parse(compileRecovery.output).loop.decision, "continue", "decision")
 
   const noProgressCapState = {
     ...capState,
@@ -1651,7 +1680,10 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
     }
 
     const envBefore = { ...process.env }
-    Object.assign(process.env, cleanSmellIdentityEnv(process.env), { SMELL_ARTIFACT_ROOT: artifactRoot })
+    Object.assign(process.env, cleanSmellIdentityEnv(process.env), {
+      SMELL_ARTIFACT_ROOT: artifactRoot,
+      SMELL_PROJECTS: path.join(fixtureRoot, "projects.yaml"),
+    })
     try {
       const plugin = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
       const smellVerify = plugin?.tool?.smell_verify
@@ -1666,12 +1698,31 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       if (typeof commandHook !== "function") {
         throw new SelfCheckError("command_policy_hook", "command.execute.before hook was not registered.", {})
       }
+      try {
+        await smellVerify.execute(
+          {
+            projectRoot: fixtureRoot,
+            language: "java",
+            smell: "long_method",
+            location: "src/main/java/SelfCheckSample.java:2",
+            verificationMode: "project_full",
+          },
+          { sessionID: "unowned-java-checkpoint", agent: "java-refactor-agent", directory: fixtureRoot },
+        )
+        throw new SelfCheckError("unowned_checkpoint", "Unowned Java checkpoint verification was not rejected.", {})
+      } catch (error) {
+        assertCond(
+          "unowned_java_checkpoint_fails_closed",
+          String(error?.message || error).includes("CHECKPOINT_CONTROLLER_IDENTITY_MISSING"),
+          String(error?.message || error),
+        )
+      }
       const commandOutput = { parts: [{ type: "text", text: "placeholder" }] }
       await commandHook(
         {
           command: "java-refactor-run",
           sessionID: "command-policy-self-check",
-          arguments: `--verification-mode=local --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2`,
+          arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2`,
         },
         commandOutput,
       )
@@ -1680,12 +1731,46 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         String(commandOutput.parts?.[0]?.text || "").includes("Controller-owned verification and loop policy"),
         "command hook must inject canonical policy",
       )
+      const sealProbe = await run(
+        "python3",
+        [
+          bridgeFile,
+          "capture-baseline",
+          "--project-root", fixtureRoot,
+          "--language", "java",
+          "--smell", "long_method",
+          "--location", "src/main/java/SelfCheckSample.java:2",
+          "--projects", path.join(fixtureRoot, "projects.yaml"),
+          "--verification-mode", "project_full",
+        ],
+        { cwd: fixtureRoot, env: process.env },
+      )
+      assertEqual("controller_seal_probe_rc", sealProbe.exitCode, 0, "exitCode")
+      const controllerSeal = String(parseJson("controller_seal_probe", sealProbe.stdout).baseline_seal || "")
+      assertCond("controller_seal_probe_value", controllerSeal.length > 0, "baseline seal missing")
+      const untrustedConfig = path.join(tempRoot, "model-refactor.yaml")
+      const untrustedProjects = path.join(tempRoot, "model-projects.yaml")
+      await writeFile(
+        untrustedConfig,
+        "defaults:\n  run_build: false\n  run_tests: false\nlanguages:\n  java:\n    smells:\n      mysterious_name:\n        guards: []\n",
+        "utf8",
+      )
+      await writeFile(
+        untrustedProjects,
+        `projects:\n- root: ${JSON.stringify(tempRoot)}\n  language: java\n  build:\n    command: \"true\"\n  test:\n    command: \"true\"\n`,
+        "utf8",
+      )
       const verifyArgs = {
-        projectRoot: fixtureRoot,
+        // These model-controlled values must not replace the identity and
+        // configuration frozen by command.execute.before.
+        projectRoot: tempRoot,
         language: "java",
-        smell: "long_method",
-        location: "src/main/java/SelfCheckSample.java:2",
-        verificationMode: "local",
+        smell: "mysterious_name",
+        location: "Missing.java:1",
+        targetContextJson: '{"symbol_kind":"local","symbol_name":"forged"}',
+        verificationMode: "sample_optimized",
+        config: untrustedConfig,
+        projects: untrustedProjects,
         noSnapshot: true,
       }
       const verifyContext = {
@@ -1717,6 +1802,49 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       const successPath = normalizeToolResult(repairedResult)
       assertEqual("command_policy_pass_decision", successPath.loop?.decision, "stop", "loop.decision")
       assertEqual("command_policy_pass_reason", successPath.loop?.termination_reason, "PASS", "termination_reason")
+
+      Object.assign(process.env, {
+        SMELL_PROJECT_ROOT: fixtureRoot,
+        SMELL_LANGUAGE: "java",
+        SMELL_SMELL: "long_method",
+        SMELL_LOCATION: "src/main/java/SelfCheckSample.java:2",
+        SMELL_VERIFICATION_MODE: "project_full",
+      })
+      delete process.env.SMELL_BASELINE_SEAL
+      const reloadedWithoutSeal = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      try {
+        await reloadedWithoutSeal.tool.smell_verify.execute(verifyArgs, {
+          sessionID: "batch-reload-no-seal",
+          agent: "java-refactor-agent",
+          directory: fixtureRoot,
+        })
+        throw new SelfCheckError("batch_reload_no_seal", "Batch identity without its external seal was accepted.", {})
+      } catch (error) {
+        assertCond(
+          "batch_reload_without_seal_fails_closed",
+          String(error?.message || error).includes("CHECKPOINT_CONTROLLER_SEAL_MISSING"),
+          String(error?.message || error),
+        )
+      }
+      process.env.SMELL_BASELINE_SEAL = controllerSeal
+      const reloadedWithSeal = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      const reloadedResult = await reloadedWithSeal.tool.smell_verify.execute(verifyArgs, {
+        sessionID: "batch-reload-with-seal",
+        agent: "java-refactor-agent",
+        directory: fixtureRoot,
+      })
+      const reloadedPayload = parseJson("batch_reload_with_seal", reloadedResult.output)
+      assertEqual("batch_reload_external_seal_status", reloadedPayload.status, "PASS", "status")
+      assertEqual("batch_reload_external_seal_resolution", reloadedPayload.resolution, "resolved", "resolution")
+      assertEqual("batch_reload_external_seal_accepted", reloadedPayload.accepted, true, "accepted")
+      for (const key of [
+        "SMELL_PROJECT_ROOT",
+        "SMELL_LANGUAGE",
+        "SMELL_SMELL",
+        "SMELL_LOCATION",
+        "SMELL_VERIFICATION_MODE",
+        "SMELL_BASELINE_SEAL",
+      ]) delete process.env[key]
       const normalizeUnit = await runPluginNormalizeSelfCheck(pluginModule)
       const failureIntegration = await runPluginFailureIntegrationSelfCheck(smellVerify)
       const idleContinue = await runIdleContinueSelfCheck(pluginModule)

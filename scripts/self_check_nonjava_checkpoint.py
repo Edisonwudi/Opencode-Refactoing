@@ -14,8 +14,9 @@ CONFIG = ROOT / "runtime" / "python" / "smell_core" / "defaults" / "refactor.yam
 
 
 def run(project: Path, *args: str) -> dict:
+    bridge_args = [*args, "--output-detail", "audit"]
     result = subprocess.run(
-        [sys.executable, str(BRIDGE), *args, "--config", str(CONFIG)],
+        [sys.executable, str(BRIDGE), *bridge_args, "--config", str(CONFIG)],
         cwd=project,
         text=True,
         stdout=subprocess.PIPE,

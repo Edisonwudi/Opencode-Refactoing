@@ -1,8 +1,8 @@
-"""Generic smell guards and build/test verification.
+"""Generic non-Java smell guards and build/test verification.
 
-Language-specific guard implementations register themselves via the
-``registry`` module.  This module owns the top-level dispatch and
-the language-agnostic text-analysis fallback path.
+Java product smells are accepted only through their frozen checkpoint
+contract.  The helpers in this module are the language-agnostic detector path
+used by non-Java profiles; they are deliberately not a Java fallback.
 """
 from __future__ import annotations
 
@@ -41,18 +41,6 @@ from ..feature_envy import (
 )
 from ..checkpoint_contract import checkpoint_gate_result
 from .context import GuardRunContext
-from .registry import get_clone_guard, get_smell_guard, get_syntactic_guard
-
-# Language-specific registrations are loaded lazily on first use to avoid
-# pulling in optional heavy dependencies (e.g. tree_sitter) at import time.
-_JAVA_REGISTERED = False
-
-
-def _ensure_java_registered() -> None:
-    global _JAVA_REGISTERED
-    if not _JAVA_REGISTERED:
-        from . import java_registration  # noqa: F401
-        _JAVA_REGISTERED = True
 
 
 SUMMARY_PATTERNS = [
@@ -106,30 +94,175 @@ CRITICAL_FAILURE_PATTERNS = [
     ]
 ]
 
+GRADLE_COMMAND_RE = re.compile(
+    r"(?<![\w./-])"
+    r"(?P<launcher>(?:\./)?gradlew(?:\.bat)?|gradle)"
+    r"(?![\w.-])"
+    r"(?P<body>(?:\\\r?\n|[^\n;&|])*)"
+)
+GRADLE_TEST_TASK_RE = re.compile(
+    r"(?<!\S)"
+    r"(?P<task>(?:(?::[A-Za-z0-9_.-]+)+:test|:test|test))"
+    r"(?=\s|$)"
+)
+
+
+def validate_java_strict_verification_contract(
+    config: ResolvedRunConfig,
+) -> List[Dict[str, str]]:
+    """Return Java-only configuration violations for strict verification.
+
+    This validation intentionally lives below the bridge so direct Python
+    callers cannot obtain a Java PASS by omitting a smell guard, disabling a
+    build phase, or relying on ``_run_command_config``'s generic skipped result.
+    Non-Java configurations retain their existing behavior.
+    """
+    if str(getattr(config, "language", "")).strip().lower() != "java":
+        return []
+
+    violations: List[Dict[str, str]] = []
+    smell = str(getattr(config, "smell", "")).strip()
+    profile = getattr(config, "profile", None)
+    guards = list(getattr(profile, "guards", []) or [])
+    if len(guards) != 1:
+        violations.append({
+            "code": "JAVA_GUARD_COUNT_INVALID",
+            "message": f"Java requires exactly one smell guard; configured {len(guards)}.",
+        })
+    else:
+        guard_type = str(guards[0].get("type", "")).strip()
+        if not smell or guard_type != smell:
+            violations.append({
+                "code": "JAVA_GUARD_SMELL_MISMATCH",
+                "message": (
+                    f"Java guard type '{guard_type}' must equal configured smell '{smell}'."
+                ),
+            })
+
+    defaults = getattr(config, "defaults", None)
+    if getattr(defaults, "run_build", None) is not True:
+        violations.append({
+            "code": "JAVA_BUILD_DISABLED",
+            "message": "Java strict verification requires defaults.run_build=true.",
+        })
+    if getattr(defaults, "run_tests", None) is not True:
+        violations.append({
+            "code": "JAVA_TESTS_DISABLED",
+            "message": "Java strict verification requires defaults.run_tests=true.",
+        })
+
+    for phase, command_config, code in (
+        ("build", getattr(config, "build", None), "JAVA_BUILD_COMMAND_MISSING"),
+        ("test", getattr(config, "test", None), "JAVA_TEST_COMMAND_MISSING"),
+    ):
+        command = str(getattr(command_config, "command", "") or "").strip()
+        script = str(getattr(command_config, "script", "") or "").strip()
+        if not command and not script:
+            violations.append({
+                "code": code,
+                "message": f"Java strict verification requires a non-empty {phase} command or script.",
+            })
+    return violations
+
+
+def _java_verification_contract_failure(
+    config: ResolvedRunConfig,
+    result_type: str,
+    violations: List[Dict[str, str]],
+) -> Dict[str, object]:
+    codes = ", ".join(item["code"] for item in violations)
+    return {
+        "type": result_type,
+        "success": False,
+        "message": f"Java strict verification contract is invalid: {codes}.",
+        "details": {
+            "detector": "java_strict_verification_contract",
+            "reason": "JAVA_VERIFICATION_CONTRACT_INVALID",
+            "smell": str(getattr(config, "smell", "") or ""),
+            "violations": violations,
+        },
+    }
+
 
 def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContext] = None) -> List[Dict[str, object]]:
-    if config.language == "java":
-        _ensure_java_registered()
+    strict_violations = validate_java_strict_verification_contract(config)
+    if strict_violations:
+        return [
+            _java_verification_contract_failure(
+                config,
+                str(getattr(config, "smell", "") or "java_smell_guard"),
+                strict_violations,
+            )
+        ]
+
     outcomes: List[Dict[str, object]] = []
     for guard in config.profile.guards:
         guard_type = str(guard.get("type", "")).strip()
 
-        if (
+        checkpoint_matches = (
             context is not None
             and context.checkpoint_required
             and context.checkpoint_smell == guard_type
-        ):
+        )
+
+        if config.language == "java":
+            if not checkpoint_matches:
+                # Java verification has one authority: the target Guard frozen
+                # in c000. Missing or mismatched context fails closed.
+                missing = checkpoint_gate_result(
+                    guard_type,
+                    {
+                        "required": False,
+                        "reason": "baseline_checkpoint_missing",
+                    },
+                )
+                if missing is None:  # pragma: no cover - defensive invariant
+                    raise RuntimeError("missing Java checkpoint unexpectedly passed")
+                outcomes.append(missing)
+                continue
+
             checkpoint_failure = checkpoint_gate_result(guard_type, context.checkpoint)
             if checkpoint_failure is not None:
                 outcomes.append(checkpoint_failure)
-                continue
+            else:
+                outcomes.append({
+                    "type": guard_type,
+                    "success": True,
+                    "message": (
+                        f"{guard_type} resolved: the frozen target smell is absent "
+                        "and the changed-scope Guard contract passed."
+                    ),
+                    "details": {
+                        "guard": "checkpoint_contract",
+                        "checkpoint_id": context.checkpoint.get("checkpoint_id"),
+                        "guard_contract": context.checkpoint.get("guard_contract"),
+                        "current_metrics": context.checkpoint.get("current_metrics"),
+                        "metric_delta": context.checkpoint.get("delta"),
+                    },
+                })
+            continue
 
-        # --- Language-specific smell guard (registered via registry) ---
-        smell_handler = get_smell_guard(config.language)
-        if smell_handler is not None:
-            result = smell_handler(config, guard, context)
-            if result is not None:
-                outcomes.append(result)
+        if checkpoint_matches:
+            checkpoint_failure = checkpoint_gate_result(guard_type, context.checkpoint)
+            if checkpoint_failure is not None:
+                outcomes.append(checkpoint_failure)
+            else:
+                outcomes.append({
+                    "type": guard_type,
+                    "success": True,
+                    "message": (
+                        f"{guard_type} resolved: the frozen target smell is absent "
+                        "and the changed-scope Guard contract passed."
+                    ),
+                    "details": {
+                        "guard": "checkpoint_contract",
+                        "checkpoint_id": context.checkpoint.get("checkpoint_id"),
+                        "guard_contract": context.checkpoint.get("guard_contract"),
+                        "current_metrics": context.checkpoint.get("current_metrics"),
+                        "metric_delta": context.checkpoint.get("delta"),
+                    },
+                })
+            if checkpoint_failure is not None:
                 continue
 
         # --- Language-agnostic smell types ---
@@ -148,8 +281,6 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
         elif guard_type == "feature_envy" and config.language != "java":
             outcomes.append(_run_generic_feature_envy_guard(config, guard))
         elif guard_type == "mysterious_name":
-            # Java is intercepted by the registered smell handler above; this
-            # generic branch only ever serves non-Java languages.
             outcomes.append(_run_generic_mysterious_name_guard(config, guard))
         elif guard_type == "dead_code":
             outcomes.append(_run_dead_code_guard(config, guard))
@@ -224,8 +355,22 @@ def god_class_relative_reduction(context: Optional[GuardRunContext]) -> float:
     return max(0.0, float(reduction))
 
 
-def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
+def run_build_test_guard(
+    config: ResolvedRunConfig,
+    *,
+    require_test_execution: bool = False,
+) -> Dict[str, object]:
     metadata = _verification_metadata(config)
+    strict_violations = validate_java_strict_verification_contract(config)
+    if strict_violations:
+        failure = _java_verification_contract_failure(
+            config,
+            "build_test",
+            strict_violations,
+        )
+        details = dict(failure.get("details") or {})
+        details.update({"build": None, "test": None})
+        return {**failure, **metadata, "details": details}
     if config.verification_mode == "sample_optimized" and not str(config.sample_test_command or "").strip():
         return {
             "type": "build_test",
@@ -271,6 +416,10 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
     if config.defaults.run_tests:
         test_cwd = config.dataset_root if config.test_source == "dataset" else config.cwd
         test_started_ns = time.time_ns()
+        fresh_execution_required = bool(
+            config.verification_mode == "sample_optimized"
+            or require_test_execution
+        )
         test_result = _run_command_config(
             config.test,
             cwd=test_cwd,
@@ -278,6 +427,7 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
             label="test",
             project_root=config.project_root,
             source=config.test_source,
+            force_fresh_test_execution=fresh_execution_required,
         )
         if not test_result["success"]:
             message = f"Tests failed. {test_result['summary_text']}"
@@ -290,11 +440,22 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
                 **metadata,
                 "details": {"build": build_result, "test": test_result},
             }
-        if config.verification_mode == "sample_optimized":
-            execution = _sample_test_execution_evidence(
-                config,
-                test_started_ns,
-                test_result,
+        if (
+            config.verification_mode == "sample_optimized"
+            or require_test_execution
+        ):
+            execution = (
+                _sample_test_execution_evidence(
+                    config,
+                    test_started_ns,
+                    test_result,
+                )
+                if str(config.sample_test_location or "").strip()
+                else _project_test_execution_evidence(
+                    config,
+                    test_started_ns,
+                    test_result,
+                )
             )
             test_result["execution_evidence"] = execution
             if not execution["success"]:
@@ -307,7 +468,10 @@ def run_build_test_guard(config: ResolvedRunConfig) -> Dict[str, object]:
                 return {
                     "type": "build_test",
                     "success": False,
-                    "message": f"Sample test failed. {execution['message']}",
+                    "message": (
+                        "Declared test execution failed. "
+                        f"{execution['message']}"
+                    ),
                     **metadata,
                     "details": {"build": build_result, "test": test_result},
                 }
@@ -363,14 +527,7 @@ def _sample_test_execution_evidence(
             "tests": 0,
             "skipped": 0,
         }
-    fresh_reports: List[tuple[Path, ET.Element]] = []
-    for report in config.project_root.rglob("TEST-*.xml"):
-        try:
-            if report.stat().st_mtime_ns < started_ns:
-                continue
-            fresh_reports.append((report, ET.parse(report).getroot()))
-        except (OSError, ET.ParseError):
-            continue
+    fresh_reports = _fresh_test_reports(config.project_root, started_ns)
 
     classes: List[Dict[str, object]] = []
     for test_class in test_classes:
@@ -541,18 +698,76 @@ def _sample_test_execution_evidence(
     }
 
 
+def _fresh_test_reports(
+    project_root: Path,
+    started_ns: int,
+) -> List[tuple[Path, ET.Element]]:
+    reports: List[tuple[Path, ET.Element]] = []
+    for report in project_root.rglob("TEST-*.xml"):
+        try:
+            if report.stat().st_mtime_ns < started_ns:
+                continue
+            reports.append((report, ET.parse(report).getroot()))
+        except (OSError, ET.ParseError):
+            continue
+    return reports
+
+
+def _project_test_execution_evidence(
+    config: ResolvedRunConfig,
+    started_ns: int,
+    command_result: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Require fresh non-zero execution when no narrower test is pinned."""
+    reports: List[str] = []
+    executed = 0
+    skipped_total = 0
+    for report, root in _fresh_test_reports(config.project_root, started_ns):
+        try:
+            tests = int(str(root.attrib.get("tests") or ""))
+        except ValueError:
+            tests = len(root.findall(".//testcase"))
+        try:
+            skipped = int(str(root.attrib.get("skipped") or "0"))
+        except ValueError:
+            skipped = len(root.findall(".//testcase/skipped"))
+        non_skipped = max(tests - skipped, 0)
+        if non_skipped <= 0:
+            continue
+        reports.append(str(report.relative_to(config.project_root)))
+        executed += non_skipped
+        skipped_total += skipped
+
+    output = str(command_result.get("output") or "") if isinstance(command_result, dict) else ""
+    console_tests = 0
+    for match in re.finditer(
+        r"Tests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*(\d+)",
+        output,
+    ):
+        console_tests += max(int(match.group(1)) - int(match.group(2)), 0)
+    junit_match = re.search(r"\bOK\s+\((\d+)\s+tests?\)", output)
+    if junit_match:
+        console_tests += int(junit_match.group(1))
+    executed = max(executed, console_tests)
+    success = executed > 0
+    return {
+        "success": success,
+        "mode": "project_full",
+        "message": (
+            f"Project-full verification executed {executed} non-skipped test(s)."
+            if success
+            else "Project-full test command exited successfully but produced no "
+            "fresh non-skipped test execution evidence."
+        ),
+        "reports": sorted(reports),
+        "tests": executed,
+        "skipped": skipped_total,
+        "console_tests": console_tests,
+    }
+
+
 def _run_long_method_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
     max_lines = int(guard.get("max_lines", 60))
-    syntactic_handler = get_syntactic_guard(config.language)
-    if syntactic_handler is not None:
-        syntactic = syntactic_handler(
-            config,
-            "long_method",
-            {"long_method_ncss": max_lines},
-            str(guard.get("evidence", "")),
-        )
-        if syntactic is not None:
-            return syntactic
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -573,16 +788,6 @@ def _run_long_method_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
 
 def _run_long_parameter_list_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
     max_params = int(guard.get("max_params", 5))
-    syntactic_handler = get_syntactic_guard(config.language)
-    if syntactic_handler is not None:
-        syntactic = syntactic_handler(
-            config,
-            "long_parameter_list",
-            {"long_parameter_list": max_params},
-            str(guard.get("evidence", "")),
-        )
-        if syntactic is not None:
-            return syntactic
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -603,16 +808,6 @@ def _run_long_parameter_list_guard(config: ResolvedRunConfig, guard: Dict[str, o
 
 def _run_nested_complexity_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
     max_complexity = int(guard.get("max_complexity", 20))
-    syntactic_handler = get_syntactic_guard(config.language)
-    if syntactic_handler is not None:
-        syntactic = syntactic_handler(
-            config,
-            "nested_complexity",
-            {"cognitive_complexity": max_complexity},
-            str(guard.get("evidence", "")),
-        )
-        if syntactic is not None:
-            return syntactic
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -632,16 +827,6 @@ def _run_nested_complexity_guard(config: ResolvedRunConfig, guard: Dict[str, obj
 
 
 def _run_switch_statements_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    syntactic_handler = get_syntactic_guard(config.language)
-    if syntactic_handler is not None:
-        syntactic = syntactic_handler(
-            config,
-            "switch_statements",
-            {},
-            str(guard.get("evidence", "")),
-        )
-        if syntactic is not None:
-            return syntactic
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -1051,11 +1236,6 @@ def _run_code_clone_guard(
     guard: Dict[str, object],
     context: Optional[GuardRunContext] = None,
 ) -> Dict[str, object]:
-    clone_handler = get_clone_guard(config.language)
-    if clone_handler is not None:
-        syntactic = clone_handler(config, guard, context)
-        if syntactic is not None:
-            return syntactic
     first, second = extract_pair_snippets(config.locations, config.language)
     if len(config.locations) >= 2 and (not first or not second):
         return {
@@ -1106,17 +1286,22 @@ def _run_command_config(
     label: str,
     project_root: Path,
     source: str = "",
+    force_fresh_test_execution: bool = False,
 ) -> Dict[str, object]:
     rendered_command = ""
     rendered_script = ""
     if command_config.script:
         rendered_script = interpolate_command_text(command_config.script, project_root)
+        if force_fresh_test_execution:
+            rendered_script = _force_fresh_gradle_test_execution(rendered_script)
         command, shell = _build_script_command(
             rendered_script,
             label,
         )
     elif command_config.command:
         rendered_command = interpolate_command_text(command_config.command, project_root)
+        if force_fresh_test_execution:
+            rendered_command = _force_fresh_gradle_test_execution(rendered_command)
         command, shell = rendered_command, True
     else:
         return {
@@ -1164,6 +1349,42 @@ def _run_command_config(
         "summary_text": command_summary["summary_text"],
         "output": output,
     }
+
+
+def _force_fresh_gradle_test_execution(command_text: str) -> str:
+    """Precede explicit Gradle ``test`` tasks with their matching clean task.
+
+    ``--no-build-cache`` does not disable Gradle's local up-to-date checks.  A
+    configured test command can therefore exit zero without executing a test
+    after the build phase (or a prior verification) has produced the same task
+    outputs.  When fresh evidence is required, cleaning only the named test
+    tasks invalidates those outputs without forcing compilation and dependency
+    tasks to rerun as the broader ``--rerun-tasks`` option would.
+
+    Commands without an explicit Gradle ``test`` task are left unchanged and
+    continue to fail closed if they produce no fresh execution evidence.
+    """
+
+    def add_clean_tasks(match: re.Match[str]) -> str:
+        launcher = match.group("launcher")
+        body = match.group("body")
+        clean_tasks: List[str] = []
+        for task_match in GRADLE_TEST_TASK_RE.finditer(body):
+            test_task = task_match.group("task")
+            clean_task = f"{test_task[:-4]}cleanTest"
+            if clean_task in clean_tasks:
+                continue
+            if re.search(
+                rf"(?<!\S){re.escape(clean_task)}(?=\s|$)",
+                body,
+            ):
+                continue
+            clean_tasks.append(clean_task)
+        if not clean_tasks:
+            return match.group(0)
+        return f"{launcher} {' '.join(clean_tasks)}{body}"
+
+    return GRADLE_COMMAND_RE.sub(add_clean_tasks, str(command_text or ""))
 
 
 def _summarize_command_output(output: str, *, label: str, returncode: int) -> Dict[str, object]:

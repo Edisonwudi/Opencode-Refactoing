@@ -5,11 +5,25 @@
 Remove the reported unused declaration and any stale local fallout without turning reachable
 code into a stub.
 
+## Reference-closure fast path
+
+1. Re-anchor the frozen private declaration after line drift and confirm the target Guard
+   still reports that declaration as private, unused, and unreferenced in its caller-supplied scope.
+2. Search the complete production tree for invocations, method references, overrides,
+   annotations, service registration, and reflection strings. Treat a real reference as a
+   blocker to safe deletion, not as permission to empty the body.
+3. Delete the whole declaration once, then remove only imports and private declarations that
+   became unused solely because of that deletion. Keep independently reachable helpers.
+4. Search for the frozen declaration identity before a single `smell_verify`. If a residual
+   declaration is returned, delete that exact entity; do not delete a same-named declaration
+   in another owner or create a no-op replacement.
+
 ## Common verification fit
 
 - The reported target should no longer resolve.
 - If references remain, migrate them safely or report the blocker instead of deleting
   reachable code.
+- Deleting unrelated unused code does not resolve the frozen finding.
 
 ## Common avoid
 

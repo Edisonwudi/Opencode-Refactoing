@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
-from .detector_utils import normalize_group, parse_group_from_evidence
+from .detector_utils import (
+    normalize_group,
+    normalize_qualified_group,
+)
 from .semantic_detector import (
     DEFAULT_THRESHOLDS,
     SemanticFinding,
@@ -11,22 +14,56 @@ from .semantic_detector import (
 )
 
 
-def data_clump_group_from_evidence(evidence: str) -> str:
-    return normalize_group(parse_group_from_evidence(evidence))
+def normalize_data_clump_group(group: str) -> str:
+    return normalize_qualified_group(group)
+
+
+def data_clump_finding_group(finding: SemanticFinding) -> str:
+    return normalize_qualified_group(
+        str(finding.attributes.get("group") or "")
+    )
+
+
+def matching_data_clump_groups(
+    findings: Iterable[SemanticFinding],
+    *,
+    group: str,
+) -> set[str]:
+    """Resolve an exact group or one globally unique simple-type shorthand."""
+    selector = normalize_qualified_group(group)
+    if not selector:
+        return set()
+    candidate_groups = {
+        data_clump_finding_group(item)
+        for item in findings
+        if data_clump_finding_group(item)
+    }
+    exact = {item for item in candidate_groups if item == selector}
+    if exact:
+        return exact
+    selector_simple = normalize_group(selector)
+    return {
+        item for item in candidate_groups
+        if normalize_group(item) == selector_simple
+    }
 
 
 def same_group_data_clump_findings(
     findings: Iterable[SemanticFinding],
     *,
-    evidence: str,
+    group: str,
 ) -> list[SemanticFinding]:
-    target_group = data_clump_group_from_evidence(evidence)
+    target_group = normalize_data_clump_group(group)
     if not target_group:
         return []
+    resolved = matching_data_clump_groups(findings, group=target_group)
+    if len(resolved) != 1:
+        return []
+    selected = next(iter(resolved))
     return [
         finding
         for finding in findings
-        if normalize_group(parse_group_from_evidence(finding.evidence)) == target_group
+        if data_clump_finding_group(finding) == selected
     ]
 
 
@@ -44,17 +81,17 @@ def data_clump_occurrence_payloads(
 def detect_data_clump_occurrences(
     project_root: Path,
     *,
-    evidence: str,
+    group: str,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    group = data_clump_group_from_evidence(evidence)
+    group = normalize_data_clump_group(group)
     if not group:
         return {
             "success": False,
             "group": "",
             "occurrence_count": 0,
             "occurrences": [],
-            "error": "missing group=... evidence",
+            "error": "missing data-clump group selector",
         }
     try:
         matches = find_data_clump_group_occurrences(project_root, group=group)
@@ -88,5 +125,6 @@ def _data_clump_occurrence_payload(finding: SemanticFinding) -> dict[str, Any]:
         "end_line": finding.end_line,
         "score": finding.score,
         "rule_id": finding.rule_id,
+        "group": data_clump_finding_group(finding),
         "evidence": finding.evidence,
     }
