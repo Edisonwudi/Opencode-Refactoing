@@ -484,6 +484,17 @@ class Noise{index:02d} {{
     assert streamed["objectives"]["occurrence_count"] == 2, streamed
     assert streamed["witness"]["scan_mode"] == "target_anchor_then_stream", streamed
 
+    camel_case = _write(
+        project,
+        "src/main/java/q/CamelCase.java",
+        """\
+package q;
+class CamelCase {
+  void publish(String oldValue, int newValue, boolean emitEvent) {}
+}
+""",
+    )
+
     for command in (
         ["git", "init", "-q"],
         ["git", "add", "."],
@@ -509,6 +520,11 @@ class Noise{index:02d} {{
         assert completed.returncode == 0, completed.stderr
     queried = target_guard._data_clump_candidate_files(project, group)
     assert len(queried) > 32, queried
+    camel_queried = target_guard._data_clump_candidate_files(
+        project,
+        "java.lang.String:oldvalue|int:newvalue|boolean:emitevent",
+    )
+    assert camel_case.relative_to(project).as_posix() in camel_queried, camel_queried
 
     print(
         "  ok   Data Clumps >=3 group + target anchor + streaming relation"

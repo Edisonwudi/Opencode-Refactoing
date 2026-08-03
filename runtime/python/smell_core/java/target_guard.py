@@ -498,6 +498,7 @@ def _data_clump_candidate_files(project_root: Path, group: str) -> tuple[str, ..
                 "--untracked",
                 "-l",
                 "-z",
+                "--ignore-case",
                 "--fixed-strings",
                 "-e",
                 stem,
