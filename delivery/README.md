@@ -4,6 +4,11 @@
 2026-07-30；Python/C/C++ 仍沿用 2026-07-20 批次。Java mounted-source
 镜像从 pre-IDEA OpenCode 基础层构建，不包含 IDEA/IDEA-Refactoring。
 
+`java-current.json` 和下表记录的是已经交付的冻结归档，不随候选源码或
+dataset 改动提前改写。候选 dataset 的完整性由
+`Dockerfile.mounted-source` 中的 SHA256 固定；只有候选镜像完成全量验收并
+生成新归档后，才更新这里的 current 记录。
+
 | 语言 | 原始镜像 tag | 压缩包 | 大小 | sha256 |
 |---|---|---|---|---|
 | Java | `opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2` | `smell-refactor-env-java.tar.gz` | 6,151,372,449 bytes | `d08d9e2c87507da7ac51d6d74763494b20ef71d16da0eae8d15728a53b1a2c95` |
@@ -33,7 +38,7 @@ plugin、Python runtime、runner、IDEA 或 IDEA-Refactoring。
 正式运行必须把当前仓库只读挂载到 `/agent-src`。因此 Agent、skill、plugin、
 checkpoint 或 runner 更新只需同步 Git 工作树，不重建镜像；仅当 Java 工具链、项目
 快照、dataset、离线依赖或两个 lockfile 变化时才需要重建环境镜像。Java
-交付镜像不支持 `java-refactor-agent-idea`。
+产品只注册 `java-refactor-agent`，不包含旧 IDEA agent/command/runner 入口。
 
 ## 使用
 

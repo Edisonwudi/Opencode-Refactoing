@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,14 +25,23 @@ from audit_java_image_dependencies import (
 def check_dataset_snapshot_contract() -> None:
     root = Path(__file__).resolve().parents[1]
     dataset_dir = root / "dataset" / "java" / "delivery_schema"
-    refused_files = sorted(path.name for path in dataset_dir.glob("refused_bequest*.csv"))
-    assert refused_files == ["refused_bequest.csv"], refused_files
+    csv_files = sorted(dataset_dir.glob("*.csv"), key=lambda path: path.name)
+    assert len(csv_files) == 11, [path.name for path in csv_files]
+    row_count = 0
+    manifest_lines: list[str] = []
+    for path in csv_files:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+        assert rows and all(row["smell_type"] == path.stem for row in rows), path
+        row_count += len(rows)
+        manifest_lines.append(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+        )
+    assert row_count == 751, row_count
+    dataset_manifest_sha256 = hashlib.sha256(
+        "".join(manifest_lines).encode("utf-8")
+    ).hexdigest()
     refused_csv = dataset_dir / "refused_bequest.csv"
-    with refused_csv.open(
-        newline="", encoding="utf-8-sig"
-    ) as handle:
-        assert sum(1 for _ in csv.DictReader(handle)) == 30
-    refused_sha256 = hashlib.sha256(refused_csv.read_bytes()).hexdigest()
 
     dockerfile = (
         root
@@ -69,10 +79,17 @@ def check_dataset_snapshot_contract() -> None:
         'ENTRYPOINT ["/usr/local/bin/run-mounted-opencode-agent"]'
         in dockerfile
     )
-    assert f"ARG REFUSED_BEQUEST_CSV_SHA256={refused_sha256}" in dockerfile
+    assert "ARG DATASET_SNAPSHOT=java-finding-contract-v4-20260801" in dockerfile
+    assert (
+        f"ARG JAVA_DATASET_MANIFEST_SHA256={dataset_manifest_sha256}"
+        in dockerfile
+    )
     assert "org.opencontainers.refactor.dataset-snapshot=" in dockerfile
-    assert "org.opencontainers.refactor.refused-bequest-csv-sha256=" in dockerfile
-    assert "| sha256sum -c -" in dockerfile
+    assert "org.opencontainers.refactor.java-dataset-manifest-sha256=" in dockerfile
+    assert "LC_ALL=C sha256sum -- *.csv" in dockerfile
+    assert "LC_ALL=C sort -k2,2" in dockerfile
+    assert "REFUSED_BEQUEST_CSV_SHA256" not in dockerfile
+    assert "refused-bequest-csv-sha256" not in dockerfile
 
     manifest = json.loads(
         (root / "delivery" / "java-current.json").read_text(encoding="utf-8")
@@ -80,7 +97,13 @@ def check_dataset_snapshot_contract() -> None:
     refused_manifest = manifest["dataset"]["refused_bequest"]
     assert refused_manifest["path"] == str(refused_csv.relative_to(root))
     assert refused_manifest["row_count"] == 30
-    assert refused_manifest["sha256"] == refused_sha256
+    # java-current.json describes the already accepted archive and therefore
+    # remains immutable while a new mounted-source candidate is under test.
+    # The current source dataset is pinned by Dockerfile.mounted-source above;
+    # it is promoted into java-current.json only after a replacement archive
+    # completes the full image acceptance run.
+    assert isinstance(refused_manifest["sha256"], str)
+    assert re.fullmatch(r"[0-9a-f]{64}", refused_manifest["sha256"])
     assert manifest["schema_version"] == 2
     acceptance = manifest["acceptance"]
     assert acceptance["sample_count"] == 751

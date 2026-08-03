@@ -32,7 +32,6 @@ from smell_core.config import (  # noqa: E402
     load_project_overrides,
     load_refactor_config,
     resolve_run_config,
-    select_dataset_test_command,
 )
 from smell_core.guards import run_build_test_guard  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
@@ -168,11 +167,7 @@ def load_samples(
                     location=str(row.get("location") or "").strip(),
                     evidence=str(row.get("evidence") or "").strip(),
                     test_file=str(row.get("test_file") or "").strip(),
-                    test_command=select_dataset_test_command(
-                        verification_mode=verification_mode,
-                        test_command=row.get("test_command"),
-                        focused_test_command=row.get("focused_test_command"),
-                    ),
+                    test_command=str(row.get("test_command") or "").strip(),
                     target_method=target_method(row.get("group_occurrences")),
                     verification_mode=verification_mode,
                     legacy_test_commit=str(row.get("test_commit") or "").strip(),
@@ -304,7 +299,7 @@ def resolve(
 ):
     verification_mode = _effective_verification_mode(
         as_runner_sample(sample),
-        argparse.Namespace(verification_mode="auto"),
+        argparse.Namespace(verification_mode="project_full"),
     )
     resolved = resolve_run_config(
         refactor_config=refactor_config,
