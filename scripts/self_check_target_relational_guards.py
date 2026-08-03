@@ -16,6 +16,7 @@ if str(RUNTIME) not in sys.path:
 
 from smell_core.java import target_relational_guards as relational  # noqa: E402
 from smell_core.java import target_guard  # noqa: E402
+from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
 from smell_core.java.target_relational_guards import (  # noqa: E402
     evaluate_data_clumps_guard,
     evaluate_long_parameter_list_guard,
@@ -92,6 +93,29 @@ class Service {
         "src/main/java/p/Service.java"
     ], ordinary
 
+    # Target context is a selector, not the checkpoint identity.  This is the
+    # production shape from the target-only smoke: only the class hint was
+    # supplied, while the selected method also had an existing short overload.
+    contextual = evaluate_long_parameter_list_guard(
+        project,
+        location,
+        {"target_class": "p.Service"},
+    )
+    contextual_identity = contextual["entity_identity"]
+    assert contextual["target_match_count"] == 1, contextual
+    assert contextual_identity["file"] == "src/main/java/p/Service.java", contextual
+    assert contextual_identity["class"] == "p.Service", contextual
+    assert contextual_identity["method"] == "process", contextual
+    assert contextual_identity["parameter_types"] == [
+        "int",
+        "long",
+        "java.lang.String",
+        "boolean",
+        "double",
+        "p.Request",
+    ], contextual
+    assert len(contextual_identity["baseline_short_overloads"]) == 1, contextual
+
     varargs_target = _write(
         project,
         "src/main/java/p/VarargsService.java",
@@ -119,7 +143,7 @@ class VarargsService {
     assert varargs["witness"]["target"]["parameter_count"] == 6, varargs
     assert varargs_target.exists()
 
-    frozen = ordinary["entity_identity"]
+    frozen = contextual_identity
     assert frozen["class"] == "p.Service", frozen
     target.write_text(_lpl_source("Request"), encoding="utf-8")
     resolved = evaluate_long_parameter_list_guard(
@@ -137,6 +161,17 @@ class VarargsService {
     assert resolved["witness"]["successor"]["parameter_types"] == [
         "p.Request"
     ], resolved
+    normalized = target_guard._normalize("long_parameter_list", resolved)
+    assert normalized["target_absence_allowed"] is True, normalized
+    delta = evaluate_checkpoint_contract(
+        ordinary,
+        normalized,
+        has_production_diff=True,
+        smell="long_parameter_list",
+    )
+    assert delta.reason == "METRIC_PROGRESS", delta
+    assert delta.metric_available is True, delta
+    assert delta.metric_progress is True, delta
 
     target.write_text(_lpl_source("Object"), encoding="utf-8")
     weak = evaluate_long_parameter_list_guard(

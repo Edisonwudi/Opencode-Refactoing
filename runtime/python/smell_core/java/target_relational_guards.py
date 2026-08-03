@@ -267,8 +267,21 @@ def evaluate_long_parameter_list_guard(
                 and len(item.parameter_types) < LONG_PARAMETER_LIST_THRESHOLD
                 and item.identity_key != match.identity_key
             )
-            if not entity_identity:
+            identity_complete = bool(
+                _type_tuple(entity_identity.get("parameter_types"))
+                and str(entity_identity.get("file") or "").strip()
+                and str(entity_identity.get("class") or "").strip()
+                and str(entity_identity.get("method") or "").strip()
+                and "baseline_short_overloads" in entity_identity
+            )
+            if not identity_complete:
+                # ``target_context`` is only a selector.  Once it resolves a
+                # unique declaration, freeze the canonical source identity;
+                # otherwise a hint such as ``target_class`` would become the
+                # whole checkpoint identity and a legal signature migration
+                # could only be retried through the obsolete source line.
                 entity_identity = {
+                    **entity_identity,
                     "file": match.file,
                     "class": match.owner,
                     "method": match.method,
