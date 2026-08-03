@@ -38,7 +38,13 @@ require_lock_match() {
 [[ -d "$source_root" ]] || die "Mounted agent source directory not found: $source_root" 66
 
 required_dirs=(.opencode runtime scripts docker/java-refactor-delivery)
-required_files=(package.json package-lock.json opencode.json .opencode/package-lock.json)
+required_files=(
+  package.json
+  package-lock.json
+  opencode.json
+  .dockerignore
+  .opencode/package-lock.json
+)
 for path in "${required_dirs[@]}"; do
   [[ -d "$source_root/$path" ]] || die "Mounted agent source is missing directory: $path" 66
 done
@@ -81,7 +87,7 @@ for path in agents commands plugins skills package.json package-lock.json .gitig
     cp -a "$source_root/.opencode/$path" "$runtime_root/.opencode/$path"
   fi
 done
-for path in package.json package-lock.json opencode.json; do
+for path in package.json package-lock.json opencode.json .dockerignore; do
   cp "$source_root/$path" "$runtime_root/$path"
 done
 
