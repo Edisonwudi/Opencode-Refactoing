@@ -54,7 +54,8 @@ _TERMINAL_SOURCE_ANCESTORS = frozenset(
         "java.lang.annotation.Annotation",
     }
 )
-_DECLARATION_PREFIX = rb"\b(?:class|interface)\s+"
+_ANCESTOR_DECLARATION_KINDS = ("class", "interface")
+_TYPE_DECLARATION_KINDS = ("class", "interface", "enum", "record")
 
 
 @dataclass(frozen=True)
@@ -382,8 +383,65 @@ def _query_declaration_files(
     max_bytes: int,
     existing_files: set[str],
 ) -> tuple[str, ...]:
+    return _query_java_declaration_files(
+        root,
+        simple_name,
+        source_name=source_name,
+        expected_qualified=expected_qualified,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        existing_files=existing_files,
+        declaration_kinds=_ANCESTOR_DECLARATION_KINDS,
+        error_prefix="ANCESTOR",
+        relation_label="ancestor",
+    )
+
+
+def query_type_declaration_files(
+    root: Path,
+    simple_name: str,
+    *,
+    source_name: str,
+    expected_qualified: str,
+    max_files: int,
+    max_bytes: int,
+    existing_files: set[str],
+) -> tuple[str, ...]:
+    """Return bounded production declarations for one exact Java type name.
+
+    This is a relation query rooted in a type already present in the selected
+    target source.  It never enumerates or parses the project source tree.
+    """
+    return _query_java_declaration_files(
+        root,
+        simple_name,
+        source_name=source_name,
+        expected_qualified=expected_qualified,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        existing_files=existing_files,
+        declaration_kinds=_TYPE_DECLARATION_KINDS,
+        error_prefix="TYPE_DECLARATION",
+        relation_label="type declaration",
+    )
+
+
+def _query_java_declaration_files(
+    root: Path,
+    simple_name: str,
+    *,
+    source_name: str,
+    expected_qualified: str,
+    max_files: int,
+    max_bytes: int,
+    existing_files: set[str],
+    declaration_kinds: Sequence[str],
+    error_prefix: str,
+    relation_label: str,
+) -> tuple[str, ...]:
+    kind_expression = "|".join(re.escape(item) for item in declaration_kinds)
     declaration_query = (
-        r"(^|[^A-Za-z0-9_$])(class|interface)[[:space:]]+"
+        rf"(^|[^A-Za-z0-9_$])({kind_expression})[[:space:]]+"
         + re.escape(simple_name)
         + r"([^A-Za-z0-9_$]|$)"
     )
@@ -407,8 +465,8 @@ def _query_declaration_files(
     )
     if result.returncode not in (0, 1):
         raise TargetRelationScopeError(
-            "ANCESTOR_QUERY_FAILED",
-            "Git could not execute the bounded ancestor symbol query",
+            f"{error_prefix}_QUERY_FAILED",
+            f"Git could not execute the bounded {relation_label} symbol query",
             symbol=simple_name,
             stderr=result.stderr.decode("utf-8", errors="replace").strip(),
         )
@@ -452,8 +510,8 @@ def _query_declaration_files(
         )
         if package_result.returncode not in (0, 1):
             raise TargetRelationScopeError(
-                "ANCESTOR_QUERY_FAILED",
-                "Git could not execute the ancestor package query",
+                f"{error_prefix}_QUERY_FAILED",
+                f"Git could not execute the {relation_label} package query",
                 symbol=simple_name,
                 package=expected_package,
                 stderr=package_result.stderr.decode(
@@ -476,8 +534,8 @@ def _query_declaration_files(
     )
     if len(set(existing_files).union(normalized)) > max_files:
         raise TargetRelationScopeError(
-            "ANCESTOR_QUERY_TOO_BROAD",
-            "Ancestor symbol query exceeds the bounded file limit",
+            f"{error_prefix}_QUERY_TOO_BROAD",
+            f"{relation_label.capitalize()} symbol query exceeds the bounded file limit",
             symbol=simple_name,
             candidate_count=len(normalized),
             max_files=max_files,
@@ -492,7 +550,9 @@ def _query_declaration_files(
         max_bytes=max_bytes,
     )
     declaration_pattern = re.compile(
-        _DECLARATION_PREFIX
+        rb"\b(?:"
+        + b"|".join(item.encode("ascii") for item in declaration_kinds)
+        + rb")\s+"
         + re.escape(simple_name.encode("utf-8"))
         + rb"(?![A-Za-z0-9_$])"
     )
@@ -503,8 +563,8 @@ def _query_declaration_files(
             payload = path.read_bytes()
         except OSError as exc:
             raise TargetRelationScopeError(
-                "ANCESTOR_SOURCE_READ_FAILED",
-                f"Cannot read ancestor candidate: {exc}",
+                f"{error_prefix}_SOURCE_READ_FAILED",
+                f"Cannot read {relation_label} candidate: {exc}",
                 path=relative,
             ) from exc
         if (
@@ -971,5 +1031,6 @@ __all__ = [
     "JavaRelationEdge",
     "RefusedBequestRelationScope",
     "TargetRelationScopeError",
+    "query_type_declaration_files",
     "resolve_refused_bequest_relation_scope",
 ]

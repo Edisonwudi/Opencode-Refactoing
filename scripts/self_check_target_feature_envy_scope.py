@@ -74,6 +74,24 @@ class DirectTarget {
 }
 """,
         )
+        wildcard = _write(
+            project,
+            "src/main/java/app/WildcardTarget.java",
+            """\
+package app;
+import foreign.*;
+import unused.*;
+class WildcardTarget {
+  private Receiver receiver;
+  int calculate() { return receiver.a() + receiver.b() + receiver.c(); }
+}
+""",
+        )
+        _write(
+            project,
+            "src/main/java/unused/Marker.java",
+            "package unused; public class Marker {}\n",
+        )
         inherited = _write(
             project,
             "src/main/java/app/InheritedTarget.java",
@@ -322,15 +340,29 @@ class AmbiguousTarget extends Parent { int calculate() { return 1; } }
                     {"target_class": "ambiguous.AmbiguousTarget"},
                 ),
             )
+
+            assert receiver.resolve() not in java_reads, java_reads
+            java_reads.clear()
+            wildcard_scope = feature_scope.resolve_feature_envy_scope(
+                project,
+                [wildcard],
+                "src/main/java/app/WildcardTarget.java:method=calculate()|line=6",
+                {"target_class": "app.WildcardTarget"},
+            )
+            assert receiver.relative_to(project).as_posix() in wildcard_scope.files
+            assert wildcard_scope.expanded_for_receivers
+            assert wildcard_scope.receiver_types[0].field == "receiver"
+            assert wildcard_scope.receiver_types[0].resolved_type == "foreign.Receiver"
+            assert receiver.resolve() in java_reads, java_reads
         finally:
             Path.read_bytes = original_read_bytes
 
         assert not any(path.name.startswith("Noise") for path in java_reads), java_reads
-        assert receiver.resolve() not in java_reads, java_reads
 
     print(
         "target feature-envy scope self-check PASS "
-        "receiver_source=excluded inherited_ancestor=returned "
+        "exact_receiver_source=excluded ambiguous_receiver=exact-query "
+        "inherited_ancestor=returned "
         "private_ancestor_field=excluded child_shadow=preferred "
         "explicit_import=disambiguated wildcard_collision=fail_closed "
         "budgets=32_files/8MiB "
