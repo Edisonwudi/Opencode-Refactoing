@@ -135,10 +135,6 @@ def _dispatch_scoped_guard(
             root,
             str(selector.get("group") or ""),
         )
-        _enforce_explicit_scope_budget(
-            root,
-            tuple(sorted(set(target_files).union(source_files))),
-        )
         return evaluate_data_clumps_guard(
             root,
             locations[0],
@@ -476,10 +472,11 @@ def _file_contains_method_declaration(path: Path, method: str) -> bool:
 
 
 def _data_clump_candidate_files(project_root: Path, group: str) -> tuple[str, ...]:
-    """Use three exact Git text queries to bound the Data Clumps file scope.
+    """Use exact Git text queries to select Data Clumps candidate files.
 
-    This is an exact relational query, not source/smell discovery: only files
-    containing every selector-supplied parameter stem are parsed afterwards.
+    This is an exact target relation query, not smell discovery. Candidate
+    count is not an AST-memory budget: the relational Guard parses each
+    returned file independently and never builds one common project model.
     """
     stems = tuple(
         sorted(
@@ -490,7 +487,7 @@ def _data_clump_candidate_files(project_root: Path, group: str) -> tuple[str, ..
             }
         )
     )
-    if len(stems) != 3:
+    if len(stems) < 3:
         return ()
     matches: set[str] | None = None
     for stem in stems:
@@ -532,7 +529,6 @@ def _data_clump_candidate_files(project_root: Path, group: str) -> tuple[str, ..
             and _is_bounded_production_java_path(path)
         )
     )
-    _enforce_explicit_scope_budget(project_root, files)
     return files
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -13,6 +14,8 @@ RUNTIME = ROOT / "runtime" / "python"
 if str(RUNTIME) not in sys.path:
     sys.path.insert(0, str(RUNTIME))
 
+from smell_core.java import target_relational_guards as relational  # noqa: E402
+from smell_core.java import target_guard  # noqa: E402
 from smell_core.java.target_relational_guards import (  # noqa: E402
     evaluate_data_clumps_guard,
     evaluate_long_parameter_list_guard,
@@ -237,12 +240,25 @@ class TextCandidate {
         third.relative_to(project),
         text_candidate.relative_to(project),
     )
-    ordinary = evaluate_data_clumps_guard(
-        project,
-        location,
-        {"group": group},
-        source_files=source_files,
-    )
+    parse_widths: list[int] = []
+    original_parse_scope = relational._parse_scope
+
+    def tracked_parse_scope(root: Path, files: object) -> object:
+        frozen = tuple(files)  # type: ignore[arg-type]
+        parse_widths.append(len(frozen))
+        return original_parse_scope(root, frozen)
+
+    relational._parse_scope = tracked_parse_scope
+    try:
+        ordinary = evaluate_data_clumps_guard(
+            project,
+            location,
+            {"group": group},
+            source_files=source_files,
+        )
+    finally:
+        relational._parse_scope = original_parse_scope
+    assert parse_widths and max(parse_widths) == 1, parse_widths
     forged = evaluate_data_clumps_guard(
         project,
         location,
@@ -340,14 +356,162 @@ class TextCandidate {
     invalid = evaluate_data_clumps_guard(
         project,
         location,
-        {"group": "int:a|int:b|int:c|int:d"},
+        {"group": "int:a|int:b"},
         source_files=source_files,
     )
     assert invalid["ok"] is False, invalid
     assert "DATA_CLUMPS_GROUP_INVALID" in _codes(invalid), invalid
 
+    large_files = tuple(
+        _write(
+            project,
+            f"src/main/java/large/Large{name}.java",
+            f"""\
+package large;
+class Large{name} {{
+  void {method}(String host, int port, boolean secure, long timeout) {{}}
+}}
+""",
+        ).relative_to(project)
+        for name, method in (
+            ("First", "open"),
+            ("Second", "close"),
+            ("Third", "open"),
+        )
+    )
+    large = evaluate_data_clumps_guard(
+        project,
+        (
+            "src/main/java/large/LargeFirst.java:method="
+            "open(String host, int port, boolean secure, long timeout)|line=3"
+        ),
+        {
+            "group": (
+                "java.lang.String:host|int:port|boolean:secure|long:timeout"
+            )
+        },
+        source_files=large_files,
+    )
+    assert large["ok"] is True, large
+    assert large["target_smell_present"] is True, large
+    assert large["objectives"] == {
+        "occurrence_count": 3,
+        "class_count": 3,
+        "method_name_count": 2,
+    }, large
+    assert len(large["entity_identity"]["group"].split("|")) == 4, large
+
+    qualified_files: list[Path] = []
+    _write(project, "src/main/java/right/Token.java", "package right; class Token {}\n")
+    _write(project, "src/main/java/wrong/Token.java", "package wrong; class Token {}\n")
+    for package, owner, method, imported in (
+        ("anchor", "First", "send", "right.Token"),
+        ("anchor", "Second", "receive", "right.Token"),
+        ("anchor", "Third", "send", "right.Token"),
+        ("decoy", "Wrong", "receive", "wrong.Token"),
+    ):
+        qualified_files.append(
+            _write(
+                project,
+                f"src/main/java/{package}/{owner}.java",
+                f"""\
+package {package};
+import {imported};
+class {owner} {{ void {method}(Token token, int port, boolean secure) {{}} }}
+""",
+            ).relative_to(project)
+        )
+    qualified = evaluate_data_clumps_guard(
+        project,
+        "src/main/java/anchor/First.java:method=send|line=3",
+        {"group": "Token:token|int:port|boolean:secure"},
+        source_files=qualified_files,
+    )
+    assert qualified["ok"] is True, qualified
+    assert qualified["target_smell_present"] is True, qualified
+    assert qualified["objectives"]["occurrence_count"] == 3, qualified
+    assert "src/main/java/decoy/Wrong.java" not in qualified["witness"][
+        "occurrence_files"
+    ], qualified
+
+    nested = _write(
+        project,
+        "src/main/java/q/GeometryUtils.java",
+        """\
+package q;
+class GeometryUtils {
+  static class Target {}
+  static class First { void send(Target target, int port, boolean secure) {} }
+  static class Second { void receive(Target target, int port, boolean secure) {} }
+  static class Third { void send(Target target, int port, boolean secure) {} }
+}
+""",
+    )
+    nested_result = evaluate_data_clumps_guard(
+        project,
+        "src/main/java/q/GeometryUtils.java:method=send|line=4",
+        {"group": "Target:target|int:port|boolean:secure"},
+        source_files=(nested.relative_to(project),),
+    )
+    assert nested_result["target_smell_present"] is True, nested_result
+    assert "q.geometryutils.target:target" in nested_result["entity_identity"][
+        "group"
+    ], nested_result
+
+    many_candidates = tuple(
+        _write(
+            project,
+            f"src/main/java/noise/Noise{index:02d}.java",
+            f"""\
+package noise;
+class Noise{index:02d} {{
+  void hostOnly(String host) {{}}
+  void portOnly(int port) {{}}
+  void secureOnly(boolean secure) {{}}
+}}
+""",
+        ).relative_to(project)
+        for index in range(40)
+    )
+    streamed = evaluate_data_clumps_guard(
+        project,
+        location,
+        {"group": group},
+        source_files=(*source_files, *many_candidates),
+    )
+    assert streamed["ok"] is True, streamed
+    assert streamed["witness"]["scope_file_count"] == 44, streamed
+    assert streamed["objectives"]["occurrence_count"] == 2, streamed
+    assert streamed["witness"]["scan_mode"] == "target_anchor_then_stream", streamed
+
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "add", "."],
+        [
+            "git",
+            "-c",
+            "user.name=target-relational-self-check",
+            "-c",
+            "user.email=target-relational@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ):
+        completed = subprocess.run(
+            command,
+            cwd=project,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+    queried = target_guard._data_clump_candidate_files(project, group)
+    assert len(queried) > 32, queried
+
     print(
-        "  ok   Data Clumps real occurrence files + strict frozen anchor"
+        "  ok   Data Clumps >=3 group + target anchor + streaming relation"
     )
 
 

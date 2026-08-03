@@ -375,11 +375,11 @@ def evaluate_data_clumps_guard(
     analysis_files: Iterable[str | Path] | None = None,
     source_files: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
-    """Measure exactly one selector-supplied parameter triple.
+    """Measure exactly one selector-supplied parameter group.
 
-    ``source_files`` is an explicit baseline occurrence scope when the target
-    file alone cannot establish the 3/3/2 contract.  It is combined only with
-    the target and explicit ``analysis_files``; no other Java file is read.
+    The target file first resolves the group identity. Candidate files are
+    then parsed one at a time, so the active AST scope stays bounded even when
+    a common parameter group occurs in many source files.
     """
 
     try:
@@ -390,10 +390,10 @@ def evaluate_data_clumps_guard(
         raw_group = str(identity.get("group") or selected.get("group") or "")
         group = normalize_qualified_group(raw_group)
         members = tuple(item for item in group.split("|") if item)
-        if len(members) != 3 or len(set(members)) != 3:
+        if len(members) < 3 or len(set(members)) != len(members):
             raise TargetRelationalGuardError(
                 "DATA_CLUMPS_GROUP_INVALID",
-                "Data Clumps selector.group must be one normalized three-member group",
+                "Data Clumps selector.group must contain at least three distinct normalized members",
                 group=group,
             )
 
@@ -403,41 +403,64 @@ def evaluate_data_clumps_guard(
         scope_files = tuple(
             sorted({target_file, *explicit_analysis, *explicit_sources})
         )
-        parsed = _parse_scope(root, scope_files)
-
-        occurrences: list[tuple[_JavaCallable, str, str]] = []
-        for item in parsed.callables:
-            matched = _match_exact_group(item, group)
-            if matched is None:
-                continue
-            resolved_group, match_mode = matched
-            occurrences.append((item, resolved_group, match_mode))
-        occurrences.sort(key=lambda value: _callable_sort_key(value[0]))
-
-        resolved_groups = {resolved for _, resolved, _ in occurrences}
-        violations: list[dict[str, Any]] = []
-        if len(resolved_groups) > 1:
-            violations.append(
-                _violation(
-                    "DATA_CLUMPS_TYPE_AMBIGUOUS",
-                    "The selector shorthand resolves to multiple qualified parameter groups in the explicit scope",
-                    resolved_groups=sorted(resolved_groups),
-                )
-            )
-
-        anchor_candidates = [
-            item
-            for item, _, _ in occurrences
+        target_scope = _parse_scope(root, (target_file,))
+        target_group_matches = [
+            (item, matched)
+            for item in target_scope.callables
             if _matches_data_clump_anchor(
                 item,
                 target=target,
                 target_file=target_file,
                 identity=identity,
             )
+            for matched in [_match_exact_group(item, group)]
+            if matched is not None
         ]
-        owner_names = {item.owner for item, _, _ in occurrences}
-        method_names = {item.method for item, _, _ in occurrences}
-        occurrence_count = len(occurrences)
+        anchor_group = group
+        if not _has_anchor_identity(identity) and len(target_group_matches) == 1:
+            anchor_group = target_group_matches[0][1][0]
+
+        occurrence_count = 0
+        owner_names: set[str] = set()
+        method_names: set[str] = set()
+        occurrence_files: set[str] = set()
+        anchor_candidates: list[_JavaCallable] = []
+        occurrence_preview: list[dict[str, Any]] = []
+        parsed_files: list[str] = []
+        preview_limit = 32
+        for relative in scope_files:
+            parsed = (
+                target_scope
+                if relative == target_file
+                else _parse_scope(root, (relative,))
+            )
+            parsed_files.extend(parsed.files)
+            for item in parsed.callables:
+                matched = _match_anchored_group(item, anchor_group)
+                if matched is None:
+                    continue
+                resolved_group, match_mode = matched
+                occurrence_count += 1
+                owner_names.add(item.owner)
+                method_names.add(item.method)
+                occurrence_files.add(item.file)
+                if _matches_data_clump_anchor(
+                    item,
+                    target=target,
+                    target_file=target_file,
+                    identity=identity,
+                ):
+                    anchor_candidates.append(item)
+                if len(occurrence_preview) < preview_limit:
+                    occurrence_preview.append(
+                        {
+                            **item.witness(),
+                            "group": resolved_group,
+                            "match_mode": match_mode,
+                        }
+                    )
+
+        violations: list[dict[str, Any]] = []
         class_count = len(owner_names)
         method_name_count = len(method_names)
         target_smell_present = (
@@ -445,7 +468,6 @@ def evaluate_data_clumps_guard(
             and occurrence_count >= DATA_CLUMPS_OCCURRENCE_THRESHOLD
             and class_count >= DATA_CLUMPS_CLASS_THRESHOLD
             and method_name_count >= DATA_CLUMPS_METHOD_NAME_THRESHOLD
-            and not violations
         )
 
         entity_identity = dict(identity)
@@ -456,11 +478,7 @@ def evaluate_data_clumps_guard(
                 "class": anchor.owner,
                 "method": anchor.method,
                 "parameter_types": list(anchor.parameter_types),
-                "group": (
-                    next(iter(resolved_groups))
-                    if len(resolved_groups) == 1
-                    else group
-                ),
+                "group": anchor_group,
             }
         if len(anchor_candidates) > 1:
             violations.append(
@@ -472,31 +490,31 @@ def evaluate_data_clumps_guard(
             )
             target_smell_present = False
 
-        preview_limit = 32
-        preview = [
-            {
-                **item.witness(),
-                "group": resolved,
-                "match_mode": mode,
-            }
-            for item, resolved, mode in occurrences[:preview_limit]
-        ]
+        scope_preview_limit = 64
+        class_preview = sorted(owner_names)[:scope_preview_limit]
+        method_preview = sorted(method_names)[:scope_preview_limit]
+        occurrence_file_preview = sorted(occurrence_files)[:scope_preview_limit]
         witness = {
-            "group": group,
-            "scope_files": list(parsed.files),
-            "occurrence_files": sorted(
-                {item.file for item, _, _ in occurrences}
+            "group": anchor_group,
+            "requested_group": group,
+            "scope_file_count": len(parsed_files),
+            "scope_files": parsed_files[:scope_preview_limit],
+            "scope_files_truncated": len(parsed_files) > scope_preview_limit,
+            "occurrence_file_count": len(occurrence_files),
+            "occurrence_files": occurrence_file_preview,
+            "occurrence_files_truncated": (
+                len(occurrence_files) > scope_preview_limit
             ),
-            "occurrences": preview,
+            "occurrences": occurrence_preview,
             "occurrence_preview_truncated": occurrence_count > preview_limit,
-            "classes": sorted(owner_names),
-            "method_names": sorted(method_names),
+            "class_preview": class_preview,
+            "classes_truncated": len(owner_names) > scope_preview_limit,
+            "method_name_preview": method_preview,
+            "method_names_truncated": len(method_names) > scope_preview_limit,
+            "scan_mode": "target_anchor_then_stream",
         }
         return _result(
-            ok=not any(
-                item.get("code") == "DATA_CLUMPS_TYPE_AMBIGUOUS"
-                for item in violations
-            ),
+            ok=True,
             target_match_count=len(anchor_candidates),
             target_smell_present=target_smell_present,
             target_missing=len(anchor_candidates) == 0,
@@ -590,6 +608,7 @@ def _parse_scope(project_root: Path, files: Sequence[str]) -> _ParsedScope:
                 path=relative,
             )
         package, imports, wildcard_imports = _source_namespace(root, source)
+        local_types = _local_type_identities(root, source, package)
         for node in _walk(root):
             if node.type not in _CALLABLE_NODE_TYPES:
                 continue
@@ -600,6 +619,7 @@ def _parse_scope(project_root: Path, files: Sequence[str]) -> _ParsedScope:
                 package=package,
                 imports=imports,
                 wildcard_imports=wildcard_imports,
+                local_types=local_types,
             )
             if parsed is not None:
                 callables.append(parsed)
@@ -634,6 +654,38 @@ def _source_namespace(
     return package, imports, tuple(sorted(set(wildcard_imports)))
 
 
+def _local_type_identities(
+    root: Node,
+    source: bytes,
+    package: str,
+) -> dict[str, str]:
+    candidates: dict[str, set[str]] = {}
+    for node in _walk(root):
+        if node.type not in _OWNER_NODE_TYPES:
+            continue
+        names: list[str] = []
+        current: Node | None = node
+        while current is not None:
+            if current.type in _OWNER_NODE_TYPES:
+                name_node = current.child_by_field_name("name")
+                name = _node_text(source, name_node).strip() if name_node else ""
+                if name:
+                    names.append(name)
+            current = current.parent
+        names.reverse()
+        if not names:
+            continue
+        local = ".".join(names)
+        qualified = f"{package}.{local}" if package else local
+        for key in {names[-1], local}:
+            candidates.setdefault(key, set()).add(qualified)
+    return {
+        key: next(iter(values))
+        for key, values in candidates.items()
+        if len(values) == 1
+    }
+
+
 def _callable_from_node(
     relative: str,
     node: Node,
@@ -642,6 +694,7 @@ def _callable_from_node(
     package: str,
     imports: Mapping[str, str],
     wildcard_imports: Sequence[str],
+    local_types: Mapping[str, str],
 ) -> _JavaCallable | None:
     name_node = node.child_by_field_name("name")
     parameters = node.child_by_field_name("parameters")
@@ -664,6 +717,7 @@ def _callable_from_node(
             package=package,
             imports=imports,
             wildcard_imports=wildcard_imports,
+            local_types=local_types,
         )
         if parameter.type == "spread_parameter":
             type_name += "..."
@@ -737,9 +791,11 @@ def _canonical_type(
     package: str = "",
     imports: Mapping[str, str] | None = None,
     wildcard_imports: Sequence[str] = (),
+    local_types: Mapping[str, str] | None = None,
 ) -> str:
     text = re.sub(r"\s+", "", str(raw or ""))
     imports = imports or {}
+    local_types = local_types or {}
 
     def resolve(match: re.Match[str]) -> str:
         token = match.group(0)
@@ -747,6 +803,8 @@ def _canonical_type(
             return token
         if token in imports:
             return str(imports[token])
+        if token in local_types:
+            return str(local_types[token])
         if token in _JAVA_LANG_TYPES:
             return f"java.lang.{token}"
         if "." in token:
@@ -756,8 +814,13 @@ def _canonical_type(
             return token
         if len(token) == 1 and token.isupper():
             return token
-        if len(wildcard_imports) == 1 and token[:1].isupper():
-            return f"{wildcard_imports[0]}.{token}"
+        if wildcard_imports and token[:1].isupper():
+            if len(wildcard_imports) == 1:
+                return f"{wildcard_imports[0]}.{token}"
+            # Without a project catalog there is no sound way to choose one
+            # of several on-demand imports. Keep the simple type unresolved;
+            # the target-anchored matcher will only compare compatible types.
+            return token
         if package and token[:1].isupper():
             return f"{package}.{token}"
         return token
@@ -972,6 +1035,91 @@ def _match_exact_group(
             unused.remove(index)
             selected.append(item.descriptors[index])
     return normalize_qualified_group("|".join(selected)), match_mode
+
+
+def _match_anchored_group(
+    item: _JavaCallable,
+    group: str,
+) -> tuple[str, str] | None:
+    """Match a callable against the target-resolved group identity.
+
+    Fully qualified conflicts are rejected. A simple type is accepted only
+    when its normalized descriptor agrees and at least one side is genuinely
+    unresolved (for example, multiple wildcard imports). This prevents an
+    unrelated same-simple-name type from invalidating or joining the target
+    clump while keeping the Guard independent of a project type catalog.
+    """
+    exact = _match_exact_qualified_group(item, group)
+    if exact is not None:
+        return exact, "qualified"
+
+    requested = tuple(group.split("|"))
+    actual = tuple(item.descriptors)
+    unused = set(range(len(actual)))
+    selected: list[str] = []
+    for member in requested:
+        index = next(
+            (
+                candidate
+                for candidate in sorted(unused)
+                if _compatible_group_member(actual[candidate], member)
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        unused.remove(index)
+        selected.append(actual[index])
+    return normalize_qualified_group("|".join(selected)), "compatible"
+
+
+def _match_exact_qualified_group(
+    item: _JavaCallable,
+    group: str,
+) -> str | None:
+    qualified_members = tuple(
+        normalize_qualified_group(descriptor) for descriptor in item.descriptors
+    )
+    unused = set(range(len(qualified_members)))
+    selected: list[str] = []
+    for member in group.split("|"):
+        index = next(
+            (
+                candidate
+                for candidate in sorted(unused)
+                if qualified_members[candidate] == member
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        unused.remove(index)
+        selected.append(item.descriptors[index])
+    return normalize_qualified_group("|".join(selected))
+
+
+def _compatible_group_member(actual: str, expected: str) -> bool:
+    if normalize_group(actual) != normalize_group(expected):
+        return False
+    actual_type = _descriptor_type(actual)
+    expected_type = _descriptor_type(expected)
+    if actual_type == expected_type:
+        return True
+    return not (
+        _is_fully_qualified_type(actual_type)
+        and _is_fully_qualified_type(expected_type)
+    )
+
+
+def _descriptor_type(descriptor: str) -> str:
+    return str(descriptor).rsplit(":", 1)[0].strip()
+
+
+def _is_fully_qualified_type(type_name: str) -> bool:
+    erased = re.sub(r"<.*>", "", str(type_name)).removesuffix("...")
+    erased = erased.removesuffix("[]")
+    first = erased.split(".", 1)[0]
+    return "." in erased and bool(first) and first[:1].islower()
 
 
 def _matches_data_clump_anchor(
