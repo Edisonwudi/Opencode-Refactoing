@@ -19,6 +19,11 @@ from typing import Any
 
 ARCHIVE_SUFFIXES = {".aar", ".ear", ".jar", ".war", ".zip"}
 PACKAGE_SUFFIXES = ARCHIVE_SUFFIXES | {".module", ".pom"}
+DEFAULT_MAVEN_SETTINGS = (
+    Path("/opt/buildenv/maven-offline-settings.xml"),
+    Path("/opt/buildenv/maven-global-settings.xml"),
+    Path("/opt/buildenv/offline-home/.m2/settings.xml"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,16 +49,19 @@ def parse_args() -> argparse.Namespace:
         "--maven-settings",
         type=Path,
         action="append",
-        default=[
-            Path("/opt/buildenv/maven-offline-settings.xml"),
-            Path("/opt/buildenv/maven-global-settings.xml"),
-            Path("/opt/buildenv/offline-home/.m2/settings.xml"),
-        ],
+        default=[],
+        help=(
+            "Maven settings file to compare; repeat as needed. Explicit values "
+            "replace the three delivery-image defaults."
+        ),
     )
     parser.add_argument("--repository-id", default="local-all")
     parser.add_argument("--verify-archives", action="store_true")
     parser.add_argument("--report", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.maven_settings:
+        args.maven_settings = list(DEFAULT_MAVEN_SETTINGS)
+    return args
 
 
 def _tag(element: ET.Element) -> str:

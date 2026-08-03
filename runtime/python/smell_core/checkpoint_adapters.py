@@ -1,8 +1,8 @@
 """Metric adapters for the generic checkpoint contract."""
 from __future__ import annotations
 
+import ast
 import hashlib
-import os
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -33,14 +33,8 @@ from .guard_scope import (
     MAX_GUARD_ANALYSIS_FILES,
 )
 from .java.source_layout import standard_test_root
-from .java.catalog_identity import (
-    CATALOG_IDENTITY_SCHEMA,
-    stable_method_record_signature,
-)
-from .java.semantic_detector import (
-    god_class_product_profile,
-    run_java_semantic_detector,
-)
+from .java.catalog_identity import CATALOG_IDENTITY_SCHEMA
+from .java.semantic_detector import god_class_product_profile
 from .java.target_guard import capture_java_target_guard, evaluate_java_target_guard
 from .loop_policy import CHECKPOINT_SMELLS
 
@@ -119,49 +113,33 @@ DETECTOR_PROFILES = {
 }
 
 
-_JAVA_GUARD_COMMON_IMPLEMENTATION_FILES = (
-    "checkpoint_adapters.py",
-    "guard_scope.py",
-    "java/source_layout.py",
-    "java/target_guard.py",
-)
-
-
-_JAVA_GUARD_IMPLEMENTATION_FILES = {
-    "long_method": ("java/target_guard_predicates.py", "java/ast_ncss.py"),
-    "nested_complexity": ("java/target_guard_predicates.py", "java/syntactic_detector.py"),
-    "long_parameter_list": ("java/target_relational_guards.py", "java/syntactic_detector.py"),
+_JAVA_GUARD_ENTRY_MODULES = {
+    "long_method": ("smell_core.java.target_guard_predicates",),
+    "nested_complexity": ("smell_core.java.target_guard_predicates",),
+    "long_parameter_list": ("smell_core.java.target_relational_guards",),
     "feature_envy": (
-        "java/target_feature_envy_scope.py",
-        "java/target_relation_scope.py",
-        "java/target_semantic_guards.py",
-        "java/semantic_detector.py",
-        "java/catalog_identity.py",
+        "smell_core.java.target_semantic_guards",
+        "smell_core.java.target_feature_envy_scope",
     ),
-    "data_clumps": ("java/target_relational_guards.py",),
-    "code_clone_type1": ("java/target_clone_guard.py",),
-    "god_class": ("java/target_semantic_guards.py", "java/semantic_detector.py"),
+    "data_clumps": ("smell_core.java.target_relational_guards",),
+    "code_clone_type1": ("smell_core.java.target_clone_guard",),
+    "god_class": ("smell_core.java.target_semantic_guards",),
     "refused_bequest": (
-        "java/target_relation_scope.py",
-        "java/target_semantic_guards.py",
-        "java/semantic_detector.py",
+        "smell_core.java.target_semantic_guards",
+        "smell_core.java.target_relation_scope",
     ),
-    "switch_statements": ("java/target_guard_predicates.py", "java/syntactic_detector.py"),
-    "mysterious_name": ("java/target_guard_predicates.py", "java/syntactic_detector.py"),
-    "dead_code": ("java/target_semantic_guards.py", "java/semantic_detector.py"),
+    "switch_statements": ("smell_core.java.target_guard_predicates",),
+    "mysterious_name": ("smell_core.java.target_guard_predicates",),
+    "dead_code": ("smell_core.java.target_semantic_guards",),
 }
 
-
-_JAVA_SYMBOL_AWARE_SMELLS = frozenset({
-    "long_parameter_list",
-    "feature_envy",
-    "data_clumps",
-    "code_clone_type1",
-    "god_class",
-    "refused_bequest",
-    "mysterious_name",
-    "dead_code",
-})
+_JAVA_GUARD_DISPATCH_MODULES = frozenset(
+    module
+    for modules in _JAVA_GUARD_ENTRY_MODULES.values()
+    for module in modules
+)
+_JAVA_GUARD_ORCHESTRATOR_MODULE = "smell_core.java.target_guard"
+_JAVA_GUARD_PROFILE_OWNER = "checkpoint_adapters.py"
 
 
 def capture_metric_snapshot(config: Any, evidence: str) -> dict[str, Any]:
@@ -305,13 +283,12 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
 def _java_guard_implementation_profile(smell: str) -> dict[str, Any]:
     """Hash the executable target-Guard surface so drift recaptures c000."""
     package_root = Path(__file__).resolve().parent
-    relative_files = (
-        *_JAVA_GUARD_COMMON_IMPLEMENTATION_FILES,
-        *_JAVA_GUARD_IMPLEMENTATION_FILES.get(smell, ()),
+    relative_files = sorted(
+        {_JAVA_GUARD_PROFILE_OWNER, *_java_guard_dependency_closure(smell)}
     )
     files: list[dict[str, str]] = []
     digest = hashlib.sha256()
-    for relative in dict.fromkeys(relative_files):
+    for relative in relative_files:
         path = package_root / relative
         content = path.read_bytes()
         content_sha256 = hashlib.sha256(content).hexdigest()
@@ -324,6 +301,147 @@ def _java_guard_implementation_profile(smell: str) -> dict[str, Any]:
         "files": files,
         "sha256": digest.hexdigest(),
     }
+
+
+def _java_guard_dependency_closure(smell: str) -> tuple[str, ...]:
+    """Return the deterministic in-package import closure for one Guard route.
+
+    ``target_guard`` is the shared orchestrator.  Its function-local imports
+    are dispatch edges, so only the entries for the selected smell are
+    followed.  Every other ``smell_core`` import is traversed transitively.
+    Missing modules and invalid syntax are profile errors, never a reason to
+    silently retain the previous hand-written file set.
+    """
+    entries = _JAVA_GUARD_ENTRY_MODULES.get(smell)
+    if entries is None:
+        raise ValueError(f"unsupported Java Guard implementation profile: {smell}")
+
+    pending = [_JAVA_GUARD_ORCHESTRATOR_MODULE, *entries]
+    visited: set[str] = set()
+    relative_files: set[str] = set()
+    allowed_dispatch = frozenset(entries)
+    while pending:
+        module = pending.pop()
+        if module in visited:
+            continue
+        visited.add(module)
+        path = _smell_core_module_path(module)
+        relative_files.add(path.relative_to(Path(__file__).resolve().parent).as_posix())
+        # Importing a submodule executes every parent package initializer.
+        # Treat those files as normal closure nodes so their imports are also
+        # followed instead of silently omitting package-level behavior.
+        parts = module.split(".")
+        for length in range(1, len(parts)):
+            package = ".".join(parts[:length])
+            if package not in visited:
+                pending.append(package)
+        for imported, function_local in _smell_core_imports(module, path):
+            if (
+                module == _JAVA_GUARD_ORCHESTRATOR_MODULE
+                and function_local
+                and imported in _JAVA_GUARD_DISPATCH_MODULES
+                and imported not in allowed_dispatch
+            ):
+                continue
+            if imported not in visited:
+                pending.append(imported)
+    return tuple(sorted(relative_files))
+
+
+def _smell_core_module_path(module: str) -> Path:
+    package_root = Path(__file__).resolve().parent
+    if module == "smell_core":
+        candidates = (package_root / "__init__.py",)
+    elif module.startswith("smell_core."):
+        relative = Path(*module.split(".")[1:])
+        candidates = (
+            package_root / relative.with_suffix(".py"),
+            package_root / relative / "__init__.py",
+        )
+    else:
+        raise RuntimeError(f"Guard implementation import escaped smell_core: {module}")
+    existing = [candidate for candidate in candidates if candidate.is_file()]
+    if len(existing) != 1:
+        raise RuntimeError(
+            f"Guard implementation module must resolve exactly once: {module}"
+        )
+    return existing[0]
+
+
+def _smell_core_imports(module: str, path: Path) -> tuple[tuple[str, bool], ...]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise RuntimeError(f"Cannot inspect Guard implementation imports: {path}") from exc
+
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+    imports: set[tuple[str, bool]] = set()
+
+    class ImportVisitor(ast.NodeVisitor):
+        function_depth = 0
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.function_depth += 1
+            self.generic_visit(node)
+            self.function_depth -= 1
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self.function_depth += 1
+            self.generic_visit(node)
+            self.function_depth -= 1
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                if alias.name == "smell_core" or alias.name.startswith("smell_core."):
+                    _smell_core_module_path(alias.name)
+                    imports.add((alias.name, self.function_depth > 0))
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            base = _resolve_smell_core_import(package, node.level, node.module)
+            if base is None:
+                return
+            _smell_core_module_path(base)
+            imports.add((base, self.function_depth > 0))
+            for alias in node.names:
+                candidate = f"{base}.{alias.name}"
+                try:
+                    _smell_core_module_path(candidate)
+                except RuntimeError:
+                    if node.module is None and alias.name != "*":
+                        raise
+                    continue
+                imports.add((candidate, self.function_depth > 0))
+
+    ImportVisitor().visit(tree)
+    return tuple(sorted(imports))
+
+
+def _resolve_smell_core_import(
+    package: str,
+    level: int,
+    imported_module: str | None,
+) -> str | None:
+    if level:
+        parts = package.split(".")
+        keep = len(parts) - level + 1
+        if keep < 1:
+            raise RuntimeError(
+                f"Guard implementation relative import escapes smell_core: {package}"
+            )
+        resolved = parts[:keep]
+        if imported_module:
+            resolved.extend(imported_module.split("."))
+        module = ".".join(resolved)
+        if module != "smell_core" and not module.startswith("smell_core."):
+            raise RuntimeError(
+                f"Guard implementation relative import escaped smell_core: {module}"
+            )
+        return module
+    if imported_module == "smell_core" or str(imported_module).startswith("smell_core."):
+        return str(imported_module)
+    return None
 
 
 def _identity(config: Any, target: Any, **extra: Any) -> dict[str, Any]:
@@ -348,52 +466,6 @@ def _contract_identity(config: Any) -> dict[str, Any]:
 def _selector_context(config: Any) -> dict[str, Any]:
     value = getattr(config, "target_context", None)
     return dict(value) if isinstance(value, dict) else {}
-
-
-def _java_symbol_classpath(config: Any) -> str:
-    entries: list[str] = [str(config.project_root)]
-    override = getattr(config, "project_override", None)
-    override_root = getattr(override, "root", None)
-    if override_root:
-        entries.append(str(override_root))
-    env = getattr(config, "env", None)
-    if isinstance(env, dict):
-        for key in ("GRADLE_USER_HOME", "MAVEN_USER_HOME", "BUILDENV", "JAVA_HOME"):
-            value = str(env.get(key) or "").strip()
-            if value:
-                entries.append(value)
-    return os.pathsep.join(dict.fromkeys(entries))
-
-
-
-def _java_semantic_detection(config: Any) -> Any:
-    """Run the product detector with read-only build symbol roots."""
-    return run_java_semantic_detector(
-        config.project_root,
-        classpath=_java_symbol_classpath(config),
-    )
-
-
-def _same_method(left: str, right: str) -> bool:
-    return method_basename(left).lower() == method_basename(right).lower()
-
-
-def _simple_type(value: str) -> str:
-    return str(value or "").strip().split("<", 1)[0].rsplit(".", 1)[-1].lower()
-
-
-
-def _semantic_identity(config: Any, finding: Any, **extra: Any) -> dict[str, Any]:
-    identity = {
-        "smell": str(config.smell),
-        "file": str(finding.file).replace("\\", "/"),
-        "class": str(finding.class_name or ""),
-        "method": str(finding.method or ""),
-        "rule_id": str(finding.rule_id or ""),
-    }
-    identity.update({key: value for key, value in extra.items() if value not in (None, "")})
-    return identity
-
 
 
 def _target(config: Any) -> Any:
@@ -705,99 +777,6 @@ def _code_clone(config: Any, evidence: str) -> dict[str, Any]:
     }
 
 
-def _refused_bequest_semantic_finding(
-    config: Any,
-    detection: Any,
-) -> dict[str, Any]:
-    target = _target(config)
-    identity = _contract_identity(config)
-    selector = _selector_context(config)
-    if not detection.ok:
-        return {"ok": False, "objectives": {}, "error": detection.error}
-    findings = detection.findings.get("refused_bequest", [])
-    parent = str(identity.get("parent") or selector.get("parent") or "")
-    method = str(identity.get("method") or target.method or "")
-    target_class = str(
-        identity.get("target_class")
-        or identity.get("class")
-        or selector.get("target_class")
-        or target.class_name
-        or ""
-    )
-    matches = [
-        item for item in findings
-        if (
-            (
-                _same_file(item.file, str(identity.get("file") or ""))
-                and str(identity.get("method") or "") == str(item.method)
-                if identity
-                else _same_file(item.file, target.project_path)
-                and (not method or _same_method(item.method, method))
-            )
-            and (
-                not parent
-                or _simple_type(_semantic_attribute(item, "parent"))
-                == _simple_type(parent)
-            )
-            and (
-                not target_class
-                or _simple_type(item.class_name) == _simple_type(target_class)
-            )
-        )
-    ]
-    match = matches[0] if len(matches) == 1 else None
-    objectives = {
-        "refusal_score": 1.0 if match is not None else 0.0,
-        "refusal_finding_present": 1.0 if match is not None else 0.0,
-        "rejection_signals": 1.0 if match is not None else 0.0,
-    }
-    extra = (
-        {
-            "parent": _semantic_attribute(match, "parent"),
-            "target_class": _semantic_attribute(match, "target_class"),
-            "rejection_kind": _semantic_attribute(match, "rejection_kind"),
-        }
-        if match is not None
-        else {}
-    )
-    snapshot = {
-        "ok": True,
-        "detector": "python_semantic_detector",
-        "objectives": objectives,
-        "finding_present": match is not None,
-        "candidate_count": len(matches),
-        "finding_identity": (
-            _semantic_identity(config, match, **extra)
-            if match is not None
-            else identity or _identity(config, target)
-        ),
-        "evidence": match.evidence if match else "",
-    }
-    # The immutable project-level catalog lets the strict guard distinguish a
-    # newly relocated rejection from unrelated rejecting overrides at c000.
-    snapshot["project_finding_catalog"] = [
-        {
-            "file": str(item.file).replace("\\", "/"),
-            "class_name": str(item.class_name or ""),
-            "method": str(item.method or ""),
-            "source_method": _semantic_source_method_signature(
-                detection.project_model,
-                item,
-            ),
-            "rule_id": str(item.rule_id or ""),
-            "parent": _semantic_attribute(item, "parent"),
-            "inheritance_source": (
-                list(item.attributes.get("inheritance_source") or [])
-                if isinstance(item.attributes, dict)
-                and isinstance(item.attributes.get("inheritance_source"), list)
-                else []
-            ),
-        }
-        for item in findings
-    ]
-    return snapshot
-
-
 def _god_class(config: Any, evidence: str) -> dict[str, Any]:
     target = _target(config)
     text = extract_class_text(target, config.language)
@@ -818,138 +797,6 @@ def _god_class(config: Any, evidence: str) -> dict[str, Any]:
     }
 
 
-def _compact_refused_bequest_impact_map(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("ok") is not True:
-        return {
-            "analysis_ok": False,
-            "error": (
-                str(value.get("error") or "capability_impact_map_unavailable")
-                if isinstance(value, dict)
-                else "capability_impact_map_unavailable"
-            ),
-            "contract_declarations": [],
-            "implementers": [],
-            "production_call_sites": [],
-        }
-
-    def select(item: Any, keys: tuple[str, ...]) -> dict[str, Any]:
-        if not isinstance(item, dict):
-            return {}
-        return {
-            key: item[key]
-            for key in keys
-            if key in item and item[key] not in (None, "", [], {})
-        }
-
-    declarations = [
-        select(
-            item,
-            ("owner", "file", "line", "signature", "modifiers", "body_kind"),
-        )
-        for item in value.get("contract_declarations", [])
-    ]
-    implementers = []
-    for item in value.get("implementers", []):
-        payload = select(
-            item,
-            ("class", "kind", "file", "line", "modifiers", "role"),
-        )
-        declared = item.get("declared_target_methods") if isinstance(item, dict) else None
-        if isinstance(declared, list) and declared:
-            payload["declared_target_methods"] = [
-                select(method, ("owner", "file", "line", "signature", "body_kind"))
-                for method in declared
-            ]
-        implementers.append(payload)
-    calls = [
-        select(
-            item,
-            (
-                "file", "line", "enclosing_method", "receiver",
-                "static_receiver_type", "receiver_resolution",
-                "exposes_reported_contract", "expression",
-            ),
-        )
-        for item in value.get("production_call_sites", [])
-    ]
-    inherited_surface = [
-        {
-            **select(item, ("owner", "file")),
-            "state_field_count": len(item.get("state_fields", [])),
-            "non_target_method_count": len(item.get("non_target_methods", [])),
-            "bodyless_non_target_method_count": len(
-                item.get("bodyless_non_target_methods", [])
-            ),
-        }
-        for item in value.get("inherited_surface_at_risk", [])
-        if isinstance(item, dict)
-    ]
-    unresolved_count = int(value.get("unresolved_receiver_call_sites") or 0)
-    return {
-        "analysis_ok": unresolved_count == 0,
-        "error": "" if unresolved_count == 0 else "unresolved_receiver_call_sites",
-        "target": select(
-            value.get("target"),
-            ("class", "file", "method", "parameter_count", "reported_parent"),
-        ),
-        "contract_declarations": declarations,
-        "implementers": implementers,
-        "production_call_sites": calls,
-        "inherited_surface_at_risk": inherited_surface,
-        "unresolved_receiver_call_sites": unresolved_count,
-        "excluded_unrelated_same_name_calls": int(
-            value.get("excluded_unrelated_same_name_calls") or 0
-        ),
-        "dependency_order": list(value.get("dependency_order") or []),
-        "remaining_work_count": len(declarations) + len(implementers) + len(calls),
-        "authority": "java_product_semantic_model",
-    }
-
-
-def _refused_bequest(config: Any, evidence: str) -> dict[str, Any]:
-    detection = _java_semantic_detection(config)
-    snapshot = _refused_bequest_semantic_finding(config, detection)
-    return snapshot
-
-
-def _semantic_attribute(finding: Any, name: str) -> str:
-    attributes = getattr(finding, "attributes", None)
-    if not isinstance(attributes, dict):
-        return ""
-    value = attributes.get(name)
-    return "" if value is None else str(value).strip()
-
-
-def _semantic_source_method_signature(model: Any, finding: Any) -> str:
-    """Return the finding declaration's lexical signature when uniquely bound."""
-    if model is None:
-        return ""
-    file_name = str(getattr(finding, "file", "") or "")
-    class_name = str(getattr(finding, "class_name", "") or "")
-    begin_line = int(getattr(finding, "begin_line", 0) or 0)
-    method_name = method_basename(str(getattr(finding, "method", "") or ""))
-    candidates = [
-        method
-        for method in getattr(model, "methods", ())
-        if _same_file(str(getattr(method, "file", "") or ""), file_name)
-        and int(getattr(method, "begin_line", 0) or 0) == begin_line
-        and _simple_type(str(getattr(method, "class_name", "") or ""))
-        == _simple_type(class_name)
-        and method_basename(str(getattr(method, "method_name", "") or ""))
-        == method_name
-    ]
-    if len(candidates) != 1:
-        return ""
-    try:
-        return stable_method_record_signature(candidates[0])
-    except ValueError:
-        return ""
-
-
-def _same_file(left: str, right: Any) -> bool:
-    return str(left).replace("\\", "/").lstrip("/") == str(right).replace("\\", "/").lstrip("/")
-
-
 _ADAPTERS: dict[str, Callable[[Any, str], dict[str, Any]]] = {
     "long_method": _long_method,
     "nested_complexity": _nested_complexity,
@@ -958,7 +805,6 @@ _ADAPTERS: dict[str, Callable[[Any, str], dict[str, Any]]] = {
     "data_clumps": _data_clumps,
     "code_clone_type1": _code_clone,
     "god_class": _god_class,
-    "refused_bequest": _refused_bequest,
     "switch_statements": _switch_statements,
     "mysterious_name": _mysterious_name,
     "dead_code": _dead_code,

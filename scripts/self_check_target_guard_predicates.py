@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
-from smell_core.java import semantic_detector, syntactic_detector  # noqa: E402
+from smell_core.java import semantic_detector  # noqa: E402
 from smell_core.java import target_guard_predicates as predicates  # noqa: E402
 from smell_core.location import parse_location_descriptor  # noqa: E402
 
@@ -124,17 +124,10 @@ def _run() -> None:
             },
         }
 
-        with (
-            patch.object(
-                syntactic_detector,
-                "run_java_syntactic_detector",
-                _forbidden,
-            ),
-            patch.object(
-                semantic_detector,
-                "run_java_semantic_detector",
-                _forbidden,
-            ),
+        with patch.object(
+            semantic_detector,
+            "run_java_semantic_detector",
+            _forbidden,
         ):
             captured: dict[str, dict[str, object]] = {}
             for smell in locations:

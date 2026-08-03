@@ -43,8 +43,7 @@ out/
 *~
 
 # ---------- Env / secrets ----------
-.env
-.env.*
+.env*
 !.env.example
 
 # ---------- Logs ----------

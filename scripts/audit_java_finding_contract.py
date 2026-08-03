@@ -8,7 +8,6 @@ import hashlib
 import json
 import sys
 from collections import Counter
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -39,21 +38,6 @@ from smell_core.java.source_layout import (  # noqa: E402
 from smell_core.resolution_plan import build_resolution_plan  # noqa: E402
 
 
-@lru_cache(maxsize=None)
-def _semantic(project_root: str, classpath: str):
-    return _ORIGINAL_SEMANTIC(Path(project_root), classpath=classpath)
-
-
-def _cached_semantic(project_root: Path, **kwargs: Any):
-    return _semantic(
-        str(project_root.expanduser().resolve()),
-        str(kwargs.get("classpath") or ""),
-    )
-
-
-_ORIGINAL_SEMANTIC = adapters.run_java_semantic_detector
-
-
 def _rows(dataset_root: Path) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for path in sorted(dataset_root.glob("*.csv")):
@@ -81,7 +65,7 @@ def _render_md(
         f"- original source guard PASS: {summary['original_guard_pass']}/{summary['rows']}",
         f"- evidence-free finding stable: {summary['evidence_free_same_finding']}/{summary['rows']}",
         f"- production-source provenance valid: {summary['production_source_provenance']}/{summary['rows']}",
-        "- execution: every row is captured once with CSV evidence and recaptured with empty evidence; both calls use the production-only detector.",
+        "- execution: every row is captured once with CSV evidence and recaptured with empty evidence; both calls use the target Guard.",
         "",
         "| smell | rows | hit | unavailable | ambiguous | evidence-free stable | production provenance | original PASS |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
@@ -269,7 +253,8 @@ def main() -> int:
     parser.add_argument(
         "--projects-root",
         type=Path,
-        default=Path("/Users/a1-6/Code/Project/Java_Project"),
+        required=True,
+        help="Directory containing the pinned Java project checkouts named by the dataset.",
     )
     parser.add_argument(
         "--projects-config",
@@ -299,7 +284,6 @@ def main() -> int:
     projects_config_path = args.projects_config.expanduser().resolve()
     if not projects_config_path.is_file():
         parser.error(f"--projects-config is not a readable file: {projects_config_path}")
-    adapters.run_java_semantic_detector = _cached_semantic
     refactor = load_refactor_config(bundled_refactor_config_path())
     projects = load_project_overrides(str(projects_config_path))
     records = _rows(args.dataset_root)

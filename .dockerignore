@@ -6,6 +6,7 @@
 # Local images, run output, and refactoring artifacts
 images
 runs
+batch_runs
 .smell-artifacts
 .codex_tmp
 backups

@@ -10,7 +10,8 @@ in this repository.
 
 Dataset CSVs are stored in container (image) path format
 (``/opt/projects/<lang>/<name>``). Candidates and the scan cache keep local
-checkout paths; ``write_csv`` is the only container-path conversion boundary.
+checkout paths supplied through repeated ``--project-root LANG=PATH`` options;
+``write_csv`` is the only container-path conversion boundary.
 Reads of existing CSV rows only use path-free keys
 (project_name, file, begin_line), so both path formats round-trip cleanly.
 
@@ -66,11 +67,6 @@ from smell_core.mysterious_name import (  # noqa: E402
 DEFAULT_DATASET_ROOT = ROOT / "dataset" / "nonjava"
 CACHE_DIR = ROOT / "runs" / "build_envy_name_dataset"
 
-PROJECT_ROOTS = {
-    "c": Path("/Users/a1-6/Code/Project/C_Project"),
-    "cpp": Path("/Users/a1-6/Code/Project/CPP_Project"),
-    "python": Path("/Users/a1-6/Code/Project/Python_Project"),
-}
 # Dataset CSVs store image-format roots; local checkouts back them.
 CONTAINER_PROJECT_PREFIX = "/opt/projects"
 
@@ -79,9 +75,13 @@ def _container_project_root(language: str, project_name: str) -> str:
     return f"{CONTAINER_PROJECT_PREFIX}/{language}/{project_name}"
 
 
-def _local_project_root(language: str, project_name: str) -> Path:
+def _local_project_root(
+    project_roots: dict[str, Path], language: str, project_name: str
+) -> Path:
     """Local checkout for a project, regardless of CSV path format."""
-    return PROJECT_ROOTS[language] / project_name
+    return project_roots[language] / project_name
+
+
 PROJECTS = {
     "c": ["cJSON", "curl", "git", "libevent", "libssh2", "libuv", "lua", "nginx", "redis", "rrdtool", "tmux"],
     "cpp": [
@@ -96,6 +96,58 @@ PROJECTS = {
 SMELLS = ("feature_envy", "mysterious_name")
 SAMPLE_COUNT = 30
 MAX_PER_PROJECT = 7
+
+
+def _parse_project_roots(
+    parser: argparse.ArgumentParser,
+    values: list[str],
+    languages: list[str],
+) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for value in values:
+        language, separator, raw_path = value.partition("=")
+        language = language.strip()
+        raw_path = raw_path.strip()
+        if not separator or language not in PROJECTS or not raw_path:
+            parser.error(
+                "--project-root must use LANG=PATH with LANG in "
+                + ", ".join(sorted(PROJECTS))
+            )
+        if language in roots:
+            parser.error(f"duplicate --project-root for {language}")
+        root = Path(raw_path).expanduser().resolve()
+        if not root.is_dir():
+            parser.error(f"--project-root for {language} is not a directory: {root}")
+        roots[language] = root
+    missing = [language for language in languages if language not in roots]
+    if missing:
+        parser.error(
+            "missing --project-root for selected language(s): " + ", ".join(missing)
+        )
+    return roots
+
+
+def _rebase_cached_project_roots(
+    cache: dict[str, dict[str, dict[str, list[dict]]]],
+    project_roots: dict[str, Path],
+) -> None:
+    """Rebind cached candidates to the roots declared for this invocation."""
+    for language, language_root in project_roots.items():
+        projects = cache.get(language)
+        if not isinstance(projects, dict):
+            continue
+        for project, findings_by_smell in projects.items():
+            if not isinstance(findings_by_smell, dict):
+                continue
+            current_root = str(language_root / project)
+            for candidates in findings_by_smell.values():
+                if not isinstance(candidates, list):
+                    continue
+                for candidate in candidates:
+                    if isinstance(candidate, dict):
+                        candidate["project_root"] = current_root
+
+
 # Skip test trees: bare test/tests/testing dirs, poco-style testsuite dirs, and
 # *Test.* / *Tests.* file names (case-sensitive so latest.c/contest.cpp survive).
 TEST_DIR_NAMES = {"test", "tests", "testing", "testsuite"}
@@ -347,11 +399,13 @@ def _refactorability_verdict(language, body_node, source_bytes, receiver) -> dic
     }
 
 
-def calibrate_refactorability_filter() -> bool:
+def calibrate_refactorability_filter(project_roots: dict[str, Path]) -> bool:
     """Print the verdict for each review anchor; False when any mismatches."""
     all_ok = True
     for language, project, rel, function_name, line, expected in CALIBRATION_TARGETS:
-        root = PROJECT_ROOTS[language] / project
+        if language not in project_roots:
+            continue
+        root = project_roots[language] / project
         try:
             function_nodes = parse_function_nodes(root / rel, language)
         except Exception as exc:
@@ -781,24 +835,43 @@ def main() -> int:
     parser.add_argument("--out-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--languages", nargs="*", default=list(PROJECTS))
     parser.add_argument("--smells", nargs="*", default=list(SMELLS))
+    parser.add_argument(
+        "--project-root",
+        action="append",
+        default=[],
+        metavar="LANG=PATH",
+        help=(
+            "Local directory containing the pinned project checkouts for one "
+            "language; repeat for every selected language."
+        ),
+    )
     parser.add_argument("--cache", type=Path, default=CACHE_DIR / "candidates.json")
     parser.add_argument("--rescan", action="store_true", help="ignore the candidate cache")
     parser.add_argument("--no-write", action="store_true", help="curate/validate only, do not write CSVs")
     args = parser.parse_args()
 
-    if "feature_envy" in args.smells and not calibrate_refactorability_filter():
+    unknown_languages = sorted(set(args.languages) - set(PROJECTS))
+    if unknown_languages:
+        parser.error("unsupported language(s): " + ", ".join(unknown_languages))
+    unknown_smells = sorted(set(args.smells) - set(SMELLS))
+    if unknown_smells:
+        parser.error("unsupported smell(s): " + ", ".join(unknown_smells))
+    project_roots = _parse_project_roots(parser, args.project_root, args.languages)
+
+    if "feature_envy" in args.smells and not calibrate_refactorability_filter(project_roots):
         print("refactorability filter calibration FAILED; aborting", flush=True)
         return 1
 
     cache: dict[str, dict[str, dict[str, list[dict]]]] = {}
     if args.cache.is_file() and not args.rescan:
         cache = json.loads(args.cache.read_text(encoding="utf-8"))
+        _rebase_cached_project_roots(cache, project_roots)
 
     summary: dict[str, dict] = {}
     for language in args.languages:
         cache.setdefault(language, {})
         for project in PROJECTS[language]:
-            root = _local_project_root(language, project)
+            root = _local_project_root(project_roots, language, project)
             if project in cache[language]:
                 continue
             if not root.is_dir():

@@ -256,7 +256,7 @@ key 来源优先级：`--opencode-api-key`（不推荐）>
   Guard 只确认该目标是否具有该异味，不提供“扫描项目并发现所有异味”的 Detect
   能力。Long Method 等局部异味只解析目标文件；Feature Envy、Clone 等结构异味
   在 verify 时额外解析本次 diff 中的生产 Java 文件，以拒绝搬运或复制。
-- **c000 Guard contract**（schema v5 / contract v4）：冻结 guard rule/profile hash、唯一
+- **c000 Guard contract**（schema v5 / contract v5）：冻结 guard rule/profile hash、唯一
   target identity、baseline objectives、selector、项目 revision、目标源码 hash、测试修改策略、
   解析后的 build/test 命令与 verification 配置；controller 另持有外部
   baseline seal。会话身份、验证合同或 seal
@@ -421,7 +421,7 @@ docker run --rm \
 .opencode/skills/            无 IDEA Java 编辑模式（IDEA 原型文件保留但默认不启用）
 runtime/python/bridge/       smell_bridge(verify/capture-baseline 入口)
 runtime/python/smell_core/   checkpoint contract、adapters、检测器、guards
-scripts/                     run_smell_dataset.py 与全部自检
+scripts/                     runner、自检及维护入口（见 scripts/README.md）
 delivery/                    交付镜像清单(tag / sha256 / 使用说明)
 docker/                      mounted-source 与 delivery entrypoint
 ```

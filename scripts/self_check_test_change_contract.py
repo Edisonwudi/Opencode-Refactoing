@@ -23,7 +23,6 @@ from smell_core.test_change_contract import (  # noqa: E402
     is_standard_java_test_path,
 )
 from smell_core.checkpoints import _is_production_source  # noqa: E402
-from smell_core.java.syntactic_detector import run_java_syntactic_detector  # noqa: E402
 
 
 def _write(root: Path, relative: str, content: str) -> Path:
@@ -137,13 +136,6 @@ sourceSets {
             project_root=project,
             configured_test_roots=discovered_roots,
         )
-        product_detection = run_java_syntactic_detector(project)
-        assert product_detection.ok, product_detection.error
-        assert not any(
-            item.file == "qa/contract/p/ConfiguredGradleTest.java"
-            for findings in product_detection.findings.values()
-            for item in findings
-        ), product_detection.findings
         assert is_java_test_source_path(
             maven_custom_test,
             project_root=project,

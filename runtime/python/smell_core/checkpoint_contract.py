@@ -14,12 +14,11 @@ from typing import Any, Iterable, Mapping
 from .java.catalog_identity import (
     clone_catalog_additions_in_impact_cone,
     feature_envy_catalog_additions_in_impact_cone,
-    refused_bequest_catalog_additions_in_impact_cone,
 )
 from .resolution_plan import resolution_plan_next_action
 
 
-CHECKPOINT_CONTRACT_VERSION = 4
+CHECKPOINT_CONTRACT_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -351,15 +350,7 @@ def _semantic_contract_delta(
     smell: str,
     changed_production_source_files: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Compare route-independent semantic contracts captured by adapters.
-
-    Refused Bequest may legitimately change the superclass, declaration owner,
-    and capability topology.  The comparison therefore ignores ownership and
-    hard-checks API declared by the target itself and records inherited API
-    removal for review. Inherited removal cannot be a universal hard failure:
-    shedding an unwanted inherited capability is the purpose of this smell.
-    No project, class, method, or sample name is encoded in this policy.
-    """
+    """Compare route-independent semantic contracts captured by adapters."""
     guard_violations = current.get("guard_violations")
     if isinstance(guard_violations, list):
         regressions = [
@@ -557,97 +548,7 @@ def _semantic_contract_delta(
             "endpoints_retaining_baseline_body": retained_endpoints,
             "regressions": regressions,
         }
-    if smell != "refused_bequest":
-        return {"applicable": False, "regressions": []}
-    before = baseline.get("contract_snapshot")
-    after = current.get("contract_snapshot")
-    if not isinstance(before, Mapping) or not before.get("ok"):
-        return {
-            "applicable": False,
-            "regressions": [],
-            "reason": "baseline_contract_unavailable",
-        }
-    if not isinstance(after, Mapping) or not after.get("ok"):
-        return {
-            "applicable": True,
-            "regressions": ["target_contract_unavailable_after_edit"],
-            "before_class": before.get("class"),
-            "after_class": after.get("class") if isinstance(after, Mapping) else "",
-        }
-
-    before_methods = _api_entries(before.get("visible_non_target_methods"))
-    after_methods = _api_entries(after.get("visible_non_target_methods"))
-    before_constructors = _api_entries(before.get("declared_visible_constructors"))
-    after_constructors = _api_entries(after.get("declared_visible_constructors"))
-    regressions: list[str] = []
-    relocated_findings = (
-        refused_bequest_catalog_additions_in_impact_cone(
-            baseline.get("project_finding_catalog"),
-            current.get("project_finding_catalog"),
-            changed_files=changed_production_source_files,
-            affected_classes=_refused_bequest_affected_classes(
-                baseline,
-                current,
-                changed_production_source_files,
-            ),
-        )
-        if changed_production_source_files is not None
-        else _finding_catalog_additions(
-            baseline.get("project_finding_catalog"),
-            current.get("project_finding_catalog"),
-            fields=("file", "class_name", "method", "rule_id", "parent"),
-        )
-    )
-    regressions.extend(
-        "rejecting_override_relocated:"
-        f"{item.get('file', '')}#{item.get('method', '')}"
-        for item in relocated_findings[:8]
-    )
-    missing_methods = sorted(set(before_methods).difference(after_methods))
-    missing_constructors = sorted(set(before_constructors).difference(after_constructors))
-    review_signals: list[str] = []
-    for key in missing_methods:
-        if before_methods[key].get("declared_on_target") is True:
-            regressions.append(f"missing_declared_method:{key}")
-        else:
-            review_signals.append(f"missing_inherited_method:{key}")
-    for key in missing_constructors:
-        regressions.append(f"missing_constructor:{key}")
-    for key in sorted(set(before_methods).intersection(after_methods)):
-        if (
-            _visibility_rank(after_methods[key].get("visibility"))
-            < _visibility_rank(before_methods[key].get("visibility"))
-        ):
-            signal = (
-                f"{key}:{before_methods[key].get('visibility')}"
-                f"->{after_methods[key].get('visibility')}"
-            )
-            if before_methods[key].get("declared_on_target") is True:
-                regressions.append(f"narrowed_declared_method:{signal}")
-            else:
-                review_signals.append(f"narrowed_inherited_method:{signal}")
-    for key in sorted(set(before_constructors).intersection(after_constructors)):
-        if (
-            _visibility_rank(after_constructors[key].get("visibility"))
-            < _visibility_rank(before_constructors[key].get("visibility"))
-        ):
-            regressions.append(
-                "narrowed_constructor:"
-                f"{key}:{before_constructors[key].get('visibility')}"
-                f"->{after_constructors[key].get('visibility')}"
-            )
-    return {
-        "applicable": True,
-        "before_class": before.get("class"),
-        "after_class": after.get("class"),
-        "superclass_changed": before.get("direct_superclass") != after.get("direct_superclass"),
-        "missing_methods": missing_methods,
-        "missing_constructors": missing_constructors,
-        "regressions": regressions,
-        "review_signals": review_signals,
-        "new_rejecting_findings": relocated_findings,
-        "policy": before.get("comparison_policy") or {},
-    }
+    return {"applicable": False, "regressions": []}
 
 
 def _clone_strict_deduplication(
@@ -953,54 +854,3 @@ def _finding_catalog_additions(
     before = entries(before_value)
     after = entries(after_value)
     return [after[key] for key in sorted(set(after).difference(before))]
-
-
-def _refused_bequest_affected_classes(
-    baseline: Mapping[str, Any],
-    current: Mapping[str, Any],
-    changed_files: tuple[str, ...],
-) -> set[str]:
-    """Expand to descendants only when a frozen contract declaration changed."""
-    changed = {str(path).replace("\\", "/").lstrip("./") for path in changed_files}
-    names: set[str] = set()
-    for snapshot in (baseline, current):
-        impact = snapshot.get("migration_impact_map")
-        if not isinstance(impact, Mapping):
-            continue
-        declarations = impact.get("contract_declarations")
-        declaration_changed = bool(
-            isinstance(declarations, list)
-            and any(
-                isinstance(item, Mapping)
-                and str(item.get("file") or "").replace("\\", "/").lstrip("./") in changed
-                for item in declarations
-            )
-        )
-        implementers = impact.get("implementers")
-        if not isinstance(implementers, list):
-            continue
-        for item in implementers:
-            if not isinstance(item, Mapping):
-                continue
-            file_name = str(item.get("file") or "").replace("\\", "/").lstrip("./")
-            class_name = str(item.get("class") or "").strip()
-            if class_name and (declaration_changed or file_name in changed):
-                names.add(class_name)
-    return names
-
-
-def _api_entries(value: Any) -> dict[str, Mapping[str, Any]]:
-    if not isinstance(value, list):
-        return {}
-    entries: dict[str, Mapping[str, Any]] = {}
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        key = str(item.get("api_key") or "").strip()
-        if key:
-            entries[key] = item
-    return entries
-
-
-def _visibility_rank(value: Any) -> int:
-    return {"protected": 1, "public": 2}.get(str(value or ""), 0)

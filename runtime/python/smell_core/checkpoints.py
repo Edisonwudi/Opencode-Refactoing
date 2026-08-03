@@ -44,9 +44,9 @@ def _require_current_checkpoint_versions(payload: dict[str, Any]) -> None:
     """Reject checkpoints that predate either half of the frozen contract.
 
     Schema v5 describes the target-Guard manifest shape, while ``contract_version``
-    versions the resolution/structural semantics stored inside it.  Reusing a
-    v4 manifest produced by an older contract would silently omit baseline
-    catalogs required by the current closure checks.
+    versions the resolution/structural semantics stored inside it. Reusing a
+    v4 manifest would silently preserve the retired Refused Bequest snapshot
+    semantics instead of the target-Guard-only contract.
     """
     if int(payload.get("schema_version") or 0) != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
@@ -54,7 +54,7 @@ def _require_current_checkpoint_versions(payload: dict[str, Any]) -> None:
         )
     if int(payload.get("contract_version") or 0) != CHECKPOINT_CONTRACT_VERSION:
         raise ValueError(
-            "CHECKPOINT_RECAPTURE_REQUIRED: checkpoint contract v4 must be captured before editing"
+            "CHECKPOINT_RECAPTURE_REQUIRED: checkpoint contract v5 must be captured before editing"
         )
 
 

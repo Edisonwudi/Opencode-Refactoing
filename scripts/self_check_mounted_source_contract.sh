@@ -17,6 +17,7 @@ required_docker_ignores=(
   '.idea-trial-worktrees'
   'images'
   'runs'
+  'batch_runs'
   '.smell-artifacts'
   '.codex_tmp'
   'backups'

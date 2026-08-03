@@ -18,11 +18,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from tree_sitter_language_pack import get_parser
 
 from ..analysis import java_cognitive_complexity_from_text
-from .source_layout import (
-    JavaSourceLayoutError,
-    discover_java_source_layout,
-    standard_test_root,
-)
+from .source_layout import standard_test_root
 JAVA_CONTROL_KEYWORDS = {
     "if",
     "for",
@@ -112,25 +108,6 @@ DEFAULT_THRESHOLDS = {
     "mysterious_name_profile": "strict",
 }
 
-DEFAULT_EXCLUDE_PATHS = [
-    ".git",
-    ".gradle",
-    ".idea",
-    ".settings",
-    ".venv",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    "target",
-    "build",
-    "out",
-    "bin",
-    "dist",
-    "node_modules",
-    "venv",
-    "env",
-]
-
 DEFAULT_LOW_INFO_NAMES = {
     "tmp",
     "temp",
@@ -192,67 +169,6 @@ class JavaSyntacticFinding:
     switch_density: float = 0.0
 
 
-@dataclass(frozen=True)
-class JavaSyntacticDetectionResult:
-    ok: bool
-    findings: Dict[str, List[JavaSyntacticFinding]]
-    error: str = ""
-    unavailable: Optional[Dict[str, object]] = None
-
-
-def run_java_syntactic_detector(
-    project_root: Path,
-    *,
-    include_tests: bool = False,
-    target_files: Optional[Sequence[Path]] = None,
-    thresholds: Optional[Dict[str, object]] = None,
-    include_mysterious_name: bool = True,
-) -> JavaSyntacticDetectionResult:
-    config = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
-    project_root = project_root.expanduser().resolve()
-    try:
-        java_files = _resolve_java_files(project_root, include_tests=include_tests, target_files=target_files)
-        classes, methods = load_project_model(project_root, java_files)
-        mysterious_findings = (
-            _detect_mysterious_name(
-                methods,
-                int(config["mysterious_name_min_len"]),
-                DEFAULT_LOW_INFO_NAMES,
-                profile=str(config["mysterious_name_profile"]),
-                exclude_tests=True,
-            )
-            if include_mysterious_name
-            else []
-        )
-        if include_mysterious_name:
-            mysterious_findings.extend(
-                _detect_mysterious_names_outside_methods(
-                    project_root,
-                    java_files,
-                    classes,
-                    methods,
-                    int(config["mysterious_name_min_len"]),
-                    DEFAULT_LOW_INFO_NAMES,
-                    profile=str(config["mysterious_name_profile"]),
-                )
-            )
-        findings = {
-            "nested_complexity": _detect_nested_complexity(methods, int(config["cognitive_complexity"])),
-            "switch_statements": _detect_switch_statements(methods),
-            "mysterious_name": mysterious_findings,
-        }
-        return JavaSyntacticDetectionResult(ok=True, findings={k: _sort_findings(v) for k, v in findings.items()})
-    except JavaSourceLayoutError as exc:
-        return JavaSyntacticDetectionResult(
-            ok=False,
-            findings=_empty_findings(),
-            error="DETECTOR_UNAVAILABLE",
-            unavailable=exc.to_unavailable(),
-        )
-    except Exception as exc:
-        return JavaSyntacticDetectionResult(ok=False, findings=_empty_findings(), error=str(exc))
-
-
 def method_parameter_type_fingerprint(method: Optional[str]) -> Optional[str]:
     """Canonical Java parameter types from a declaration-like signature."""
     signature = str(method or "")
@@ -288,40 +204,6 @@ def load_project_model(project_root: Path, java_files: Sequence[Path]) -> Tuple[
         all_classes.extend(classes)
         all_methods.extend(methods)
     return all_classes, all_methods
-
-
-def _detect_nested_complexity(methods: Sequence[JavaMethodInfo], threshold: int) -> List[JavaSyntacticFinding]:
-    rows = []
-    for method in methods:
-        score = compute_cognitive_complexity(method.body_text, method.method_name)
-        if score < threshold:
-            continue
-        rows.append(_finding("nested_complexity", method, float(score), "custom:cognitive_complexity", f"complexity={score}; threshold={threshold}"))
-    return rows
-
-
-def _detect_switch_statements(
-    methods: Sequence[JavaMethodInfo],
-) -> List[JavaSyntacticFinding]:
-    rows = []
-    for method in methods:
-        switch_count, case_count, density = compute_switch_metrics(method.body_text)
-        if switch_count == 0:
-            continue
-        score = max(float(case_count), float(density))
-        rows.append(
-            _finding(
-                "switch_statements",
-                method,
-                score,
-                "custom:target_method_contains_switch",
-                f"switch_count={switch_count}; case_count={case_count}; density={density:.2f}",
-                switch_count=switch_count,
-                switch_case_count=case_count,
-                switch_density=density,
-            )
-        )
-    return rows
 
 
 def is_thin_forwarder(body_text: str) -> bool:
@@ -953,40 +835,6 @@ def _stem_name(name: str) -> str:
     return lowered or name.lower()
 
 
-def _resolve_java_files(
-    project_root: Path,
-    *,
-    include_tests: bool,
-    target_files: Optional[Sequence[Path]],
-) -> List[Path]:
-    source_layout = None if include_tests else discover_java_source_layout(project_root)
-    if target_files:
-        resolved = []
-        for path in target_files:
-            candidate = path if path.is_absolute() else project_root / path
-            if (
-                candidate.exists()
-                and candidate.suffix == ".java"
-                and (
-                    include_tests
-                    or source_layout is None
-                    or not source_layout.is_test_path(candidate)
-                )
-            ):
-                resolved.append(candidate.resolve())
-        return sorted(set(resolved))
-    exclude = set(DEFAULT_EXCLUDE_PATHS)
-    files = []
-    for path in project_root.rglob("*.java"):
-        if not path.is_file() or exclude & set(path.parts):
-            continue
-        rel_path = str(path.relative_to(project_root)).replace("\\", "/")
-        if not include_tests and source_layout is not None and source_layout.is_test_path(rel_path):
-            continue
-        files.append(path)
-    return sorted(files)
-
-
 def _build_line_starts(text: str) -> List[int]:
     starts = [0]
     for i, ch in enumerate(text):
@@ -1261,15 +1109,3 @@ def _is_test_like_path(rel_path: str) -> bool:
 def _is_generated_like_path(rel_path: str) -> bool:
     normalized = "/" + rel_path.replace("\\", "/").lower().strip("/") + "/"
     return any(token in normalized for token in ("/generated/", "/build/generated/", "/target/generated-sources/"))
-
-
-def _sort_findings(findings: Sequence[JavaSyntacticFinding]) -> List[JavaSyntacticFinding]:
-    return sorted(findings, key=lambda item: (item.file, item.begin_line, item.class_name, item.method, item.rule_id, item.evidence))
-
-
-def _empty_findings() -> Dict[str, List[JavaSyntacticFinding]]:
-    return {
-        "nested_complexity": [],
-        "switch_statements": [],
-        "mysterious_name": [],
-    }

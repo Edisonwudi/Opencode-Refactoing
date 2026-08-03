@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
 from smell_core import checkpoint_adapters  # noqa: E402
 from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS, detector_profile_for  # noqa: E402
+from smell_core.checkpoints import _require_current_checkpoint_versions  # noqa: E402
 from smell_core.config import ResolvedRunConfig  # noqa: E402
 from smell_core.guard_scope import GuardVerificationScope  # noqa: E402
 from smell_core.java.target_guard import (  # noqa: E402
@@ -154,19 +155,10 @@ class Subject extends MissingBase {
         config.target_context = {}
         config.guard_contract = {}
         config.guard_scope = scope
-        original_detector = checkpoint_adapters.run_java_semantic_detector
-
-        def forbidden_detector(*_args: object, **_kwargs: object) -> object:
-            raise AssertionError("Java product Guard invoked the full-project detector")
-
-        checkpoint_adapters.run_java_semantic_detector = forbidden_detector
-        try:
-            captured = checkpoint_adapters.capture_metric_snapshot(
-                config,
-                "score=999;finding_present=false",
-            )
-        finally:
-            checkpoint_adapters.run_java_semantic_detector = original_detector
+        captured = checkpoint_adapters.capture_metric_snapshot(
+            config,
+            "score=999;finding_present=false",
+        )
         assert captured["ok"] is True and captured["target_smell_present"] is True, captured
         assert (
             captured["witness"][0]["relation_scope"]["relation_state"]
@@ -177,11 +169,7 @@ class Subject extends MissingBase {
             "entity_identity": captured["entity_identity"],
             "witness": captured["witness"],
         }
-        checkpoint_adapters.run_java_semantic_detector = forbidden_detector
-        try:
-            evaluated = checkpoint_adapters.capture_metric_snapshot(config, "score=0")
-        finally:
-            checkpoint_adapters.run_java_semantic_detector = original_detector
+        evaluated = checkpoint_adapters.capture_metric_snapshot(config, "score=0")
         assert evaluated["ok"] is True, evaluated
         assert evaluated["target_smell_present"] is False, evaluated
         assert not evaluated["guard_violations"], evaluated
@@ -535,6 +523,15 @@ class Subject extends MissingBase implements Capability {
 
 
 def main() -> int:
+    try:
+        _require_current_checkpoint_versions(
+            {"schema_version": 5, "contract_version": 4}
+        )
+    except ValueError as exc:
+        assert "checkpoint contract v5" in str(exc), exc
+    else:
+        raise AssertionError("checkpoint contract v4 did not require recapture")
+
     _profile_matrix()
     _feature_envy_dispatch()
     _guard_evidence_hard_limit()
@@ -583,7 +580,7 @@ def main() -> int:
         manifest_path = Path(baseline["artifacts"]["baseline_manifest"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["schema_version"] == 5, manifest
-        assert manifest["contract_version"] == 4, manifest
+        assert manifest["contract_version"] == 5, manifest
         assert "guard_contract" in manifest and "finding_contract" not in manifest
         assert "baseline_finding_catalog" not in json.dumps(manifest)
         assert "baseline_occurrence_contract" not in json.dumps(manifest)
@@ -608,7 +605,7 @@ def main() -> int:
 
     print(
         "java-target-guard-v5 self-check PASS "
-        "smells=11 schema=5 contract=4 full_scan=blocked "
+        "smells=11 schema=5 contract=5 full_scan=blocked "
         "decision_lt_64KiB evidence_lt_2MiB verify_full=removed"
     )
     return 0

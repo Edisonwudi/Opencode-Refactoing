@@ -12,10 +12,6 @@ from pathlib import Path
 import subprocess
 from typing import Any, Mapping
 
-from .target_guard_predicates import (
-    capture_target_guard_predicate,
-    evaluate_target_guard_predicate,
-)
 from .source_layout import standard_test_root
 from ..analysis import method_basename
 from ..guard_scope import (
@@ -59,6 +55,11 @@ def _run_java_target_guard(config: Any, *, capture: bool) -> dict[str, Any]:
         selector = {**selector, **dict(frozen_identity)}
 
     if smell in _LOCAL_PREDICATE_SMELLS:
+        from .target_guard_predicates import (
+            capture_target_guard_predicate,
+            evaluate_target_guard_predicate,
+        )
+
         predicate = (
             capture_target_guard_predicate
             if capture

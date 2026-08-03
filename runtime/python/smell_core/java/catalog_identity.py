@@ -155,27 +155,6 @@ def stable_clone_method_identity(value: Any) -> str:
     )
 
 
-def stable_refused_bequest_identity(entry: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return the source-level identity of one rejecting override finding."""
-    inheritance_source = _stable_inheritance_source(entry.get("inheritance_source"))
-    source_method = entry.get("source_method")
-    method_identity = (
-        stable_java_method_signature(
-            source_method,
-            preserve_source_qualification=True,
-        )
-        if str(source_method or "").strip()
-        else stable_java_method_signature(entry.get("method"))
-    )
-    return (
-        normalize_catalog_path(entry.get("file")),
-        str(entry.get("class_name") or entry.get("class") or "").strip(),
-        method_identity,
-        str(entry.get("rule_id") or "").strip(),
-        inheritance_source or _stable_type_name(entry.get("parent")),
-    )
-
-
 def clone_catalog_entries(value: Any) -> dict[str, set[str]]:
     """Read a clone catalog using source-stable method identities."""
     if not isinstance(value, list):
@@ -294,60 +273,6 @@ def clone_catalog_additions_in_impact_cone(
     return additions
 
 
-def refused_bequest_catalog_additions_in_impact_cone(
-    before_value: Any,
-    after_value: Any,
-    *,
-    changed_files: Sequence[str],
-    affected_classes: Iterable[str] = (),
-    affected_methods: Iterable[str] = (),
-) -> list[dict[str, Any]]:
-    """Return newly rejecting overrides inside the Java diff impact cone.
-
-    A changed parent contract may create a genuine rejecting finding in an
-    unchanged child.  ``affected_classes`` therefore accepts the class/type
-    closure computed from a frozen hierarchy; both the finding owner and its
-    parent are checked.  ``affected_methods`` accepts stable clone-style method
-    keys for any additional call/hierarchy edges chosen by the caller.
-    """
-    before = _refused_entries(before_value)
-    after = _refused_entries(after_value)
-    changed = {normalize_catalog_path(path) for path in changed_files if str(path or "")}
-    affected_types = {_stable_type_name(value) for value in affected_classes if str(value or "")}
-    affected_method_ids = {
-        stable_clone_method_identity(value)
-        for value in affected_methods
-        if str(value or "")
-    }
-    additions: list[dict[str, Any]] = []
-    for identity in sorted(set(after).difference(before)):
-        item = after[identity]
-        file_name, owner, method, _rule, parent = identity
-        method_id = f"{file_name}#{owner}#{method}"
-        if not (
-            file_name in changed
-            or _stable_type_name(owner) in affected_types
-            or parent in affected_types
-            or method_id in affected_method_ids
-        ):
-            continue
-        additions.append(dict(item))
-    return additions
-
-
-def _refused_entries(value: Any) -> dict[tuple[str, ...], Mapping[str, Any]]:
-    if not isinstance(value, list):
-        return {}
-    entries: dict[tuple[str, ...], Mapping[str, Any]] = {}
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        identity = stable_refused_bequest_identity(item)
-        if identity[0] and identity[1] and identity[2]:
-            entries[identity] = item
-    return entries
-
-
 def _clone_method_file(value: str) -> str:
     return normalize_catalog_path(str(value or "").split("#", 1)[0])
 
@@ -409,21 +334,6 @@ def _lexical_parameter_type(parameter: Any) -> str:
 def _node_text(node: Any) -> str:
     raw = getattr(node, "text", None)
     return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw or "")
-
-
-def _stable_type_name(value: Any) -> str:
-    text = str(value or "").strip().replace(_AMBIGUOUS_TYPE_PREFIX, "")
-    text = re.sub(r"<.*>", "", text).replace("[]", "")
-    return text.rsplit(".", 1)[-1]
-
-
-def _stable_inheritance_source(value: Any) -> str:
-    """Normalize the lexical extends/implements clause without resolving it."""
-    if isinstance(value, list):
-        parts = [str(item).strip() for item in value if str(item).strip()]
-        return ",".join(re.sub(r"\s+", "", item) for item in parts)
-    text = str(value or "").strip()
-    return re.sub(r"\s+", "", text) if text else ""
 
 
 def split_top_level_java_types(value: str) -> list[str]:

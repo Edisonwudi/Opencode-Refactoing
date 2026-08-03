@@ -189,13 +189,11 @@ def _verify_projects(
 
 
 def _forbid_full_detector() -> None:
-    from smell_core import checkpoint_adapters
     from smell_core.java import semantic_detector
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("FULL_PROJECT_DETECTOR_FORBIDDEN_IN_TARGET_GUARD_AUDIT")
 
-    checkpoint_adapters.run_java_semantic_detector = forbidden
     semantic_detector.run_java_semantic_detector = forbidden
 
 
