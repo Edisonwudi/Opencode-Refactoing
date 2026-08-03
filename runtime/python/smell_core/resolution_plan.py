@@ -265,17 +265,6 @@ def _worklist(
         endpoints = structure.get("endpoints") if isinstance(structure, Mapping) else None
         if isinstance(endpoints, list):
             items.extend(_mapping_items("clone_endpoint", endpoints))
-    elif smell == "refused_bequest":
-        impact = current.get("migration_impact_map")
-        if isinstance(impact, Mapping):
-            for key, kind in (
-                ("contract_declarations", "contract_declaration"),
-                ("implementers", "implementer"),
-                ("production_call_sites", "production_call_site"),
-            ):
-                values = impact.get(key)
-                if isinstance(values, list):
-                    items.extend(_mapping_items(kind, values))
     elif smell == "god_class":
         profile = current.get("god_class_profile")
         clusters = current.get("responsibility_clusters")
