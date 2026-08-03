@@ -89,6 +89,33 @@ class Service {
         "src/main/java/p/Service.java"
     ], ordinary
 
+    varargs_target = _write(
+        project,
+        "src/main/java/p/VarargsService.java",
+        """\
+package p;
+class VarargsService {
+  void join(String separator, int start, int end, boolean skipNulls,
+            String prefix, char... characters) {}
+}
+""",
+    )
+    varargs = evaluate_long_parameter_list_guard(
+        project,
+        (
+            "src/main/java/p/VarargsService.java:method="
+            "join(String separator, int start, int end, boolean skipNulls, "
+            "String prefix, char... characters)|line=3"
+        ),
+        {},
+    )
+    assert varargs["ok"] is True, varargs
+    assert varargs["target_smell_present"] is True, varargs
+    assert varargs["objectives"] == {"parameter_count": 6}, varargs
+    assert varargs["entity_identity"]["parameter_types"][-1] == "char...", varargs
+    assert varargs["witness"]["target"]["parameter_count"] == 6, varargs
+    assert varargs_target.exists()
+
     frozen = ordinary["entity_identity"]
     assert frozen["class"] == "p.Service", frozen
     target.write_text(_lpl_source("Request"), encoding="utf-8")

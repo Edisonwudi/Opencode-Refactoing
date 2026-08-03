@@ -655,8 +655,8 @@ def _callable_from_node(
     for parameter in parameters.named_children:
         if parameter.type not in _PARAMETER_NODE_TYPES:
             continue
-        type_node = parameter.child_by_field_name("type")
-        parameter_name = parameter.child_by_field_name("name")
+        type_node = _parameter_type_node(parameter)
+        parameter_name = _parameter_name_node(parameter)
         if type_node is None or parameter_name is None:
             continue
         type_name = _canonical_type(
@@ -689,6 +689,45 @@ def _callable_from_node(
         parameter_names=tuple(parameter_names),
         begin_line=node.start_point.row + 1,
         end_line=node.end_point.row + 1,
+    )
+
+
+def _parameter_type_node(parameter: Node) -> Node | None:
+    direct = parameter.child_by_field_name("type")
+    if direct is not None:
+        return direct
+    for child in parameter.named_children:
+        if child.type in {
+            "array_type",
+            "boolean_type",
+            "floating_point_type",
+            "generic_type",
+            "integral_type",
+            "scoped_type_identifier",
+            "type_identifier",
+        }:
+            return child
+    return None
+
+
+def _parameter_name_node(parameter: Node) -> Node | None:
+    direct = parameter.child_by_field_name("name")
+    if direct is not None:
+        return direct
+    declarator = parameter.child_by_field_name("declarator")
+    if declarator is None:
+        declarator = next(
+            (
+                child
+                for child in parameter.named_children
+                if child.type == "variable_declarator"
+            ),
+            None,
+        )
+    return (
+        declarator.child_by_field_name("name")
+        if declarator is not None
+        else None
     )
 
 
