@@ -329,12 +329,8 @@ type ContinuationState = {
   updatedAt: number
 }
 
-// The bridge emits failure_pack.artifact_paths as an object (name -> path), not
-// a string array. Accept both shapes defensively.
+// The bridge contract emits failure_pack.artifact_paths as name -> path.
 function artifactPathsFrom(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.map((item) => (typeof item === "string" ? item : "")).filter((item) => item.length > 0)
-  }
   if (value && typeof value === "object") {
     const entries = Object.values(value as Record<string, unknown>)
     return entries
