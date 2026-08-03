@@ -416,7 +416,7 @@ def _select_methods(
         )
     ]
     has_identity = bool(method_name or class_anchor or fingerprint is not None)
-    if target.line and (len(candidates) > 1 or not has_identity):
+    if target.line:
         candidates = [
             method
             for method in candidates

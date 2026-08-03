@@ -173,6 +173,59 @@ def _run() -> None:
             assert ambiguous["target_missing"] is False, ambiguous
             assert ambiguous["witness"]["error"] == "TARGET_AMBIGUOUS", ambiguous
 
+            wrong_line = predicates.evaluate_long_method(
+                project,
+                parse_location_descriptor(
+                    "Fixture.java:method=longTarget()|line=1",
+                    project,
+                ),
+                {"target_class": "Fixture"},
+            )
+            _assert_schema(wrong_line)
+            assert wrong_line["ok"] is True, wrong_line
+            assert wrong_line["target_match_count"] == 0, wrong_line
+            assert wrong_line["target_missing"] is True, wrong_line
+
+            enum_body = "\n".join(
+                f"      consume({index});" for index in range(59)
+            )
+            enum_source = f"""\
+enum Tool {{
+  SHORT {{
+    @Override void touched(int value) {{ consume(value); }}
+  }},
+  LONG {{
+    @Override void touched(int value) {{
+{enum_body}
+    }}
+  }};
+  void touched(int value) {{}}
+  void consume(int value) {{}}
+}}
+"""
+            enum_file = project / "Tool.java"
+            enum_file.write_text(enum_source, encoding="utf-8")
+            enum_line = next(
+                index
+                for index, line in enumerate(enum_source.splitlines(), start=1)
+                if "consume(30)" in line
+            )
+            enum_target = predicates.capture_long_method(
+                project,
+                parse_location_descriptor(
+                    f"Tool.java:method=touched(int value)|line={enum_line}",
+                    project,
+                ),
+                {"target_class": "Tool"},
+            )
+            _assert_schema(enum_target)
+            assert enum_target["ok"] is True, enum_target
+            assert enum_target["target_match_count"] == 1, enum_target
+            assert enum_target["target_smell_present"] is True, enum_target
+            assert enum_target["objectives"] == {"ast_ncss": 60.0}, enum_target
+            matched_range = enum_target["witness"]["matched_range"]
+            assert matched_range["begin_line"] <= enum_line <= matched_range["end_line"]
+
             source.write_text(_source(resolved=True), encoding="utf-8")
             for smell in locations:
                 result = predicates.evaluate_target_guard_predicate(

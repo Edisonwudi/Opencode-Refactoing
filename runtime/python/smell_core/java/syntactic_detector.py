@@ -947,6 +947,14 @@ def _scan_java_methods(
             idx = paren_end + 1
             continue
         name_index = text.rfind(method_name, 0, paren_idx)
+        callable_kind = callable_kinds.get(name_index)
+        if callable_kind is None:
+            # Text such as ``ENUM_VALUE(args) { ... }`` and anonymous-class
+            # construction also looks callable to the lightweight scanner.
+            # It must not consume the enclosing body and hide real nested
+            # method declarations that tree-sitter has already classified.
+            idx = paren_end + 1
+            continue
         begin_line = _idx_to_line(
             line_starts,
             name_index if name_index >= 0 else paren_idx,
@@ -976,7 +984,7 @@ def _scan_java_methods(
                 end_line=end_line,
                 body_begin_line=_idx_to_line(line_starts, body_start),
                 body_text=body_text,
-                is_constructor=callable_kinds.get(name_index) == "constructor",
+                is_constructor=callable_kind == "constructor",
                 parameter_names=param_names,
                 parameter_tokens=param_tokens,
             )
