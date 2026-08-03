@@ -183,7 +183,37 @@ def _dispatch_scoped_guard(
         semantic_selector = dict(getattr(config, "target_context", {}) or {})
         changed_line_ranges: dict[str, list[tuple[int, int]]] = {}
         relation_witness: dict[str, Any] = {}
-        if smell == "feature_envy":
+        contract = dict(getattr(config, "guard_contract", {}) or {})
+        location = str(getattr(locations[0], "raw", locations[0]))
+        relation_state = _frozen_relation_state(contract)
+
+        # FE and RB often have enough information in the target file itself.
+        # Capture that exact target first and expand source ancestry only when
+        # the method declaration exists but the smell predicate cannot yet
+        # produce a finding.  Optional/unrelated parents must not make an
+        # already measurable target unavailable.
+        if capture and smell in {"feature_envy", "refused_bequest"}:
+            target_only = capture_target_semantic_guard(
+                smell,
+                root,
+                location,
+                semantic_selector,
+                explicit_files,
+            )
+            if _semantic_capture_is_sufficient(target_only):
+                _attach_relation_witness(
+                    target_only,
+                    _target_only_relation_witness(explicit_files),
+                )
+                return target_only
+            if not _semantic_capture_needs_relation(target_only):
+                return target_only
+
+        use_relation_scope = (
+            smell in {"feature_envy", "refused_bequest"}
+            and (capture or relation_state != "target_only_sufficient")
+        )
+        if smell == "feature_envy" and use_relation_scope:
             explicit_files, relation_witness = _feature_envy_target_files(
                 root,
                 explicit_files,
@@ -196,10 +226,12 @@ def _dispatch_scoped_guard(
             # parsing: every method actually touched by the refactoring diff
             # is checked for relocation.  Unchanged methods in those files are
             # filtered by ``changed_line_ranges`` in the semantic Guard.
-            explicit_files = tuple(sorted(set(target_files).union(changed_files)))
+            explicit_files = tuple(
+                sorted(set(explicit_files).union(changed_files))
+            )
             _enforce_explicit_scope_budget(root, explicit_files)
             changed_line_ranges = _changed_range_map(root, scope, changed_files)
-        if smell == "refused_bequest":
+        if smell == "refused_bequest" and use_relation_scope:
             explicit_files, relation_witness = _refused_bequest_relation_files(
                 root,
                 explicit_files,
@@ -207,7 +239,12 @@ def _dispatch_scoped_guard(
                 selector,
                 capture=capture,
             )
-        location = str(getattr(locations[0], "raw", locations[0]))
+        if (
+            smell in {"feature_envy", "refused_bequest"}
+            and not capture
+            and not use_relation_scope
+        ):
+            relation_witness = _target_only_relation_witness(explicit_files)
         if capture:
             captured = capture_target_semantic_guard(
                 smell,
@@ -219,7 +256,6 @@ def _dispatch_scoped_guard(
             if relation_witness:
                 _attach_relation_witness(captured, relation_witness)
             return captured
-        contract = dict(getattr(config, "guard_contract", {}) or {})
         evaluated = evaluate_target_semantic_guard(
             smell,
             root,
@@ -541,7 +577,10 @@ def _refused_bequest_relation_files(
         raise GuardScopeError(exc.code, exc.message, **exc.details) from exc
     files = tuple(relation.files)
     _enforce_explicit_scope_budget(project_root, files)
-    return files, relation.witness()
+    return files, {
+        **relation.witness(),
+        "relation_state": "expanded",
+    }
 
 
 def _feature_envy_target_files(
@@ -576,7 +615,10 @@ def _feature_envy_target_files(
         raise GuardScopeError(exc.code, exc.message, **exc.details) from exc
     files = tuple(relation.files)
     _enforce_explicit_scope_budget(project_root, files)
-    return files, relation.witness()
+    return files, {
+        **relation.witness(),
+        "relation_state": "expanded",
+    }
 
 
 def _attach_relation_witness(
@@ -592,6 +634,56 @@ def _attach_relation_witness(
         witness["relation_scope"] = dict(relation_witness)
         return
     result["witness"] = {"relation_scope": dict(relation_witness)}
+
+
+def _semantic_capture_is_sufficient(result: Mapping[str, Any]) -> bool:
+    identity = result.get("entity_identity")
+    objectives = result.get("objectives")
+    return bool(
+        result.get("ok") is True
+        and int(result.get("target_match_count") or 0) == 1
+        and result.get("target_smell_present") is True
+        and isinstance(identity, Mapping)
+        and bool(identity)
+        and isinstance(objectives, Mapping)
+        and bool(objectives)
+    )
+
+
+def _semantic_capture_needs_relation(result: Mapping[str, Any]) -> bool:
+    violations = {
+        str(item.get("code") if isinstance(item, Mapping) else item)
+        for item in (result.get("guard_violations") or [])
+    }
+    return bool(
+        int(result.get("target_match_count") or 0) == 0
+        and result.get("target_missing") is False
+        and "TARGET_FINDING_NOT_FOUND" in violations
+        and "ANALYSIS_FAILED" not in violations
+    )
+
+
+def _target_only_relation_witness(
+    explicit_files: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "relation_state": "target_only_sufficient",
+        "scope_files": list(explicit_files),
+    }
+
+
+def _frozen_relation_state(contract: Mapping[str, Any]) -> str:
+    witness = contract.get("witness")
+    items: list[Mapping[str, Any]] = []
+    if isinstance(witness, Mapping):
+        items.append(witness)
+    elif isinstance(witness, (list, tuple)):
+        items.extend(item for item in witness if isinstance(item, Mapping))
+    for item in items:
+        relation = item.get("relation_scope")
+        if isinstance(relation, Mapping) and relation.get("relation_state"):
+            return str(relation["relation_state"])
+    return ""
 
 
 def _is_bounded_production_java_path(path: str) -> bool:

@@ -102,7 +102,7 @@ def _profile_matrix() -> None:
 def _feature_envy_dispatch() -> None:
     before = """\
 class Collaborator { void a() {} void b() {} void c() {} void d() {} }
-class Subject {
+class Subject extends MissingBase {
   static final Collaborator RECEIVER = new Collaborator();
   void target(String value) {
     RECEIVER.a(); RECEIVER.b(); RECEIVER.c(); RECEIVER.d();
@@ -111,7 +111,7 @@ class Subject {
 """
     after = """\
 class Collaborator { void a() {} void b() {} void c() {} void d() {} }
-class Subject {
+class Subject extends MissingBase {
   static final Collaborator RECEIVER = new Collaborator();
   void target(String value) { RECEIVER.a(); }
 }
@@ -119,7 +119,7 @@ class Subject {
     changed_diff = """\
 class Collaborator { void a() {} void b() {} void c() {} void d() {} }
 class Alternative { void w() {} void x() {} void y() {} void z() {} }
-class Subject {
+class Subject extends MissingBase {
   static final Collaborator RECEIVER = new Collaborator();
   static final Alternative ALTERNATE = new Alternative();
   void target(String value) { RECEIVER.a(); }
@@ -163,6 +163,10 @@ class Subject {
         finally:
             checkpoint_adapters.run_java_semantic_detector = original_detector
         assert captured["ok"] is True and captured["target_smell_present"] is True, captured
+        assert (
+            captured["witness"][0]["relation_scope"]["relation_state"]
+            == "target_only_sufficient"
+        ), captured
         source.write_text(after, encoding="utf-8")
         config.guard_contract = {
             "entity_identity": captured["entity_identity"],
@@ -409,6 +413,7 @@ class Subject extends AbstractCapability {
         assert captured["target_smell_present"] is True, captured
         assert captured["entity_identity"]["parent"] == "Capability", captured
         relation_scope = captured["witness"][0]["relation_scope"]
+        assert relation_scope["relation_state"] == "expanded", relation_scope
         assert set(relation_scope["scope_files"]) == {
             "AbstractCapability.java",
             "Capability.java",
@@ -442,12 +447,95 @@ class Subject extends AbstractCapability {
         assert not relation_removed["guard_violations"], relation_removed
 
 
+def _refused_bequest_target_first_dispatch() -> None:
+    before = """\
+interface Capability { Object target(); }
+class Subject extends MissingBase implements Capability {
+  public Object target() { throw new UnsupportedOperationException(); }
+}
+"""
+    after = """\
+interface Capability { Object target(); }
+class Subject extends MissingBase implements Capability {
+  public Object target() { return new Object(); }
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="refused-target-first-v5-") as temp_dir:
+        project = Path(temp_dir)
+        source = project / "Subject.java"
+        source.write_text(before, encoding="utf-8")
+        env = os.environ.copy()
+        for args in (["git", "init", "-q"], ["git", "add", "."]):
+            result = _run(list(args), project, env)
+            assert result.returncode == 0, result.stderr
+        result = _run(
+            [
+                "git",
+                "-c",
+                "user.name=guard-v5-self-check",
+                "-c",
+                "user.email=guard-v5@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+            project,
+            env,
+        )
+        assert result.returncode == 0, result.stderr
+
+        config = type("GuardConfig", (), {})()
+        config.project_root = project
+        config.language = "java"
+        config.smell = "refused_bequest"
+        config.locations = [
+            parse_location_descriptor(
+                "Subject.java:method=target()|line=3",
+                project,
+            )
+        ]
+        config.target_context = {}
+        config.guard_contract = {}
+        config.guard_scope = GuardVerificationScope(
+            changed_files=(),
+            changed_production_files=(),
+            target_files=("Subject.java",),
+            analysis_files=("Subject.java",),
+        )
+        captured = checkpoint_adapters.capture_metric_snapshot(config, "")
+        assert captured["ok"] is True, captured
+        assert captured["target_smell_present"] is True, captured
+        assert captured["entity_identity"]["parent"] == "Capability", captured
+        assert (
+            captured["witness"][0]["relation_scope"]["relation_state"]
+            == "target_only_sufficient"
+        ), captured
+
+        source.write_text(after, encoding="utf-8")
+        config.guard_contract = {
+            "entity_identity": captured["entity_identity"],
+            "witness": captured["witness"],
+        }
+        config.guard_scope = GuardVerificationScope(
+            changed_files=("Subject.java",),
+            changed_production_files=("Subject.java",),
+            target_files=("Subject.java",),
+            analysis_files=("Subject.java",),
+            changed_line_ranges=(("Subject.java", 3, 3),),
+        )
+        evaluated = checkpoint_adapters.capture_metric_snapshot(config, "")
+        assert evaluated["ok"] is True, evaluated
+        assert evaluated["target_smell_present"] is False, evaluated
+        assert not evaluated["guard_violations"], evaluated
+
+
 def main() -> int:
     _profile_matrix()
     _feature_envy_dispatch()
     _guard_evidence_hard_limit()
     _changed_noise_is_not_an_eager_parse_scope()
     _refused_bequest_cross_file_dispatch()
+    _refused_bequest_target_first_dispatch()
     with tempfile.TemporaryDirectory(prefix="java-target-guard-v5-") as temp_dir:
         project = Path(temp_dir)
         source = project / "Fixture.java"
