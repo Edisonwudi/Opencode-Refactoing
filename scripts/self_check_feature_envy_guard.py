@@ -32,6 +32,13 @@ class Subject {
   private Other other;
   private int a, b, c;
 
+  Subject() {
+    collaborator.a();
+    collaborator.b();
+    collaborator.c();
+    collaborator.d();
+  }
+
   void direct() {
     collaborator.a();
     collaborator.b();
@@ -129,7 +136,13 @@ def main() -> int:
             if finding.class_name == "Subject"
         }
 
-        for method in ("direct", "aliased", "transitivelyAliased", "dominantField"):
+        for method in (
+            "Subject",
+            "direct",
+            "aliased",
+            "transitivelyAliased",
+            "dominantField",
+        ):
             if method not in findings:
                 raise AssertionError(f"Expected Feature Envy finding for {method}")
         if "reassignedAlias" in findings:
@@ -140,11 +153,16 @@ def main() -> int:
             raise AssertionError("this-qualified self calls must equal unqualified self calls")
 
         direct = _metrics(findings["direct"].evidence)
+        constructor = _metrics(findings["Subject"].evidence)
         aliased = _metrics(findings["aliased"].evidence)
         transitive = _metrics(findings["transitivelyAliased"].evidence)
         dominant = _metrics(findings["dominantField"].evidence)
         if direct[:2] != (4, 0):
             raise AssertionError(f"Direct field metric is incorrect: {direct}")
+        if constructor[:2] != direct[:2]:
+            raise AssertionError(
+                f"Constructors must use the same Designite metric: {constructor}"
+            )
         if aliased[:2] != direct[:2] or transitive[:2] != direct[:2]:
             raise AssertionError(
                 f"Stable aliases must preserve field provenance: direct={direct} "
@@ -186,6 +204,7 @@ def main() -> int:
 
         print(
             "feature-envy-self-check PASS "
+            f"constructor={constructor[0]}/{constructor[1]} "
             f"direct={direct[0]}/{direct[1]} alias={aliased[0]}/{aliased[1]} "
             f"dominant={dominant[3]}:{dominant[0]}"
         )

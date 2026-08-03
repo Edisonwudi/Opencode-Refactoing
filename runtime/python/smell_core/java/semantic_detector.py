@@ -1080,8 +1080,8 @@ def _designite_feature_envy_profiles(
     model: ProjectModel,
     method: MethodRecord,
 ) -> List[FeatureEnvyProfile]:
-    """Mirror Designite 2.8.6's ordinary-method Feature Envy metric."""
-    if method.is_constructor or method.body is None or "abstract" in method.modifiers:
+    """Mirror Designite 2.8.6's concrete-callable Feature Envy metric."""
+    if method.body is None or "abstract" in method.modifiers:
         return []
     owner = model.classes.get(method.owner_qualified_name)
     if owner is None:
