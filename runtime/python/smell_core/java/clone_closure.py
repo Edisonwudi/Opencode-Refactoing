@@ -109,7 +109,11 @@ def analyze_exact_clone_closure(
     }
 
 
-def _body_profile(method: MethodRecord) -> dict[str, Any]:
+def _body_profile(
+    method: MethodRecord,
+    *,
+    include_method_tokens: bool = False,
+) -> dict[str, Any]:
     raw_body_tokens = tokenize_clone_node(method.body)
     thin_forwarder = is_thin_forwarder(method.body_text)
     body_tokens = list(raw_body_tokens)
@@ -127,7 +131,7 @@ def _body_profile(method: MethodRecord) -> dict[str, Any]:
         else []
     )
     encoded = "\x1f".join(body_tokens).encode("utf-8")
-    return {
+    result = {
         "method": _method_key(method),
         "body_tokens": raw_body_tokens,
         "thin_forwarder": thin_forwarder,
@@ -138,6 +142,9 @@ def _body_profile(method: MethodRecord) -> dict[str, Any]:
         ),
         "fingerprint": hashlib.sha256(encoded).hexdigest() if body_tokens else "",
     }
+    if include_method_tokens:
+        result["method_tokens"] = [*declaration_tokens, *raw_body_tokens]
+    return result
 
 
 def _clone_catalog(

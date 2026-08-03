@@ -2,8 +2,10 @@
 
 The caller supplies exactly two frozen endpoints plus optional changed/new
 ``analysis_files``.  This module never discovers project files and never runs a
-project smell detector.  It reuses the product clone token contract on a scoped
-semantic model, then emits only a bounded witness instead of a clone catalog.
+project smell detector.  A finding is one exact, contiguous token window of at
+least ``MIN_CLONE_TOKENS`` inside the two target methods.  This mirrors CPD's
+method-local duplicate contract without requiring the complete method bodies to
+be equal, and emits only a bounded witness instead of a clone catalog.
 """
 
 from __future__ import annotations
@@ -24,8 +26,8 @@ from . import semantic_detector
 
 
 MIN_CLONE_TOKENS = 30
-PREDICATE_ID = "java-target/code-clone-type1/exact-v1"
-PROFILE_ID = "java-target-clone-guard/v1"
+PREDICATE_ID = "java-target/code-clone-type1/exact-window-v2"
+PROFILE_ID = "java-target-clone-guard/v2"
 
 _SHINGLE_WIDTH = 5
 _SKETCH_SIZE = 64
@@ -193,29 +195,20 @@ def _evaluate_scope(
     pair_present = False
     pair_token_count = 0
     pair_fingerprint = ""
+    pair_window: dict[str, Any] = {}
     current_endpoint_witness: list[dict[str, Any]] = []
     profiles: dict[str, dict[str, Any]] = {}
     for method in methods:
-        profile = clone_closure._body_profile(method)
+        profile = _target_method_profile(method)
         profiles[stable_method_record_identity(method)] = profile
     if pair_count == 1:
         left, right = pairs[0]
         left_profile = profiles.get(stable_method_record_identity(left), {})
         right_profile = profiles.get(stable_method_record_identity(right), {})
-        pair_token_count = min(
-            int(left_profile.get("token_count") or 0),
-            int(right_profile.get("token_count") or 0),
-        )
-        pair_fingerprint = (
-            str(left_profile.get("fingerprint") or "")
-            if str(left_profile.get("fingerprint") or "")
-            == str(right_profile.get("fingerprint") or "")
-            else ""
-        )
-        pair_present = bool(
-            pair_fingerprint
-            and pair_token_count >= MIN_CLONE_TOKENS
-        )
+        pair_window = _pair_clone_window(left_profile, right_profile)
+        pair_token_count = int(pair_window.get("token_count") or 0)
+        pair_fingerprint = str(pair_window.get("fingerprint") or "")
+        pair_present = bool(pair_fingerprint and pair_token_count >= MIN_CLONE_TOKENS)
         current_endpoint_witness = [
             _bounded_method_profile(left, left_profile),
             _bounded_method_profile(right, right_profile),
@@ -223,7 +216,7 @@ def _evaluate_scope(
 
     if baseline_identity is None:
         identity = (
-            _capture_identity(pairs[0], profiles)
+            _capture_identity(pairs[0], profiles, pair_window)
             if pair_count == 1 and pair_present
             else {}
         )
@@ -246,13 +239,18 @@ def _evaluate_scope(
                 "endpoints": current_endpoint_witness,
                 "pair_fingerprint": pair_fingerprint,
                 "pair_token_count": pair_token_count if pair_present else 0,
+                "pair_window_kind": str(pair_window.get("kind") or ""),
+                "pair_window_offsets": _pair_window_offsets(pair_window),
             },
             guard_violations=[],
         )
 
     baseline_fingerprint = str(baseline_identity.get("pair_fingerprint") or "")
-    baseline_body_token_count = int(
-        baseline_identity.get("body_token_count") or 0
+    baseline_window_token_count = int(
+        baseline_identity.get("clone_window_token_count") or 0
+    )
+    baseline_window_anchor = str(
+        baseline_identity.get("clone_window_anchor") or ""
     )
     baseline_sketch = {
         str(item)
@@ -263,7 +261,8 @@ def _evaluate_scope(
         methods,
         profiles,
         baseline_fingerprint=baseline_fingerprint,
-        baseline_body_token_count=baseline_body_token_count,
+        baseline_window_token_count=baseline_window_token_count,
+        baseline_window_anchor=baseline_window_anchor,
         baseline_sketch=baseline_sketch,
         endpoint_method_keys={
             stable_method_record_identity(method)
@@ -310,6 +309,8 @@ def _evaluate_scope(
             "endpoints": current_endpoint_witness,
             "current_pair_fingerprint": pair_fingerprint,
             "current_pair_token_count": pair_token_count if pair_present else 0,
+            "current_pair_window_kind": str(pair_window.get("kind") or ""),
+            "current_pair_window_offsets": _pair_window_offsets(pair_window),
             "baseline_copy_scan": {
                 "diff_filter": _changed_range_witness(
                     normalized_changed_ranges
@@ -332,41 +333,49 @@ def _evaluate_scope(
 def _capture_identity(
     pair: tuple[Any, Any],
     profiles: Mapping[str, Mapping[str, Any]],
+    pair_window: Mapping[str, Any],
 ) -> dict[str, Any]:
     left, right = pair
     left_profile = profiles[stable_method_record_identity(left)]
     right_profile = profiles[stable_method_record_identity(right)]
-    left_tokens = list(left_profile.get("body_tokens") or [])
-    right_tokens = list(right_profile.get("body_tokens") or [])
-    if left_tokens != right_tokens:
+    window_tokens = [str(item) for item in pair_window.get("tokens", [])]
+    pair_fingerprint = str(pair_window.get("fingerprint") or "")
+    pair_token_count = int(pair_window.get("token_count") or 0)
+    if (
+        len(pair_fingerprint) != 64
+        or pair_token_count < MIN_CLONE_TOKENS
+        or len(window_tokens) != pair_token_count
+    ):
         return {}
-    pair_token_count = min(
-        int(left_profile.get("token_count") or 0),
-        int(right_profile.get("token_count") or 0),
-    )
     return {
         "smell": "code_clone_type1",
         "profile_id": PROFILE_ID,
         "minimum_token_count": MIN_CLONE_TOKENS,
-        "pair_fingerprint": str(left_profile.get("fingerprint") or ""),
+        "pair_fingerprint": pair_fingerprint,
         "pair_token_count": pair_token_count,
-        "body_token_count": len(left_tokens),
-        "token_sketch": _token_sketch(left_tokens),
+        "clone_window_token_count": len(window_tokens),
+        "clone_window_kind": str(pair_window.get("kind") or ""),
+        "clone_window_anchor": _token_window_anchor(window_tokens),
+        "token_sketch": _token_sketch(window_tokens),
         "endpoints": [
-            _endpoint_identity(left, left_profile),
-            _endpoint_identity(right, right_profile),
+            _endpoint_identity(left, left_profile, pair_fingerprint),
+            _endpoint_identity(right, right_profile, pair_fingerprint),
         ],
     }
 
 
-def _endpoint_identity(method: Any, profile: Mapping[str, Any]) -> dict[str, Any]:
+def _endpoint_identity(
+    method: Any,
+    profile: Mapping[str, Any],
+    pair_fingerprint: str,
+) -> dict[str, Any]:
     return {
         "kind": "method",
         "file": str(method.file).replace("\\", "/").lstrip("/"),
         "class": str(method.owner_qualified_name or method.class_name or ""),
         "method": stable_method_record_signature(method),
         "method_identity": stable_method_record_identity(method),
-        "normalized_clone_fingerprint": str(profile.get("fingerprint") or ""),
+        "normalized_clone_fingerprint": pair_fingerprint,
         "token_count": int(profile.get("token_count") or 0),
     }
 
@@ -377,7 +386,125 @@ def _bounded_method_profile(method: Any, profile: Mapping[str, Any]) -> dict[str
         "fingerprint": str(profile.get("fingerprint") or ""),
         "token_count": int(profile.get("token_count") or 0),
         "body_token_count": len(profile.get("body_tokens") or []),
+        "method_token_count": len(profile.get("method_tokens") or []),
         "thin_forwarder": bool(profile.get("thin_forwarder")),
+    }
+
+
+def _target_method_profile(method: Any) -> dict[str, Any]:
+    """Build the two bounded token streams used by the target predicate."""
+    return dict(
+        clone_closure._body_profile(method, include_method_tokens=True)
+    )
+
+
+def _profile_clone_streams(
+    profile: Mapping[str, Any],
+) -> list[tuple[str, list[str]]]:
+    """Return body-first CPD streams; thin delegates are resolved adapters."""
+    if bool(profile.get("thin_forwarder")):
+        return []
+    body = [str(item) for item in profile.get("body_tokens", [])]
+    method = [
+        str(item) for item in profile.get("method_tokens", [])
+    ]
+    streams: list[tuple[str, list[str]]] = []
+    if body:
+        streams.append(("body", body))
+    if method and method != body:
+        streams.append(("method", method))
+    return streams
+
+
+def _pair_clone_window(
+    left_profile: Mapping[str, Any],
+    right_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select one deterministic exact window from the two target methods.
+
+    Body windows are preferred because they remain stable when a legitimate
+    shared helper changes modifiers or its method name.  For short bodies, the
+    same predicate is applied to the complete method token stream because
+    the CPD-sized duplicate may span the signature and body; it never widens
+    beyond the two target methods.
+    """
+    left_streams = dict(_profile_clone_streams(left_profile))
+    right_streams = dict(_profile_clone_streams(right_profile))
+    for kind in ("body", "method"):
+        match = _first_exact_token_window(
+            left_streams.get(kind, []),
+            right_streams.get(kind, []),
+            minimum=MIN_CLONE_TOKENS,
+        )
+        if match:
+            match["kind"] = kind
+            return match
+    return {}
+
+
+def _first_exact_token_window(
+    left: Sequence[str],
+    right: Sequence[str],
+    *,
+    minimum: int,
+) -> dict[str, Any]:
+    """Find an exact contiguous window in linear bounded-method space.
+
+    A tuple index implements the same exact-token predicate as CPD without a
+    project catalog or quadratic dynamic-programming matrix.  Once the first
+    deterministic minimum window is selected, it is extended to its maximal
+    local run for a useful progress metric.
+    """
+    if minimum <= 0 or len(left) < minimum or len(right) < minimum:
+        return {}
+    left_starts: dict[tuple[str, ...], int] = {}
+    for start in range(0, len(left) - minimum + 1):
+        left_starts.setdefault(tuple(left[start : start + minimum]), start)
+    selected: tuple[int, int] | None = None
+    for right_start in range(0, len(right) - minimum + 1):
+        left_start = left_starts.get(
+            tuple(right[right_start : right_start + minimum])
+        )
+        if left_start is None:
+            continue
+        candidate = (left_start, right_start)
+        if selected is None or candidate < selected:
+            selected = candidate
+    if selected is None:
+        return {}
+    left_start, right_start = selected
+    while (
+        left_start > 0
+        and right_start > 0
+        and left[left_start - 1] == right[right_start - 1]
+    ):
+        left_start -= 1
+        right_start -= 1
+    left_end = left_start + minimum
+    right_end = right_start + minimum
+    while (
+        left_end < len(left)
+        and right_end < len(right)
+        and left[left_end] == right[right_end]
+    ):
+        left_end += 1
+        right_end += 1
+    tokens = [str(item) for item in left[left_start:left_end]]
+    return {
+        "tokens": tokens,
+        "token_count": len(tokens),
+        "fingerprint": _token_fingerprint(tokens),
+        "left_start": left_start,
+        "right_start": right_start,
+    }
+
+
+def _pair_window_offsets(value: Mapping[str, Any]) -> dict[str, int]:
+    if not value:
+        return {}
+    return {
+        "left_start": int(value.get("left_start") or 0),
+        "right_start": int(value.get("right_start") or 0),
     }
 
 
@@ -386,7 +513,8 @@ def _baseline_like_methods(
     profiles: Mapping[str, Mapping[str, Any]],
     *,
     baseline_fingerprint: str,
-    baseline_body_token_count: int,
+    baseline_window_token_count: int,
+    baseline_window_anchor: str,
     baseline_sketch: set[str],
     endpoint_method_keys: set[str],
     changed_line_ranges: Mapping[str, Sequence[tuple[int, int]]] | None,
@@ -404,38 +532,43 @@ def _baseline_like_methods(
         ):
             continue
         profile = profiles.get(key, {})
-        fingerprint = str(profile.get("fingerprint") or "")
-        if not fingerprint or bool(profile.get("thin_forwarder")):
+        if bool(profile.get("thin_forwarder")):
             continue
-        tokens = list(profile.get("body_tokens") or [])
+        streams = _profile_clone_streams(profile)
+        if not streams:
+            continue
         match_kind = ""
         similarity = 0.0
-        if fingerprint == baseline_fingerprint:
+        if any(
+            _contains_token_window_fingerprint(
+                tokens,
+                baseline_window_token_count,
+                baseline_fingerprint,
+                baseline_window_anchor,
+            )
+            for _, tokens in streams
+        ):
             match_kind = "exact"
             similarity = 1.0
-        elif baseline_body_token_count and baseline_sketch:
-            token_ratio = min(len(tokens), baseline_body_token_count) / max(
-                len(tokens),
-                baseline_body_token_count,
+        elif baseline_window_token_count and baseline_sketch:
+            similarity = max(
+                (
+                    _baseline_sketch_coverage(tokens, baseline_sketch)
+                    if len(tokens)
+                    >= baseline_window_token_count * _NEAR_TOKEN_RATIO
+                    else 0.0
+                )
+                for _, tokens in streams
             )
-            current_sketch = set(_token_sketch(tokens))
-            sketch_overlap = (
-                len(current_sketch.intersection(baseline_sketch))
-                / max(1, min(len(current_sketch), len(baseline_sketch)))
-            )
-            if (
-                token_ratio >= _NEAR_TOKEN_RATIO
-                and sketch_overlap >= _NEAR_SKETCH_OVERLAP
-            ):
+            if similarity >= _NEAR_SKETCH_OVERLAP:
                 match_kind = "near"
-                similarity = min(token_ratio, sketch_overlap)
         if match_kind:
             matches.append({
                 "method": key,
                 "match_kind": match_kind,
                 "similarity": round(float(similarity), 6),
                 "token_count": int(profile.get("token_count") or 0),
-                "body_token_count": len(tokens),
+                "body_token_count": len(profile.get("body_tokens") or []),
             })
     return sorted(matches, key=lambda item: (item["method"], item["match_kind"]))
 
@@ -527,16 +660,74 @@ def _changed_range_witness(
 
 
 def _token_sketch(tokens: Sequence[str]) -> list[str]:
+    return sorted(_token_shingle_hashes(tokens))[:_SKETCH_SIZE]
+
+
+def _token_fingerprint(tokens: Sequence[str]) -> str:
     if not tokens:
-        return []
+        return ""
+    return hashlib.sha256(
+        "\x1f".join(tokens).encode("utf-8")
+    ).hexdigest()
+
+
+def _token_shingle_hashes(tokens: Sequence[str]) -> set[str]:
+    if not tokens:
+        return set()
     width = min(_SHINGLE_WIDTH, len(tokens))
-    hashes = {
+    return {
         hashlib.sha256(
             "\x1f".join(tokens[index : index + width]).encode("utf-8")
         ).hexdigest()[:16]
         for index in range(0, len(tokens) - width + 1)
     }
-    return sorted(hashes)[:_SKETCH_SIZE]
+
+
+def _token_window_anchor(tokens: Sequence[str]) -> str:
+    if not tokens:
+        return ""
+    width = min(_SHINGLE_WIDTH, len(tokens))
+    return hashlib.sha256(
+        "\x1f".join(tokens[:width]).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _contains_token_window_fingerprint(
+    tokens: Sequence[str],
+    window_token_count: int,
+    fingerprint: str,
+    anchor: str,
+) -> bool:
+    if (
+        window_token_count <= 0
+        or len(tokens) < window_token_count
+        or len(fingerprint) != 64
+        or not anchor
+    ):
+        return False
+    anchor_width = min(_SHINGLE_WIDTH, window_token_count)
+    for start in range(0, len(tokens) - window_token_count + 1):
+        current_anchor = hashlib.sha256(
+            "\x1f".join(tokens[start : start + anchor_width]).encode("utf-8")
+        ).hexdigest()[:16]
+        if current_anchor != anchor:
+            continue
+        if (
+            _token_fingerprint(tokens[start : start + window_token_count])
+            == fingerprint
+        ):
+            return True
+    return False
+
+
+def _baseline_sketch_coverage(
+    tokens: Sequence[str],
+    baseline_sketch: set[str],
+) -> float:
+    if not tokens or not baseline_sketch:
+        return 0.0
+    current = _token_shingle_hashes(tokens)
+    return len(current.intersection(baseline_sketch)) / len(baseline_sketch)
 
 
 def _locate_methods(methods: Sequence[Any], anchor: _Endpoint) -> list[Any]:
@@ -679,14 +870,25 @@ def _baseline_identity_error(value: Mapping[str, Any]) -> str:
     if str(value.get("profile_id") or "") != PROFILE_ID:
         return "BASELINE_CLONE_PROFILE_MISMATCH"
     fingerprint = str(value.get("pair_fingerprint") or "")
+    pair_token_count = int(value.get("pair_token_count") or 0)
+    window_token_count = int(value.get("clone_window_token_count") or 0)
+    window_kind = str(value.get("clone_window_kind") or "")
+    window_anchor = str(value.get("clone_window_anchor") or "")
     endpoints = value.get("endpoints")
     sketch = value.get("token_sketch")
     if len(fingerprint) != 64:
         return "BASELINE_CLONE_FINGERPRINT_INVALID"
     if not isinstance(endpoints, list) or len(endpoints) != 2:
         return "BASELINE_CLONE_ENDPOINTS_INVALID"
-    if int(value.get("pair_token_count") or 0) < MIN_CLONE_TOKENS:
+    if (
+        pair_token_count < MIN_CLONE_TOKENS
+        or window_token_count != pair_token_count
+    ):
         return "BASELINE_CLONE_TOKEN_COUNT_INVALID"
+    if window_kind not in {"body", "method"}:
+        return "BASELINE_CLONE_WINDOW_KIND_INVALID"
+    if len(window_anchor) != 16:
+        return "BASELINE_CLONE_WINDOW_ANCHOR_INVALID"
     if not isinstance(sketch, list) or not sketch:
         return "BASELINE_CLONE_SKETCH_INVALID"
     return ""

@@ -61,6 +61,47 @@ def _class_with_unrelated_field(name: str, body: str) -> str:
     )
 
 
+def _partial_clone_class(name: str, parent_type: str, child_type: str) -> str:
+    return (
+        f"class {name} {{\n"
+        "  void insert(Node newChild, int index) {\n"
+        f"    {parent_type} oldParent = ({parent_type}) newChild.getParent();\n"
+        "    if (oldParent != null) {\n"
+        "      oldParent.remove(newChild);\n"
+        "    }\n"
+        "    newChild.setParent(this);\n"
+        f"    children.add(index, ({child_type}) newChild);\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def _short_clone_class(name: str) -> str:
+    return (
+        f"class {name} {{\n"
+        "  int tiny(int a, int b, int c, int d, int e, int f) {\n"
+        "    return a + b + c + d + e + f;\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def _structural_near_class(name: str, variable: str, operator: str, base: int) -> str:
+    statements = "\n".join(
+        f"    {variable} {operator}= {base + index};"
+        for index in range(10)
+    )
+    return (
+        f"class {name} {{\n"
+        "  int calculate(int value) {\n"
+        f"    int {variable} = value;\n"
+        f"{statements}\n"
+        f"    return {variable};\n"
+        "  }\n"
+        "}\n"
+    )
+
+
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -149,6 +190,20 @@ def _run() -> None:
             assert len(identity["pair_fingerprint"]) == 64, identity
             assert 0 < len(identity["token_sketch"]) <= 64, identity
             assert set(java_reads) == {left.resolve(), right.resolve()}, java_reads
+
+            stale_identity = dict(identity)
+            stale_identity["profile_id"] = "java-target-clone-guard/v1"
+            stale = guard.evaluate_code_clone_type1(
+                project,
+                locations,
+                stale_identity,
+            )
+            _schema(stale)
+            assert stale["ok"] is False, stale
+            assert (
+                stale["witness"]["error"]
+                == "BASELINE_CLONE_PROFILE_MISMATCH"
+            ), stale
 
             # Legal deduplication: both endpoints become thin delegates to one
             # surviving implementation. One baseline-like implementation is
@@ -265,6 +320,78 @@ def _run() -> None:
             scan = perturbed["witness"]["baseline_copy_scan"]
             assert scan["exact_match_count"] == 1, scan
             assert scan["near_match_count"] == 1, scan
+
+            # CPD-style Type-1 findings are exact contiguous windows inside
+            # the two selected methods. The complete method bodies need not be
+            # equal when a sufficiently long exact middle remains.
+            partial_left = project / "PartialLeft.java"
+            partial_right = project / "PartialRight.java"
+            _write(
+                partial_left,
+                _partial_clone_class("PartialLeft", "ParentA", "ChildA"),
+            )
+            _write(
+                partial_right,
+                _partial_clone_class("PartialRight", "ParentB", "ChildB"),
+            )
+            partial_locations = [
+                parse_location_descriptor(
+                    "PartialLeft.java:method=insert(Node newChild, int index)",
+                    project,
+                ),
+                parse_location_descriptor(
+                    "PartialRight.java:method=insert(Node newChild, int index)",
+                    project,
+                ),
+            ]
+            partial = guard.capture_code_clone_type1(project, partial_locations)
+            _schema(partial)
+            assert partial["ok"] is True, partial
+            assert partial["target_smell_present"] is True, partial
+            assert partial["objectives"]["clone_token_count"] >= 30, partial
+            assert partial["entity_identity"]["clone_window_kind"] == "body", partial
+
+            # Short bodies may form a CPD-sized exact window only when their
+            # method declaration and body are considered together.
+            short_left = project / "ShortLeft.java"
+            short_right = project / "ShortRight.java"
+            _write(short_left, _short_clone_class("ShortLeft"))
+            _write(short_right, _short_clone_class("ShortRight"))
+            short_locations = [
+                parse_location_descriptor(
+                    "ShortLeft.java:method=tiny(int a, int b, int c, int d, int e, int f)",
+                    project,
+                ),
+                parse_location_descriptor(
+                    "ShortRight.java:method=tiny(int a, int b, int c, int d, int e, int f)",
+                    project,
+                ),
+            ]
+            short = guard.capture_code_clone_type1(project, short_locations)
+            _schema(short)
+            assert short["target_smell_present"] is True, short
+            assert short["entity_identity"]["clone_window_kind"] == "method", short
+
+            # Identifier/literal similarity alone is Type-2, not an exact
+            # Type-1 finding; the Guard must not normalize it into a PASS-able
+            # baseline.
+            near_left = project / "NearLeft.java"
+            near_right = project / "NearRight.java"
+            _write(near_left, _structural_near_class("NearLeft", "total", "+", 1))
+            _write(near_right, _structural_near_class("NearRight", "result", "-", 21))
+            near_locations = [
+                parse_location_descriptor(
+                    "NearLeft.java:method=calculate(int value)", project
+                ),
+                parse_location_descriptor(
+                    "NearRight.java:method=calculate(int value)", project
+                ),
+            ]
+            near = guard.capture_code_clone_type1(project, near_locations)
+            _schema(near)
+            assert near["ok"] is False, near
+            assert near["target_smell_present"] is False, near
+            assert near["witness"]["error"] == "BASELINE_FINDING_NOT_FOUND", near
 
             # None of the 400 unrelated Java files may be opened.
             assert not any("Noise" in path.name for path in java_reads), java_reads

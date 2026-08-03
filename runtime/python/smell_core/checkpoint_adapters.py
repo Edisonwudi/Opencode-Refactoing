@@ -117,9 +117,11 @@ DETECTOR_PROFILES = {
     },
     "switch_statements": {"definition": "target_method_contains_switch"},
     "code_clone_type1": {
-        "definition": "exact_normalized_body",
+        "definition": "exact_contiguous_token_window_in_target_method_pair",
         "finding_min_tokens": 30,
-        "size_metric": "normalized_declaration_plus_body_tokens",
+        "selection_contract": "body_window_then_complete_method_window-v2",
+        "size_metric": "selected_exact_window_tokens",
+        "relocation_check": "target_endpoints_plus_changed_methods_near_copy_count-v2",
         "catalog_identity_schema": CATALOG_IDENTITY_SCHEMA,
     },
     "feature_envy": {
