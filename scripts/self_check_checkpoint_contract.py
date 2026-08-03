@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 sys.path.insert(0, str(ROOT / "runtime" / "python" / "bridge"))
 
-from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
+from smell_core.checkpoint_adapters import (  # noqa: E402
+    CHECKPOINT_SMELLS,
+    _java_guard_implementation_profile,
+)
 from smell_core.checkpoint_contract import (  # noqa: E402
     checkpoint_feedback_highlights,
     checkpoint_gate_result,
@@ -289,6 +292,18 @@ def _check_large_clone_failure_pack_is_bounded() -> None:
 
 def main() -> int:
     assert CHECKPOINT_SMELLS == EXPECTED, CHECKPOINT_SMELLS
+    clone_implementation = {
+        item["path"]
+        for item in _java_guard_implementation_profile("code_clone_type1")["files"]
+    }
+    assert "java/target_clone_guard.py" in clone_implementation
+    assert "java/clone_closure.py" not in clone_implementation
+    clump_implementation = {
+        item["path"]
+        for item in _java_guard_implementation_profile("data_clumps")["files"]
+    }
+    assert "java/target_relational_guards.py" in clump_implementation
+    assert "java/data_clumps.py" not in clump_implementation
 
     objective_fixtures = {
         "long_method": {"ast_ncss": 74},

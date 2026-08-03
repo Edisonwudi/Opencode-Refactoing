@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,16 +8,6 @@ from .analysis import FunctionSignature, iter_function_signatures
 from .detector_utils import normalize_group, parse_group_from_evidence
 
 DEFAULT_DATA_CLUMPS_OCCURRENCES = 3
-
-
-@dataclass(frozen=True)
-class DataClumpOccurrence:
-    file: str
-    method: str
-    begin_line: int
-    end_line: int
-    signature_text: str
-    evidence: str
 
 
 def data_clump_group_from_evidence(evidence: str) -> str:

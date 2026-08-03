@@ -16,13 +16,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..location import LocationTarget, parse_location_descriptor
-from . import clone_closure
 from .catalog_identity import (
     stable_java_method_signature,
     stable_method_record_identity,
     stable_method_record_signature,
 )
 from . import semantic_detector
+from .syntactic_detector import is_thin_forwarder, tokenize_clone_node
 
 
 MIN_CLONE_TOKENS = 30
@@ -393,9 +393,28 @@ def _bounded_method_profile(method: Any, profile: Mapping[str, Any]) -> dict[str
 
 def _target_method_profile(method: Any) -> dict[str, Any]:
     """Build the two bounded token streams used by the target predicate."""
-    return dict(
-        clone_closure._body_profile(method, include_method_tokens=True)
+    raw_body_tokens = tokenize_clone_node(method.body)
+    thin_forwarder = is_thin_forwarder(method.body_text)
+    body_tokens = [] if thin_forwarder else list(raw_body_tokens)
+    declaration = getattr(method.body, "parent", None)
+    declaration_tokens = (
+        tokenize_clone_node(declaration, exclude_nodes=(method.body,))
+        if declaration is not None
+        else []
     )
+    encoded = "\x1f".join(body_tokens).encode("utf-8")
+    return {
+        "method": stable_method_record_identity(method),
+        "body_tokens": raw_body_tokens,
+        "method_tokens": [*declaration_tokens, *raw_body_tokens],
+        "thin_forwarder": thin_forwarder,
+        "token_count": (
+            len(body_tokens) + len(declaration_tokens)
+            if body_tokens
+            else 0
+        ),
+        "fingerprint": hashlib.sha256(encoded).hexdigest() if body_tokens else "",
+    }
 
 
 def _profile_clone_streams(

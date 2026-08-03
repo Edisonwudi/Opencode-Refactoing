@@ -135,24 +135,6 @@ def detect_mysterious_names(
     return findings
 
 
-def find_matching_name_finding(
-    findings: list[MysteriousNameFinding],
-    *,
-    kind: str,
-    name: str,
-    scope: Optional[tuple[int, int]] = None,
-) -> Optional[MysteriousNameFinding]:
-    for finding in findings:
-        if finding.name != name or (kind and finding.kind != kind):
-            continue
-        if scope is not None and finding.func_start_line and finding.func_end_line:
-            scope_start, scope_end = scope
-            if finding.func_end_line < scope_start or finding.func_start_line > scope_end:
-                continue
-        return finding
-    return None
-
-
 def _finding(
     file_path: Path,
     line: int,

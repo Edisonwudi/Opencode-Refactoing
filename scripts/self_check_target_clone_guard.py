@@ -130,6 +130,7 @@ def _forbidden(*_args: object, **_kwargs: object) -> object:
 
 def _run() -> None:
     module_source = inspect.getsource(guard)
+    assert "clone_closure" not in module_source
     assert "run_java_" not in module_source
     assert "_list_java_files" not in module_source
     assert "_build_project_model" not in module_source

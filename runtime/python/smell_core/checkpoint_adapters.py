@@ -138,14 +138,8 @@ _JAVA_GUARD_IMPLEMENTATION_FILES = {
         "java/semantic_detector.py",
         "java/catalog_identity.py",
     ),
-    "data_clumps": (
-        "java/target_relational_guards.py",
-        "java/data_clumps.py",
-    ),
-    "code_clone_type1": (
-        "java/target_clone_guard.py",
-        "java/clone_closure.py",
-    ),
+    "data_clumps": ("java/target_relational_guards.py",),
+    "code_clone_type1": ("java/target_clone_guard.py",),
     "god_class": ("java/target_semantic_guards.py", "java/semantic_detector.py"),
     "refused_bequest": (
         "java/target_relation_scope.py",

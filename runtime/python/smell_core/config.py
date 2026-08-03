@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import subprocess
 from dataclasses import asdict, dataclass, field, replace
@@ -545,10 +544,6 @@ def _derive_git_worktree_common_root(project_root: Path) -> Optional[Path]:
     if candidate == project_root.resolve():
         return None
     return candidate
-
-
-def dump_resolved_config(config: ResolvedRunConfig) -> str:
-    return json.dumps(config.to_dict(), indent=2, ensure_ascii=True)
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:

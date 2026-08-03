@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from .location import LocationTarget
 
@@ -151,22 +151,6 @@ def detect_language_from_path(path: Path) -> Optional[str]:
     if ext in C_EXTENSIONS:
         return "c"
     return None
-
-
-def tree_sitter_ready(languages: Optional[Iterable[str]] = None) -> List[str]:
-    issues: List[str] = []
-    if _TREE_SITTER_IMPORT_ERROR is not None:
-        issues.append(
-            "tree-sitter runtime unavailable: "
-            f"{_TREE_SITTER_IMPORT_ERROR}. Install 'tree-sitter' and 'tree-sitter-language-pack'."
-        )
-        return issues
-    for language in sorted(set(languages or [])):
-        try:
-            _get_parser(language)
-        except RuntimeError as exc:
-            issues.append(str(exc))
-    return issues
 
 
 def _strip_brace_comments(text: str) -> str:
@@ -329,35 +313,6 @@ def extract_snippet(target: LocationTarget, language: str) -> Optional[SourceSni
     if function_node is None:
         return None
     return _build_source_snippet(function_node, source_bytes, language)
-
-
-def extract_function_signature(
-    target: LocationTarget,
-    language: str,
-) -> Optional[FunctionSignature]:
-    """Resolve one declaration, including interface/abstract methods without bodies."""
-    source_bytes = target.file_path.read_bytes()
-    root = _parse_tree(target.file_path, language, source_bytes)
-    function_node = _find_matching_function(root, source_bytes, target, language)
-    if function_node is None:
-        return None
-    body_node = function_node.child_by_field_name("body")
-    signature_end = body_node.start_byte if body_node is not None else function_node.end_byte
-    if body_node is not None and source_bytes[body_node.start_byte : body_node.start_byte + 1] == b"{":
-        signature_end += 1
-    signature_text = _decode(source_bytes[function_node.start_byte:signature_end]).rstrip().removesuffix(";")
-    return FunctionSignature(
-        file_path=target.file_path,
-        start_line=_node_start_line(function_node),
-        end_line=_node_end_line(function_node),
-        name=_extract_declared_name(function_node, language, source_bytes) or "",
-        signature_text=signature_text,
-        parameter_fingerprints=_parameter_fingerprints_from_node(
-            function_node,
-            language,
-            source_bytes,
-        ),
-    )
 
 
 def extract_pair_snippets(targets: List[LocationTarget], language: str) -> Tuple[Optional[SourceSnippet], Optional[SourceSnippet]]:
