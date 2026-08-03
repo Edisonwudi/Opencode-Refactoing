@@ -498,6 +498,75 @@ class Key<T> {{}}
         "java.lang.Number",
     ), bounded
 
+    recovery_files = tuple(
+        _write(
+            project,
+            f"src/main/java/recovery/{owner}.java",
+            f"""\
+package recovery;
+class {owner} {{
+  void {method}(String host, int port, boolean secure) {{ int broken = ; }}
+}}
+""",
+        ).relative_to(project)
+        for owner, method in (
+            ("First", "open"),
+            ("Second", "close"),
+            ("Third", "open"),
+        )
+    )
+    recovery = evaluate_data_clumps_guard(
+        project,
+        "src/main/java/recovery/First.java:method=open|line=3",
+        {"group": "java.lang.String:host|int:port|boolean:secure"},
+        source_files=recovery_files,
+    )
+    assert recovery["ok"] is True, recovery
+    assert recovery["target_smell_present"] is True, recovery
+    assert len(recovery["witness"]["parse_recoveries"]) == 3, recovery
+    assert all(
+        item["skipped_callable_count"] == 0
+        for item in recovery["witness"]["parse_recoveries"]
+    ), recovery
+
+    unsafe_header = _write(
+        project,
+        "src/main/java/recovery/UnsafeHeader.java",
+        """\
+package recovery;
+class UnsafeHeader {
+  void broken(String host, int port, boolean secure { }
+}
+""",
+    )
+    unsafe_scope = relational._parse_scope(
+        project,
+        (unsafe_header.relative_to(project),),
+    )
+    assert not unsafe_scope.callables, unsafe_scope
+    assert unsafe_scope.parse_recoveries[0]["skipped_callable_count"] == 1, (
+        unsafe_scope
+    )
+
+    unsafe_namespace = _write(
+        project,
+        "src/main/java/recovery/UnsafeNamespace.java",
+        """\
+package recovery
+class UnsafeNamespace {
+  void open(String host, int port, boolean secure) { }
+}
+""",
+    )
+    try:
+        relational._parse_scope(
+            project,
+            (unsafe_namespace.relative_to(project),),
+        )
+        raise AssertionError("unsafe namespace parse should fail closed")
+    except relational.TargetRelationalGuardError as exc:
+        assert exc.code == "JAVA_NAMESPACE_PARSE_FAILED", exc.violation()
+
     qualified_files: list[Path] = []
     _write(project, "src/main/java/right/Token.java", "package right; class Token {}\n")
     _write(project, "src/main/java/wrong/Token.java", "package wrong; class Token {}\n")

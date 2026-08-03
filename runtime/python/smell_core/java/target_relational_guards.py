@@ -118,6 +118,7 @@ class _JavaCallable:
 class _ParsedScope:
     files: tuple[str, ...]
     callables: tuple[_JavaCallable, ...]
+    parse_recoveries: tuple[dict[str, Any], ...]
 
 
 class TargetRelationalGuardError(ValueError):
@@ -223,7 +224,10 @@ def evaluate_long_parameter_list_guard(
 
         matches.sort(key=_callable_sort_key)
         violations: list[dict[str, Any]] = []
-        witness: dict[str, Any] = {"scope_files": list(parsed.files)}
+        witness: dict[str, Any] = {
+            "scope_files": list(parsed.files),
+            "parse_recoveries": list(parsed.parse_recoveries),
+        }
         entity_identity = dict(identity)
 
         if len(matches) > 1:
@@ -431,6 +435,7 @@ def evaluate_data_clumps_guard(
         anchor_candidates: list[_JavaCallable] = []
         occurrence_preview: list[dict[str, Any]] = []
         parsed_files: list[str] = []
+        parse_recoveries: list[dict[str, Any]] = []
         preview_limit = 32
         for relative in scope_files:
             parsed = (
@@ -439,6 +444,7 @@ def evaluate_data_clumps_guard(
                 else _parse_scope(root, (relative,))
             )
             parsed_files.extend(parsed.files)
+            parse_recoveries.extend(parsed.parse_recoveries)
             for item in parsed.callables:
                 matched = _match_anchored_group(item, anchor_group)
                 if matched is None:
@@ -516,6 +522,10 @@ def evaluate_data_clumps_guard(
             "method_name_preview": method_preview,
             "method_names_truncated": len(method_names) > scope_preview_limit,
             "scan_mode": "target_anchor_then_stream",
+            "parse_recoveries": parse_recoveries[:scope_preview_limit],
+            "parse_recoveries_truncated": (
+                len(parse_recoveries) > scope_preview_limit
+            ),
         }
         return _result(
             ok=True,
@@ -599,22 +609,36 @@ def _parse_scope(project_root: Path, files: Sequence[str]) -> _ParsedScope:
     parser = get_parser("java")
     callables: list[_JavaCallable] = []
     existing_files: list[str] = []
+    parse_recoveries: list[dict[str, Any]] = []
     for relative in files:
         source = read_current_bytes(project_root, relative)
         if source is None:
             continue
         existing_files.append(relative)
         root = parser.parse(source).root_node
-        if root.has_error:
+        parse_errors = tuple(_parse_error_nodes(root))
+        namespace_nodes = tuple(
+            child
+            for child in root.named_children
+            if child.type in {"import_declaration", "package_declaration"}
+        )
+        if any(
+            _node_contains_error(item, parse_errors)
+            for item in namespace_nodes
+        ):
             raise TargetRelationalGuardError(
-                "JAVA_PARSE_FAILED",
-                "Explicit Guard source contains Java parse errors",
+                "JAVA_NAMESPACE_PARSE_FAILED",
+                "Explicit Guard source has an unsafe package/import parse error",
                 path=relative,
             )
         package, imports, wildcard_imports = _source_namespace(root, source)
         local_types = _local_type_identities(root, source, package)
+        skipped_callables = 0
         for node in _walk(root):
             if node.type not in _CALLABLE_NODE_TYPES:
+                continue
+            if _callable_signature_has_parse_error(node, parse_errors):
+                skipped_callables += 1
                 continue
             parsed = _callable_from_node(
                 relative,
@@ -627,11 +651,56 @@ def _parse_scope(project_root: Path, files: Sequence[str]) -> _ParsedScope:
             )
             if parsed is not None:
                 callables.append(parsed)
+        if parse_errors:
+            parse_recoveries.append(
+                {
+                    "file": relative,
+                    "error_node_count": len(parse_errors),
+                    "skipped_callable_count": skipped_callables,
+                    "mode": "complete_signature_projection",
+                }
+            )
     callables.sort(key=_callable_sort_key)
     return _ParsedScope(
         files=tuple(existing_files),
         callables=tuple(callables),
+        parse_recoveries=tuple(parse_recoveries),
     )
+
+
+def _parse_error_nodes(root: Node):
+    for node in _walk(root):
+        if node.type == "ERROR" or node.is_missing:
+            yield node
+
+
+def _node_contains_error(node: Node, errors: Sequence[Node]) -> bool:
+    return any(
+        node.start_byte <= error.start_byte
+        and error.end_byte <= node.end_byte
+        for error in errors
+    )
+
+
+def _callable_signature_has_parse_error(
+    callable_node: Node,
+    errors: Sequence[Node],
+) -> bool:
+    declarations: list[Node] = [callable_node]
+    current = callable_node.parent
+    while current is not None:
+        if current.type in _OWNER_NODE_TYPES:
+            declarations.append(current)
+        current = current.parent
+    for declaration in declarations:
+        body = declaration.child_by_field_name("body")
+        header_end = body.start_byte if body is not None else declaration.end_byte
+        if any(
+            declaration.start_byte <= error.start_byte < header_end
+            for error in errors
+        ):
+            return True
+    return False
 
 
 def _source_namespace(
