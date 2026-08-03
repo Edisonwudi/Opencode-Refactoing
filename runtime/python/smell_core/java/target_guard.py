@@ -128,7 +128,7 @@ def _dispatch_scoped_guard(
                 selector,
                 analysis_files=relation_files,
             )
-        # Re-run the same exact three-member relation query at capture and
+        # Re-run the same exact parameter-group relation query at capture and
         # verification.  Reusing only baseline files would allow a clump to be
         # copied to a newly changed file without being observed.
         source_files = _data_clump_candidate_files(

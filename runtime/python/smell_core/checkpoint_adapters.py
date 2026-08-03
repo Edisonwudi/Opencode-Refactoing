@@ -129,7 +129,7 @@ DETECTOR_PROFILES = {
         "catalog_identity_schema": CATALOG_IDENTITY_SCHEMA,
     },
     "data_clumps": {
-        "group_size": 3,
+        "minimum_group_size": 3,
         "min_occurrences": 3,
         "min_classes": 3,
         "min_method_names": 2,
@@ -137,8 +137,12 @@ DETECTOR_PROFILES = {
         "track_baseline_parameter_types": True,
         "track_baseline_parameter_positions": True,
         "track_baseline_body_dispersion": True,
-        "group_identity": "fully-qualified-type-and-parameter-stem-v4",
-        "type_resolution": "two-phase-source-and-classpath-symbols-v4",
+        "group_identity": "erased-qualified-type-and-parameter-stem-v5",
+        "type_resolution": "target-package-import-and-type-variable-erasure-v5",
+        "relation_query": "case-insensitive-fixed-stem-intersection-v1",
+        "candidate_evaluation": "streamed-complete-signature-projection-v1",
+        "active_parse_file_limit": 1,
+        "active_parse_byte_limit": MAX_GUARD_ANALYSIS_BYTES,
     },
     "mysterious_name": {
         "definition": "strict_symbol_name",
@@ -349,6 +353,10 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
             "smell_evidence": "audit-only",
             **DETECTOR_PROFILES.get(smell, {}),
         }
+        if smell == "data_clumps":
+            profile["scope"] = "target-plus-streamed-parameter-relations-v4"
+            profile.pop("scope_file_limit", None)
+            profile.pop("scope_byte_limit", None)
     else:
         # Non-Java adapters are outside the Java product-profile migration;
         # preserve their existing checkpoint identity byte-for-byte.

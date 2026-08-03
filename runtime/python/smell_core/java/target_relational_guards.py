@@ -16,7 +16,11 @@ from typing import Any, Iterable, Mapping, Sequence
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
-from ..guard_scope import GuardScopeError, read_current_bytes
+from ..guard_scope import (
+    MAX_GUARD_ANALYSIS_BYTES,
+    GuardScopeError,
+    read_current_bytes,
+)
 from ..location import LocationTarget, parse_location_descriptor
 from .detector_utils import (
     erase_java_type,
@@ -614,6 +618,14 @@ def _parse_scope(project_root: Path, files: Sequence[str]) -> _ParsedScope:
         source = read_current_bytes(project_root, relative)
         if source is None:
             continue
+        if len(source) > MAX_GUARD_ANALYSIS_BYTES:
+            raise TargetRelationalGuardError(
+                "JAVA_SOURCE_TOO_LARGE",
+                "One explicit Guard source exceeds the active AST byte limit",
+                path=relative,
+                source_bytes=len(source),
+                max_bytes=MAX_GUARD_ANALYSIS_BYTES,
+            )
         existing_files.append(relative)
         root = parser.parse(source).root_node
         parse_errors = tuple(_parse_error_nodes(root))

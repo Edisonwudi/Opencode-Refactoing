@@ -97,6 +97,11 @@ def _profile_matrix() -> None:
         assert profile["schema"] == 5, profile
         assert profile["source_discovery"] == "forbidden", profile
         assert profile["smell_discovery"] == "forbidden", profile
+        if smell == "data_clumps":
+            assert profile["minimum_group_size"] == 3, profile
+            assert profile["active_parse_file_limit"] == 1, profile
+            assert "scope_file_limit" not in profile, profile
+            assert "scope_byte_limit" not in profile, profile
 
 
 def _feature_envy_dispatch() -> None:
