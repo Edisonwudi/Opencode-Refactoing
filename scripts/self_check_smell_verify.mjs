@@ -528,7 +528,11 @@ async function runPluginNormalizeSelfCheck(pluginModule) {
       exports: Object.keys(pluginModule),
     })
   }
-  if (typeof hooks.normalizeToolResult !== "function" || typeof hooks.buildBridgeOutputPayload !== "function") {
+  if (
+    typeof hooks.normalizeToolResult !== "function" ||
+    typeof hooks.buildBridgeOutputPayload !== "function" ||
+    typeof hooks.normalizeBridgeContractPayload !== "function"
+  ) {
     throw new SelfCheckError("plugin_self_test_hooks", "Plugin __selfTest is missing required helpers.", {
       keys: Object.keys(hooks).sort(),
     })
@@ -562,6 +566,72 @@ async function runPluginNormalizeSelfCheck(pluginModule) {
         json: { success: false, status: "SMELL_GUARD_FAILED", error: "x" },
       },
       expectStatus: "SMELL_GUARD_FAILED",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_empty_object_exit_zero_fails_closed",
+      bridgeResult: {
+        exitCode: 0,
+        stdout: "{}",
+        stderr: "",
+        json: {},
+      },
+      expectStatus: "BRIDGE_CONTRACT_INVALID",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_pass_false_exit_zero_fails_closed",
+      bridgeResult: {
+        exitCode: 0,
+        stdout: '{"success":false,"status":"PASS"}',
+        stderr: "",
+        json: { success: false, status: "PASS" },
+      },
+      expectStatus: "BRIDGE_CONTRACT_INVALID",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_lowercase_pass_exit_zero_fails_closed",
+      bridgeResult: {
+        exitCode: 0,
+        stdout: '{"success":true,"status":"pass"}',
+        stderr: "",
+        json: { success: true, status: "pass" },
+      },
+      expectStatus: "BRIDGE_CONTRACT_INVALID",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_failure_status_true_exit_zero_fails_closed",
+      bridgeResult: {
+        exitCode: 0,
+        stdout: '{"success":true,"status":"SMELL_GUARD_FAILED"}',
+        stderr: "",
+        json: { success: true, status: "SMELL_GUARD_FAILED" },
+      },
+      expectStatus: "BRIDGE_CONTRACT_INVALID",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_nonpass_success_exit_zero_fails_closed",
+      bridgeResult: {
+        exitCode: 0,
+        stdout: '{"success":true,"status":"BASELINE_CAPTURED"}',
+        stderr: "",
+        json: { success: true, status: "BASELINE_CAPTURED" },
+      },
+      expectStatus: "BRIDGE_CONTRACT_INVALID",
+      expectSuccess: false,
+    },
+    {
+      name: "bridge_pass_payload_nonzero_exit_fails_closed",
+      bridgeResult: {
+        exitCode: 7,
+        stdout: '{"success":true,"status":"PASS"}',
+        stderr: "bridge terminated after emitting output",
+        json: { success: true, status: "PASS" },
+      },
+      expectStatus: "BRIDGE_FAILED",
       expectSuccess: false,
     },
     {
@@ -1199,6 +1269,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
     "buildContinuationMessage",
     "buildVerifyRequiredMessage",
     "createIdleContinueRuntime",
+    "shouldPluginHandleSessionIdle",
     "SMELL_IDLE_CONTINUE_PREFIX",
   ]) {
     assertCond(`unified_loop_hook:${key}`, Boolean(hooks && key in hooks), `missing ${key}`)
@@ -1242,24 +1313,76 @@ async function runIdleContinueSelfCheck(pluginModule) {
     })
   }
 
-  // All OpenCode modes and batch-like environments use exactly the same path.
+  assertEqual(
+    "idle_owner_interactive_default",
+    hooks.shouldPluginHandleSessionIdle({}),
+    true,
+    "enabled",
+  )
+  assertEqual(
+    "idle_owner_batch_exact_marker",
+    hooks.shouldPluginHandleSessionIdle({ SMELL_BATCH_RUN: "1" }),
+    false,
+    "enabled",
+  )
+  assertEqual(
+    "idle_owner_batch_trimmed_marker",
+    hooks.shouldPluginHandleSessionIdle({ SMELL_BATCH_RUN: " 1 " }),
+    false,
+    "enabled",
+  )
+  assertEqual(
+    "idle_owner_nonbatch_marker",
+    hooks.shouldPluginHandleSessionIdle({ SMELL_BATCH_RUN: "0" }),
+    true,
+    "enabled",
+  )
+
+  // Interactive OpenCode surfaces keep plugin-owned idle prompts. Dataset
+  // batch runs expose the same loop decision but leave prompt transport to the
+  // synchronous runner, so session.idle must remain silent.
   for (const modeCase of [
-    { name: "tui", argv: ["opencode"] },
-    { name: "run", argv: ["opencode", "run"] },
-    { name: "serve", argv: ["opencode", "serve"] },
-    { name: "web", argv: ["opencode", "web"] },
-    { name: "attach", argv: ["opencode", "attach"] },
-    { name: "batch", argv: ["opencode", "run"], env: { SMELL_BATCH_RUN: "1", SMELL_PROJECT_ROOT: "/tmp/project" } },
+    { name: "tui", argv: ["opencode"], enabled: true },
+    { name: "run", argv: ["opencode", "run"], enabled: true },
+    { name: "serve", argv: ["opencode", "serve"], enabled: true },
+    { name: "web", argv: ["opencode", "web"], enabled: true },
+    { name: "attach", argv: ["opencode", "attach"], enabled: true },
+    {
+      name: "batch",
+      argv: ["opencode", "run"],
+      env: { SMELL_BATCH_RUN: "1", SMELL_PROJECT_ROOT: "/tmp/project" },
+      enabled: false,
+    },
   ]) {
     const { client, calls } = makeFakeClient()
     const rt = hooks.createIdleContinueRuntime({ client, argv: modeCase.argv, env: modeCase.env || {} })
     const metadata = record(rt)
-    assertEqual(`unified_${modeCase.name}_enabled`, metadata.enabled, true, "enabled")
+    assertEqual(`idle_owner_${modeCase.name}_enabled`, metadata.enabled, modeCase.enabled, "enabled")
     assertEqual(`unified_${modeCase.name}_continuation`, metadata.continuation, 1, "continuation")
     assertEqual(`unified_${modeCase.name}_max`, metadata.maxContinuations, 2, "maxContinuations")
-    assertEqual(`unified_${modeCase.name}_dispatch`, rt.handleIdle("s1"), true, "dispatch")
+    assertEqual(`idle_owner_${modeCase.name}_dispatch`, rt.handleIdle("s1"), modeCase.enabled, "dispatch")
     await flush()
-    assertEqual(`unified_${modeCase.name}_calls`, calls.length, 1, "calls")
+    assertEqual(`idle_owner_${modeCase.name}_calls`, calls.length, modeCase.enabled ? 1 : 0, "calls")
+    if (!modeCase.enabled) {
+      assertEqual(`idle_owner_${modeCase.name}_state`, rt.size(), 0, "state size")
+    }
+  }
+
+  {
+    const { client, calls } = makeFakeClient()
+    const rt = hooks.createIdleContinueRuntime({ client, env: { SMELL_BATCH_RUN: "1" } })
+    rt.armInitialVerification({
+      sessionID: "batch-initial",
+      agent: "java-refactor-agent",
+      directory: IDLE_DIR,
+      maxContinuations: 2,
+      instruction: "repair narrowly",
+      allowTestChanges: false,
+    })
+    assertEqual("idle_owner_batch_initial_state", rt.size(), 0, "state size")
+    assertEqual("idle_owner_batch_initial_dispatch", rt.handleIdle("batch-initial"), false, "dispatch")
+    await flush()
+    assertEqual("idle_owner_batch_initial_calls", calls.length, 0, "calls")
   }
 
   // The loop decision owns the only budget. Dispatch does not increment it.
@@ -1371,7 +1494,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
   }
 
   return {
-    modes: ["tui", "run", "serve", "web", "attach", "batch"],
+    interactiveModes: ["tui", "run", "serve", "web", "attach"],
+    batchIdleController: "runner",
     sharedBudget: true,
     verifyClosure: true,
     passed: true,

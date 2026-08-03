@@ -798,6 +798,8 @@ with tempfile.TemporaryDirectory() as tmp:
     fake.write_text(
         """#!/usr/bin/env python3
 import json, os, sys
+if os.environ.get("SMELL_BATCH_RUN") != "1":
+    raise SystemExit(20)
 continued = "--session" in sys.argv
 if continued:
     raw = os.environ.get("SMELL_COMMAND_LOOP_STATE_JSON", "")

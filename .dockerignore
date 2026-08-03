@@ -1,8 +1,42 @@
+# Version-control metadata and alternate worktrees
 .git
 .trial-worktrees
+.idea-trial-worktrees
+
+# Local images, run output, and refactoring artifacts
 images
 runs
+.smell-artifacts
+.codex_tmp
+backups
+
+# Local editor/tool state and machine-specific project configuration
+.zcode
+.vscode
+.idea
+runtime/python/smell_core/defaults/projects.java.local.yaml
+
+# Local environment files and secrets; keep the checked-in example available
+.env*
+!.env.example
+
+# Dependency, cache, log, and build output
 node_modules
 .opencode/node_modules
 **/__pycache__
 **/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.venv
+venv
+env
+logs
+*.log
+dist
+build
+out
+
+# Host filesystem metadata
+.DS_Store
+._*

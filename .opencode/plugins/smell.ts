@@ -282,14 +282,22 @@ const MAX_STDOUT_STDERR_LEN = 4000
 // --- session.idle command-policy continuation -------------------------------
 //
 // smell_verify attaches the authoritative command-owned loop decision and this
-// runtime resumes the same session after session.idle when that decision is
-// `continue`. There is no interactive/batch/run-mode switch and no second retry
-// budget: command policy is the single source of truth.
+// runtime resumes interactive sessions after session.idle when that decision is
+// `continue`. Batch runs set SMELL_BATCH_RUN=1 and synchronously resume the same
+// session from run_smell_dataset.py, so the plugin must not dispatch a competing
+// prompt. Command policy remains the single source of truth for the retry budget.
 
 const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
 const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
 const DIRECT_BUILD_COMMAND_RE =
   /(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:\.\/)?(?:mvnw|mvn|gradlew|gradle)\b/
+
+function shouldPluginHandleSessionIdle(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  return String(env.SMELL_BATCH_RUN || "").trim() !== "1"
+}
+
 type FailureClassification = {
   category: string
   verifyStatus: string
@@ -602,6 +610,65 @@ function normalizeMetadata(
   return metadata
 }
 
+function normalizeBridgeContractPayload(json: unknown, exitCode: number): Record<string, unknown> {
+  const jsonPayload =
+    json && typeof json === "object" && !Array.isArray(json)
+      ? (json as Record<string, unknown>)
+      : { value: toJsonSafe(json) }
+  const status = typeof jsonPayload.status === "string" ? jsonPayload.status.trim() : ""
+  const hasStatus = status.length > 0
+  const hasSuccess = typeof jsonPayload.success === "boolean"
+  const validVerifySuccess =
+    hasStatus &&
+    hasSuccess &&
+    jsonPayload.success === true &&
+    status === "PASS"
+  const validStructuredFailure =
+    hasStatus &&
+    hasSuccess &&
+    jsonPayload.success === false &&
+    status !== "PASS"
+
+  // normalizeToolResult currently wraps only the bridge `verify` command, whose
+  // sole successful top-level status is PASS. Baseline success statuses such as
+  // BASELINE_CAPTURED are consumed by their dedicated command hook instead.
+  if (exitCode === 0 && validVerifySuccess) {
+    return {
+      ...jsonPayload,
+      success: true,
+      status,
+    }
+  }
+
+  // A structured bridge failure remains useful even when the bridge returns a
+  // non-zero process status. Preserve its domain-specific status while forcing
+  // success=false. Successful, incomplete, or contradictory payloads fail
+  // closed to a transport/contract status instead.
+  if (validStructuredFailure) {
+    return {
+      ...jsonPayload,
+      success: false,
+      status,
+    }
+  }
+
+  const fallbackStatus = exitCode === 0 ? "BRIDGE_CONTRACT_INVALID" : "BRIDGE_FAILED"
+  const fallbackError =
+    exitCode === 0
+      ? "Python bridge JSON payload must contain a consistent verify result: success=true only with status=PASS; failures require success=false and a non-PASS status."
+      : "Python bridge exited non-zero without a valid structured failure result."
+  const existingError =
+    typeof jsonPayload.error === "string" && jsonPayload.error.trim()
+      ? jsonPayload.error
+      : fallbackError
+  return {
+    ...jsonPayload,
+    success: false,
+    status: fallbackStatus,
+    error: existingError,
+  }
+}
+
 function buildBridgeOutputPayload(result: BridgeResult): string {
   const fields = normalizeStdioFields(result)
   const stderrSummary = truncateText(fields.stderr)
@@ -618,20 +685,9 @@ function buildBridgeOutputPayload(result: BridgeResult): string {
       },
     })
   }
-  const jsonPayload =
-    result.json && typeof result.json === "object"
-      ? (result.json as Record<string, unknown>)
-      : { value: result.json }
-  const hasStatus = typeof jsonPayload.status === "string" && jsonPayload.status.trim() !== ""
-  const hasSuccess = typeof jsonPayload.success === "boolean"
+  const jsonPayload = normalizeBridgeContractPayload(result.json, fields.exitCode)
   return safeJsonStringify({
     ...jsonPayload,
-    success: hasSuccess ? (jsonPayload.success as boolean) : fields.exitCode === 0,
-    status: hasStatus
-      ? (jsonPayload.status as string)
-      : fields.exitCode === 0
-        ? "BRIDGE_OK_NO_STATUS"
-        : "BRIDGE_FAILED",
     bridge: {
       exitCode: fields.exitCode,
       stderr: stderrSummary,
@@ -1354,13 +1410,16 @@ function renderIdeaResult(
 }
 
 // Create an isolated idle-continuation runtime. It consumes the authoritative
-// loop decision already attached by applyCommandLoopDecision; it neither owns
-// a second budget nor varies behavior by OpenCode invocation mode.
+// loop decision already attached by applyCommandLoopDecision and never owns a
+// second budget. Batch transport is runner-owned, so this runtime records and
+// dispatches idle prompts only when shouldPluginHandleSessionIdle allows it.
 function createIdleContinueRuntime(options: {
   client?: { session: { promptAsync: (opts: unknown) => Promise<unknown> } }
   log?: (msg: string, details?: unknown) => void
+  env?: Readonly<Record<string, string | undefined>>
 }) {
   const log = options.log || (() => {})
+  const sessionIdleEnabled = shouldPluginHandleSessionIdle(options.env || process.env)
   const states = new Map<string, ContinuationState>()
   let disposed = false
   let lastDispatchError = ""
@@ -1396,6 +1455,7 @@ function createIdleContinueRuntime(options: {
     instruction: string
     allowTestChanges: boolean
   }) {
+    if (!sessionIdleEnabled) return
     if (!input.sessionID) return
     states.set(input.sessionID, {
       taskKey: "",
@@ -1471,13 +1531,18 @@ function createIdleContinueRuntime(options: {
     const instruction = typeof loop?.instruction === "string" ? loop.instruction : ""
 
     const base = {
-      enabled: true,
+      enabled: sessionIdleEnabled,
       continuation,
       maxContinuations,
       generation: existing ? existing.generation : 0,
       status,
       category: category || (existing ? existing.failureCategory : ""),
       dispatched: existing ? existing.dispatchedGeneration === existing.generation : false,
+    }
+
+    if (!sessionIdleEnabled) {
+      if (input.sessionID) states.delete(input.sessionID)
+      return { ...base, dispatched: false }
     }
 
     // Any result other than the controller's authoritative `continue` revokes a
@@ -1575,6 +1640,7 @@ function createIdleContinueRuntime(options: {
   function handleIdle(sessionID: string): boolean {
     cleanupStale()
     if (disposed) return false
+    if (!sessionIdleEnabled) return false
     const state = states.get(sessionID)
     if (!state) return false
     if (!options.client) return false
@@ -2122,7 +2188,7 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
 }
 
 export const SmellPlugin: Plugin = async ({ worktree, client }) => {
-  const idleRuntime = createIdleContinueRuntime({ client })
+  const idleRuntime = createIdleContinueRuntime({ client, env: process.env })
   const commandLoopStates = new Map<string, CommandLoopState>()
   const commandBaselineSeals = new Map<string, string>()
   const commonShape = {
@@ -2215,9 +2281,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           applyCommandLoopDecision(normalized, commandState)
           normalized.metadata.command_loop_state = toJsonSafe(commandLoopStateSnapshot(commandState))
         }
-        // Consume the authoritative loop decision and arm same-session
-        // continuation. This path is identical for TUI, run, serve, web,
-        // attach, and batch environments.
+        // Every mode consumes the same authoritative loop decision. Interactive
+        // surfaces arm plugin-owned idle continuation; batch transport remains
+        // exclusively runner-owned and this runtime stays disabled there.
         let autoContinuation: Record<string, unknown> | undefined
         try {
           const cont = idleRuntime.recordFromBridgeOutput({
@@ -2554,6 +2620,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
 ;(SmellPlugin as Plugin & { __selfTest: unknown }).__selfTest = {
   normalizeToolResult,
   buildBridgeOutputPayload,
+  normalizeBridgeContractPayload,
   normalizeMetadata,
   normalizeStdioFields,
   safeStringOutput,
@@ -2583,6 +2650,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   redactSecrets,
   artifactPathsFrom,
   createIdleContinueRuntime,
+  shouldPluginHandleSessionIdle,
   SMELL_IDLE_CONTINUE_PREFIX,
   IDLE_CONTINUE_STATE_TTL_MS,
 }

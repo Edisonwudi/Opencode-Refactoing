@@ -5,8 +5,45 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 entrypoint="$repo_root/docker/mounted-source/entrypoint.sh"
 delivery_entrypoint="$repo_root/docker/java-refactor-delivery/entrypoint.sh"
 dockerfile="$repo_root/docker/java-refactor-delivery/Dockerfile.mounted-source"
+dockerignore="$repo_root/.dockerignore"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mounted-source-contract.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
+
+# The mounted-source image is built from the repository root. Keep local
+# worktrees, credentials, generated artifacts, and machine-only configuration
+# out of that context while retaining the public environment template.
+required_docker_ignores=(
+  '.trial-worktrees'
+  '.idea-trial-worktrees'
+  'images'
+  'runs'
+  '.smell-artifacts'
+  '.codex_tmp'
+  'backups'
+  '.zcode'
+  '.env*'
+  'runtime/python/smell_core/defaults/projects.java.local.yaml'
+  'node_modules'
+  '.opencode/node_modules'
+)
+for pattern in "${required_docker_ignores[@]}"; do
+  grep -Fqx -- "$pattern" "$dockerignore" || {
+    echo "Missing required Docker context exclusion: $pattern" >&2
+    exit 1
+  }
+done
+grep -Fqx -- '!.env.example' "$dockerignore" || {
+  echo 'Docker context must retain .env.example' >&2
+  exit 1
+}
+awk '
+  $0 == ".env*" { exclude_line = NR }
+  $0 == "!.env.example" { include_line = NR }
+  END { exit !(exclude_line > 0 && include_line > exclude_line) }
+' "$dockerignore" || {
+  echo 'The .env.example exception must follow the .env.* exclusion' >&2
+  exit 1
+}
 
 mkdir -p "$tmp/deps/node_modules" "$tmp/deps/opencode-node_modules"
 root_hash="$(shasum -a 256 "$repo_root/package-lock.json" | awk '{print $1}')"
