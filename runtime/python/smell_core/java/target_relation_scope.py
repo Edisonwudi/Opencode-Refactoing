@@ -314,6 +314,12 @@ def _resolve_parent_declaration(
         max_bytes=max_bytes,
         existing_files=scope_files,
     )
+    # An exact declaration query with no production-source result proves that
+    # this relation leaves the source Guard boundary (JDK, dependency, or
+    # generated binary). It is a terminal branch, not a source ambiguity.
+    # Other direct source parents on the same child are still followed.
+    if not queried:
+        return None
     candidate_scope = set(scope_files).union(queried)
     _enforce_scope_budget(
         root,

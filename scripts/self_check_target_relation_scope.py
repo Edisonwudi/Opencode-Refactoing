@@ -146,6 +146,17 @@ class AmbiguousChild implements Capability {
             "src/main/java/rightcap/Capability.java",
             "package rightcap; public interface Capability { void execute(); }\n",
         )
+        external_child = _write(
+            project,
+            "src/main/java/external/ExternalChild.java",
+            """\
+package external;
+import dependency.framework.ExternalBase;
+class ExternalChild extends ExternalBase {
+  public void execute() { throw new UnsupportedOperationException(); }
+}
+""",
+        )
 
         for index in range(200):
             _write(
@@ -233,6 +244,18 @@ class AmbiguousChild implements Capability {
                 wrong_parent.relative_to(project).as_posix() in scope
                 for scope in semantic_scopes
             ), semantic_scopes
+
+            external = relation_scope.resolve_refused_bequest_relation_scope(
+                project,
+                [external_child],
+                "src/main/java/external/ExternalChild.java:method=execute()|line=4",
+                {"target_class": "external.ExternalChild"},
+            )
+            assert external.files == (
+                "src/main/java/external/ExternalChild.java",
+            ), external.witness()
+            assert external.ancestors == (), external.witness()
+            assert external.edges == (), external.witness()
 
             _expect_error(
                 "ANCESTOR_TYPE_AMBIGUOUS",
