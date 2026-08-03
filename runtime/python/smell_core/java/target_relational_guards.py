@@ -707,6 +707,14 @@ def _callable_from_node(
     method = _node_text(source, name_node).strip()
     if not method:
         return None
+    type_parameters = _type_parameter_erasures(
+        node,
+        source,
+        package=package,
+        imports=imports,
+        wildcard_imports=wildcard_imports,
+        local_types=local_types,
+    )
     parameter_types: list[str] = []
     parameter_names: list[str] = []
     for parameter in parameters.named_children:
@@ -722,6 +730,7 @@ def _callable_from_node(
             imports=imports,
             wildcard_imports=wildcard_imports,
             local_types=local_types,
+            type_parameters=type_parameters,
         )
         if parameter.type == "spread_parameter":
             type_name += "..."
@@ -796,6 +805,7 @@ def _canonical_type(
     imports: Mapping[str, str] | None = None,
     wildcard_imports: Sequence[str] = (),
     local_types: Mapping[str, str] | None = None,
+    type_parameters: Mapping[str, str] | None = None,
 ) -> str:
     text = re.sub(
         r"\s+",
@@ -804,11 +814,14 @@ def _canonical_type(
     )
     imports = imports or {}
     local_types = local_types or {}
+    type_parameters = type_parameters or {}
 
     def resolve(match: re.Match[str]) -> str:
         token = match.group(0)
         if token in _PRIMITIVES or token in {"extends", "super", "void"}:
             return token
+        if token in type_parameters:
+            return str(type_parameters[token])
         if token in imports:
             return str(imports[token])
         if token in local_types:
@@ -834,6 +847,88 @@ def _canonical_type(
         return token
 
     return _TYPE_TOKEN.sub(resolve, text)
+
+
+def _type_parameter_erasures(
+    node: Node,
+    source: bytes,
+    *,
+    package: str,
+    imports: Mapping[str, str],
+    wildcard_imports: Sequence[str],
+    local_types: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve class and method type variables to their Java erasures."""
+    owners: list[Node] = []
+    current = node.parent
+    while current is not None:
+        if current.type in _OWNER_NODE_TYPES:
+            owners.append(current)
+        current = current.parent
+    declarations = [*reversed(owners), node]
+    resolved: dict[str, str] = {}
+    for declaration in declarations:
+        parameters = next(
+            (
+                child
+                for child in declaration.named_children
+                if child.type == "type_parameters"
+            ),
+            None,
+        )
+        if parameters is None:
+            continue
+        for parameter in parameters.named_children:
+            if parameter.type != "type_parameter":
+                continue
+            name_node = next(
+                (
+                    child
+                    for child in parameter.named_children
+                    if child.type == "type_identifier"
+                ),
+                None,
+            )
+            if name_node is None:
+                continue
+            name = _node_text(source, name_node).strip()
+            if not name:
+                continue
+            bound_text = "java.lang.Object"
+            bound = next(
+                (
+                    child
+                    for child in parameter.named_children
+                    if child.type == "type_bound"
+                ),
+                None,
+            )
+            if bound is not None:
+                first_bound = next(
+                    (
+                        child
+                        for child in bound.named_children
+                        if child.type
+                        in {
+                            "array_type",
+                            "generic_type",
+                            "scoped_type_identifier",
+                            "type_identifier",
+                        }
+                    ),
+                    None,
+                )
+                if first_bound is not None:
+                    bound_text = _node_text(source, first_bound)
+            resolved[name] = _canonical_type(
+                bound_text,
+                package=package,
+                imports=imports,
+                wildcard_imports=wildcard_imports,
+                local_types=local_types,
+                type_parameters=resolved,
+            )
+    return resolved
 
 
 def _owner_identity(node: Node, source: bytes, package: str) -> str:

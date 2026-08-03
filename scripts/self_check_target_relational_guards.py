@@ -442,6 +442,62 @@ class {owner} {{
     }, generic
     assert "<" not in generic["entity_identity"]["group"], generic
 
+    variable_files = tuple(
+        _write(
+            project,
+            f"src/main/java/variables/{owner}.java",
+            f"""\
+package variables;
+class {owner}<C extends Number> {{
+  <T> void {method}(Key<T> attribute, T oldValue, T newValue) {{}}
+  void bounded(Key<C> attribute, C oldValue, C newValue) {{}}
+}}
+class Key<T> {{}}
+""",
+        ).relative_to(project)
+        for owner, method in (
+            ("First", "publish"),
+            ("Second", "consume"),
+            ("Third", "publish"),
+        )
+    )
+    variables = evaluate_data_clumps_guard(
+        project,
+        (
+            "src/main/java/variables/First.java:method="
+            "publish(variables.Key attribute, java.lang.Object oldValue, "
+            "java.lang.Object newValue)|line=3"
+        ),
+        {
+            "group": (
+                "variables.Key:attribute|java.lang.Object:oldvalue|"
+                "java.lang.Object:newvalue"
+            )
+        },
+        source_files=variable_files,
+    )
+    assert variables["target_smell_present"] is True, variables
+    assert variables["target_match_count"] == 1, variables
+    variable_scope = relational._parse_scope(project, variable_files)
+    first = next(
+        item
+        for item in variable_scope.callables
+        if item.owner == "variables.First" and item.method == "publish"
+    )
+    bounded = next(
+        item
+        for item in variable_scope.callables
+        if item.owner == "variables.First" and item.method == "bounded"
+    )
+    assert first.parameter_types[1:] == (
+        "java.lang.Object",
+        "java.lang.Object",
+    ), first
+    assert bounded.parameter_types[1:] == (
+        "java.lang.Number",
+        "java.lang.Number",
+    ), bounded
+
     qualified_files: list[Path] = []
     _write(project, "src/main/java/right/Token.java", "package right; class Token {}\n")
     _write(project, "src/main/java/wrong/Token.java", "package wrong; class Token {}\n")
