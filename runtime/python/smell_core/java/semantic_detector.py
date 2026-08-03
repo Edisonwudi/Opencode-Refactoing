@@ -36,7 +36,8 @@ from .source_layout import (
     standard_test_root,
 )
 from .detector_utils import (
-    normalize_qualified_group as _normalize_qualified_group,
+    erase_java_type,
+    normalize_erased_qualified_group as _normalize_qualified_group,
     normalize_method as _normalize_method,
     normalize_path as _normalize_path,
     normalize_rel_path as _normalize_rel_path,
@@ -6052,13 +6053,7 @@ def _split_array_suffix(type_name: str) -> Tuple[str, str]:
 
 
 def _erase_type(type_text: str) -> str:
-    text = re.sub(r"@\w+(?:\([^)]*\))?\s*", "", str(type_text or ""))
-    text = re.sub(r"\b(final|public|protected|private|static|volatile|transient)\b", "", text)
-    text = text.replace("...", "[]")
-    text = re.sub(r"<.*>", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = text.replace(" []", "[]")
-    return text
+    return erase_java_type(type_text)
 
 
 def _superclass_text(source: bytes, class_node: Node) -> str:

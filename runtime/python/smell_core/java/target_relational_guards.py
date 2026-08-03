@@ -18,7 +18,11 @@ from tree_sitter_language_pack import get_parser
 
 from ..guard_scope import GuardScopeError, read_current_bytes
 from ..location import LocationTarget, parse_location_descriptor
-from .detector_utils import normalize_group, normalize_qualified_group
+from .detector_utils import (
+    erase_java_type,
+    normalize_erased_qualified_group as normalize_qualified_group,
+    normalize_group,
+)
 
 
 LONG_PARAMETER_LIST_THRESHOLD = 6
@@ -793,7 +797,11 @@ def _canonical_type(
     wildcard_imports: Sequence[str] = (),
     local_types: Mapping[str, str] | None = None,
 ) -> str:
-    text = re.sub(r"\s+", "", str(raw or ""))
+    text = re.sub(
+        r"\s+",
+        "",
+        erase_java_type(str(raw or ""), varargs_as_array=False),
+    )
     imports = imports or {}
     local_types = local_types or {}
 

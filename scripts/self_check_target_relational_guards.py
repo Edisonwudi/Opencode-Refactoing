@@ -401,6 +401,47 @@ class Large{name} {{
     }, large
     assert len(large["entity_identity"]["group"].split("|")) == 4, large
 
+    generic_files = tuple(
+        _write(
+            project,
+            f"src/main/java/generic/{owner}.java",
+            f"""\
+package generic;
+import java.util.List;
+class {owner} {{
+  void {method}(List<{element}> rows, int offset, boolean strict) {{}}
+}}
+""",
+        ).relative_to(project)
+        for owner, method, element in (
+            ("First", "load", "String"),
+            ("Second", "save", "Integer"),
+            ("Third", "load", "?"),
+        )
+    )
+    generic = evaluate_data_clumps_guard(
+        project,
+        (
+            "src/main/java/generic/First.java:method="
+            "load(java.util.List rows, int offset, boolean strict)|line=4"
+        ),
+        {
+            "group": (
+                "java.util.List<java.lang.String>:rows|int:offset|boolean:strict"
+            )
+        },
+        source_files=generic_files,
+    )
+    assert generic["ok"] is True, generic
+    assert generic["target_smell_present"] is True, generic
+    assert generic["target_match_count"] == 1, generic
+    assert generic["objectives"] == {
+        "occurrence_count": 3,
+        "class_count": 3,
+        "method_name_count": 2,
+    }, generic
+    assert "<" not in generic["entity_identity"]["group"], generic
+
     qualified_files: list[Path] = []
     _write(project, "src/main/java/right/Token.java", "package right; class Token {}\n")
     _write(project, "src/main/java/wrong/Token.java", "package wrong; class Token {}\n")

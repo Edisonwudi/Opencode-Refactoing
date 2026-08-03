@@ -5,7 +5,7 @@ from typing import Any, Iterable
 
 from .detector_utils import (
     normalize_group,
-    normalize_qualified_group,
+    normalize_erased_qualified_group,
 )
 from .semantic_detector import (
     DEFAULT_THRESHOLDS,
@@ -15,11 +15,11 @@ from .semantic_detector import (
 
 
 def normalize_data_clump_group(group: str) -> str:
-    return normalize_qualified_group(group)
+    return normalize_erased_qualified_group(group)
 
 
 def data_clump_finding_group(finding: SemanticFinding) -> str:
-    return normalize_qualified_group(
+    return normalize_erased_qualified_group(
         str(finding.attributes.get("group") or "")
     )
 
@@ -30,7 +30,7 @@ def matching_data_clump_groups(
     group: str,
 ) -> set[str]:
     """Resolve an exact group or one globally unique simple-type shorthand."""
-    selector = normalize_qualified_group(group)
+    selector = normalize_erased_qualified_group(group)
     if not selector:
         return set()
     candidate_groups = {
