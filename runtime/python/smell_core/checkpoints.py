@@ -443,6 +443,49 @@ def _baseline_guard_scope(config: Any, root: Path) -> GuardVerificationScope:
     )
 
 
+def capture_baseline_finding_snapshot(
+    config: Any,
+    evidence: str = "",
+) -> dict[str, Any]:
+    """Run the exact finding gate used before c000 writes any artifacts.
+
+    This is the read-only entry point for baseline audits.  Java callers get
+    the same target-only Guard scope as :func:`capture_checkpoint_baseline`;
+    the result is admitted only when one measurable target finding is present.
+    It deliberately does not capture build/test policy or write a checkpoint.
+    """
+    smell = str(config.smell)
+    if smell not in CHECKPOINT_SMELLS:
+        raise ValueError(f"CHECKPOINT_NOT_SUPPORTED: {smell}")
+    if not config.locations:
+        raise ValueError("CHECKPOINT_BASELINE_CAPTURE_FAILED: no target location")
+    is_java = str(config.language).strip().lower() == "java"
+    if is_java:
+        root = config.project_root.expanduser().resolve()
+        config.guard_scope = _baseline_guard_scope(config, root)
+    metrics = capture_metric_snapshot(config, evidence)
+    if not metrics.get("ok") or not metrics.get("objectives"):
+        raise ValueError(
+            "CHECKPOINT_BASELINE_CAPTURE_FAILED: "
+            f"{metrics.get('error', 'no measurable objectives')}"
+        )
+    candidate_count = int(
+        metrics.get("target_match_count", metrics.get("candidate_count") or 0)
+    )
+    if candidate_count != 1:
+        if candidate_count > 1:
+            raise ValueError(
+                f"TARGET_AMBIGUOUS: Guard matched {candidate_count} target entities"
+            )
+        raise ValueError("BASELINE_FINDING_NOT_FOUND")
+    if metrics.get(
+        "target_smell_present",
+        metrics.get("finding_present"),
+    ) is not True:
+        raise ValueError("BASELINE_FINDING_NOT_FOUND")
+    return metrics
+
+
 def capture_checkpoint_baseline(
     config: Any,
     evidence: str = "",
@@ -521,22 +564,7 @@ def capture_checkpoint_baseline(
                 )
         return existing
 
-    if is_java:
-        config.guard_scope = _baseline_guard_scope(config, root)
-    metrics = capture_metric_snapshot(config, evidence)
-    if not metrics.get("ok") or not metrics.get("objectives"):
-        raise ValueError(f"CHECKPOINT_BASELINE_CAPTURE_FAILED: {metrics.get('error', 'no measurable objectives')}")
-    candidate_count = int(
-        metrics.get("target_match_count", metrics.get("candidate_count") or 0)
-    )
-    if candidate_count != 1:
-        if candidate_count > 1:
-            raise ValueError(
-                f"TARGET_AMBIGUOUS: Guard matched {candidate_count} target entities"
-            )
-        raise ValueError("BASELINE_FINDING_NOT_FOUND")
-    if metrics.get("target_smell_present", metrics.get("finding_present")) is not True:
-        raise ValueError("BASELINE_FINDING_NOT_FOUND")
+    metrics = capture_baseline_finding_snapshot(config, evidence)
     finding_contract = (
         _guard_contract(smell, metrics, getattr(config, "target_context", {}))
         if is_java
