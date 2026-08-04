@@ -114,6 +114,83 @@ def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str
     return _run(["git", "-c", "safe.directory=*", *args], project_root)
 
 
+def _idea_refactor_cli() -> str:
+    return (
+        os.environ.get("SMELL_IDEA_REFACTOR_CLI", "").strip()
+        or os.environ.get("IDEA_REFACTOR_CLI", "").strip()
+        or "idea-refactor"
+    )
+
+
+def _sanitize_idea_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(payload)
+    server = sanitized.get("server")
+    if isinstance(server, dict):
+        sanitized_server = dict(server)
+        sanitized_server.pop("token", None)
+        sanitized["server"] = sanitized_server
+    sanitized.pop("token", None)
+    return sanitized
+
+
+def _prepare_idea_service(project_root: Path, sample_dir: Path) -> dict[str, Any]:
+    precheck_timeout = max(30, min(600, int(os.environ.get("SMELL_IDEA_PRECHECK_TIMEOUT", "300"))))
+    proc = _run(
+        [
+            _idea_refactor_cli(),
+            "ensure-service",
+            "--project-root",
+            str(project_root),
+            "--open",
+            "--timeout",
+            str(precheck_timeout),
+            "--poll-interval",
+            "1",
+        ],
+        project_root,
+        timeout=precheck_timeout + 60,
+    )
+    try:
+        decoded = json.loads(proc.stdout)
+        payload = decoded if isinstance(decoded, dict) else {"status": "failed"}
+    except json.JSONDecodeError:
+        payload = {
+            "status": "failed",
+            "diagnostics": [{"code": "IDEA_PRECHECK_INVALID_JSON", "summary": proc.stderr or proc.stdout}],
+        }
+    payload = _sanitize_idea_service_payload(payload)
+    payload["returncode"] = proc.returncode
+    payload["stderr"] = proc.stderr
+    (sample_dir / "idea-preflight.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+    )
+    return payload
+
+
+def _close_idea_project(project_root: Path, sample_dir: Path) -> None:
+    try:
+        proc = _run(
+            [_idea_refactor_cli(), "close-project", "--project-root", str(project_root)],
+            project_root,
+            timeout=60,
+        )
+        try:
+            decoded = json.loads(proc.stdout)
+            result = decoded if isinstance(decoded, dict) else {"status": "unknown"}
+        except json.JSONDecodeError:
+            result = {"status": "invalid_json"}
+        payload = {
+            "returncode": proc.returncode,
+            "result": _sanitize_idea_service_payload(result),
+            "stderr": proc.stderr,
+        }
+    except subprocess.TimeoutExpired:
+        payload = {"returncode": 124, "result": {"status": "timeout"}, "stderr": ""}
+    (sample_dir / "idea-close-project.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
+    )
+
+
 def _dataset_evidence(row: dict[str, str | None]) -> str:
     """Preserve the dataset evidence verbatim as audit-only metadata."""
     return str(row.get("evidence") or "").strip()
@@ -680,6 +757,7 @@ def _task_prompt(
     ]
     lines.extend(
         [
+            f"Refactoring backend: {getattr(args, 'refactoring_backend', 'direct')}",
             f"Verification mode: {verification_mode}",
             (
                 "Test changes: explicitly allowed; all changed test files are SHA-audited and the frozen build/test contract remains mandatory."
@@ -979,6 +1057,10 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     last_status = ""
     last_cap_recovery_used = False
     last_command_loop_state: dict[str, Any] | None = None
+    tool_sequence: list[str] = []
+    attempted_tool_sequence: list[str] = []
+    direct_idea_cli_calls = 0
+    direct_edit_calls = 0
     for raw in (events_text or "").splitlines():
         try:
             event = json.loads(raw)
@@ -990,8 +1072,22 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         if not isinstance(part, dict):
             continue
         state = part.get("state")
-        if not isinstance(state, dict) or state.get("status") != "completed":
+        if not isinstance(state, dict):
             continue
+        tool_name = str(part.get("tool") or "")
+        if tool_name:
+            attempted_tool_sequence.append(tool_name)
+        state_input = state.get("input")
+        if tool_name == "bash" and isinstance(state_input, dict):
+            command = str(state_input.get("command") or "")
+            if re.search(r"(?:^|[\s/])idea-refactor(?:\s|$)", command):
+                direct_idea_cli_calls += 1
+        if tool_name in {"edit", "write", "patch", "apply_patch"}:
+            direct_edit_calls += 1
+        if state.get("status") != "completed":
+            continue
+        if tool_name:
+            tool_sequence.append(tool_name)
         if part.get("tool") != "smell_verify":
             if calls:
                 tools_after_last_verify += 1
@@ -1036,6 +1132,65 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "last_payload": last_payload,
         "last_cap_recovery_used": last_cap_recovery_used,
         "command_loop_state": last_command_loop_state,
+        "tool_sequence": tool_sequence,
+        "attempted_tool_sequence": attempted_tool_sequence,
+        "idea_refactor_preview_calls": tool_sequence.count("idea_refactor_preview"),
+        "idea_refactor_apply_calls": tool_sequence.count("idea_refactor_apply"),
+        "idea_edit_calls": tool_sequence.count("idea_edit"),
+        "direct_idea_cli_calls": direct_idea_cli_calls,
+        "direct_edit_calls": direct_edit_calls,
+    }
+
+
+def _idea_protocol_contract(controller_attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    sequence = [
+        str(tool)
+        for attempt in controller_attempts
+        for tool in attempt.get("tool_sequence", [])
+        if str(tool)
+    ]
+    attempted_sequence = [
+        str(tool)
+        for attempt in controller_attempts
+        for tool in attempt.get("attempted_tool_sequence", [])
+        if str(tool)
+    ]
+    preview_positions = [index for index, tool in enumerate(sequence) if tool == "idea_refactor_preview"]
+    apply_positions = [index for index, tool in enumerate(sequence) if tool == "idea_refactor_apply"]
+    verify_positions = [index for index, tool in enumerate(sequence) if tool == "smell_verify"]
+    ordered = bool(
+        preview_positions
+        and apply_positions
+        and verify_positions
+        and min(preview_positions) < min(apply_positions) < max(verify_positions)
+    )
+    direct_idea_cli_calls = sum(int(attempt.get("direct_idea_cli_calls") or 0) for attempt in controller_attempts)
+    direct_edit_calls = sum(int(attempt.get("direct_edit_calls") or 0) for attempt in controller_attempts)
+    violations = []
+    if not preview_positions:
+        violations.append("IDEA_PREVIEW_MISSING")
+    if not apply_positions:
+        violations.append("IDEA_APPLY_MISSING")
+    if not verify_positions:
+        violations.append("SMELL_VERIFY_MISSING")
+    if preview_positions and apply_positions and verify_positions and not ordered:
+        violations.append("IDEA_PROTOCOL_ORDER_INVALID")
+    if direct_idea_cli_calls:
+        violations.append("DIRECT_IDEA_CLI_USED")
+    if direct_edit_calls:
+        violations.append("DIRECT_EDIT_USED")
+    return {
+        "success": not violations,
+        "protocol": "idea-proposal-v1",
+        "tool_sequence": sequence,
+        "attempted_tool_sequence": attempted_sequence,
+        "preview_calls": len(preview_positions),
+        "apply_calls": len(apply_positions),
+        "verify_calls": len(verify_positions),
+        "idea_edit_calls": sequence.count("idea_edit"),
+        "direct_idea_cli_calls": direct_idea_cli_calls,
+        "direct_edit_calls": direct_edit_calls,
+        "violations": violations,
     }
 
 
@@ -1182,6 +1337,16 @@ def _run_opencode(
     env["SMELL_SAMPLE_TEST_LOCATION"] = sample.test_location
     env["SMELL_SAMPLE_TEST_COMMAND"] = sample.test_command
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
+    refactoring_backend = getattr(args, "refactoring_backend", "direct")
+    env["SMELL_REFACTORING_BACKEND"] = refactoring_backend
+    if refactoring_backend == "idea":
+        env["SMELL_ENABLE_IDEA_TOOLS"] = "1"
+        env["SMELL_IDEA_PREPARED"] = "1"
+        env["SMELL_IDEA_PROJECT_ROOT"] = str(sample.project_root)
+    else:
+        env.pop("SMELL_ENABLE_IDEA_TOOLS", None)
+        env.pop("SMELL_IDEA_PREPARED", None)
+        env.pop("SMELL_IDEA_PROJECT_ROOT", None)
     if baseline_seal:
         env["SMELL_BASELINE_SEAL"] = baseline_seal
     else:
@@ -1607,6 +1772,45 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             )
             return row
 
+    if getattr(args, "refactoring_backend", "direct") == "idea":
+        idea_preflight = _prepare_idea_service(execution_sample.project_root, sample_dir)
+        if idea_preflight.get("status") != "ok" or idea_preflight.get("returncode") != 0:
+            row = {
+                "sample_id": sample.sample_id,
+                "smell": sample.smell,
+                "project_name": sample.project_name,
+                "project_root": str(sample.project_root),
+                "execution_project_root": str(execution_sample.project_root),
+                "location": execution_sample.location,
+                "verification_mode": verification_mode,
+                "refactoring_backend": "idea",
+                "agent": agent,
+                "status": "IDEA_PRECHECK_FAILED",
+                "opencode_returncode": -1,
+                "verify_returncode": -1,
+                "duration_seconds": f"{time.time() - started:.1f}",
+                "sample_dir": str(sample_dir),
+                "note": "IDEA service did not become ready for the execution worktree; see idea-preflight.json",
+            }
+            (sample_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        **row,
+                        "attempts": [],
+                        "controller_attempts": [],
+                        "revision_audit": revision_audit,
+                        "dataset_audit": dataset_audit,
+                        "baseline_capture": baseline_capture,
+                        "idea_preflight": idea_preflight,
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return row
+
     # Bootstrap .opencode once before starting the command-owned loop.
     _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
@@ -1703,6 +1907,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         verification_mode,
         baseline_seal=baseline_seal,
     )
+    if getattr(args, "refactoring_backend", "direct") == "idea":
+        _close_idea_project(execution_sample.project_root, sample_dir)
     final_verify_source = "runner_final"
     opencode_failure_category = (
         "PROVIDER_QUOTA_FAILED"
@@ -1714,6 +1920,13 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         )
     )
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
+    idea_protocol = (
+        _idea_protocol_contract(controller_attempts)
+        if getattr(args, "refactoring_backend", "direct") == "idea"
+        else None
+    )
+    if idea_protocol is not None and idea_protocol["success"] is not True:
+        final_status = "IDEA_PROTOCOL_FAILED"
     resolution = str(verify_payload.get("resolution") or "")
     accepted = _is_accepted_status(final_status)
     progress = bool(verify_payload.get("progress")) or accepted
@@ -1754,6 +1967,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "location": execution_sample.location,
         "verification_mode": verification_mode,
         "allow_test_changes": bool(getattr(args, "allow_test_changes", False)),
+        "refactoring_backend": getattr(args, "refactoring_backend", "direct"),
         "agent": agent,
         "status": final_status,
         "resolution": resolution,
@@ -1775,6 +1989,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "revision_audit": revision_audit,
         "dataset_audit": dataset_audit,
         "baseline_capture": baseline_capture,
+        "idea_protocol": idea_protocol,
     }
     (sample_dir / "result.json").write_text(json.dumps(result_summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return row
@@ -1820,6 +2035,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly allow model edits under test-source roots. The controller still freezes verification configuration and requires the full build/test contract.",
     )
     parser.add_argument(
+        "--refactoring-backend",
+        choices=["direct", "idea"],
+        default="direct",
+        help="Java edit backend. 'idea' exposes the proposal wrapper while retaining the shared java-refactor-run command and guard state.",
+    )
+    parser.add_argument(
         "--agent",
         choices=["smell-refactor-agent", "java-refactor-agent"],
         default="",
@@ -1851,11 +2072,15 @@ def main(argv: list[str] | None = None) -> int:
     # contract is an independent behavior gate.
     if args.allow_test_changes:
         args.verification_mode = "project_full"
+    if args.refactoring_backend == "idea" and args.agent == "smell-refactor-agent":
+        parser.error("--refactoring-backend=idea requires the Java refactor agent")
     # Validate the runner flags through the same parser used by the OpenCode
     # command hook, so batch and direct command invocations cannot drift.
     parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
     dataset = Path(args.dataset).expanduser().resolve()
     samples = _filter_samples(_load_samples(dataset), args)
+    if args.refactoring_backend == "idea" and any(sample.language != "java" for sample in samples):
+        parser.error("--refactoring-backend=idea supports Java samples only")
     try:
         _validate_model_auth(args)
     except ValueError as exc:
@@ -1871,6 +2096,7 @@ def main(argv: list[str] | None = None) -> int:
         "run_dir": str(run_dir),
         "execution_checkout_root": str(_execution_checkout_run_dir(run_dir)),
         "verification_mode": args.verification_mode,
+        "refactoring_backend": args.refactoring_backend,
         "loop_policy": parse_command_policy(
             _command_arguments("validation task", args, args.verification_mode)
         ).loop.to_dict(),

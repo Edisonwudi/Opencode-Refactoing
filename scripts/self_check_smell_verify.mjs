@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process"
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -11,6 +11,7 @@ const root = path.resolve(path.dirname(scriptFile), "..")
 const pluginFile = path.join(root, ".opencode", "plugins", "smell.ts")
 const bridgeFile = path.join(root, "runtime", "python", "bridge", "smell_bridge.py")
 const datasetRunnerFile = path.join(root, "scripts", "run_smell_dataset.py")
+const sampleTestCommand = "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'"
 
 function parseArgs(argv) {
   const options = {
@@ -44,6 +45,59 @@ class SelfCheckError extends Error {
     super(message)
     this.stage = stage
     this.details = details
+  }
+}
+
+async function runIdeaSkillProtocolDocSelfCheck() {
+  const skillRoot = path.join(root, ".opencode", "skills", "idea-refactor-cli")
+  const pathRoot = path.join(skillRoot, "references", "refactor-paths")
+  const routeFiles = (await readdir(pathRoot))
+    .filter((name) => name.endsWith(".yaml") || name.endsWith(".yml") || name.endsWith(".md"))
+    .map((name) => path.join(pathRoot, name))
+  const files = [
+    path.join(skillRoot, "SKILL.md"),
+    path.join(skillRoot, "references", "target-admission.md"),
+    ...routeFiles,
+  ]
+  const forbidden = [
+    {
+      id: "direct_underlying_cli",
+      pattern: /\bidea-refactor\s+(?:locate|prepare|apply)\b/gi,
+    },
+    {
+      id: "legacy_locate_prepare_narrative",
+      pattern: /\b(?:use locate|second locate|before prepare|prepare (?:returned|reports|exposed)|returned by prepare)\b|\blocators?\b[^\n]*\bprepare\b/gi,
+    },
+    {
+      id: "flat_decision_shape",
+      pattern: /decisions=\{\s*"[^"\n]+"\s*:\s*"/g,
+    },
+  ]
+  const violations = []
+  for (const file of files) {
+    const source = await readFile(file, "utf8")
+    for (const rule of forbidden) {
+      for (const match of source.matchAll(rule.pattern)) {
+        const line = source.slice(0, match.index).split("\n").length
+        violations.push({
+          rule: rule.id,
+          file: path.relative(root, file),
+          line,
+          text: match[0],
+        })
+      }
+    }
+  }
+  if (violations.length > 0) {
+    throw new SelfCheckError(
+      "idea_skill_protocol_docs",
+      "Model-visible IDEA skill references contain legacy locate/prepare/apply protocol examples.",
+      { violations },
+    )
+  }
+  return {
+    filesChecked: files.length,
+    forbiddenPatterns: forbidden.map((rule) => rule.id),
   }
 }
 
@@ -283,6 +337,8 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
     path.join(fixtureRoot, "projects.yaml"),
     "--verification-mode",
     "project_full",
+    "--sample-test-command",
+    sampleTestCommand,
   ]
   const baseline = await run(
     "python3",
@@ -665,6 +721,79 @@ async function runPluginNormalizeSelfCheck(pluginModule) {
   return { hookKeys: Object.keys(hooks).sort(), maxLen, scenarios: results, ideaResults, ideaProposalResults }
 }
 
+async function runIdeaBackendSurfaceSelfCheck(pluginModule) {
+  const envBefore = { ...process.env }
+  const restoreEnv = () => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envBefore)) delete process.env[key]
+    }
+    Object.assign(process.env, envBefore)
+  }
+  try {
+    process.env.SMELL_REFACTORING_BACKEND = "idea"
+    process.env.SMELL_ENABLE_IDEA_TOOLS = "1"
+    const ideaPlugin = await pluginModule.SmellPlugin({ worktree: "/tmp/idea-backend-self-check" })
+    const toolKeys = Object.keys(ideaPlugin?.tool || {}).sort()
+    for (const required of ["smell_verify", "idea_refactor_preview", "idea_refactor_apply", "idea_edit"]) {
+      if (!toolKeys.includes(required)) {
+        throw new SelfCheckError("idea_backend_tool_surface", `IDEA backend did not expose ${required}.`, { toolKeys })
+      }
+    }
+    const beforeHook = ideaPlugin?.["tool.execute.before"]
+    if (typeof beforeHook !== "function") {
+      throw new SelfCheckError("idea_backend_tool_hook", "IDEA backend did not register tool.execute.before.", {})
+    }
+    let editBlocked = false
+    try {
+      await beforeHook(
+        { tool: "edit", sessionID: "idea-session" },
+        { args: { filePath: "/tmp/idea-backend-self-check/src/Foo.java" } },
+      )
+    } catch (error) {
+      editBlocked = String(error).includes("IDEA_BACKEND_DIRECT_EDIT_FORBIDDEN")
+    }
+    let cliBlocked = false
+    try {
+      await beforeHook(
+        { tool: "bash", sessionID: "idea-session" },
+        { args: { command: "/usr/local/bin/idea-refactor locate --project-root /tmp/p" } },
+      )
+    } catch (error) {
+      cliBlocked = String(error).includes("IDEA_BACKEND_DIRECT_CLI_FORBIDDEN")
+    }
+    if (!editBlocked || !cliBlocked) {
+      throw new SelfCheckError("idea_backend_bypass_guard", "IDEA backend did not reject a direct edit or direct CLI call.", {
+        editBlocked,
+        cliBlocked,
+      })
+    }
+    await beforeHook(
+      { tool: "read", sessionID: "idea-session" },
+      { args: { filePath: "/tmp/idea-backend-self-check/src/Foo.java" } },
+    )
+    await ideaPlugin?.dispose?.()
+
+    process.env.SMELL_REFACTORING_BACKEND = "direct"
+    process.env.SMELL_ENABLE_IDEA_TOOLS = "1"
+    const directPlugin = await pluginModule.SmellPlugin({ worktree: "/tmp/direct-backend-self-check" })
+    const directToolKeys = Object.keys(directPlugin?.tool || {}).sort()
+    if (directToolKeys.some((name) => name.startsWith("idea_"))) {
+      throw new SelfCheckError("direct_backend_tool_surface", "Direct backend exposed IDEA tools from the enable flag alone.", {
+        toolKeys: directToolKeys,
+      })
+    }
+    await directPlugin?.dispose?.()
+    return {
+      ideaToolKeys: toolKeys.filter((name) => name.startsWith("idea_")),
+      directBackendIdeaTools: [],
+      directEditBlocked: editBlocked,
+      directCliBlocked: cliBlocked,
+    }
+  } finally {
+    restoreEnv()
+  }
+}
+
 async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
   if (typeof hooks.renderIdeaResult !== "function") {
     throw new SelfCheckError("plugin_self_test_hooks", "Plugin __selfTest is missing renderIdeaResult.", {
@@ -876,12 +1005,81 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
 }
 
 async function runPluginIdeaProposalSelfCheck(hooks) {
-  for (const name of ["runIdeaPreviewProtocol", "renderIdeaApplyProtocolResult"]) {
+  for (const name of ["runIdeaPreviewProtocol", "renderIdeaApplyProtocolResult", "ideaDecisionsShape"]) {
     if (typeof hooks[name] !== "function") {
       throw new SelfCheckError("plugin_self_test_hooks", `Plugin __selfTest is missing ${name}.`, {
         keys: Object.keys(hooks).sort(),
       })
     }
+  }
+  const decisionSchema = hooks.ideaDecisionsShape("self-check decisions")
+  const validDecisionShape = decisionSchema.safeParse({
+    "selection.extract-method.scope": { choice: "selection_0", arguments: {} },
+  })
+  const invalidDecisionShape = decisionSchema.safeParse({
+    "selection.extract-method.scope": "selection_0",
+  })
+  if (!validDecisionShape.success || invalidDecisionShape.success) {
+    throw new SelfCheckError("plugin_idea_decision_schema", "IDEA decision schema accepted the wrong value shape.", {
+      validAccepted: validDecisionShape.success,
+      invalidAccepted: invalidDecisionShape.success,
+    })
+  }
+  let invalidTargetRunnerCalls = 0
+  const invalidContinuationPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      proposalId: "draft-conflict",
+      target: { fqcn: "demo.Foo", memberName: "run", parameterTypes: [] },
+      arguments: { newName: "execute" },
+    },
+    runner: async () => {
+      invalidTargetRunnerCalls += 1
+      throw new Error("invalid preview must not invoke the CLI")
+    },
+  })).output)
+  if (
+    invalidContinuationPayload.status !== "needs_input"
+    || invalidContinuationPayload.nextAction !== "preview"
+    || invalidContinuationPayload.nextRequest?.tool !== "idea_refactor_preview"
+    || invalidContinuationPayload.nextRequest?.args?.proposalId !== "draft-conflict"
+    || invalidContinuationPayload.nextRequest?.args?.target !== undefined
+    || invalidContinuationPayload.nextRequest?.args?.file !== undefined
+  ) {
+    throw new SelfCheckError("plugin_idea_invalid_target_recovery", "Continuation conflict did not return a legal retry.", {
+      payload: invalidContinuationPayload,
+    })
+  }
+  const invalidInitialPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      target: { fqcn: "demo.Foo", memberName: "run", parameterTypes: [] },
+      file: "/p/src/Foo.java",
+      line: 4,
+      column: 5,
+    },
+    runner: async () => {
+      invalidTargetRunnerCalls += 1
+      throw new Error("invalid preview must not invoke the CLI")
+    },
+  })).output)
+  if (
+    invalidInitialPayload.status !== "needs_input"
+    || invalidInitialPayload.nextAction !== "preview"
+    || invalidInitialPayload.nextRequest?.args?.target?.fqcn !== "demo.Foo"
+    || invalidInitialPayload.nextRequest?.args?.file !== undefined
+    || invalidTargetRunnerCalls !== 0
+  ) {
+    throw new SelfCheckError("plugin_idea_invalid_target_recovery", "Initial target conflict did not return a legal retry.", {
+      payload: invalidInitialPayload,
+      runnerCalls: invalidTargetRunnerCalls,
+    })
   }
   const calls = []
   const runner = async (_worktree, _cli, argv) => {
@@ -912,6 +1110,11 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
         operation: "rename:method",
         resolvedContext: { stableTargetId: "method:Foo#run", kind: "method" },
         inputs: [{ name: "newName", type: "string", required: true }],
+        nextCliCommandExample: {
+          action: "apply",
+          argumentsJson: { newName: "execute" },
+          decisionsJson: {},
+        },
         diagnostics: [],
       },
     }
@@ -933,6 +1136,17 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
   if (previewPayload.status !== "ready") previewErrors.push(`status=${previewPayload.status}`)
   if (previewPayload.proposalId !== "draft-1") previewErrors.push(`proposalId=${previewPayload.proposalId}`)
   if (previewPayload.nextAction !== "apply") previewErrors.push(`nextAction=${previewPayload.nextAction}`)
+  if (JSON.stringify(previewPayload.nextRequest) !== JSON.stringify({
+    tool: "idea_refactor_apply",
+    args: {
+      ideaProjectRoot: "/p",
+      proposalId: "draft-1",
+      arguments: { newName: "execute" },
+      decisions: {},
+    },
+  })) {
+    previewErrors.push(`ready nextRequest=${JSON.stringify(previewPayload.nextRequest)}`)
+  }
   if ("raw" in previewPayload) previewErrors.push("compact preview leaked raw payload")
   if (calls.length !== 2 || calls[0][0] !== "locate" || calls[1][0] !== "prepare") {
     previewErrors.push(`unexpected call sequence=${JSON.stringify(calls.map((argv) => argv[0]))}`)
@@ -961,6 +1175,124 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
     previewErrors.push("proposal continuation performed locate")
   }
 
+  const locateRetryPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      target: { fqcn: "demo.Foo", memberName: "run", parameterTypes: [] },
+      arguments: { newName: "execute" },
+    },
+    runner: async (_worktree, _cli, argv) => ({
+      exitCode: 3,
+      stdout: "",
+      stderr: "",
+      argv,
+      json: {
+        status: "retryable_failed",
+        diagnostics: [{ code: "SERVICE_REQUEST_TIMEOUT", summary: "locate timed out" }],
+      },
+    }),
+  })).output)
+  if (locateRetryPayload.status !== "retryable_failed" || locateRetryPayload.nextAction !== "preview") {
+    previewErrors.push(`locate retry state=${locateRetryPayload.status}/${locateRetryPayload.nextAction}`)
+  }
+  if (
+    locateRetryPayload.nextRequest?.tool !== "idea_refactor_preview"
+    || locateRetryPayload.nextRequest?.args?.proposalId !== undefined
+    || locateRetryPayload.nextRequest?.args?.target?.fqcn !== "demo.Foo"
+  ) {
+    previewErrors.push(`locate retry nextRequest=${JSON.stringify(locateRetryPayload.nextRequest)}`)
+  }
+
+  const prepareRetryPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "rename:method",
+      proposalId: "draft-retry",
+      arguments: { newName: "execute" },
+    },
+    runner: async (_worktree, _cli, argv) => ({
+      exitCode: 3,
+      stdout: "",
+      stderr: "",
+      argv,
+      json: {
+        status: "retryable_failed",
+        draftId: "draft-retry",
+        operation: "rename:method",
+        diagnostics: [{ code: "INDEX_NOT_READY", summary: "prepare must wait" }],
+      },
+    }),
+  })).output)
+  if (prepareRetryPayload.status !== "retryable_failed" || prepareRetryPayload.nextAction !== "preview") {
+    previewErrors.push(`prepare retry state=${prepareRetryPayload.status}/${prepareRetryPayload.nextAction}`)
+  }
+  if (
+    prepareRetryPayload.nextRequest?.tool !== "idea_refactor_preview"
+    || prepareRetryPayload.nextRequest?.args?.proposalId !== "draft-retry"
+    || prepareRetryPayload.nextRequest?.args?.target !== undefined
+    || prepareRetryPayload.nextRequest?.args?.file !== undefined
+  ) {
+    previewErrors.push(`prepare retry nextRequest=${JSON.stringify(prepareRetryPayload.nextRequest)}`)
+  }
+
+  const decisionPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
+    worktree: "/p",
+    cli: "idea-refactor",
+    request: {
+      projectRoot: "/p",
+      operation: "extract:method",
+      proposalId: "draft-decision",
+      arguments: { newName: "extractPart" },
+    },
+    runner: async (_worktree, _cli, argv) => ({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      argv,
+      json: {
+        status: "needs_decision",
+        draftId: "draft-decision",
+        operation: "extract:method",
+        decisions: [{
+          id: "selection.extract-method.scope",
+          kind: "selection",
+          recommended: "selection_0",
+          choices: [{ value: "selection_0", label: "Use the selected block" }],
+        }],
+        nextCliCommandExample: {
+          action: "prepare",
+          argumentsJson: { newName: "extractPart" },
+          decisionsJson: {
+            "selection.extract-method.scope": { choice: "selection_0", arguments: {} },
+          },
+        },
+        diagnostics: [],
+      },
+    }),
+  })).output)
+  if (decisionPayload.status !== "needs_decision" || decisionPayload.nextAction !== "preview") {
+    previewErrors.push(`decision state=${decisionPayload.status}/${decisionPayload.nextAction}`)
+  }
+  if (JSON.stringify(decisionPayload.nextRequest) !== JSON.stringify({
+    tool: "idea_refactor_preview",
+    args: {
+      ideaProjectRoot: "/p",
+      operation: "extract:method",
+      proposalId: "draft-decision",
+      arguments: { newName: "extractPart" },
+      decisions: {
+        "selection.extract-method.scope": { choice: "selection_0", arguments: {} },
+      },
+    },
+  })) {
+    previewErrors.push(`decision nextRequest=${JSON.stringify(decisionPayload.nextRequest)}`)
+  }
+
   const selectionCalls = []
   const selectionPreview = await hooks.runIdeaPreviewProtocol({
     worktree: "/p",
@@ -980,10 +1312,20 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
         json: {
           status: "ok",
           draftId: "draft-selection",
+          resolvedContext: {
+            stableTargetId: "method:Foo#run",
+            filePath: "/p/src/Foo.java",
+            kind: "method",
+          },
           availableOperations: [],
           operationCandidates: [{
             operation: "extract:method",
-            candidates: [{ startLine: 4, startColumn: 5, endLine: 8, endColumn: 6 }],
+            candidates: [{
+              "selection-start-line": 4,
+              "selection-start-column": 5,
+              "selection-end-line": 8,
+              "selection-end-column": 6,
+            }],
           }],
           diagnostics: [],
         },
@@ -996,6 +1338,28 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
   }
   if (selectionCalls.length !== 1 || selectionCalls[0][0] !== "locate") {
     previewErrors.push("selection discovery unexpectedly prepared")
+  }
+  const selectionNextRequest = selectionPayload.selectionCandidates?.[0]?.nextRequest
+  if (selectionNextRequest?.tool !== "idea_refactor_preview") {
+    previewErrors.push(`selection nextRequest tool=${selectionNextRequest?.tool}`)
+  }
+  if (selectionNextRequest?.args?.proposalId !== undefined) {
+    previewErrors.push("selection nextRequest reused a proposalId")
+  }
+  if (JSON.stringify(selectionNextRequest?.args?.selection) !== JSON.stringify({
+    startLine: 4,
+    startColumn: 5,
+    endLine: 8,
+    endColumn: 6,
+  })) {
+    previewErrors.push(`selection nextRequest range=${JSON.stringify(selectionNextRequest?.args?.selection)}`)
+  }
+  if (
+    selectionNextRequest?.args?.file !== "/p/src/Foo.java"
+    || selectionNextRequest?.args?.line !== 4
+    || selectionNextRequest?.args?.column !== 5
+  ) {
+    previewErrors.push(`selection nextRequest target=${JSON.stringify(selectionNextRequest?.args)}`)
   }
 
   const apply = hooks.renderIdeaApplyProtocolResult(
@@ -1042,6 +1406,35 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
   if (stalePayload.status !== "stale" || stalePayload.nextAction !== "preview" || !stalePayload.raw) {
     previewErrors.push(`stale state=${stalePayload.status}/${stalePayload.nextAction}`)
   }
+  const applyTimeoutPayload = JSON.parse(hooks.renderIdeaApplyProtocolResult(
+    "draft-timeout",
+    {
+      exitCode: 3,
+      stdout: "",
+      stderr: "",
+      argv: ["apply"],
+      json: {
+        status: "retryable_failed",
+        applied: false,
+        operation: "rename:method",
+        diagnostics: [{ code: "SERVICE_REQUEST_TIMEOUT", summary: "apply response timed out" }],
+        nextCliCommandExample: {
+          action: "apply",
+          argumentsJson: { newName: "execute" },
+          decisionsJson: {},
+        },
+      },
+    },
+    "compact",
+    30000,
+    { project_root: "/p" },
+  ).output)
+  if (applyTimeoutPayload.status !== "outcome_unknown" || applyTimeoutPayload.nextAction !== "verify") {
+    previewErrors.push(`apply timeout state=${applyTimeoutPayload.status}/${applyTimeoutPayload.nextAction}`)
+  }
+  if (applyTimeoutPayload.nextRequest !== undefined) {
+    previewErrors.push(`apply timeout suggested a duplicate request=${JSON.stringify(applyTimeoutPayload.nextRequest)}`)
+  }
   if (previewErrors.length) {
     throw new SelfCheckError("plugin_idea_proposal_assertions", "IDEA proposal protocol self-check failed.", {
       errors: previewErrors,
@@ -1055,8 +1448,13 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
     initialCalls,
     continuationCalls: continuationCalls.map((argv) => argv[0]),
     selectionStatus: selectionPayload.status,
+    locateRetryStatus: locateRetryPayload.status,
+    prepareRetryStatus: prepareRetryPayload.status,
+    decisionStatus: decisionPayload.status,
     applyStatus: applyPayload.status,
+    applyTimeoutStatus: applyTimeoutPayload.status,
     staleStatus: stalePayload.status,
+    decisionSchema: "strict-object",
     changedFilePaths: applyPayload.changedFilePaths,
   }
 }
@@ -1899,7 +2297,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         {
           command: "java-refactor-run",
           sessionID: "command-policy-self-check",
-          arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2`,
+          arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2\nSample test command: ${sampleTestCommand}`,
         },
         commandOutput,
       )
@@ -1919,6 +2317,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
           "--location", "src/main/java/SelfCheckSample.java:2",
           "--projects", path.join(fixtureRoot, "projects.yaml"),
           "--verification-mode", "project_full",
+          "--sample-test-command", sampleTestCommand,
         ],
         { cwd: fixtureRoot, env: process.env },
       )
@@ -1997,6 +2396,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         SMELL_SMELL: "long_method",
         SMELL_LOCATION: "src/main/java/SelfCheckSample.java:2",
         SMELL_VERIFICATION_MODE: "project_full",
+        SMELL_SAMPLE_TEST_COMMAND: sampleTestCommand,
       })
       delete process.env.SMELL_BASELINE_SEAL
       delete process.env.SMELL_COMMAND_LOOP_STATE_JSON
@@ -2105,12 +2505,16 @@ async function main() {
   if (options.ideaProtocolOnly) {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "idea-proposal-self-check-"))
     try {
+      const skillDocs = await runIdeaSkillProtocolDocSelfCheck()
       const compiledFile = await compilePluginForSelfCheck(tempRoot)
       const pluginModule = await import(`${pathToFileURL(compiledFile).href}?idea_protocol=${Date.now()}`)
+      const backendSurface = await runIdeaBackendSurfaceSelfCheck(pluginModule)
       const result = await runPluginNormalizeSelfCheck(pluginModule)
       console.log(JSON.stringify({
         success: true,
         node: process.version,
+        ideaSkillDocs: skillDocs,
+        ideaBackendSurface: backendSurface,
         ideaProposalProtocol: result.ideaProposalResults,
       }, null, 2))
       return
@@ -2121,6 +2525,7 @@ async function main() {
   const fixtureRoot = await makeFixtureProject()
   const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "smell-verify-self-check-artifacts-"))
   try {
+    const ideaSkillDocs = await runIdeaSkillProtocolDocSelfCheck()
     const bridge = await runBridgeSelfCheck(fixtureRoot, artifactRoot)
     const pluginSelfCheck = await runPluginSelfCheck(fixtureRoot, artifactRoot)
     const datasetSmoke = options.requireDataset ? await runDatasetSmokeSelfCheck(options) : null
@@ -2134,6 +2539,7 @@ async function main() {
         opencodePlugin: await readPackageVersion(path.join(root, ".opencode"), "@opencode-ai/plugin"),
         opencodeSdk: await readPackageVersion(path.join(root, ".opencode"), "@opencode-ai/sdk"),
       },
+      ideaSkillDocs,
       bridge,
       smellVerifyTool: pluginSelfCheck.successPath,
       unchangedCheckpoint: pluginSelfCheck.unchangedCheckpoint,

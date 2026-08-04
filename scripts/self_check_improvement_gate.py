@@ -64,6 +64,8 @@ def _bridge(
         str(project / "projects.yaml"),
         "--verification-mode",
         "project_full",
+        "--sample-test-command",
+        "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'",
     ]
     if target_context:
         cmd += ["--target-context-json", json.dumps(target_context, sort_keys=True)]

@@ -7,10 +7,11 @@ or tests, and it never provides a weaker fallback verdict.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, Mapping
 
 
-RESOLUTION_PLAN_VERSION = 2
+RESOLUTION_PLAN_VERSION = 3
 
 
 _PRIMARY_OBJECTIVES: dict[str, tuple[str, ...]] = {
@@ -207,7 +208,8 @@ def _passing_max(
     profile: Mapping[str, Any],
 ) -> float | None:
     if smell == "data_clumps" and name == "occurrence_count":
-        return _number(current.get("passing_max"))
+        minimum = _number(profile.get("min_occurrences"))
+        return max(0.0, minimum - 1.0) if minimum is not None else None
     if smell == "feature_envy" and name == "envy_access_diff":
         return _number(profile.get("finding_min_exclusive"))
     if smell in {"code_clone_type1", "refused_bequest", "switch_statements", "mysterious_name", "dead_code"}:
@@ -227,6 +229,7 @@ def _worklist(
     current: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
     items: list[dict[str, Any]] = []
+    actionable_total: int | None = None
     identity = frozen.get("entity_identity")
     if not isinstance(identity, Mapping):
         identity = current.get("finding_identity")
@@ -255,11 +258,23 @@ def _worklist(
                 if isinstance(values, list):
                     items.extend(_mapping_items(kind, values))
     elif smell == "data_clumps":
-        occurrence_catalog = current.get("occurrence_catalog")
-        if isinstance(occurrence_catalog, list):
+        witness = current.get("witness")
+        occurrences = (
+            witness.get("occurrences")
+            if isinstance(witness, Mapping)
+            else None
+        )
+        if isinstance(occurrences, list):
             items.extend(
-                _mapping_items("remaining_occurrence", occurrence_catalog)
+                _mapping_items("remaining_occurrence", occurrences)
             )
+        occurrence_count = _number(
+            (current.get("objectives") or {}).get("occurrence_count")
+            if isinstance(current.get("objectives"), Mapping)
+            else None
+        )
+        if occurrence_count is not None:
+            actionable_total = max(0, math.ceil(occurrence_count))
     elif smell == "code_clone_type1":
         structure = current.get("clone_structure")
         endpoints = structure.get("endpoints") if isinstance(structure, Mapping) else None
@@ -296,7 +311,10 @@ def _worklist(
     actionable = [item for item in deduped if item.get("kind") != "frozen_finding"]
     # Full closure data remains in current_metrics.  Duplicate only the first
     # deterministic batch in the plan to keep bridge/plugin payloads bounded.
-    return [*frozen_items[:1], *actionable[:32]], len(actionable)
+    return (
+        [*frozen_items[:1], *actionable[:32]],
+        max(len(actionable), actionable_total or 0),
+    )
 
 
 def _next_action(
@@ -359,9 +377,14 @@ def _next_action(
         )
         return _with_priority_item(action, worklist, {"receiver_access", "receiver_cluster"})
     if smell == "data_clumps":
-        reductions = int(_number(current.get("remaining_reductions")) or 0)
+        remaining = _objective_remaining(objectives, "occurrence_count")
+        budget = (
+            f"at least {max(1, math.ceil(remaining))} occurrence(s)"
+            if remaining is not None and remaining > 0
+            else "the next complete occurrence family"
+        )
         return _with_priority_item(
-            f"migrate at least {reductions} occurrence(s) from the frozen scoped occurrence witness in one semantic component to the existing typed holder and remove every old-group wrapper",
+            f"migrate {budget} from the frozen scoped occurrence witness in one semantic component to one cohesive typed holder; update every affected production caller and method reference, then remove every old-group wrapper",
             worklist,
             {"remaining_occurrence"},
         )
@@ -562,6 +585,17 @@ def _objective_current(
         if str(item.get("name") or "") != name:
             continue
         return _number(item.get("current"))
+    return None
+
+
+def _objective_remaining(
+    objectives: Iterable[Mapping[str, Any]],
+    name: str,
+) -> float | None:
+    for item in objectives:
+        if str(item.get("name") or "") != name:
+            continue
+        return _number(item.get("remaining"))
     return None
 
 

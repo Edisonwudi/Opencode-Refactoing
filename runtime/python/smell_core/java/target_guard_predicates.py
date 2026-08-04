@@ -416,12 +416,29 @@ def _select_methods(
         )
     ]
     has_identity = bool(method_name or class_anchor or fingerprint is not None)
-    if target.line:
+    # ``source_signature`` is emitted only by a captured entity identity; it
+    # cannot come from mutable target_context.  Once that frozen identity
+    # resolves a unique current declaration, the original source line is only
+    # historical evidence and must not make ordinary line drift look like a
+    # deleted target. Capture still uses the caller's line as a hard
+    # disambiguator. During verify, retain it only as a soft disambiguator for
+    # structurally identical declarations and never collapse multiple valid
+    # identity matches to NOT_FOUND merely because every declaration moved.
+    frozen_identity = bool(str(selector.get("source_signature") or "").strip())
+    if target.line and not frozen_identity:
         candidates = [
             method
             for method in candidates
             if method.begin_line <= int(target.line) <= method.end_line
         ]
+    elif target.line and len(candidates) > 1:
+        containing = [
+            method
+            for method in candidates
+            if method.begin_line <= int(target.line) <= method.end_line
+        ]
+        if containing:
+            candidates = containing
     if not has_identity and not target.line:
         return []
     return sorted(

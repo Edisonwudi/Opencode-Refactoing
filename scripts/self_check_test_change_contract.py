@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(RUNTIME_PYTHON) not in sys.path:
 from smell_core.test_change_contract import (  # noqa: E402
     TestChangeContractError,
     capture_test_change_contract,
+    clean_transient_test_artifacts,
     discover_java_test_source_roots,
     evaluate_test_change_contract,
     is_java_test_source_path,
@@ -489,6 +491,112 @@ sourceSets {
             }
         ], resource_edit
         print("  ok   api_migration rejects weakened, skipped, or non-source tests")
+
+        cleanup_root = Path(temporary) / "transient-test-artifacts"
+        cleanup_root.mkdir()
+        _write(
+            cleanup_root,
+            "src/test/java/RuntimeArtifactTest.java",
+            "class RuntimeArtifactTest { @Test void runs() { assertTrue(true); } }\n",
+        )
+        tracked_database = _write(
+            cleanup_root,
+            "src/test/resources/tracked-fixture.db",
+            "frozen fixture\n",
+        )
+        _write(cleanup_root, ".gitignore", "*.log\n")
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=cleanup_root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=cleanup_root,
+            check=True,
+        )
+        cleanup_baseline = capture_test_change_contract(
+            cleanup_root,
+            allow_test_changes=True,
+        )
+        generated_database = _write(
+            cleanup_root,
+            "src/test/resources/session.mv.db",
+            "generated database\n",
+        )
+        generated_log = _write(
+            cleanup_root,
+            "src/test/resources/session.log",
+            "generated log\n",
+        )
+        authored_resource = _write(
+            cleanup_root,
+            "src/test/resources/new-fixture.json",
+            '{"expected": true}\n',
+        )
+        cleanup = clean_transient_test_artifacts(
+            cleanup_root,
+            cleanup_baseline,
+        )
+        assert cleanup["policy"] == "c000-new-untracked-test-runtime-artifacts/v1"
+        assert cleanup["removed_count"] == 2, cleanup
+        assert [item["path"] for item in cleanup["removed"]] == [
+            "src/test/resources/session.log",
+            "src/test/resources/session.mv.db",
+        ], cleanup
+        assert {item["git_disposition"] for item in cleanup["removed"]} == {
+            "ignored",
+            "untracked",
+        }
+        assert not generated_database.exists()
+        assert not generated_log.exists()
+        assert authored_resource.is_file()
+        authored_result = evaluate_test_change_contract(
+            cleanup_root,
+            cleanup_baseline,
+        ).to_dict()
+        assert authored_result["status"] == "TEST_SOURCE_MIGRATION_REJECTED"
+        assert [
+            item["path"] for item in authored_result["test_strength_violations"]
+        ] == ["src/test/resources/new-fixture.json"], authored_result
+        authored_resource.unlink()
+        tracked_database.write_text("changed fixture\n", encoding="utf-8")
+        tracked_cleanup = clean_transient_test_artifacts(
+            cleanup_root,
+            cleanup_baseline,
+        )
+        assert tracked_cleanup["removed_count"] == 0, tracked_cleanup
+        assert tracked_database.is_file()
+        tracked_result = evaluate_test_change_contract(
+            cleanup_root,
+            cleanup_baseline,
+        ).to_dict()
+        assert tracked_result["status"] == "TEST_SOURCE_MIGRATION_REJECTED"
+        assert [
+            item["path"] for item in tracked_result["test_strength_violations"]
+        ] == ["src/test/resources/tracked-fixture.db"], tracked_result
+
+        no_git_root = Path(temporary) / "transient-without-git-proof"
+        no_git_root.mkdir()
+        _write(no_git_root, "src/test/java/NoGitTest.java", "class NoGitTest {}\n")
+        no_git_baseline = capture_test_change_contract(no_git_root)
+        unproven_database = _write(
+            no_git_root,
+            "src/test/resources/unproven.db",
+            "not proven transient\n",
+        )
+        no_git_cleanup = clean_transient_test_artifacts(
+            no_git_root,
+            no_git_baseline,
+        )
+        assert no_git_cleanup["removed_count"] == 0
+        assert unproven_database.is_file()
+        assert evaluate_test_change_contract(
+            no_git_root,
+            no_git_baseline,
+        ).success is False
+        print("  ok   only new Git-proven runtime artifacts are cleaned before tests")
+        print("  ok   tracked/authored resources and unproven files remain fail-closed")
 
         allowed_deleted.unlink()
         deleted_result = evaluate_test_change_contract(

@@ -13,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
+from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
 from smell_core.java import semantic_detector  # noqa: E402
 from smell_core.java import target_guard_predicates as predicates  # noqa: E402
 from smell_core.location import parse_location_descriptor  # noqa: E402
@@ -151,6 +152,98 @@ def _run() -> None:
             }
             assert captured["switch_statements"]["objectives"]["switch_count"] == 1.0
             assert captured["mysterious_name"]["entity_identity"]["symbol_name"] == "tmp"
+
+            # A source edit before the frozen method changes every following
+            # line number. Verification must follow the captured structural
+            # identity instead of requiring the old dataset line to remain
+            # inside the current declaration.
+            baseline_source = _source(resolved=False)
+            declaration_needles = {
+                "long_method": "void longTarget()",
+                "nested_complexity": "void nested(",
+                "switch_statements": "void dispatch(",
+            }
+            line_locations = {}
+            line_captures = {}
+            for smell, needle in declaration_needles.items():
+                line = next(
+                    index
+                    for index, text in enumerate(
+                        baseline_source.splitlines(), start=1
+                    )
+                    if needle in text
+                )
+                line_locations[smell] = parse_location_descriptor(
+                    f"{locations[smell].raw}|line={line}",
+                    project,
+                )
+                line_captures[smell] = predicates.capture_target_guard_predicate(
+                    smell,
+                    project,
+                    line_locations[smell],
+                    selectors[smell],
+                )
+                assert line_captures[smell]["ok"] is True, (
+                    smell,
+                    line_captures[smell],
+                )
+
+            source.write_text(
+                "// unrelated line drift\n" * 7 + baseline_source,
+                encoding="utf-8",
+            )
+            for smell in declaration_needles:
+                shifted = predicates.evaluate_target_guard_predicate(
+                    smell,
+                    project,
+                    line_locations[smell],
+                    line_captures[smell]["entity_identity"],
+                )
+                _assert_schema(shifted)
+                assert shifted["ok"] is True, (smell, shifted)
+                assert shifted["target_match_count"] == 1, (smell, shifted)
+                assert shifted["target_missing"] is False, (smell, shifted)
+                assert shifted["target_smell_present"] is True, (smell, shifted)
+                assert shifted["objectives"] == line_captures[smell]["objectives"], (
+                    smell,
+                    shifted,
+                )
+            source.write_text(baseline_source, encoding="utf-8")
+
+            missing_current_metric = evaluate_checkpoint_contract(
+                {"ok": True, "objectives": {"ast_ncss": 93}},
+                {
+                    "ok": True,
+                    "objectives": {},
+                    "target_missing": True,
+                    "target_absence_allowed": False,
+                },
+                has_production_diff=True,
+                smell="long_method",
+            )
+            assert missing_current_metric.reason == "TARGET_NOT_LOCATED", (
+                missing_current_metric
+            )
+
+            invalid_baseline_metric = evaluate_checkpoint_contract(
+                {"ok": True, "objectives": {}},
+                {"ok": True, "objectives": {"ast_ncss": 20}},
+                has_production_diff=True,
+                smell="long_method",
+            )
+            assert invalid_baseline_metric.reason == "BASELINE_METRIC_UNAVAILABLE", (
+                invalid_baseline_metric
+            )
+
+            invalid_current_metric = evaluate_checkpoint_contract(
+                {"ok": True, "objectives": {"ast_ncss": 93}},
+                {"ok": True, "objectives": {}, "target_missing": False},
+                has_production_diff=True,
+                smell="long_method",
+            )
+            assert invalid_current_metric.reason == "CURRENT_METRIC_UNAVAILABLE", (
+                invalid_current_metric
+            )
 
             ambiguous = predicates.evaluate_nested_complexity(
                 project,

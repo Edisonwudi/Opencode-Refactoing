@@ -326,7 +326,11 @@ def main() -> int:
             "detector_profile": {"finding_min": 1},
         }
         if smell == "data_clumps":
-            metrics.update({"passing_max": 2, "remaining_reductions": 3})
+            metrics["guard_profile"] = {
+                "min_occurrences": 3,
+                "min_classes": 3,
+                "min_method_names": 2,
+            }
         plan = build_resolution_plan(
             smell,
             finding_contract={"finding_id": f"finding-{smell}", "entity_identity": {"method": "target"}},
@@ -379,6 +383,44 @@ def main() -> int:
     assert large_lpl["worklist_complete"] is False, large_lpl
     assert len(large_lpl["worklist"]) == 33, large_lpl
     assert "src/Api.java:5" in large_lpl["next_action"], large_lpl
+
+    large_clump = build_resolution_plan(
+        "data_clumps",
+        finding_contract={
+            "finding_id": "large-clump",
+            "entity_identity": {"group": "int:x|int:y|int:z"},
+        },
+        baseline_metrics={
+            "ok": True,
+            "finding_present": True,
+            "objectives": {
+                "occurrence_count": 40,
+                "class_count": 40,
+                "method_name_count": 2,
+            },
+            "guard_profile": {
+                "min_occurrences": 3,
+                "min_classes": 3,
+                "min_method_names": 2,
+            },
+            "witness": {
+                "occurrences": [
+                    {
+                        "file": f"src/Owner{index}.java",
+                        "method": "apply",
+                        "signature": "apply(int, int, int)",
+                        "begin_line": index + 1,
+                    }
+                    for index in range(32)
+                ],
+                "occurrence_preview_truncated": True,
+            },
+        },
+    )
+    assert large_clump["remaining_work_count"] == 40, large_clump
+    assert large_clump["worklist_complete"] is False, large_clump
+    assert len(large_clump["worklist"]) == 33, large_clump
+    assert "at least 38 occurrence(s)" in large_clump["next_action"], large_clump
 
     god_plan = build_resolution_plan(
         "god_class",
@@ -637,20 +679,51 @@ def main() -> int:
     clump_current = {
         "ok": True,
         "finding_present": True,
-        "objectives": {"occurrence_count": 5},
-        "passing_max": 2,
-        "remaining_reductions": 3,
-        "occurrences": [{"file": "src/Tile.java", "method": "setTile(Tile, Block, Team)"}],
+        "objectives": {
+            "occurrence_count": 5,
+            "class_count": 5,
+            "method_name_count": 3,
+        },
+        "guard_profile": {
+            "min_occurrences": 3,
+            "min_classes": 3,
+            "min_method_names": 2,
+        },
+        "witness": {
+            "occurrences": [
+                {
+                    "file": f"src/Tile{index}.java",
+                    "method": "setTile",
+                    "signature": "setTile(Tile, Block, Team)",
+                    "begin_line": 40 + index,
+                }
+                for index in range(1, 6)
+            ],
+        },
     }
+    clump_plan = build_resolution_plan(
+        "data_clumps",
+        finding_contract={
+            "finding_id": "clump",
+            "entity_identity": {"group": "int:x|string:y|boolean:z"},
+        },
+        baseline_metrics=clump_current,
+    )
+    assert clump_plan["remaining_work_count"] == 5, clump_plan
+    assert clump_plan["worklist_complete"] is True, clump_plan
+    assert len([
+        item
+        for item in clump_plan["worklist"]
+        if item.get("kind") == "remaining_occurrence"
+    ]) == 5, clump_plan
+    assert "at least 3 occurrence(s)" in clump_plan["next_action"], clump_plan
+    assert "method reference" in clump_plan["next_action"], clump_plan
+    assert "src/Tile1.java:41" in clump_plan["next_action"], clump_plan
     clump_feedback = checkpoint_feedback_highlights({
         "required": True,
         "adapter": "data_clumps",
         "current_metrics": clump_current,
-        "resolution_plan": build_resolution_plan(
-            "data_clumps",
-            finding_contract={"finding_id": "clump", "entity_identity": {"group": "int:x|string:y|boolean:z"}},
-            baseline_metrics=clump_current,
-        ),
+        "resolution_plan": clump_plan,
         "delta": evaluate_checkpoint_contract(
             {"ok": True, "objectives": {"occurrence_count": 5}},
             {"ok": True, "objectives": {"occurrence_count": 5}},

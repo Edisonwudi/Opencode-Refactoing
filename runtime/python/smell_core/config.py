@@ -164,6 +164,7 @@ class ResolvedRunConfig:
     defaults: DefaultsConfig
     build: CommandConfig
     test: CommandConfig
+    sample_test: CommandConfig
     env: Dict[str, str]
     cwd: Path
     profile: SmellProfile
@@ -208,6 +209,7 @@ class ResolvedRunConfig:
             "defaults": asdict(self.defaults),
             "build": self.build.to_dict(),
             "test": self.test.to_dict(),
+            "sample_test": self.sample_test.to_dict(),
             "env": dict(self.env),
             "cwd": str(self.cwd),
             "profile": asdict(self.profile),
@@ -329,8 +331,11 @@ def resolve_run_config(
         language=language,
         sample_test_command=sample_test_command,
     )
-    if normalized_verification_mode == "sample_optimized" and _clean_optional_string(sample_test_command):
-        test = CommandConfig(command=str(sample_test_command))
+    sample_test = CommandConfig(
+        command=_clean_optional_string(sample_test_command),
+    )
+    if normalized_verification_mode == "sample_optimized" and sample_test.command:
+        test = sample_test
     else:
         test = project_test
     test_source = (
@@ -365,6 +370,7 @@ def resolve_run_config(
         defaults=copy.deepcopy(refactor_config.defaults),
         build=build,
         test=test,
+        sample_test=sample_test,
         env=resolved_env,
         cwd=cwd,
         profile=merged_profile,

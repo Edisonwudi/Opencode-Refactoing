@@ -18,7 +18,7 @@ from .java.catalog_identity import (
 from .resolution_plan import resolution_plan_next_action
 
 
-CHECKPOINT_CONTRACT_VERSION = 5
+CHECKPOINT_CONTRACT_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,11 @@ def evaluate_checkpoint_contract(
         }
         for name in shared
     }
-    available = bool(baseline.get("ok")) and bool(shared) and any(before[name] > 0 for name in shared)
+    baseline_available = bool(baseline.get("ok")) and bool(before) and any(
+        value > 0 for value in before.values()
+    )
+    current_metric_available = bool(shared)
+    available = baseline_available and current_metric_available
     # A missing target is never inferred to be success. An adapter may mark an
     # absence transition valid only after its smell-specific closure has
     # resolved the frozen finding (for example a rename, safe deletion, or
@@ -98,12 +102,14 @@ def evaluate_checkpoint_contract(
     )
     if not has_production_diff:
         reason = "EDIT_REQUIRED"
-    elif not available:
+    elif not baseline_available:
         reason = "BASELINE_METRIC_UNAVAILABLE"
     elif current_detector_failure:
         reason = current_detector_failure
     elif target_unlocated:
         reason = "TARGET_NOT_LOCATED"
+    elif not current_metric_available:
+        reason = "CURRENT_METRIC_UNAVAILABLE"
     elif not semantic_contract_preserved:
         reason = "SEMANTIC_CONTRACT_REGRESSION"
     elif not progress:
@@ -164,6 +170,10 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         "BASELINE_METRIC_UNAVAILABLE": "the immutable baseline has no comparable continuous metric",
         "CURRENT_DETECTOR_UNAVAILABLE": (
             "the target Guard could not produce a valid current snapshot"
+        ),
+        "CURRENT_METRIC_UNAVAILABLE": (
+            "the current target Guard snapshot has no metric comparable with "
+            "the immutable baseline"
         ),
         "CURRENT_DETECTOR_RESULT_INVALID": (
             "the target Guard returned an invalid current match count"

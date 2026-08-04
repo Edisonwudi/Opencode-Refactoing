@@ -282,6 +282,13 @@ def _compact_test_changes(value: Any) -> Optional[dict[str, Any]]:
     ):
         if isinstance(value.get(key), list):
             output[f"{key}_count"] = len(value[key])
+    cleanup = value.get("transient_test_artifact_cleanup")
+    if isinstance(cleanup, dict):
+        output["transient_test_artifact_cleanup"] = {
+            "policy": _bounded_text(cleanup.get("policy"), limit=128),
+            "removed_count": int(cleanup.get("removed_count") or 0),
+            "removed_bytes": int(cleanup.get("removed_bytes") or 0),
+        }
     return output or None
 
 
@@ -873,6 +880,7 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
         "verification_mode": resolved.verification_mode,
         "build_source": resolved.build_source,
         "test_source": resolved.test_source,
+        "sample_test_source": "dataset",
         "test_location": resolved.sample_test_location,
         "test_changes": audit,
         "details": {
@@ -882,6 +890,7 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
                 "status": "test_source_modified",
                 "failure_highlights": [message],
             },
+            "sample_test": None,
         },
     }
 
@@ -933,9 +942,12 @@ def _verify_status(
         details = build_test_result.get("details") or {}
         build = details.get("build") or {}
         test = details.get("test") or {}
+        sample_test = details.get("sample_test") or {}
         if build.get("success") is False:
             return "BUILD_FAILED"
         if test.get("success") is False:
+            return "TEST_FAILED"
+        if sample_test.get("success") is False:
             return "TEST_FAILED"
         return "BUILD_TEST_FAILED"
     if improvement_pass:
@@ -982,12 +994,14 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
         "verification_mode": result.get("verification_mode", ""),
         "build_source": result.get("build_source", ""),
         "test_source": result.get("test_source", ""),
+        "sample_test_source": result.get("sample_test_source", ""),
         "test_location": _bounded_text(result.get("test_location", "")),
         "test_command_hash": result.get("test_command_hash", ""),
         "test_changes": _compact_test_changes(result.get("test_changes")),
         "details": {
             "build": _summarize_command_result(details.get("build")),
             "test": _summarize_command_result(details.get("test")),
+            "sample_test": _summarize_command_result(details.get("sample_test")),
         },
     }
 
@@ -1153,6 +1167,7 @@ def _write_verify_artifacts(artifact_dir: Path, full_payload: dict[str, Any]) ->
         details = build_test_result.get("details") or {}
         build_result = details.get("build")
         test_result = details.get("test")
+        sample_test_result = details.get("sample_test")
         if isinstance(build_result, dict):
             artifacts["build_result"] = _write_json_artifact(artifact_dir / "build.full.json", build_result)
             if isinstance(build_result.get("output"), str):
@@ -1161,6 +1176,16 @@ def _write_verify_artifacts(artifact_dir: Path, full_payload: dict[str, Any]) ->
             artifacts["test_result"] = _write_json_artifact(artifact_dir / "test.full.json", test_result)
             if isinstance(test_result.get("output"), str):
                 artifacts["test_log"] = _write_text_artifact(artifact_dir / "test.log", test_result["output"])
+        if isinstance(sample_test_result, dict):
+            artifacts["sample_test_result"] = _write_json_artifact(
+                artifact_dir / "sample-test.full.json",
+                sample_test_result,
+            )
+            if isinstance(sample_test_result.get("output"), str):
+                artifacts["sample_test_log"] = _write_text_artifact(
+                    artifact_dir / "sample-test.log",
+                    sample_test_result["output"],
+                )
 
     snapshot = full_payload.get("snapshot")
     if isinstance(snapshot, dict):
@@ -1314,10 +1339,12 @@ def _artifact_paths_from_verify_payload(payload: Optional[dict[str, Any]], disco
         sibling_names = {
             "build_log": "build.log",
             "test_log": "test.log",
+            "sample_test_log": "sample-test.log",
             "diff": "diff.patch",
             "diff_stat": "diff.stat",
             "build_result": "build.full.json",
             "test_result": "test.full.json",
+            "sample_test_result": "sample-test.full.json",
         }
         for key, name in sibling_names.items():
             sibling = artifact_dir / name
@@ -1383,7 +1410,7 @@ def _failure_text_bundle(payload: Optional[dict[str, Any]], paths: dict[str, str
     # Structured result artifacts duplicate the inline payload and may contain
     # complete Guard evidence.  Only diagnostic log/diff tails belong in
     # failure classification.
-    for key in ("build_log", "test_log", "diff"):
+    for key in ("build_log", "test_log", "sample_test_log", "diff"):
         text = _read_artifact_text(paths, key)
         if text:
             chunks.append(f"\n--- {key} ---\n{text}")
@@ -1436,7 +1463,7 @@ def _timed_out_build_test_step(payload: dict[str, Any]) -> str:
     details = build_test.get("details") if isinstance(build_test, dict) else None
     if not isinstance(details, dict):
         return ""
-    for label in ("build", "test"):
+    for label in ("build", "test", "sample_test"):
         result = details.get(label)
         if isinstance(result, dict) and result.get("status") == "timeout":
             return label
@@ -1509,6 +1536,12 @@ def _classify_failure_pack(
             build_test = payload.get("build_test_guard") or {}
             details = build_test.get("details") if isinstance(build_test, dict) else {}
             test = details.get("test") if isinstance(details, dict) else {}
+            if (
+                isinstance(details, dict)
+                and isinstance(details.get("sample_test"), dict)
+                and details["sample_test"].get("success") is False
+            ):
+                test = details["sample_test"]
             test_status = str(test.get("status") or "") if isinstance(test, dict) else ""
             failure_text = " ".join(
                 str(item)
@@ -1548,6 +1581,7 @@ def _classify_failure_pack(
         details = build_test.get("details") or {}
         build = details.get("build") or {}
         test = details.get("test") or {}
+        sample_test = details.get("sample_test") or {}
         if isinstance(build, dict) and build.get("success") is False:
             if _looks_like_dependency_resolution_failure(text):
                 return "BUILD_DEPENDENCY_RESOLUTION", [
@@ -1556,6 +1590,8 @@ def _classify_failure_pack(
                 ]
             return "BUILD_COMPILE_ERROR", ["Inspect the build log and fix the build failure before retrying verification."]
         if isinstance(test, dict) and test.get("success") is False:
+            status = "TEST_FAILED"
+        if isinstance(sample_test, dict) and sample_test.get("success") is False:
             status = "TEST_FAILED"
     lowered = text.lower()
     if _looks_like_dependency_resolution_failure(text):

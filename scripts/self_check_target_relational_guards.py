@@ -17,6 +17,7 @@ if str(RUNTIME) not in sys.path:
 from smell_core.java import target_relational_guards as relational  # noqa: E402
 from smell_core.java import target_guard  # noqa: E402
 from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
+from smell_core.resolution_plan import build_resolution_plan  # noqa: E402
 from smell_core.java.target_relational_guards import (  # noqa: E402
     evaluate_data_clumps_guard,
     evaluate_long_parameter_list_guard,
@@ -316,6 +317,26 @@ class TextCandidate {
         "src/main/java/q/Second.java",
         "src/main/java/q/Third.java",
     ], ordinary
+    ordinary_with_profile = {
+        **ordinary,
+        "guard_profile": {
+            "min_occurrences": 3,
+            "min_classes": 3,
+            "min_method_names": 2,
+        },
+    }
+    ordinary_plan = build_resolution_plan(
+        "data_clumps",
+        finding_contract={
+            "target_id": "data-clumps-self-check",
+            "entity_identity": ordinary["entity_identity"],
+        },
+        baseline_metrics=ordinary_with_profile,
+    )
+    assert ordinary_plan["remaining_work_count"] == 3, ordinary_plan
+    assert ordinary_plan["worklist_complete"] is True, ordinary_plan
+    assert "at least 1 occurrence(s)" in ordinary_plan["next_action"], ordinary_plan
+    assert "src/main/java/q/First.java" in ordinary_plan["next_action"], ordinary_plan
 
     target_only = evaluate_data_clumps_guard(
         project,

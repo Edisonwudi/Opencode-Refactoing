@@ -53,15 +53,18 @@ DETECTOR_PROFILES = {
     "long_method": {
         "metric": "ast_ncss",
         "finding_min": 60,
-        "selection_contract": "unique_signature_types_containing_line-v2",
+        "selection_contract": "capture-line-verify-frozen-signature-v3",
     },
     "long_parameter_list": {"metric": "parameter_count", "finding_min": 6},
     "nested_complexity": {
         "metric": "cognitive_complexity",
         "finding_min": 20,
-        "selection_contract": "unique_signature_types_containing_line-v2",
+        "selection_contract": "capture-line-verify-frozen-signature-v3",
     },
-    "switch_statements": {"definition": "target_method_contains_switch"},
+    "switch_statements": {
+        "definition": "target_method_contains_switch",
+        "selection_contract": "capture-line-verify-frozen-signature-v3",
+    },
     "code_clone_type1": {
         "definition": "exact_contiguous_token_window_in_target_method_pair",
         "finding_min_tokens": 30,

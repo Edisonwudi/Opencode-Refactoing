@@ -32,6 +32,7 @@ def _java_config(
     run_tests: bool = True,
     build_command: str = "true",
     test_command: str = "true",
+    sample_test_command: str = "true",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         language="java",
@@ -42,11 +43,12 @@ def _java_config(
         defaults=DefaultsConfig(run_build=run_build, run_tests=run_tests),
         build=CommandConfig(command=build_command or None),
         test=CommandConfig(command=test_command or None),
+        sample_test=CommandConfig(command=sample_test_command or None),
         verification_mode="project_full",
         build_source="self_check",
         test_source="self_check",
         sample_test_location="",
-        sample_test_command="",
+        sample_test_command=sample_test_command,
     )
 
 
@@ -127,6 +129,12 @@ def main() -> int:
     empty_test = run_build_test_guard(_java_config(test_command=""))
     assert empty_test["success"] is False, empty_test
     assert "JAVA_TEST_COMMAND_MISSING" in _violation_codes(empty_test), empty_test
+
+    empty_sample_test = run_build_test_guard(_java_config(sample_test_command=""))
+    assert empty_sample_test["success"] is False, empty_sample_test
+    assert "JAVA_SAMPLE_TEST_COMMAND_MISSING" in _violation_codes(
+        empty_sample_test
+    ), empty_sample_test
 
     with tempfile.TemporaryDirectory(prefix="nonjava-guard-dispatch-") as temp_dir:
         project = Path(temp_dir)

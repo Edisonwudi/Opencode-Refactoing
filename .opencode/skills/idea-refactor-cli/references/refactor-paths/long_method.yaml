@@ -131,7 +131,7 @@ long_method:
       1534
       1535                            priorVariables.remove(priorVariables.size() - 1);
       1536                            break;
-      // extract:method prepare reports multiple outputs: altered, lengthChange, bufEnd, pos
+      // The extract:method preview reports multiple outputs: altered, lengthChange, bufEnd, pos
     actions:
       - op: extract:method
         apply_args: '{"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}'
@@ -140,7 +140,7 @@ long_method:
           - idea_refactor_preview(operation="extract:method", file="src/main/java/org/apache/commons/text/StringSubstitutor.java", line=1515, column=29, selection={"startLine":1515,"startColumn":29,"endLine":1538,"endColumn":80}, arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
 
           - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false})
-          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, decisions={"extract.multipleOutputVariables":"use_extract_method_object"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"newName":"resolveAndReplaceVariable","visibility":"private","makeStatic":false}, decisions={"extract.multipleOutputVariables":{"choice":"use_extract_method_object","arguments":{}}})
     after: |
       1514                            // resolve the variable
       1515                            ResolveAndReplaceVariableMethodObject resolveAndReplaceVariableMethodObject = new ResolveAndReplaceVariableMethodObject(builder, priorVariables, substitutionInVariablesEnabled, substitutionInValuesDisabled, undefinedVariableException, altered, lengthChange, bufEnd, pos, startPos, endPos, varName, varDefaultValue).invoke();
@@ -168,4 +168,4 @@ long_method:
       1636        }
       1637    }
     source: { project: commons-text, class: StringSubstitutor, verified: "2026-05-11", mode: "OpenCode IDEA tools" }
-    notes: "Verified on an attached IDEA service against a clean temporary commons-text project. prepare for extract:method returned needs_decision with extract.multipleOutputVariables because the selected block updates altered, lengthChange, bufEnd, and pos. The first apply round stayed at needs_decision; the second apply round with idea_refactor_apply(decisions={\"extract.multipleOutputVariables\":\"use_extract_method_object\"}) completed by generating an inner method object named ResolveAndReplaceVariableMethodObject. The temporary project still compiled with mvn -q -DskipTests compile. IntelliJ also shortened a few same-file Javadoc @value references during the rewrite, but the refactoring result remained compilable."
+    notes: "Verified on an attached IDEA service against a clean temporary commons-text project. The extract preview returned needs_decision with extract.multipleOutputVariables because the selected block updates altered, lengthChange, bufEnd, and pos. The first apply stayed at needs_decision; reusing the returned nextRequest with the same proposalId and its nested use_extract_method_object choice completed by generating an inner method object named ResolveAndReplaceVariableMethodObject. The temporary project still compiled with mvn -q -DskipTests compile. IntelliJ also shortened a few same-file Javadoc @value references during the rewrite, but the refactoring result remained compilable."

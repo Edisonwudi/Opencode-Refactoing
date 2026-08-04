@@ -87,7 +87,7 @@ mysterious_name:
       6552            j--;
       // All three local references updated together within the method body.
     source: { project: commons-lang-3.20.0, class: ArrayUtils, verified: "2026-05-15", mode: "IDEA CLI" }
-    notes: "Use locate on the local variable identifier, then prepare/apply rename:local-variable. The installed CLI path was verified on Java local-variable smoke cases."
+    notes: "Call idea_refactor_preview on the local-variable identifier, then pass the returned proposalId unchanged to idea_refactor_apply. The wrapper performs target location and preparation internally; the proposal flow was verified on Java local-variable smoke cases."
   - id: rename-mysterious-class-name
     when: "a type name is an opaque abbreviation at module scope, so the right fix is a class rename rather than only renaming one member"
     before: |

@@ -183,6 +183,12 @@ parsed = parser.parse_args(["--dataset", "/tmp/input.csv", "--sample-deadline", 
 check("sample_deadline_public_entry", parsed.sample_deadline, 2400)
 check("project_full_is_default", parsed.verification_mode, "project_full")
 check("test_changes_default_forbidden", parsed.allow_test_changes, False)
+check("direct_backend_is_default", parsed.refactoring_backend, "direct")
+check(
+    "idea_backend_is_explicit",
+    parser.parse_args(["--dataset", "/tmp/input.csv", "--refactoring-backend", "idea"]).refactoring_backend,
+    "idea",
+)
 check(
     "test_changes_explicit_opt_in",
     parser.parse_args(["--dataset", "/tmp/input.csv", "--allow-test-changes"]).allow_test_changes,
@@ -459,6 +465,25 @@ edited_after_verify = R._verification_trace(
     + post_verify_tool
 )
 check("trace_counts_tools_after_verify", edited_after_verify["tools_after_last_verify"], 1)
+idea_protocol_events = "\n".join([
+    json.dumps({"type": "tool_use", "part": {"tool": "idea_refactor_preview", "state": {"status": "completed", "output": "{}"}}}),
+    json.dumps({"type": "tool_use", "part": {"tool": "idea_refactor_apply", "state": {"status": "completed", "output": "{}"}}}),
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}}),
+])
+idea_trace = R._verification_trace(idea_protocol_events)
+idea_contract = R._idea_protocol_contract([{**idea_trace, "last_payload": None}])
+check("idea_trace_preview_calls", idea_trace["idea_refactor_preview_calls"], 1)
+check("idea_trace_apply_calls", idea_trace["idea_refactor_apply_calls"], 1)
+check("idea_protocol_contract_passes", idea_contract["success"], True)
+check("idea_protocol_contract_sequence", idea_contract["tool_sequence"], ["idea_refactor_preview", "idea_refactor_apply", "smell_verify"])
+idea_bypass_trace = R._verification_trace("\n".join([
+    json.dumps({"type": "tool_use", "part": {"tool": "bash", "state": {"status": "completed", "input": {"command": "/usr/local/bin/idea-refactor locate --project-root /tmp/p"}, "output": "{}"}}}),
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}}),
+]))
+idea_bypass_contract = R._idea_protocol_contract([{**idea_bypass_trace, "last_payload": None}])
+check("idea_trace_detects_direct_cli", idea_bypass_trace["direct_idea_cli_calls"], 1)
+check("idea_bypass_contract_fails", idea_bypass_contract["success"], False)
+check_true("idea_bypass_contract_reason", "DIRECT_IDEA_CLI_USED" in idea_bypass_contract["violations"])
 malformed = json.dumps({"type": "tool_use", "part": {"tool": "smell_verify", "state": {"status": "completed", "output": "truncated"}}})
 malformed_trace = R._verification_trace(malformed)
 check("malformed_still_counts_verify", malformed_trace["smell_verify_calls"], 1)
@@ -678,6 +703,22 @@ check_true(
     run_sample_source.index("_initial_command_loop_state(")
     < run_sample_source.index("_run_opencode("),
 )
+check_true(
+    "idea_preflight_precedes_model",
+    run_sample_source.index("_prepare_idea_service(") < run_sample_source.index("_run_opencode("),
+)
+check_true(
+    "idea_close_follows_final_verify",
+    run_sample_source.index("_run_verify(") < run_sample_source.index("_close_idea_project("),
+)
+sanitized_service = R._sanitize_idea_service_payload({
+    "status": "ok",
+    "token": "top-level-secret",
+    "server": {"token": "nested-secret", "tokenSummary": "safe-summary", "status": "running"},
+})
+check("idea_preflight_removes_top_level_token", "token" in sanitized_service, False)
+check("idea_preflight_removes_server_token", "token" in sanitized_service["server"], False)
+check("idea_preflight_keeps_safe_summary", sanitized_service["server"]["tokenSummary"], "safe-summary")
 
 command_args = argparse.Namespace(opencode_bin="opencode", model="minimax/MiniMax-M2.7")
 initial_cmd = R._opencode_run_command(command_args, "java-refactor-agent")
@@ -760,6 +801,7 @@ args = argparse.Namespace(
     loop_instruction="Repair from the latest failure pack",
     sample_deadline=1800,
     allow_test_changes=False,
+    refactoring_backend="direct",
 )
 prompt_plain = R._task_prompt(sample, args, "project_full")
 check_true("prompt_has_base", "Repair this one java smell" in prompt_plain)
@@ -768,6 +810,10 @@ roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "proje
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
 check_true("prompt_freezes_test_policy", "Test changes: forbidden" in prompt_plain)
+check_true("prompt_freezes_direct_backend", "Refactoring backend: direct" in prompt_plain)
+idea_args = argparse.Namespace(**{**vars(args), "refactoring_backend": "idea"})
+idea_prompt = R._task_prompt(sample, idea_args, "project_full")
+check_true("prompt_freezes_idea_backend", "Refactoring backend: idea" in idea_prompt)
 initial_controller_state = R._initial_command_loop_state(
     sample,
     args,
@@ -800,6 +846,8 @@ with tempfile.TemporaryDirectory() as tmp:
 import json, os, sys
 if os.environ.get("SMELL_BATCH_RUN") != "1":
     raise SystemExit(20)
+if os.environ.get("SMELL_REFACTORING_BACKEND") != "idea" or os.environ.get("SMELL_ENABLE_IDEA_TOOLS") != "1":
+    raise SystemExit(23)
 continued = "--session" in sys.argv
 if continued:
     raw = os.environ.get("SMELL_COMMAND_LOOP_STATE_JSON", "")
@@ -834,6 +882,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         projects="",
         sample_deadline=60,
         allow_test_changes=False,
+        refactoring_backend="idea",
         loop_mode="verify-failure",
         loop_max=2,
         loop_no_progress_limit=1,

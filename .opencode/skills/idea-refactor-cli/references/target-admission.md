@@ -49,7 +49,7 @@ parameter list and relevant formal parameters. Pass parameter subsets as
 
 For hierarchy and ownership operations, inspect the receiver and hierarchy
 before using direct edits. For `extract:class`, choose a cohesive `memberNames`
-set from the source before prepare.
+set from the source before the initial `idea_refactor_preview` call.
 
 ## Extract Method Selection Repair
 

@@ -64,13 +64,13 @@ idea_refactor_preview(
   operation,
   proposalId=<preview.proposalId>,
   arguments=<updated arguments>,
-  decisions=<chosen decisions>
+  decisions={"<decision-id>": {"choice": "<choice-value>", "arguments": {}}}
 )
 
 idea_refactor_apply(
   proposalId=<preview.proposalId>,
   arguments=<prepared arguments>,
-  decisions=<chosen decisions>
+  decisions={"<decision-id>": {"choice": "<choice-value>", "arguments": {}}}
 )
 ```
 
@@ -80,6 +80,11 @@ another target or operation.
 
 Use `detail="compact"` unless raw IDEA payloads are needed to diagnose a
 protocol defect.
+
+When a response contains `nextRequest`, treat its `tool` and `args` as the
+canonical continuation shape. Reuse them directly; change only a value that
+the response explicitly leaves for selection. The wrapper projects this request
+from IDEA's own `nextCliCommandExample`; do not reconstruct it from prose.
 
 ## State Routing
 
@@ -95,14 +100,19 @@ Treat `status` and `nextAction` as a state machine:
 | `retryable_failed` | IDEA asks for a corrected retry | correct only the reported condition |
 | `stale` | source changed after preview | create a fresh preview; do not reuse the proposal |
 | `applied` | IDEA committed the refactor | inspect paths, then verify |
+| `outcome_unknown` | an apply request timed out after dispatch, so source may already be changed | do not repeat apply; inspect and call `smell_verify` |
 | `failed` | command or refactor failed | inspect diagnostics |
 
 Do not treat transport completion as refactor completion. Only `ready` may
-advance to apply, and only `applied` may advance to verification.
+advance to apply. `applied` advances to normal verification;
+`outcome_unknown` advances only to diagnostic verification and must never
+repeat apply.
 
-When a decision is requested, keep decision keys inside `decisions`, never
-inside `arguments`. If a choice exposes inputs, fill only those inputs. Do not
-invent unrelated decision arguments.
+When a decision is requested, use
+`decisions={"<id>": {"choice": "<value>", "arguments": {...}}}`. Never pass a
+bare choice string, and keep decision keys out of operation `arguments`. If a
+choice exposes inputs, fill only those inputs. Prefer the returned
+`nextRequest.args.decisions` over manually rebuilding the object.
 
 ## Target Admission And Selection
 
@@ -111,9 +121,10 @@ target. Read `references/target-admission.md` before relocating an unsupported
 target, selecting an extraction range, or recording an IDEA blocker.
 
 For `extract:method`, preview a concrete statement anchor first. If the result
-is `needs_selection`, choose one returned `selectionCandidates` range and start
-a fresh preview with that explicit range. Do not encode a selection as a
-decision.
+is `needs_selection`, choose one returned candidate and invoke that candidate's
+`nextRequest`. It is a fresh preview with file/caret/selection and intentionally
+contains no `proposalId`. Do not add the old proposal ID or encode a selection
+as a decision.
 
 For parameter operations, target the method or constructor name first and pass
 subsets via `parameterNames`. For hierarchy or ownership operations, target the
@@ -171,15 +182,10 @@ files.
 
 ## Service Check
 
-Batch execution normally starts IDEA. In a manual run, if preview reports that
-the service is unavailable:
-
-```sh
-idea-refactor status --project-root <project-root>
-idea-refactor ensure-service --project-root <project-root> --open
-```
-
-Do not repeatedly open IDEA after the runner has prepared the service.
+The runner owns IDEA service startup and readiness. If preview reports that the
+service is unavailable, report the wrapper diagnostic as a concrete
+infrastructure blocker. Do not call the underlying CLI through bash and do not
+repeatedly open IDEA from the agent session.
 
 ## Revert Last Apply
 
@@ -195,13 +201,13 @@ reusable.
 
 ## Fallback Rule
 
-For a planned IDEA step, direct `edit`/`write` is allowed only after a concrete
-IDEA blocker: unsupported native operation after target admission, no legal
-selection, unresolved/open failure for `idea_edit`, unrecoverable stale
-proposal, non-decision failure, or a non-IDE-visible reflection/config/fixture
-repair.
+Direct OpenCode `edit`/`write` is not an IDEA-backend fallback. For a planned
+native step, `idea_edit` is allowed only after a concrete proposal blocker:
+unsupported native operation after target admission, no legal selection,
+unrecoverable stale proposal, or non-decision failure. It never substitutes for
+the required preview/apply lifecycle in a proposal-contract run.
 
-Before fallback editing, record a short `deviation_reason` with that blocker.
+Before using `idea_edit`, record a short `deviation_reason` with that blocker.
 
 ## Common Operation Notes
 

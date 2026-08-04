@@ -6,6 +6,7 @@ used by non-Java profiles; they are deliberately not a Java fallback.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import hashlib
@@ -41,6 +42,15 @@ from ..feature_envy import (
     feature_envy_receiver_from_evidence,
 )
 from ..checkpoint_contract import checkpoint_gate_result
+from ..java_test_attestation_runner import (
+    ATTESTATION_ADAPTER_ID,
+    ATTESTATION_SCHEMA,
+)
+from ..java_test_evidence import (
+    declared_java_test_sources,
+    prepare_java_sample_test_command,
+    reset_java_sample_test_evidence,
+)
 from .context import GuardRunContext
 
 
@@ -163,6 +173,17 @@ def validate_java_strict_verification_contract(
                 "code": code,
                 "message": f"Java strict verification requires a non-empty {phase} command or script.",
             })
+    sample_test = getattr(config, "sample_test", None)
+    sample_command = str(getattr(sample_test, "command", "") or "").strip()
+    sample_script = str(getattr(sample_test, "script", "") or "").strip()
+    if not sample_command and not sample_script:
+        violations.append({
+            "code": "JAVA_SAMPLE_TEST_COMMAND_MISSING",
+            "message": (
+                "Java strict verification requires the dataset sample test command; "
+                "project_full executes it after the projects.yaml test command."
+            ),
+        })
     return violations
 
 
@@ -370,33 +391,11 @@ def run_build_test_guard(
             strict_violations,
         )
         details = dict(failure.get("details") or {})
-        details.update({"build": None, "test": None})
+        details.update({"build": None, "test": None, "sample_test": None})
         return {**failure, **metadata, "details": details}
-    if config.verification_mode == "sample_optimized" and not str(config.sample_test_command or "").strip():
-        return {
-            "type": "build_test",
-            "success": False,
-            "message": "Sample-level test command is required for sample_optimized verification.",
-            **metadata,
-            "details": {
-                "build": None,
-                "test": {
-                    "label": "test",
-                    "success": False,
-                    "status": "missing",
-                    "returncode": None,
-                    "summary": [],
-                    "failure_highlights": ["Sample-level test command is missing."],
-                    "diagnostics": [],
-                    "tail": [],
-                    "summary_text": "Sample-level test command is missing.",
-                    "output": "",
-                    "source": config.test_source,
-                },
-            },
-        }
     build_result = None
     test_result = None
+    sample_test_result = None
     if config.defaults.run_build:
         build_result = _run_command_config(
             config.build,
@@ -413,7 +412,11 @@ def run_build_test_guard(
                 "success": False,
                 "message": f"Build failed. {build_result['summary_text']}",
                 **metadata,
-                "details": {"build": build_result, "test": None},
+                "details": {
+                    "build": build_result,
+                    "test": None,
+                    "sample_test": None,
+                },
             }
     if config.defaults.run_tests:
         test_cwd = config.dataset_root if config.test_source == "dataset" else config.cwd
@@ -441,19 +444,22 @@ def run_build_test_guard(
                 "success": False,
                 "message": message,
                 **metadata,
-                "details": {"build": build_result, "test": test_result},
+                "details": {
+                    "build": build_result,
+                    "test": test_result,
+                    "sample_test": None,
+                },
             }
-        if (
-            config.verification_mode == "sample_optimized"
-            or require_test_execution
-        ):
+        if config.verification_mode == "sample_optimized" or require_test_execution:
             execution = (
                 _sample_test_execution_evidence(
                     config,
                     test_started_ns,
-                    test_result,
                 )
-                if str(config.sample_test_location or "").strip()
+                if (
+                    config.verification_mode == "sample_optimized"
+                    and str(config.sample_test_location or "").strip()
+                )
                 else _project_test_execution_evidence(
                     config,
                     test_started_ns,
@@ -476,14 +482,97 @@ def run_build_test_guard(
                         f"{execution['message']}"
                     ),
                     **metadata,
-                    "details": {"build": build_result, "test": test_result},
+                    "details": {
+                        "build": build_result,
+                        "test": test_result,
+                        "sample_test": None,
+                    },
+                }
+        if (
+            str(getattr(config, "language", "")).strip().lower() == "java"
+            and config.verification_mode == "project_full"
+        ):
+            reset_java_sample_test_evidence(config.project_root)
+            sample_test_started_ns = time.time_ns()
+            sample_test_command, evidence_adapter = (
+                prepare_java_sample_test_command(config)
+            )
+            sample_test_result = _run_command_config(
+                sample_test_command,
+                cwd=config.dataset_root,
+                env=config.env,
+                label="sample_test",
+                project_root=config.project_root,
+                source="dataset",
+                force_fresh_test_execution=True,
+                timeout_seconds=config.defaults.shell_timeout,
+            )
+            sample_test_result["evidence_adapter"] = evidence_adapter
+            if not sample_test_result["success"]:
+                return {
+                    "type": "build_test",
+                    "success": False,
+                    "message": (
+                        "Sample test failed. "
+                        f"{sample_test_result['summary_text']}"
+                    ),
+                    **metadata,
+                    "details": {
+                        "build": build_result,
+                        "test": test_result,
+                        "sample_test": sample_test_result,
+                    },
+                }
+            sample_execution = (
+                _sample_test_execution_evidence(
+                    config,
+                    sample_test_started_ns,
+                )
+                if str(config.sample_test_location or "").strip()
+                else _project_test_execution_evidence(
+                    config,
+                    sample_test_started_ns,
+                    sample_test_result,
+                )
+            )
+            sample_test_result["execution_evidence"] = sample_execution
+            if not sample_execution["success"]:
+                sample_test_result["success"] = False
+                sample_test_result["status"] = "test_not_executed"
+                sample_test_result["failure_highlights"] = [
+                    str(sample_execution["message"])
+                ]
+                sample_test_result["summary_text"] = str(
+                    sample_execution["message"]
+                )
+                return {
+                    "type": "build_test",
+                    "success": False,
+                    "message": (
+                        "Declared sample test execution failed. "
+                        f"{sample_execution['message']}"
+                    ),
+                    **metadata,
+                    "details": {
+                        "build": build_result,
+                        "test": test_result,
+                        "sample_test": sample_test_result,
+                    },
                 }
     return {
         "type": "build_test",
         "success": True,
-        "message": _build_success_message(build_result, test_result),
+        "message": _build_success_message(
+            build_result,
+            test_result,
+            sample_test_result,
+        ),
         **metadata,
-        "details": {"build": build_result, "test": test_result},
+        "details": {
+            "build": build_result,
+            "test": test_result,
+            "sample_test": sample_test_result,
+        },
     }
 
 
@@ -492,10 +581,11 @@ def _verification_metadata(config: ResolvedRunConfig) -> Dict[str, object]:
         "verification_mode": config.verification_mode,
         "build_source": config.build_source,
         "test_source": config.test_source,
-        "test_location": config.sample_test_location if config.test_source == "dataset" else "",
-        "test_command_hash": _command_hash(config.sample_test_command)
-        if config.test_source == "dataset"
-        else "",
+        "test_location": config.sample_test_location,
+        "test_command_hash": _command_hash(config.sample_test_command),
+        "sample_test_source": (
+            "dataset" if str(config.sample_test_command or "").strip() else ""
+        ),
     }
 
 
@@ -509,15 +599,20 @@ def _command_hash(command: str) -> str:
 def _sample_test_execution_evidence(
     config: ResolvedRunConfig,
     started_ns: int,
-    command_result: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    """Require fresh XML or explicit direct-Java evidence for a declared test."""
-    test_classes = [
-        Path(part.strip()).stem
+    """Require native evidence for every explicitly declared Java test class.
+
+    JUnit tests must produce a fresh non-empty XML report. A direct Java main
+    test must produce a fresh attestation written only after that class exits
+    successfully in its own JVM. Main executions are counted separately from
+    JUnit tests; they are never represented as invented test cases.
+    """
+    locations = [
+        part.strip()
         for part in str(config.sample_test_location or "").split(";")
         if part.strip() and Path(part.strip()).stem
     ]
-    if not test_classes:
+    if not locations:
         return {
             "success": False,
             "message": "Pinned sample test location does not identify a test class.",
@@ -529,11 +624,42 @@ def _sample_test_execution_evidence(
             "reports": [],
             "tests": 0,
             "skipped": 0,
+            "executions": 0,
         }
+
+    entries: List[Dict[str, object]] = [
+        {
+            "location": location,
+            "test_class": Path(location).stem,
+            "declared_class": "",
+            "source": None,
+        }
+        for location in locations
+    ]
+    try:
+        declared_sources, source_error = declared_java_test_sources(config)
+    except (AttributeError, OSError, ValueError):
+        declared_sources, source_error = {}, "source_context_unavailable"
+    if not source_error and len(declared_sources) == len(entries):
+        for entry, (declared_class, source) in zip(
+            entries,
+            declared_sources.items(),
+        ):
+            entry["declared_class"] = declared_class
+            entry["source"] = source
+
+    test_classes = [str(entry["test_class"]) for entry in entries]
     fresh_reports = _fresh_test_reports(config.project_root, started_ns)
+    attestations, invalid_attestations = _fresh_main_attestations(
+        config,
+        started_ns,
+        declared_sources,
+    )
 
     classes: List[Dict[str, object]] = []
-    for test_class in test_classes:
+    for entry in entries:
+        test_class = str(entry["test_class"])
+        declared_class = str(entry["declared_class"] or "")
         class_reports: List[str] = []
         class_executed = 0
         class_skipped = 0
@@ -543,15 +669,23 @@ def _sample_test_execution_evidence(
                 str(case.attrib.get("classname") or "")
                 for case in root.findall(".//testcase")
             )
-            simple_names = {
-                name.rsplit(".", 1)[-1]
-                for name in suite_names
-                if name
-            }
-            if not any(
-                name == test_class or name.startswith(f"{test_class}$")
-                for name in simple_names
-            ):
+            if declared_class:
+                matched = any(
+                    name == declared_class or name.startswith(f"{declared_class}$")
+                    for name in suite_names
+                    if name
+                )
+            else:
+                simple_names = {
+                    name.rsplit(".", 1)[-1]
+                    for name in suite_names
+                    if name
+                }
+                matched = any(
+                    name == test_class or name.startswith(f"{test_class}$")
+                    for name in simple_names
+                )
+            if not matched:
                 continue
             tests_text = str(root.attrib.get("tests") or "").strip()
             try:
@@ -562,100 +696,57 @@ def _sample_test_execution_evidence(
                 skipped = int(str(root.attrib.get("skipped") or "0"))
             except ValueError:
                 skipped = len(root.findall(".//testcase/skipped"))
+            try:
+                failures = int(str(root.attrib.get("failures") or "0"))
+                errors = int(str(root.attrib.get("errors") or "0"))
+            except ValueError:
+                failures = len(root.findall(".//testcase/failure"))
+                errors = len(root.findall(".//testcase/error"))
             non_skipped = max(tests - skipped, 0)
-            if non_skipped <= 0:
+            if non_skipped <= 0 or failures > 0 or errors > 0:
                 continue
-            class_reports.append(str(report.relative_to(config.project_root)))
+            class_reports.append(
+                str(
+                    report.resolve().relative_to(
+                        Path(config.project_root).expanduser().resolve()
+                    )
+                )
+            )
             class_executed += non_skipped
             class_skipped += skipped
+
+        class_attestations = attestations.get(declared_class, [])
+        class_executions = sum(
+            int(payload.get("executions") or 0)
+            for _report, payload in class_attestations
+        )
+        if class_executed > 0:
+            evidence_mode = "xml"
+        elif class_executions > 0:
+            evidence_mode = "declared_main_attestation"
+            class_reports.extend(
+                str(
+                    report.resolve().relative_to(
+                        Path(config.project_root).expanduser().resolve()
+                    )
+                )
+                for report, _payload in class_attestations
+            )
+        else:
+            evidence_mode = ""
         classes.append(
             {
                 "test_class": test_class,
-                "success": class_executed > 0,
+                "declared_class": declared_class,
+                "success": class_executed > 0 or class_executions > 0,
                 "reports": sorted(class_reports),
                 "tests": class_executed,
                 "skipped": class_skipped,
-                "evidence_mode": "xml" if class_executed > 0 else "",
+                "executions": class_executions,
+                "evidence_mode": evidence_mode,
             }
         )
 
-    console_evidence: Dict[str, object] = {}
-    rendered_command = ""
-    output = ""
-    if isinstance(command_result, dict):
-        rendered_command = str(
-            command_result.get("command")
-            or command_result.get("script")
-            or ""
-        )
-        output = str(command_result.get("output") or "")
-    console_suite_counts: Dict[str, int] = {test_class: 0 for test_class in test_classes}
-    for match in re.finditer(
-        r"Tests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*"
-        r"Skipped:\s*(\d+).*?\bin\s+([A-Za-z0-9_.$]+)",
-        output,
-    ):
-        tests = int(match.group(1))
-        skipped = int(match.group(2))
-        simple_name = match.group(3).rsplit(".", 1)[-1]
-        non_skipped = max(tests - skipped, 0)
-        if non_skipped <= 0:
-            continue
-        for test_class in test_classes:
-            if simple_name == test_class or simple_name.startswith(f"{test_class}$"):
-                console_suite_counts[test_class] += non_skipped
-    console_suite_classes = [
-        test_class
-        for test_class, count in console_suite_counts.items()
-        if count > 0
-    ]
-    if console_suite_classes:
-        for item in classes:
-            test_class = str(item["test_class"])
-            if bool(item["success"]) or console_suite_counts[test_class] <= 0:
-                continue
-            item["success"] = True
-            item["tests"] = console_suite_counts[test_class]
-            item["evidence_mode"] = "test_runner_console"
-        console_evidence = {
-            "mode": "test_runner_console",
-            "invoked_test_classes": console_suite_classes,
-            "tests": sum(console_suite_counts.values()),
-        }
-    direct_java = bool(
-        re.search(r"(?:^|[;&|]\s*)java(?:\s|$)", rendered_command)
-    )
-    if direct_java:
-        invoked = [
-            test_class
-            for test_class in test_classes
-            if re.search(
-                rf"(?<![\w$])(?:[A-Za-z_$][\w$]*\.)*"
-                rf"{re.escape(test_class)}(?![\w$])",
-                rendered_command,
-            )
-        ]
-        junit_match = re.search(r"\bOK\s+\((\d+)\s+tests?\)", output)
-        junit_core = "org.junit.runner.JUnitCore" in rendered_command
-        console_tests = (
-            int(junit_match.group(1))
-            if junit_core and junit_match
-            else (1 if invoked and not junit_core else 0)
-        )
-        if console_tests > 0:
-            for item in classes:
-                if str(item["test_class"]) not in invoked or bool(item["success"]):
-                    continue
-                item["success"] = True
-                item["tests"] = console_tests if len(invoked) == 1 else 1
-                item["evidence_mode"] = (
-                    "junit_console" if junit_core else "java_main_exit_zero"
-                )
-            console_evidence = {
-                "mode": "junit_console" if junit_core else "java_main_exit_zero",
-                "invoked_test_classes": invoked,
-                "tests": console_tests,
-            }
     missing = [
         str(item["test_class"])
         for item in classes
@@ -672,12 +763,15 @@ def _sample_test_execution_evidence(
         for report in item["reports"]  # type: ignore[union-attr]
     )
     executed = sum(int(item["tests"]) for item in classes)
+    executions = sum(int(item["executions"]) for item in classes)
     skipped_total = sum(int(item["skipped"]) for item in classes)
-    success = executed > 0
+    evidence_units = executed + executions
+    success = evidence_units > 0 and not missing
     return {
         "success": success,
         "message": (
-            f"Pinned sample tests executed {executed} test(s) across "
+            f"Pinned sample tests executed {executed} JUnit test(s) and "
+            f"{executions} declared main program(s) across "
             f"{len(executed_classes)} declared class(es)"
             + (
                 f"; no fresh report for {', '.join(missing)}."
@@ -685,9 +779,14 @@ def _sample_test_execution_evidence(
                 else "."
             )
             if success
-            else "Pinned sample test evidence contains no fresh non-empty report "
-            "for declared class(es): "
-            + ", ".join(missing)
+            else (
+                "Pinned sample test evidence is incomplete; no fresh valid "
+                "XML or main attestation for declared class(es): " + ", ".join(missing)
+                if evidence_units > 0
+                else "Pinned sample test evidence contains no fresh valid XML or "
+                "main attestation "
+                "for declared class(es): " + ", ".join(missing)
+            )
         ),
         "test_class": test_classes[0] if len(test_classes) == 1 else "",
         "test_classes": test_classes,
@@ -695,10 +794,100 @@ def _sample_test_execution_evidence(
         "executed_test_classes": executed_classes,
         "missing_test_classes": missing,
         "reports": reports,
-        "console_evidence": console_evidence,
+        "console_evidence": {},
         "tests": executed,
         "skipped": skipped_total,
+        "executions": executions,
+        "evidence_units": evidence_units,
+        "invalid_attestations": invalid_attestations,
     }
+
+
+def _fresh_main_attestations(
+    config: ResolvedRunConfig,
+    started_ns: int,
+    declared_sources: Dict[str, Path],
+) -> tuple[Dict[str, List[tuple[Path, Dict[str, object]]]], List[Dict[str, str]]]:
+    valid: Dict[str, List[tuple[Path, Dict[str, object]]]] = {}
+    invalid: List[Dict[str, str]] = []
+    root = Path(config.project_root).expanduser().resolve()
+    report_root = root / ".smell-artifacts" / "test-attestations"
+    if not report_root.is_dir():
+        return valid, invalid
+    for report in sorted(report_root.glob("ATTEST-*.json")):
+        try:
+            stat = report.stat()
+            if stat.st_mtime_ns < started_ns:
+                continue
+            if stat.st_size <= 0 or stat.st_size > 64 * 1024:
+                raise ValueError("attestation_size_invalid")
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("attestation_not_object")
+            declared_class = str(payload.get("declared_class") or "")
+            source = declared_sources.get(declared_class)
+            if source is None:
+                raise ValueError("declared_class_not_frozen")
+            _validate_main_attestation(
+                payload,
+                config=config,
+                started_ns=started_ns,
+                source=source,
+            )
+            valid.setdefault(declared_class, []).append((report, payload))
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            invalid.append(
+                {
+                    "report": str(report.relative_to(root)),
+                    "reason": str(exc),
+                }
+            )
+    return valid, invalid[:20]
+
+
+def _validate_main_attestation(
+    payload: Dict[str, object],
+    *,
+    config: ResolvedRunConfig,
+    started_ns: int,
+    source: Path,
+) -> None:
+    expected = {
+        "schema_version": ATTESTATION_SCHEMA,
+        "adapter_id": ATTESTATION_ADAPTER_ID,
+        "evidence_kind": "declared_main",
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "contract_command_sha256": _command_hash(config.sample_test_command),
+        "returncode": 0,
+        "executions": 1,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"{field}_mismatch")
+
+    argv_hash = str(payload.get("argv_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", argv_hash):
+        raise ValueError("argv_sha256_invalid")
+    for field in ("uid", "euid", "started_ns", "ended_ns"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field}_invalid")
+    if payload["uid"] != os.getuid() or payload["euid"] != os.geteuid():
+        raise ValueError("process_identity_mismatch")
+    if int(payload["started_ns"]) < started_ns:
+        raise ValueError("started_ns_stale")
+    if int(payload["ended_ns"]) < int(payload["started_ns"]):
+        raise ValueError("ended_ns_invalid")
+
+    cwd_text = str(payload.get("cwd") or "").strip()
+    if not cwd_text:
+        raise ValueError("cwd_missing")
+    cwd = Path(cwd_text).expanduser().resolve()
+    project_root = Path(config.project_root).expanduser().resolve()
+    try:
+        cwd.relative_to(project_root)
+    except ValueError as exc:
+        raise ValueError("cwd_outside_project") from exc
 
 
 def _fresh_test_reports(
@@ -1697,12 +1886,18 @@ def _build_script_command(script: str, label: str) -> tuple:
         return f"sh {script_path}", True
     return str(script_path), False
 
-def _build_success_message(build_result: Optional[Dict[str, object]], test_result: Optional[Dict[str, object]]) -> str:
+def _build_success_message(
+    build_result: Optional[Dict[str, object]],
+    test_result: Optional[Dict[str, object]],
+    sample_test_result: Optional[Dict[str, object]] = None,
+) -> str:
     parts = []
     if build_result and build_result["status"] != "skipped":
         parts.append("build passed")
     if test_result and test_result["status"] != "skipped":
-        parts.append("tests passed")
+        parts.append("project tests passed" if sample_test_result else "tests passed")
+    if sample_test_result and sample_test_result["status"] != "skipped":
+        parts.append("sample tests passed")
     if not parts:
         return "Build/test verification skipped."
     return " and ".join(parts).capitalize() + "."

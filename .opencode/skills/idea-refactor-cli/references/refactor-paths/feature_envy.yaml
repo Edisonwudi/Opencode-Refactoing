@@ -66,12 +66,12 @@ feature_envy:
           - idea_refactor_preview(operation="move:method", file="app/proprietary/src/main/java/stirling/software/proprietary/security/service/KeyPairCleanupService.java", line=74, column=18, arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
 
           - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"})
-          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}, decisions={"move:method.conflict.de1a7bd7ba9a635d":"refactor_anyway"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"keyPersistenceService","newName":"removePrivateKey"}, decisions={"move:method.conflict.de1a7bd7ba9a635d":{"choice":"refactor_anyway","arguments":{}}})
     after: |
       /* KeyPairCleanupService.java */
       62                        keyPersistenceService.removeKey(key.getKeyId());
       63                        keyPersistenceService.removePrivateKey(key.getKeyId());
-      // CLI prepare exposed the conflict, the first apply round stayed at needs_decision,
+      // The preview/apply proposal lifecycle exposed the conflict; the first apply stayed at needs_decision,
       // and the second apply round with refactor_anyway moved the method successfully.
 
       /* KeyPersistenceService.java */
@@ -89,7 +89,7 @@ feature_envy:
       255        }
       256    }
     source: { project: Stirling-PDF-v2.1.5, class: KeyPairCleanupService -> KeyPersistenceService, verified: "2026-05-11", mode: "OpenCode IDEA tools" }
-    notes: "Verified against an attached IDEA service. Preview surfaced a private-field accessibility conflict; the first apply round remained at needs_decision, and the second apply round succeeded only after idea_refactor_apply(proposalId=\"<preview.proposalId>\", decisions={\"move:method.conflict.de1a7bd7ba9a635d\":\"refactor_anyway\"}). The resulting temporary project still compiled with ./gradlew :proprietary:compileJava. This exact method pair is not one of the dataset's recorded feature_envy cases."
+    notes: "Verified against an attached IDEA service. Preview surfaced a private-field accessibility conflict; the first apply remained at needs_decision, and the continuation succeeded by reusing nextRequest.tool and nextRequest.args with the same proposalId and the nested refactor_anyway decision choice. The resulting temporary project still compiled with ./gradlew :proprietary:compileJava. This exact method pair is not one of the dataset's recorded feature_envy cases."
   - id: extract-slice-then-move-to-envied-receiver
     when: "a receiver-heavy slice inside a larger source method must move to the envied receiver; extract:method is only a temporary isolation step, and the plan must not stop after extract:method or leave the helper in the original source class"
     before: |
@@ -119,7 +119,7 @@ feature_envy:
         cli_steps:
           - idea_refactor_preview(operation="move:method", file="src/demo/Source.java", line=17, column=18, arguments={"targetVariableName":"receiver","newName":"sendSecret"})
 
-          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"receiver","newName":"sendSecret"}, decisions={"move:method.visibility.938852b473beaaab":"escalate_visibility"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetVariableName":"receiver","newName":"sendSecret"}, decisions={"move:method.visibility.938852b473beaaab":{"choice":"escalate_visibility","arguments":{}}})
     after: |
       /* Source.java */
       3     class Receiver {
@@ -139,9 +139,9 @@ feature_envy:
       20    }
     source: { project: minimal-live-smoke, class: Source -> Receiver, verified: "2026-05-17", mode: "real IDEA CLI + javac" }
     notes:
-      - "The second locate carries the selected statement, so extract:method does not consume a selection.patch decision."
-      - "move:method prepare returned a visibility.patch decision because the moved method would access Source.secret from Receiver. Consuming escalate_visibility made secret package-visible, moved the method, and javac passed."
-      - "The decision id shown is the stable id from this smoke; in a new project, use the exact move:method.visibility.* id returned by prepare."
+      - "When the initial extract preview returns needs_selection, invoke the selected candidate's nextRequest as a fresh preview with its explicit selection and without the old proposalId; selection is not a decision."
+      - "The move preview returned needs_decision because the moved method would access Source.secret from Receiver. Reusing nextRequest with the nested escalate_visibility choice made secret package-visible, moved the method, and javac passed."
+      - "The decision id shown is the stable id from this smoke; in a new project, use the exact id and nested decision object returned in nextRequest.args.decisions."
       - "This path is invalid unless the extracted behavior finishes on the envied receiver through move:method or an equivalent receiver-side recreation."
       - "A helper that remains in the original source class is only an incomplete prefix, not a valid feature_envy final state."
   - id: receiver-side-helper-replace-source-delegation

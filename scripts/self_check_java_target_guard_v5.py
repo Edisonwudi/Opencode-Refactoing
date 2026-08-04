@@ -79,6 +79,8 @@ def _bridge(
             str(project / "projects.yaml"),
             "--verification-mode",
             "project_full",
+            "--sample-test-command",
+            "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'",
         ],
         ROOT,
         env,
@@ -580,7 +582,7 @@ def main() -> int:
         manifest_path = Path(baseline["artifacts"]["baseline_manifest"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["schema_version"] == 5, manifest
-        assert manifest["contract_version"] == 5, manifest
+        assert manifest["contract_version"] == 6, manifest
         assert "guard_contract" in manifest and "finding_contract" not in manifest
         assert "baseline_finding_catalog" not in json.dumps(manifest)
         assert "baseline_occurrence_contract" not in json.dumps(manifest)
@@ -605,7 +607,7 @@ def main() -> int:
 
     print(
         "java-target-guard-v5 self-check PASS "
-        "smells=11 schema=5 contract=5 full_scan=blocked "
+        "smells=11 schema=5 contract=6 full_scan=blocked "
         "decision_lt_64KiB evidence_lt_2MiB verify_full=removed"
     )
     return 0

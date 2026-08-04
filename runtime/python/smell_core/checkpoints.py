@@ -18,9 +18,12 @@ from .checkpoint_adapters import (
 )
 from .checkpoint_contract import CHECKPOINT_CONTRACT_VERSION, evaluate_checkpoint_contract
 from .config import interpolate_command_text
+from .java_test_evidence import java_sample_test_evidence_contract
 from .resolution_plan import build_resolution_plan
 from .test_change_contract import (
+    TestChangeContractError,
     capture_test_change_contract,
+    clean_transient_test_artifacts,
     evaluate_test_change_contract,
     is_standard_java_test_path,
 )
@@ -37,7 +40,7 @@ CHECKPOINT_SCHEMA_VERSION = 5
 BASELINE_SEAL_VERSION = 1
 BASELINE_SEAL_ALGORITHM = "sha256"
 BASELINE_SEAL_FIELD = "baseline_seal"
-VERIFICATION_CONTRACT_VERSION = 1
+VERIFICATION_CONTRACT_VERSION = 4
 
 
 def _require_current_checkpoint_versions(payload: dict[str, Any]) -> None:
@@ -197,11 +200,15 @@ def capture_verification_contract(config: Any) -> dict[str, Any]:
             "cwd": str(test_cwd),
         },
         "sample_test": {
+            **_command_contract(getattr(config, "sample_test", None), project_root),
+            "source": "dataset",
+            "cwd": str(dataset_root),
             "locations": sample_test_locations,
             "command_sha256": hashlib.sha256(
                 sample_test_command.encode("utf-8")
             ).hexdigest(),
             "command_present": bool(sample_test_command),
+            "evidence_adapter": java_sample_test_evidence_contract(config),
         },
         "execution": {
             "cwd": str(resolved_cwd),
@@ -730,6 +737,7 @@ def prepare_checkpoint(
     baseline = load_checkpoint_baseline(root, smell, location)
     if baseline is None:
         return {"required": False, "reason": "baseline_checkpoint_missing"}
+    transient_test_artifact_cleanup: dict[str, Any] | None = None
     actual_baseline_seal = validate_c000_baseline_seal(baseline)
     if str(config.language) == "java":
         if not expected_baseline_seal:
@@ -763,6 +771,24 @@ def prepare_checkpoint(
                 "current_verification_contract_hash": _canonical_hash(
                     current_verification
                 ),
+            }
+        frozen_test_contract = baseline.get("test_change_contract")
+        if not isinstance(frozen_test_contract, dict):
+            return {
+                "required": False,
+                "reason": "checkpoint_recapture_required",
+            }
+        try:
+            transient_test_artifact_cleanup = clean_transient_test_artifacts(
+                root,
+                frozen_test_contract,
+            )
+        except TestChangeContractError as exc:
+            return {
+                "required": False,
+                "reason": exc.status.lower(),
+                "error": exc.message,
+                "details": dict(exc.details),
             }
     state_path = task_root / "task-state.json"
     state = _read_json(state_path)
@@ -880,6 +906,10 @@ def prepare_checkpoint(
             root,
             frozen_test_contract,
         ).to_dict()
+        if transient_test_artifact_cleanup is not None:
+            test_changes["transient_test_artifact_cleanup"] = (
+                transient_test_artifact_cleanup
+            )
     evaluation = evaluate_checkpoint_contract(
         baseline_metrics,
         current,

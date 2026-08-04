@@ -141,6 +141,21 @@ function jsonObjectShape(description: string) {
   return tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe(description)
 }
 
+function ideaDecisionsShape(description: string) {
+  return tool.schema
+    .record(
+      tool.schema.string(),
+      tool.schema
+        .object({
+          choice: tool.schema.string(),
+          arguments: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional(),
+        })
+        .strict(),
+    )
+    .optional()
+    .describe(description)
+}
+
 function withBatchDefaults(input: {
   projectRoot?: string
   language?: string
@@ -1045,6 +1060,63 @@ function selectionCandidates(payload: Record<string, unknown> | null, operation:
   return arrayValue(group?.candidates)
 }
 
+function numberField(source: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === "number" && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function selectionCandidatesWithNextRequest(
+  payload: Record<string, unknown> | null,
+  operation: string,
+  request?: IdeaPreviewRequest,
+): unknown[] {
+  const candidates = selectionCandidates(payload, operation)
+  if (!request) return candidates
+  const target = compactTarget(payload)
+  const targetFile = typeof target?.filePath === "string" ? target.filePath : request.file
+  return candidates.map((candidate) => {
+    const source = recordValue(candidate)
+    if (!source || !targetFile) return candidate
+    const nestedSelection = recordValue(source.selection)
+    const startLine = numberField(source, "selection-start-line", "selectionStartLine", "startLine")
+      ?? (nestedSelection ? numberField(nestedSelection, "startLine") : undefined)
+    const startColumn = numberField(source, "selection-start-column", "selectionStartColumn", "startColumn")
+      ?? (nestedSelection ? numberField(nestedSelection, "startColumn") : undefined)
+    const endLine = numberField(source, "selection-end-line", "selectionEndLine", "endLine")
+      ?? (nestedSelection ? numberField(nestedSelection, "endLine") : undefined)
+    const endColumn = numberField(source, "selection-end-column", "selectionEndColumn", "endColumn")
+      ?? (nestedSelection ? numberField(nestedSelection, "endColumn") : undefined)
+    if (
+      startLine === undefined
+      || startColumn === undefined
+      || endLine === undefined
+      || endColumn === undefined
+    ) return candidate
+    const selection = { startLine, startColumn, endLine, endColumn }
+    const args: Record<string, unknown> = {
+      ideaProjectRoot: request.projectRoot,
+      operation,
+      file: targetFile,
+      line: startLine,
+      column: startColumn,
+      selection,
+    }
+    if (request.arguments) args.arguments = request.arguments
+    if (request.detail) args.detail = request.detail
+    return {
+      ...source,
+      selection,
+      nextRequest: {
+        tool: "idea_refactor_preview",
+        args,
+      },
+    }
+  })
+}
+
 function diagnosticCodes(payload: Record<string, unknown> | null): string[] {
   return arrayValue(payload?.diagnostics)
     .map(recordValue)
@@ -1060,21 +1132,103 @@ function nextProtocolAction(payload: Record<string, unknown> | null, fallback: s
   return fallback
 }
 
+function nextRequestFromCliExample(
+  payload: Record<string, unknown> | null,
+  operation: string,
+  proposalId: string,
+  projectRoot = "",
+): Record<string, unknown> | null {
+  if (!proposalId) return null
+  const example = recordValue(payload?.nextCliCommandExample)
+  const action = typeof example?.action === "string" ? example.action : ""
+  if (action !== "prepare" && action !== "apply") return null
+  const args: Record<string, unknown> = {}
+  if (projectRoot) args.ideaProjectRoot = projectRoot
+  if (action === "prepare") args.operation = operation
+  args.proposalId = proposalId
+  const argumentsJson = recordValue(example?.argumentsJson)
+  const decisionsJson = recordValue(example?.decisionsJson)
+  if (argumentsJson) args.arguments = argumentsJson
+  if (decisionsJson) args.decisions = decisionsJson
+  return {
+    tool: action === "prepare" ? "idea_refactor_preview" : "idea_refactor_apply",
+    args,
+  }
+}
+
+function previewRetryNextRequest(
+  request: IdeaPreviewRequest | undefined,
+  proposalId: string,
+): Record<string, unknown> | null {
+  if (!request) return null
+  const args: Record<string, unknown> = {
+    ideaProjectRoot: request.projectRoot,
+    operation: request.operation,
+  }
+  if (proposalId) {
+    args.proposalId = proposalId
+  } else if (request.target) {
+    args.target = request.target
+  } else if (request.file && request.line !== undefined && request.column !== undefined) {
+    args.file = request.file
+    args.line = request.line
+    args.column = request.column
+    if (request.selection) args.selection = request.selection
+  } else {
+    return null
+  }
+  if (request.arguments) args.arguments = request.arguments
+  if (request.decisions) args.decisions = request.decisions
+  if (request.detail) args.detail = request.detail
+  return { tool: "idea_refactor_preview", args }
+}
+
 function ideaProtocolError(
   title: string,
   code: string,
   summary: string,
+  nextRequest: Record<string, unknown> | null = null,
 ): { title: string; output: string; metadata: Record<string, unknown> } {
+  const output: Record<string, unknown> = {
+    success: false,
+    status: "needs_input",
+    nextAction: "preview",
+    diagnostics: [{ code, summary }],
+    validRequestShapes: [
+      "initial semantic target: operation + target",
+      "initial position target: operation + file + line + column (+ optional selection)",
+      "continuation: operation + proposalId (+ arguments/decisions), without target or position",
+    ],
+  }
+  if (nextRequest) output.nextRequest = nextRequest
   return {
     title,
-    output: safeJsonStringify({
-      success: false,
-      status: "failed",
-      nextAction: "none",
-      diagnostics: [{ code, summary }],
-    }),
+    output: safeJsonStringify(output),
     metadata: { exitCode: 1, stderr: "" },
   }
+}
+
+function recoverInvalidPreviewTarget(request: IdeaPreviewRequest): Record<string, unknown> | null {
+  const args: Record<string, unknown> = {
+    ideaProjectRoot: request.projectRoot,
+    operation: request.operation,
+  }
+  if (request.proposalId) {
+    args.proposalId = request.proposalId
+  } else if (request.target && (!request.selection || !request.file || request.line === undefined || request.column === undefined)) {
+    args.target = request.target
+  } else if (request.file && request.line !== undefined && request.column !== undefined) {
+    args.file = request.file
+    args.line = request.line
+    args.column = request.column
+    if (request.selection) args.selection = request.selection
+  } else {
+    return null
+  }
+  if (request.arguments) args.arguments = request.arguments
+  if (request.decisions) args.decisions = request.decisions
+  if (request.detail) args.detail = request.detail
+  return { tool: "idea_refactor_preview", args }
 }
 
 function renderIdeaPreviewProtocolResult(input: {
@@ -1082,6 +1236,7 @@ function renderIdeaPreviewProtocolResult(input: {
   proposalId: string
   locate?: IdeaCliResult
   prepare?: IdeaCliResult
+  request?: IdeaPreviewRequest
   statusOverride?: "needs_selection" | "unsupported_target"
   timingsMs: Record<string, number>
   detail: IdeaDetail
@@ -1090,32 +1245,40 @@ function renderIdeaPreviewProtocolResult(input: {
   const locatePayload = recordValue(input.locate?.json)
   const preparePayload = recordValue(input.prepare?.json)
   const activePayload = preparePayload || locatePayload
+  const activeResult = input.prepare || input.locate
   const payloadStatus = typeof activePayload?.status === "string"
     ? activePayload.status.toLowerCase()
     : ""
-  const candidates = selectionCandidates(locatePayload, input.operation)
+  const candidates = selectionCandidatesWithNextRequest(locatePayload, input.operation, input.request)
   let status = input.statusOverride || "failed"
   if (!input.statusOverride) {
     status =
-      input.prepare?.exitCode === 0 && payloadStatus === "ok"
-        ? "ready"
-        : input.prepare?.exitCode === 0 && payloadStatus === "needs_decision"
-          ? "needs_decision"
-          : input.prepare?.exitCode === 0 && payloadStatus === "needs_more_info"
-            ? "needs_input"
-            : input.prepare?.exitCode === 0 && payloadStatus === "retryable_failed"
-              ? "retryable_failed"
+      activeResult?.exitCode === 3 && payloadStatus === "retryable_failed"
+        ? "retryable_failed"
+        : input.prepare?.exitCode === 0 && payloadStatus === "ok"
+          ? "ready"
+          : input.prepare?.exitCode === 0 && payloadStatus === "needs_decision"
+            ? "needs_decision"
+            : input.prepare?.exitCode === 0 && payloadStatus === "needs_more_info"
+              ? "needs_input"
               : "failed"
   }
   const nextAction =
     status === "ready"
       ? "apply"
-      : status === "needs_selection" || status === "needs_input"
+      : status === "needs_selection" || status === "needs_input" || status === "retryable_failed"
         ? "preview"
         : status === "needs_decision"
           ? nextProtocolAction(activePayload, "preview")
           : "none"
   const lastResult = input.prepare || input.locate
+  const projectRoot = input.request?.projectRoot
+    || (typeof input.wrapperMetadata?.project_root === "string" ? input.wrapperMetadata.project_root : "")
+  const nextRequest = status === "retryable_failed"
+    ? previewRetryNextRequest(input.request, input.proposalId)
+    : status === "ready" || status === "needs_input" || status === "needs_decision"
+      ? nextRequestFromCliExample(activePayload, input.operation, input.proposalId, projectRoot)
+      : null
   const output: Record<string, unknown> = {
     success: status === "ready",
     protocol: "idea-proposal-v1",
@@ -1131,6 +1294,7 @@ function renderIdeaPreviewProtocolResult(input: {
     diagnostics: arrayValue(activePayload?.diagnostics),
     timingsMs: input.timingsMs,
   }
+  if (nextRequest) output.nextRequest = nextRequest
   if (input.detail === "full") {
     output.raw = {
       locate: locatePayload,
@@ -1166,28 +1330,42 @@ function renderIdeaApplyProtocolResult(
   const payload = recordValue(result.json)
   const payloadStatus = typeof payload?.status === "string" ? payload.status.toLowerCase() : ""
   const codes = diagnosticCodes(payload)
+  const requestTimedOut = codes.includes("SERVICE_REQUEST_TIMEOUT")
   let status =
-    result.exitCode === 0 && payloadStatus === "ok" && payload?.applied === true
+    requestTimedOut
+      ? "outcome_unknown"
+      : result.exitCode === 0 && payloadStatus === "ok" && payload?.applied === true
       ? "applied"
       : result.exitCode === 0 && payloadStatus === "needs_decision"
         ? "needs_decision"
         : result.exitCode === 0 && payloadStatus === "needs_more_info"
           ? "needs_input"
-          : result.exitCode === 0 && payloadStatus === "retryable_failed"
+          : result.exitCode === 3 && payloadStatus === "retryable_failed"
             ? "retryable_failed"
             : "failed"
   if (codes.includes("STALE_DRAFT")) status = "stale"
   const nextAction =
     status === "applied"
       ? "verify"
+      : status === "outcome_unknown"
+        ? "verify"
       : status === "needs_decision"
         ? nextProtocolAction(payload, "apply")
-        : status === "needs_input"
+        : status === "needs_input" || status === "retryable_failed"
           ? "apply"
           : status === "stale"
             ? "preview"
             : "none"
   const applyResult = recordValue(payload?.result)
+  const projectRoot = typeof wrapperMetadata.project_root === "string" ? wrapperMetadata.project_root : ""
+  const nextRequest = status === "needs_decision" || status === "needs_input" || status === "retryable_failed"
+    ? nextRequestFromCliExample(
+        payload,
+        typeof payload?.operation === "string" ? payload.operation : "",
+        proposalId,
+        projectRoot,
+      )
+    : null
   const output: Record<string, unknown> = {
     success: status === "applied",
     protocol: "idea-proposal-v1",
@@ -1205,6 +1383,7 @@ function renderIdeaApplyProtocolResult(
     rollbackAvailable: status === "applied",
     timingsMs: { apply: elapsedMs, total: elapsedMs },
   }
+  if (nextRequest) output.nextRequest = nextRequest
   if (detail === "full") output.raw = payload
   return {
     title: "IDEA refactor apply",
@@ -1235,6 +1414,7 @@ async function runIdeaPreviewProtocol(input: {
       "IDEA refactor preview",
       "INVALID_PREVIEW_TARGET",
       "proposalId continuation must not include target, file, caret, or selection.",
+      recoverInvalidPreviewTarget(request),
     )
   }
   if (!hasProposal && hasTarget === hasPosition) {
@@ -1242,6 +1422,7 @@ async function runIdeaPreviewProtocol(input: {
       "IDEA refactor preview",
       "INVALID_PREVIEW_TARGET",
       "Initial preview requires exactly one target form: semantic target or file with line and column.",
+      recoverInvalidPreviewTarget(request),
     )
   }
   if (!hasProposal && hasPosition && (!request.file || request.line === undefined || request.column === undefined)) {
@@ -1249,6 +1430,7 @@ async function runIdeaPreviewProtocol(input: {
       "IDEA refactor preview",
       "INVALID_PREVIEW_TARGET",
       "Position preview requires file, line, and column.",
+      recoverInvalidPreviewTarget(request),
     )
   }
 
@@ -1295,6 +1477,7 @@ async function runIdeaPreviewProtocol(input: {
         operation: request.operation,
         proposalId,
         locate,
+        request,
         timingsMs: { locate: locateMs, prepare: 0, total: Date.now() - startedAt },
         detail,
         wrapperMetadata: input.wrapperMetadata,
@@ -1306,6 +1489,7 @@ async function runIdeaPreviewProtocol(input: {
         operation: request.operation,
         proposalId,
         locate,
+        request,
         statusOverride: candidates.length ? "needs_selection" : "unsupported_target",
         timingsMs: { locate: locateMs, prepare: 0, total: Date.now() - startedAt },
         detail,
@@ -1333,6 +1517,7 @@ async function runIdeaPreviewProtocol(input: {
     proposalId,
     locate,
     prepare,
+    request,
     timingsMs: { locate: locateMs, prepare: prepareMs, total: Date.now() - startedAt },
     detail,
     wrapperMetadata: input.wrapperMetadata,
@@ -2185,6 +2370,8 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
 
 export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const idleRuntime = createIdleContinueRuntime({ client, env: process.env })
+  const refactoringBackend = String(process.env.SMELL_REFACTORING_BACKEND || "direct").trim().toLowerCase()
+  const ideaToolsEnabled = refactoringBackend === "idea" && process.env.SMELL_ENABLE_IDEA_TOOLS === "1"
   const commandLoopStates = new Map<string, CommandLoopState>()
   const commandBaselineSeals = new Map<string, string>()
   const commonShape = {
@@ -2313,7 +2500,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     tool: {
       smell_verify: verifyTool("Smell verification"),
 
-      ...(process.env.SMELL_ENABLE_IDEA_TOOLS === "1" ? {
+      ...(ideaToolsEnabled ? {
       idea_refactor_preview: tool({
         description:
           "Resolve and prepare one IDEA-native refactoring proposal without changing source. Initial calls require exactly one semantic target or file/caret target. Continue requested inputs or decisions by passing proposalId without a target.",
@@ -2352,7 +2539,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             .optional()
             .describe("Optional explicit selection range."),
           arguments: jsonObjectShape("Known structured operation arguments. Pass them on the first preview."),
-          decisions: jsonObjectShape("Structured prepare decisions when continuing an existing proposal."),
+          decisions: ideaDecisionsShape(
+            "Structured prepare decisions keyed by decision id. Each value must be {choice, arguments?}.",
+          ),
           detail: tool.schema
             .enum(["compact", "full"])
             .optional()
@@ -2389,7 +2578,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           ...ideaShape,
           proposalId: tool.schema.string().describe("Opaque proposalId returned by idea_refactor_preview."),
           arguments: jsonObjectShape("Structured operation arguments. The wrapper serializes this to JSON safely."),
-          decisions: jsonObjectShape("Structured decisions when IDEA requests a decision."),
+          decisions: ideaDecisionsShape(
+            "Structured decisions keyed by decision id. Each value must be {choice, arguments?}.",
+          ),
           detail: tool.schema
             .enum(["compact", "full"])
             .optional()
@@ -2490,9 +2681,24 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
 
     "tool.execute.before": async (input, output) => {
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : ""
+      if (
+        ideaToolsEnabled
+        && ["edit", "write", "patch", "apply_patch"].includes(input.tool)
+      ) {
+        throw new Error(
+          "IDEA_BACKEND_DIRECT_EDIT_FORBIDDEN: use idea_refactor_preview and "
+          + "idea_refactor_apply; use idea_edit only after a recorded proposal blocker.",
+        )
+      }
       if (input.tool !== "bash") return
       const command = String(output.args?.command ?? "")
       if (!command) return
+      if (ideaToolsEnabled && /\bidea-refactor\b/.test(command)) {
+        throw new Error(
+          "IDEA_BACKEND_DIRECT_CLI_FORBIDDEN: call idea_refactor_preview or "
+          + "idea_refactor_apply instead of invoking the underlying CLI through bash.",
+        )
+      }
       if (sessionID && commandLoopStates.has(sessionID) && DIRECT_BUILD_COMMAND_RE.test(command)) {
         throw new Error(
           "Do not run Maven or Gradle directly during a smell-refactor command. "
@@ -2560,7 +2766,18 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         instruction: policy.loop.instruction,
         allowTestChanges: policy.allow_test_changes,
       })
-      output.parts = [{ type: "text", text: commandPolicyPrompt(policy, targetIdentityPrompt) }] as typeof output.parts
+      let prompt = commandPolicyPrompt(policy, targetIdentityPrompt)
+      if (ideaToolsEnabled && input.command === "java-refactor-run") {
+        prompt += [
+          "",
+          "Controller-owned refactoring backend: idea",
+          "- Load only idea-refactor-cli for the smell-specific route.",
+          "- Use real idea_refactor_preview and idea_refactor_apply tool calls, then smell_verify.",
+          "- Reuse proposalId and nextRequest exactly; do not invoke idea-refactor through bash.",
+          "- OpenCode edit/write tools are disabled in this backend.",
+        ].join("\n")
+      }
+      output.parts = [{ type: "text", text: prompt }] as typeof output.parts
     },
 
     event: async ({ event }) => {
@@ -2628,6 +2845,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   renderIdeaApplyProtocolResult,
   runIdeaPreviewProtocol,
   selectionCandidates,
+  ideaDecisionsShape,
   parseCommandPolicyResult,
   checkpointTargetIdentityPrompt,
   commandPolicyPrompt,

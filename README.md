@@ -350,9 +350,12 @@ Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_ful
 `--loop-no-progress-limit=1..5`、`--loop-on=smell,compile,test`、
 `--sample-deadline=60..7200`。参数非法直接报 `INVALID_LOOP_POLICY`。
 
-两种验证模式都会执行严格 build/test；`sample_optimized` 使用数据行中已物化的
-聚焦测试命令，`project_full` 使用项目级命令。允许测试迁移时 runner 会无条件
-切到 `project_full`，因为被模型同步修改的聚焦测试不能再作为独立行为 oracle。
+两种验证模式都会执行严格 build/test；`sample_optimized` 在 build 后只执行数据行
+中已物化的聚焦测试命令。`project_full` 是固定的两段测试合同：先执行
+`projects.yaml` 的项目级测试，再执行数据行的 `sample_test_command`，并要求每个
+声明测试类都有新鲜、非零的 JUnit 执行证据。build、项目测试和样本测试三段任一
+失败都不通过；两个测试命令及其工作目录均冻结进 c000，不能互相替代。
+允许测试迁移时 runner 会无条件切到 `project_full`。
 此时 c000 将测试策略冻结为 `api_migration`（默认是 `immutable`）：只允许测试
 源码的 API 同步迁移，已有测试文件不得删除，测试方法/断言不得减少，不得新增
 disabled/ignored/assumption-skip，测试资源和验证配置仍不可改；声明的测试类必须
@@ -381,7 +384,7 @@ python3 scripts/run_smell_dataset.py \
   必须一致，禁止 HEAD fallback。
 - 测试默认以 `immutable` 冻结；只有 controller 显式传 `--allow-test-changes`
   才切到 `api_migration`。启用后统一执行 `project_full`；完整 test SHA 与测试强度
-  审计、c000 冻结的 build/test 合同仍必须通过，基线测试文件身份不得删除，
+  审计、c000 冻结的 build/项目测试/样本测试合同仍必须通过，基线测试文件身份不得删除，
   测试方法/断言不得减少，不能新增跳过信号，声明测试必须实际执行；构建描述符、
   测试资源与验证脚本始终不可改。
 - 离线约束：Maven/Gradle 全部走镜像内离线仓库；模型 API 是唯一外联。

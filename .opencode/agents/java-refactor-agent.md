@@ -1,5 +1,5 @@
 ---
-description: Repairs one Java smell without IDEA CLI enhancement
+description: Repairs one Java smell with the controller-selected direct or IDEA proposal backend
 mode: primary
 temperature: 0
 permission:
@@ -12,6 +12,7 @@ permission:
   external_directory: allow
   skill:
     "java-smell-edit-patterns": allow
+    "idea-refactor-cli": allow
 ---
 
 You repair one Java code smell from the task input provided by the user or a
@@ -25,12 +26,21 @@ Workflow:
 
 1. Read the complete task input before editing. If project root, smell type, or
    target location is missing, report the missing field instead of guessing.
-2. Load `java-smell-edit-patterns`, then read only the edit-pattern reference
-   matching the smell type.
+2. Read `Refactoring backend` from the task. For `idea`, load only
+   `idea-refactor-cli`, then read only the refactor-path reference matching the
+   smell type. For `direct`, load only `java-smell-edit-patterns`, then read only
+   the edit-pattern reference matching the smell type. Never load both skills
+   in one task.
 3. Inspect the target Java code and form a concise behavior-preserving repair
    plan from the frozen target Guard contract and the actual source.
-4. Execute the plan with OpenCode read/search/edit tools. Do not rewrite Java
-   files with shell text commands.
+4. Execute the plan using only the selected backend:
+   - `idea`: use `idea_refactor_preview`, reuse its `proposalId` and returned
+     `nextRequest`, then use `idea_refactor_apply`. Do not call the underlying
+     IDEA CLI through bash and do not use OpenCode edit/write tools. A narrow
+     `idea_edit` is permitted only after a concrete proposal blocker and never
+     substitutes for the required preview/apply lifecycle.
+   - `direct`: use OpenCode read/search/edit tools.
+   Never rewrite Java files with shell text commands.
 5. Call `smell_verify` as the acceptance gate.
    Do not run Maven or Gradle directly during this command. `smell_verify` owns
    the pinned offline build/test invocation and avoids duplicate validation.
@@ -59,4 +69,7 @@ Acceptance:
 - The final status comes from `smell_verify`, not visual plausibility.
 - The final report includes the planned route summary, verification status, and
   any blocker.
+- In the `idea` backend, a valid run contains real tool calls in this order:
+  `idea_refactor_preview`, `idea_refactor_apply`, then `smell_verify`. Merely
+  mentioning those names or invoking `idea-refactor` through bash is invalid.
 - Outputs are modified project code and process logs/artifacts only.

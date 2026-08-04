@@ -60,7 +60,7 @@ code_clone_type1:
           - idea_refactor_preview(operation="pullUp:method", file="src/main/java/org/apache/commons/lang3/time/FastDateParser.java", line=165, column=9, arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"})
 
           - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"})
-          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}, decisions={"pullUp.duplicate.org.apache.commons.lang3.time.FastDateParser.Strategy.isNumber":"remove_source_duplicate"})
+          - idea_refactor_apply(proposalId="<preview.proposalId>", arguments={"targetSuperFqcn":"org.apache.commons.lang3.time.FastDateParser.Strategy"}, decisions={"pullUp.duplicate.org.apache.commons.lang3.time.FastDateParser.Strategy.isNumber":{"choice":"remove_source_duplicate","arguments":{}}})
     after: |
       165        // isNumber() now inherited from Strategy's default false implementation.
       166        // The JSON decision flow allowed the pull-up to proceed without an IDEA modal.

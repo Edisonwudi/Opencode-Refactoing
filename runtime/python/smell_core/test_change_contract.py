@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -37,14 +38,21 @@ from .java.source_layout import (
 )
 
 
-# v6 replaces the broad test-edit opt-in with an explicit, sealed mode and a
-# source-derived test-strength audit. Older c000 manifests must be recaptured;
-# silently treating v5's broad permission as api_migration would be unsafe.
-TEST_CHANGE_CONTRACT_VERSION = 6
+# v7 adds one pre-verification cleanup lane for newly created, Git-untracked
+# runtime artifacts under frozen test roots. The files are removed before the
+# authoritative build/tests run, so they can neither cause a false test-source
+# rejection nor influence the final behavior result. Older c000 manifests must
+# be recaptured because this policy is part of the frozen verification input.
+TEST_CHANGE_CONTRACT_VERSION = 7
 TEST_SEMANTIC_AUDIT_VERSION = 1
+TRANSIENT_TEST_ARTIFACT_POLICY = "c000-new-untracked-test-runtime-artifacts/v1"
 
 _TEST_CHANGE_MODES = frozenset({"immutable", "api_migration"})
 _TEST_SOURCE_SUFFIXES = frozenset({".java", ".groovy", ".kt", ".kts", ".scala"})
+_TRANSIENT_TEST_ARTIFACT_SUFFIXES = frozenset(
+    {".db", ".journal", ".lock", ".log", ".pid", ".shm", ".tmp", ".wal"}
+)
+_MAX_TRANSIENT_TEST_ARTIFACTS = 512
 _TEST_ANNOTATION = re.compile(
     r"@\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*"
     r"(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b"
@@ -314,6 +322,91 @@ def evaluate_test_change_contract(
     )
 
 
+def clean_transient_test_artifacts(
+    project_root: str | Path,
+    baseline_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove newly generated test-runtime files before final verification.
+
+    This is intentionally not a project-name or filename allowlist. A file is
+    removable only when all of these source-derived conditions hold:
+
+    * it is under the same frozen Java test-input scope used by c000;
+    * it did not exist in the frozen test manifest;
+    * Git proves that it is untracked or ignored, never tracked;
+    * it is a regular, non-symlink file with a conventional runtime-artifact
+      suffix.
+
+    The final build and both test stages run after removal. Consequently an
+    authored fixture cannot use this lane to make a candidate pass: it is gone
+    before behavior verification. Tracked resources and ordinary added test
+    resources remain visible to the strict test-change audit.
+    """
+    root = _project_root(project_root)
+    baseline = _validated_baseline(baseline_contract)
+    current = _snapshot_test_tree(
+        root,
+        baseline["declared_test_files"],
+        require_declared=False,
+        frozen_test_roots=baseline["standard_test_roots"],
+        frozen_test_files=baseline["configured_test_files"],
+        frozen_test_globs=baseline["configured_test_globs"],
+        frozen_test_glob_excludes=baseline["configured_test_glob_excludes"],
+    )
+    added_paths = sorted(set(current["files"]) - set(baseline["files"]))
+    candidates: list[dict[str, Any]] = []
+    for relative in added_paths:
+        if relative.endswith("#target"):
+            continue
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        if Path(relative).suffix.casefold() not in _TRANSIENT_TEST_ARTIFACT_SUFFIXES:
+            continue
+        disposition = _git_untracked_disposition(root, relative)
+        if not disposition:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise TestChangeContractError(
+                "TRANSIENT_TEST_ARTIFACT_CLEANUP_FAILED",
+                f"cannot inspect generated test artifact {relative}: {exc}",
+                path=relative,
+            ) from exc
+        candidates.append(
+            {
+                "path": relative,
+                "sha256": current["files"][relative],
+                "bytes": size,
+                "git_disposition": disposition,
+            }
+        )
+    if len(candidates) > _MAX_TRANSIENT_TEST_ARTIFACTS:
+        raise TestChangeContractError(
+            "TRANSIENT_TEST_ARTIFACT_LIMIT_EXCEEDED",
+            "too many generated test artifacts to clean safely",
+            count=len(candidates),
+            limit=_MAX_TRANSIENT_TEST_ARTIFACTS,
+        )
+    for item in candidates:
+        path = root / str(item["path"])
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise TestChangeContractError(
+                "TRANSIENT_TEST_ARTIFACT_CLEANUP_FAILED",
+                f"cannot remove generated test artifact {item['path']}: {exc}",
+                path=item["path"],
+            ) from exc
+    return {
+        "policy": TRANSIENT_TEST_ARTIFACT_POLICY,
+        "removed_count": len(candidates),
+        "removed_bytes": sum(int(item["bytes"]) for item in candidates),
+        "removed": candidates,
+    }
+
+
 def is_standard_java_test_path(path: str | Path) -> bool:
     """Return whether a relative path belongs to a conventional Java test root."""
     return standard_test_root(path) is not None
@@ -380,6 +473,45 @@ def _project_root(project_root: str | Path) -> Path:
             project_root=str(root),
         )
     return root
+
+
+def _git_untracked_disposition(root: Path, relative: str) -> str:
+    """Return ``untracked``/``ignored`` only when Git proves that state."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", relative],
+        cwd=str(root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if tracked.returncode == 0:
+        return ""
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "--", relative],
+        cwd=str(root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if ignored.returncode == 0:
+        return "ignored"
+    status = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            relative,
+        ],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    expected = b"?? " + os.fsencode(relative) + b"\0"
+    return "untracked" if status.returncode == 0 and status.stdout == expected else ""
 
 
 def _normalize_declared_test_files(

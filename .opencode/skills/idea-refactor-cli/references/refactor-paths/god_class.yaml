@@ -199,7 +199,7 @@ god_class:
     notes:
       - "Use this only when a real owner/collaborator already exists and the moved methods primarily manipulate that owner."
       - "Do not force this route onto a field cluster with no real owner; use the extract-class-state-and-behavior route instead."
-      - "The repeated line 7 locators are intentional: after each move, the next process method becomes the first method in God and must be re-located before prepare."
+      - "Call a fresh idea_refactor_preview for every move: after each apply, the next process method becomes the first method in God, PSI state has changed, and the preceding proposalId must not be reused."
   - id: insert-type-state-cluster-member-migration
     when: "auxiliary route for a field/state cluster only when native extract:class is unavailable or cannot migrate the needed fields and maintaining methods"
     before: |
