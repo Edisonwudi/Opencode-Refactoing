@@ -8,10 +8,11 @@ description: Use when repairing Java code smells without IDEA CLI enhancement.
 Use this skill only for the plain Java refactor agent, or when the task
 explicitly disables IDEA CLI enhancement.
 
-The task input remains the source of truth for project root, smell type, target
-location, frozen finding identity, and verification mode. These references provide direct-edit
-repair patterns; they do not add hidden context and do not replace
-`smell_verify`.
+The unchanged task input remains the source of truth for the requested project
+root, smell type, target location, and frozen finding identity. Verification,
+test-change, backend, and loop policy come from the separate stable controller
+system context. These references provide direct-edit repair patterns; they do
+not replace `smell_verify` or duplicate mutable failure details.
 
 `smell_verify` applies a caller-supplied target Guard to the frozen target and
 its explicit analysis/change scope. It does not scan every smell or construct a

@@ -561,8 +561,27 @@ for name, mutation in (
         R._runner_closure_action(trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
         "stop",
     )
-check_true("verify_prompt_marker", "verify-required" in R._runner_continuation_prompt("verify_required", 0, 2, "repair"))
-check_true("continue_prompt_marker", "continue 1/2" in R._runner_continuation_prompt("continue", 1, 2, "repair"))
+verify_resume_prompt = R._runner_continuation_prompt("verify_required", 0, 2, "repair")
+continue_resume_prompt = R._runner_continuation_prompt(
+    "continue",
+    1,
+    2,
+    "repair SECRET mutable instruction",
+    allow_test_changes=True,
+    failure_category="BUILD_FAILED",
+)
+check_true("verify_prompt_marker", "[runner-resume verify-required]" in verify_resume_prompt)
+check_true("continue_prompt_marker", "[runner-resume continue 1/2]" in continue_resume_prompt)
+check_true(
+    "continue_prompt_uses_tool_result_as_source",
+    "latest smell_verify tool result" in continue_resume_prompt,
+)
+check_true(
+    "continue_prompt_does_not_duplicate_mutable_details",
+    "SECRET" not in continue_resume_prompt
+    and "BUILD_FAILED" not in continue_resume_prompt
+    and "test API migrations" not in continue_resume_prompt,
+)
 check("buildenv_mutation_status_removed", hasattr(R, "_record_buildenv_mutation"), False)
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -906,6 +925,20 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
     )
     check("zero_verify_first_process_rc", first_rc, 0)
     check("zero_verify_first_process_session", first_session, "ses_zero_verify")
+    first_manifest = json.loads(
+        (artifacts / "message-manifest.json").read_text(encoding="utf-8")
+    )
+    check("initial_message_provenance", first_manifest["provenance"], "user_command")
+    check(
+        "initial_user_parts_not_mutated",
+        first_manifest["user_parts_mutated_by_plugin"],
+        False,
+    )
+    check_true(
+        "initial_raw_user_input_audited",
+        (artifacts / "raw-user-input.txt").is_file()
+        and bool(first_manifest["raw_user_input"]["sha256"]),
+    )
     second_rc, second_session = R._run_opencode(
         handoff_sample,
         artifacts,
@@ -922,6 +955,19 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
     )
     check("zero_verify_second_process_receives_state", second_rc, 0)
     check("zero_verify_second_process_session", second_session, "ses_zero_verify")
+    second_manifest = json.loads(
+        (artifacts / "message-manifest.json.continue-1").read_text(encoding="utf-8")
+    )
+    check("resume_message_provenance", second_manifest["provenance"], "controller_resume")
+    check_true(
+        "resume_context_excludes_mutable_fields",
+        "loop_instruction"
+        in json.loads(
+            (artifacts / "controller-context.json.continue-1").read_text(
+                encoding="utf-8"
+            )
+        )["excluded_mutable_fields"],
+    )
 
 allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
 allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")

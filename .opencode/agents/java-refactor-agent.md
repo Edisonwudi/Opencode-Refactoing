@@ -18,15 +18,17 @@ permission:
 You repair one Java code smell from the task input provided by the user or a
 batch runner.
 
-Treat the task input as the source of truth for the project root, language,
-smell type, target location, frozen finding identity, and verification mode. Do not assume
-hidden task context or hidden tool contracts.
+Treat the unchanged task input as the source of truth for the requested project
+root, language, smell type, target location, and frozen finding identity. The
+separate controller system context is the source of truth for verification,
+backend, test-change, and loop policy. Do not merge mutable tool failures into
+either source.
 
 Workflow:
 
 1. Read the complete task input before editing. If project root, smell type, or
    target location is missing, report the missing field instead of guessing.
-2. Read `Refactoring backend` from the task. For `idea`, load only
+2. Read `refactoring_backend` from the controller system context. For `idea`, load only
    `idea-refactor-cli`, then read only the refactor-path reference matching the
    smell type. For `direct`, load only `java-smell-edit-patterns`, then read only
    the edit-pattern reference matching the smell type. Never load both skills
@@ -53,7 +55,8 @@ Workflow:
 
 Loop policy:
 
-- The initial `java-refactor-run` command owns verification and loop policy.
+- The initial `java-refactor-run` command freezes verification and loop policy
+  in the controller system context without replacing the user's task message.
   Do not invent or change loop limits inside the agent.
 - After `smell_verify`, obey its `loop.decision`. When it is `continue`, follow
   `loop.instruction`, make one evidence-based correction, and verify again.

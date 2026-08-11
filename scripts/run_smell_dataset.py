@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -743,6 +744,56 @@ def _attempt_artifact_path(sample_dir: Path, name: str, attempt_suffix: str) -> 
     return sample_dir / f"{name}{attempt_suffix}"
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _controller_context_manifest(
+    command_loop_state: dict[str, Any] | None,
+    refactoring_backend: str,
+) -> dict[str, Any]:
+    state = command_loop_state if isinstance(command_loop_state, dict) else {}
+    policy = state.get("policy") if isinstance(state.get("policy"), dict) else {}
+    loop = policy.get("loop") if isinstance(policy.get("loop"), dict) else {}
+    identity = policy.get("identity") if isinstance(policy.get("identity"), dict) else {}
+    return {
+        "schema_version": 1,
+        "source": "controller_command_state",
+        "identity": {
+            key: identity.get(key)
+            for key in ("project_root", "language", "smell", "location")
+        },
+        "policy": {
+            "verification_mode": policy.get("verification_mode"),
+            "allow_test_changes": policy.get("allow_test_changes"),
+            "refactoring_backend": refactoring_backend,
+            "checkpoint_required": policy.get("checkpoint_required"),
+            "loop_mode": loop.get("mode"),
+            "max_continuations": loop.get("max_continuations"),
+            "no_progress_limit": loop.get("no_progress_limit"),
+            "allowed_failure_groups": loop.get("allowed_failure_groups"),
+            "sample_deadline_seconds": loop.get("sample_deadline_seconds"),
+        },
+        "excluded_mutable_fields": [
+            "continuation_count",
+            "failure_category",
+            "failure_pack",
+            "loop_instruction",
+            "next_action",
+        ],
+    }
+
+
+def _append_synthetic_message_event(sample_dir: Path, event: dict[str, Any]) -> None:
+    path = sample_dir / "synthetic-events.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+
+
 def _task_prompt(
     sample: Sample,
     args: argparse.Namespace,
@@ -1226,31 +1277,25 @@ def _runner_continuation_prompt(
     instruction: str,
     *,
     allow_test_changes: bool = False,
+    failure_category: str = "",
 ) -> str:
-    test_policy = (
-        "Necessary test API migrations are allowed, but do not weaken or remove assertions; "
-        "the full project build/test contract must still pass."
-        if allow_test_changes
-        else "Do not modify or weaken tests."
-    )
+    # Policy and failure details already live in the stable controller context
+    # and latest smell_verify result. This message only resumes transport.
+    _ = instruction, allow_test_changes, failure_category
     if action == "verify_required":
         return "\n".join(
             [
-                "[runner-verification-closure verify-required]",
-                "The previous turn ended without a completed smell_verify call.",
-                "Call smell_verify now on the current production-code changes.",
-                "Treat its loop.decision as authoritative.",
-                test_policy,
+                "[runner-resume verify-required]",
+                "Resume the existing task in this session and call smell_verify now.",
+                "The controller policy is unchanged; use the current source state.",
             ]
         )
     return "\n".join(
         [
-            f"[runner-verification-closure continue {continuation}/{max_continuations}]",
-            "The previous smell_verify result requested another corrective iteration.",
-            instruction,
-            "Continue the same task in this session, then call smell_verify again.",
-            "Use the latest failure pack and remaining-occurrence evidence as the repair scope.",
-            test_policy,
+            f"[runner-resume continue {continuation}/{max_continuations}]",
+            "Resume the existing task in this session.",
+            "Read the latest smell_verify tool result and follow its loop.instruction.",
+            "After one narrow corrective edit, call smell_verify again.",
         ]
     )
 
@@ -1304,6 +1349,30 @@ def _run_opencode(
     stdin_payload = continuation_prompt if session_id else command_arguments
     task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
     task_path.write_text(stdin_payload + "\n", encoding="utf-8")
+    raw_input_path = _attempt_artifact_path(sample_dir, "raw-user-input.txt", attempt_suffix)
+    raw_input_path.write_text(stdin_payload, encoding="utf-8")
+    controller_source_path = _attempt_artifact_path(
+        sample_dir, "controller-context.json", attempt_suffix
+    )
+    controller_source_path.write_text(
+        json.dumps(
+            _controller_context_manifest(
+                command_loop_state,
+                getattr(args, "refactoring_backend", "direct"),
+            ),
+            indent=2,
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    controller_system_path = _attempt_artifact_path(
+        sample_dir, "controller-system.txt", attempt_suffix
+    )
+    message_manifest_path = _attempt_artifact_path(
+        sample_dir, "message-manifest.json", attempt_suffix
+    )
 
     env = os.environ.copy()
     env.update(_prepare_opencode_home(sample_dir))
@@ -1339,6 +1408,12 @@ def _run_opencode(
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
     refactoring_backend = getattr(args, "refactoring_backend", "direct")
     env["SMELL_REFACTORING_BACKEND"] = refactoring_backend
+    baseline_context_path = sample_dir / "baseline-capture.json"
+    if baseline_context_path.is_file():
+        env["SMELL_BASELINE_CONTEXT_FILE"] = str(baseline_context_path)
+    else:
+        env.pop("SMELL_BASELINE_CONTEXT_FILE", None)
+    env["SMELL_CONTROLLER_CONTEXT_AUDIT_FILE"] = str(controller_system_path)
     if refactoring_backend == "idea":
         env["SMELL_ENABLE_IDEA_TOOLS"] = "1"
         env["SMELL_IDEA_PREPARED"] = "1"
@@ -1487,6 +1562,36 @@ def _run_opencode(
                 detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
             except OSError:
                 pass
+        message_manifest = {
+            "schema_version": 1,
+            "provenance": "controller_resume" if session_id else "user_command",
+            "session_id_requested": session_id,
+            "session_id_observed": detected_sid or session_id,
+            "user_parts_mutated_by_plugin": False,
+            "raw_user_input": {
+                "path": str(raw_input_path),
+                "bytes": raw_input_path.stat().st_size,
+                "sha256": _sha256_file(raw_input_path),
+            },
+            "controller_context_source": {
+                "path": str(controller_source_path),
+                "sha256": _sha256_file(controller_source_path),
+            },
+            "controller_system_context": {
+                "path": str(controller_system_path),
+                "captured": controller_system_path.is_file(),
+                "sha256": (
+                    _sha256_file(controller_system_path)
+                    if controller_system_path.is_file()
+                    else ""
+                ),
+            },
+        }
+        message_manifest_path.write_text(
+            json.dumps(message_manifest, indent=2, ensure_ascii=True, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
         return rc, detected_sid or session_id
 
 
@@ -1897,6 +2002,21 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             args.loop_max,
             args.loop_instruction,
             allow_test_changes=bool(getattr(args, "allow_test_changes", False)),
+            failure_category=str(trace.get("last_failure_category") or ""),
+        )
+        _append_synthetic_message_event(
+            sample_dir,
+            {
+                "schema_version": 1,
+                "source": "batch_runner",
+                "provenance": "controller_resume",
+                "action": action,
+                "session_id": session_id,
+                "from_attempt": attempt_index,
+                "to_attempt": attempt_index + 1,
+                "continuation": continuations_dispatched,
+                "details_source": "latest_smell_verify_tool_result",
+            },
         )
         attempt_index += 1
 

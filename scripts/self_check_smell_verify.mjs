@@ -1814,8 +1814,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("unified_budget_stop_calls", calls.length, 3, "calls")
   }
 
-  // The source-derived detector plan is rendered before compact highlights;
-  // it is not lost behind the three-highlight continuation cap.
+  // Mutable repair details stay in the tool result rather than being copied
+  // into a second, potentially stale user message.
   {
     const { client, calls } = makeFakeClient()
     const rt = hooks.createIdleContinueRuntime({ client })
@@ -1824,9 +1824,10 @@ async function runIdleContinueSelfCheck(pluginModule) {
     rt.handleIdle("precise-next")
     await flush()
     assertCond(
-      "unified_precise_next_action",
-      calls[0].body.parts[0].text.includes(`Required next action: ${required}`),
-      "source-derived next action missing from continuation prompt",
+      "unified_latest_tool_result_is_single_source",
+      !calls[0].body.parts[0].text.includes(required)
+        && calls[0].body.parts[0].text.includes("latest smell_verify tool result"),
+      "continuation prompt duplicated mutable next-action evidence",
     )
   }
 
@@ -1863,7 +1864,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("verify_required_initial_calls", calls.length, 1, "calls")
     assertCond(
       "verify_required_initial_text",
-      calls[0].body.parts[0].text.includes("No smell_verify call has completed"),
+      calls[0].body.parts[0].text.includes("call smell_verify now")
+        && calls[0].body.parts[0].text.includes("verify-required/initial"),
       "initial reminder text missing",
     )
     assertEqual("verify_required_initial_once", rt.handleIdle("initial"), false, "dispatch")
@@ -1883,7 +1885,8 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertEqual("verify_required_after_continuation_calls", calls.length, 2, "calls")
     assertCond(
       "verify_required_after_continuation_text",
-      calls[1].body.parts[0].text.includes("corrective continuation ended without a new smell_verify"),
+      calls[1].body.parts[0].text.includes("call smell_verify now")
+        && calls[1].body.parts[0].text.includes("verify-required/continuation"),
       "continuation reminder text missing",
     )
     assertEqual("verify_required_after_continuation_once", rt.handleIdle("after-continuation"), false, "dispatch")
@@ -1990,7 +1993,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual("command_decision_continue", firstPayload.loop.decision, "continue", "decision")
   assertEqual("command_decision_count", firstPayload.loop.continuation, 1, "continuation")
   assertEqual("command_decision_instruction", firstPayload.loop.instruction, "repair narrowly", "instruction")
-  const routeLockedPrompt = hooks.commandPolicyPrompt({
+  const routeLockedPrompt = hooks.commandControllerSystemContext({
     ...state.policy,
     task: [
       "Project root: /tmp/project",
@@ -2001,7 +2004,8 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   })
   assertCond(
     "command_prompt_ignores_dataset_route_lock",
-    !routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
+    !routeLockedPrompt.includes("Smell evidence: parents=Packet")
+      && !routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
       && routeLockedPrompt.includes("Baseline capture must uniquely confirm the requested smell at the supplied target")
       && routeLockedPrompt.includes("context selects the entity but never supplies a verdict"),
     "dataset route metadata entered the command contract",
@@ -2063,7 +2067,9 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     "checkpoint_target_identity_data_clumps_product_contract",
     dataClumpsContractPrompt.includes("int:x|string:y|boolean:z")
       && dataClumpsContractPrompt.includes("migrate-semantic-occurrence-component")
-      && dataClumpsContractPrompt.includes("remove every old-group wrapper"),
+      && dataClumpsContractPrompt.includes("retain the old parameter group in a wrapper")
+      && !dataClumpsContractPrompt.includes("remove every old-group wrapper")
+      && dataClumpsContractPrompt.includes("latest smell_verify tool result"),
     "data-clumps product contract missing from prompt",
   )
   assertEqual(
@@ -2273,6 +2279,10 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       if (typeof commandHook !== "function") {
         throw new SelfCheckError("command_policy_hook", "command.execute.before hook was not registered.", {})
       }
+      const systemHook = plugin?.["experimental.chat.system.transform"]
+      if (typeof systemHook !== "function") {
+        throw new SelfCheckError("controller_system_hook", "experimental.chat.system.transform hook was not registered.", {})
+      }
       try {
         await smellVerify.execute(
           {
@@ -2293,6 +2303,9 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         )
       }
       const commandOutput = { parts: [{ type: "text", text: "placeholder" }] }
+      const originalCommandParts = JSON.stringify(commandOutput.parts)
+      const controllerAuditFile = path.join(tempRoot, "controller-system.txt")
+      process.env.SMELL_CONTROLLER_CONTEXT_AUDIT_FILE = controllerAuditFile
       await commandHook(
         {
           command: "java-refactor-run",
@@ -2302,10 +2315,47 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         commandOutput,
       )
       assertCond(
-        "command_policy_prompt",
-        String(commandOutput.parts?.[0]?.text || "").includes("Controller-owned verification and loop policy"),
-        "command hook must inject canonical policy",
+        "command_preserves_user_parts",
+        JSON.stringify(commandOutput.parts) === originalCommandParts,
+        "command hook mutated the command-expanded user message",
       )
+      const systemOutput = { system: ["base-system-context"] }
+      await systemHook(
+        { sessionID: "command-policy-self-check", model: {} },
+        systemOutput,
+      )
+      const controllerContexts = systemOutput.system.filter((item) =>
+        item.includes('<smell-controller-context schema="1">')
+      )
+      assertEqual("controller_system_context_once", controllerContexts.length, 1, "context count")
+      assertCond(
+        "controller_system_context_separate",
+        systemOutput.system[0] === "base-system-context"
+          && controllerContexts[0].includes("Controller-owned verification, identity, and loop policy")
+          && !controllerContexts[0].includes("Sample test command:"),
+        "stable controller context was not appended separately",
+      )
+      const frozenControllerContext = controllerContexts[0]
+      assertEqual(
+        "controller_system_context_audited",
+        await readFile(controllerAuditFile, "utf8"),
+        `${frozenControllerContext}\n`,
+        "audit contents",
+      )
+      await systemHook(
+        { sessionID: "command-policy-self-check", model: {} },
+        systemOutput,
+      )
+      assertEqual(
+        "controller_system_context_deduplicated",
+        systemOutput.system.filter((item) => item === frozenControllerContext).length,
+        1,
+        "context count",
+      )
+      const unrelatedSystemOutput = { system: ["base-system-context"] }
+      await systemHook({ sessionID: "unowned-system-self-check", model: {} }, unrelatedSystemOutput)
+      assertEqual("unowned_system_context_unchanged", unrelatedSystemOutput.system.length, 1, "system count")
+      delete process.env.SMELL_CONTROLLER_CONTEXT_AUDIT_FILE
       const sealProbe = await run(
         "python3",
         [
@@ -2364,6 +2414,17 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         "EDIT_REQUIRED",
         "checkpoint reason",
       )
+      const afterFailureSystemOutput = { system: [] }
+      await systemHook(
+        { sessionID: "command-policy-self-check", model: {} },
+        afterFailureSystemOutput,
+      )
+      assertEqual(
+        "controller_system_context_stable_after_failure",
+        afterFailureSystemOutput.system[0],
+        frozenControllerContext,
+        "controller context",
+      )
       await writeFile(
         path.join(fixtureRoot, "src", "main", "java", "SelfCheckSample.java"),
         [
@@ -2389,6 +2450,13 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       // the exact controller-owned transfer state used by the runner.
       const batchCommandState = JSON.parse(JSON.stringify(serializedCommandState))
       batchCommandState.policy.identity.language = "java"
+      batchCommandState.target_identity_context = ""
+      const baselineContextFile = path.join(tempRoot, "baseline-capture.json")
+      await writeFile(
+        baselineContextFile,
+        JSON.stringify({ payload: parseJson("controller_baseline_context", sealProbe.stdout) }),
+        "utf8",
+      )
 
       Object.assign(process.env, {
         SMELL_PROJECT_ROOT: fixtureRoot,
@@ -2397,6 +2465,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         SMELL_LOCATION: "src/main/java/SelfCheckSample.java:2",
         SMELL_VERIFICATION_MODE: "project_full",
         SMELL_SAMPLE_TEST_COMMAND: sampleTestCommand,
+        SMELL_BASELINE_CONTEXT_FILE: baselineContextFile,
       })
       delete process.env.SMELL_BASELINE_SEAL
       delete process.env.SMELL_COMMAND_LOOP_STATE_JSON
@@ -2454,6 +2523,17 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       }
       process.env.SMELL_BASELINE_SEAL = controllerSeal
       const reloadedWithSeal = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      const restoredSystemOutput = { system: [] }
+      await reloadedWithSeal["experimental.chat.system.transform"](
+        { sessionID: "batch-reload-with-seal", model: {} },
+        restoredSystemOutput,
+      )
+      assertCond(
+        "batch_reload_restores_stable_system_context",
+        restoredSystemOutput.system[0].includes("Frozen target:")
+          && !restoredSystemOutput.system[0].includes(batchCommandState.policy.loop.instruction),
+        "batch restart did not hydrate stable target context without copying mutable loop instruction",
+      )
       const reloadedResult = await reloadedWithSeal.tool.smell_verify.execute(verifyArgs, {
         sessionID: "batch-reload-with-seal",
         agent: "java-refactor-agent",
@@ -2471,6 +2551,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         "SMELL_VERIFICATION_MODE",
         "SMELL_COMMAND_LOOP_STATE_JSON",
         "SMELL_BASELINE_SEAL",
+        "SMELL_BASELINE_CONTEXT_FILE",
       ]) delete process.env[key]
       const normalizeUnit = await runPluginNormalizeSelfCheck(pluginModule)
       const failureIntegration = await runPluginFailureIntegrationSelfCheck(smellVerify)

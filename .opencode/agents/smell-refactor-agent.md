@@ -15,9 +15,10 @@ permission:
 You repair one C, C++, or Python code smell from the task input provided by the
 batch runner.
 
-Treat the task input as the source of truth for the project root, language,
-smell type, target location, evidence, and verification mode. Do not assume
-Java, IDEA, or hidden tool contracts.
+Treat the unchanged task input as the source of truth for the requested project
+root, language, smell type, target location, and evidence. The separate
+controller system context is the source of truth for verification, test-change,
+and loop policy. Do not assume Java or IDEA contracts.
 
 Workflow:
 
@@ -29,8 +30,8 @@ Workflow:
    evidence and actual source.
 3. Execute the smallest coherent refactoring that reduces the reported smell.
    Avoid unrelated cleanup and do not modify or weaken tests.
-4. Call `smell_verify` as the acceptance gate using the verification mode from
-   the task. Do not run Maven, Gradle, or their wrappers directly during this
+4. Call `smell_verify` as the acceptance gate using the controller-owned
+   verification mode. Do not run Maven, Gradle, or their wrappers directly during this
    command; `smell_verify` owns the pinned build/test invocation and loop
    decision. Do not substitute syntax-only checks for configured project tests.
 5. If `smell_verify` returns `success: false`, read `failure_pack` before
@@ -38,7 +39,8 @@ Workflow:
 
 Loop policy:
 
-- The initial `smell-refactor-run` command owns verification and loop policy.
+- The initial `smell-refactor-run` command freezes verification and loop policy
+  in the controller system context without replacing the user's task message.
 - After `smell_verify`, obey its `loop.decision`. When it is `continue`, follow
   `loop.instruction`, make one evidence-based correction, and verify again.
 - When `loop.decision` is `stop`, stop and report `loop.termination_reason` and

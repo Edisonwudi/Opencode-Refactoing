@@ -343,6 +343,17 @@ checkpoint 只保留作诊断证据，`restorable=false`。
 /java-refactor-run --verification-mode=sample_optimized --loop-max=2 -- Project root: /abs/java-project; Smell type: long_method; Target location: src/main/java/Foo.java:42
 ```
 
+command 展开后的用户消息会原样保留；plugin 不再重写 `output.parts`。解析出的
+验证模式、目标身份、测试修改策略、backend 与 loop 上限通过独立且稳定的
+controller system context 注入。失败类别、`failure_pack`、`next_action` 和
+`loop.instruction` 只以最新一次 `smell_verify` 工具结果为准，自动续跑消息仅恢复
+同一 session 并提示重新验证，不复制这些可变内容。
+
+批量运行会按 attempt 保存 `raw-user-input.txt*`、`controller-context.json*`、
+`controller-system.txt*` 与 `message-manifest.json*`；`synthetic-events.jsonl`
+单独记录 runner 注入的恢复消息。由此可以分别核对原始输入、稳定控制上下文和
+合成消息 provenance。
+
 Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_full`、
 `--allow-test-changes`（默认关闭并冻结到 c000；启用时必须使用
 `project_full`）、

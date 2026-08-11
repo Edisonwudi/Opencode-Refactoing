@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
-import { existsSync, readdirSync } from "node:fs"
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
 type BridgeResult = {
@@ -110,6 +110,7 @@ type CommandIdentityBinding = {
 
 type CommandLoopState = {
   policy: CommandPolicy
+  targetIdentityContext: string
   startedAt: number
   continuationCount: number
   capRecoveryUsed: boolean
@@ -119,6 +120,8 @@ type CommandLoopState = {
 
 const COMMAND_LOOP_STATE_VERSION = 3
 const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
+const BASELINE_CONTEXT_FILE_ENV = "SMELL_BASELINE_CONTEXT_FILE"
+const CONTROLLER_CONTEXT_AUDIT_FILE_ENV = "SMELL_CONTROLLER_CONTEXT_AUDIT_FILE"
 
 const pluginFile = fileURLToPath(import.meta.url)
 const pluginRoot = path.resolve(path.dirname(pluginFile), "..", "..")
@@ -459,64 +462,19 @@ function makeTaskKey(projectRoot: string, smell: string, location: string): stri
 }
 
 function buildContinuationMessage(state: ContinuationState): string {
-  const lines: string[] = []
-  lines.push(`${SMELL_IDLE_CONTINUE_PREFIX} ${state.continuation}/${state.maxContinuations}]`)
-  lines.push("")
-  lines.push("The previous smell_verify result was not accepted.")
-  lines.push(`Status: ${state.verifyStatus || "FAILED"}.`)
-  lines.push(`Failure category: ${state.failureCategory || "UNKNOWN"}.`)
-  lines.push("")
-  if (state.nextAction) {
-    const redacted = redactSecrets(state.nextAction)
-    const trimmed = redacted.length > 700 ? `${redacted.slice(0, 700)}...` : redacted
-    lines.push(`Required next action: ${trimmed}`)
-    lines.push("")
-  }
-  const highlights = state.failureHighlights.slice(0, 3)
-  if (highlights.length) {
-    lines.push("Failure highlights:")
-    for (const h of highlights) {
-      const redacted = redactSecrets(h)
-      const trimmed = redacted.length > 200 ? `${redacted.slice(0, 200)}...` : redacted
-      lines.push(`- ${trimmed}`)
-    }
-    lines.push("")
-  }
-  const paths = state.artifactPaths.slice(0, 3)
-  if (paths.length) {
-    lines.push("Artifact paths:")
-    for (const p of paths) lines.push(`- ${redactSecrets(p)}`)
-    lines.push("")
-  }
-  lines.push(state.instruction || "Read the latest failure_pack and make one narrow corrective edit.")
-  lines.push("Then call smell_verify again. Do not repeat the previous edit without new evidence.")
-  lines.push(
-    state.allowTestChanges
-      ? "Necessary test API migrations are allowed, but do not weaken or remove assertions; the full project build/test contract must still pass."
-      : "Do not modify or weaken tests.",
-  )
-  let message = lines.join("\n")
-  // Hard cap near 2 KB to keep the synthetic message small.
-  const MAX_MSG = 2048
-  if (message.length > MAX_MSG) {
-    message = `${message.slice(0, MAX_MSG - 32)}\n...[truncated]`
-  }
-  return message
+  return [
+    `${SMELL_IDLE_CONTINUE_PREFIX} ${state.continuation}/${state.maxContinuations}]`,
+    "Resume the existing task in this session.",
+    "Read the latest smell_verify tool result and follow its loop.instruction.",
+    "After one narrow corrective edit, call smell_verify again.",
+  ].join("\n")
 }
 
 function buildVerifyRequiredMessage(state: ContinuationState): string {
-  const reason = state.awaitingVerifyReason === "continuation"
-    ? "The previous corrective continuation ended without a new smell_verify result."
-    : "No smell_verify call has completed for this refactoring task."
   return [
-    `${SMELL_IDLE_CONTINUE_PREFIX} verify-required/${state.generation}]`,
-    "",
-    reason,
-    "Call smell_verify now on the current production-Java changes.",
-    "Treat its loop.decision as authoritative: continue only when instructed, otherwise stop.",
-    state.allowTestChanges
-      ? "Necessary test API migrations are allowed, but do not weaken or remove assertions; the full project build/test contract must still pass."
-      : "Do not modify or weaken tests.",
+    `${SMELL_IDLE_CONTINUE_PREFIX} verify-required/${state.awaitingVerifyReason}/${state.generation}]`,
+    "Resume the existing task in this session and call smell_verify now.",
+    "The controller policy is unchanged; use the current source state.",
   ].join("\n")
 }
 
@@ -2078,10 +2036,6 @@ function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, u
     .slice(0, 10)
     .map(([key, value]) => `${key}=${String(value)}`)
     .join(", ")
-  const worklist = Array.isArray(plan?.worklist) ? plan!.worklist.slice(0, 8) : []
-  const remainingWork = Number(plan?.remaining_work_count)
-  const hasRemainingCount = Number.isFinite(remainingWork) && remainingWork >= 0
-  const worklistComplete = plan?.worklist_complete === true
   const forbidden = asStringArray(plan?.forbidden).slice(0, 4)
   const lines = [
     "",
@@ -2089,38 +2043,39 @@ function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, u
     `- Smell: ${smell}.`,
     `- Frozen target: ${identity || String(guardContract?.target_id || guardContract?.finding_id || "the unique target at the supplied location")}.`,
     `- Route family: ${String(plan?.route_family || "close-frozen-finding")}.`,
-    `- Remaining target-scope entities: ${hasRemainingCount ? remainingWork : "unknown"}.`,
-    `- Required first action: ${String(plan?.next_action || "resolve the frozen target smell")}.`,
   ]
-  if (worklist.length) {
-    lines.push(`- Priority worklist${worklistComplete ? "" : " (bounded details remain in guard-evidence.json)"}:`)
-    for (const item of worklist) lines.push(`  - ${safeJsonStringify(item)}`)
-  }
   if (forbidden.length) {
     lines.push("- Forbidden pseudo-fixes:")
     for (const item of forbidden) lines.push(`  - ${item}`)
   }
   lines.push("- The frozen target Guard and build/test result are the acceptance authority; do not scan or rewrite unrelated sources.")
+  lines.push("- Read mutable remaining counts, worklists, and next actions only from the latest smell_verify tool result.")
   return lines.join("\n")
 }
 
-function commandPolicyPrompt(policy: CommandPolicy, targetIdentityPrompt: string = ""): string {
+function commandControllerSystemContext(
+  policy: CommandPolicy,
+  targetIdentityContext: string = "",
+  refactoringBackend: string = "direct",
+): string {
   const allowed = policy.loop.allowed_failure_groups.join(", ") || "none"
+  const backend = refactoringBackend === "idea" ? "idea" : "direct"
   const lines = [
-    policy.task,
-    "",
-    "Controller-owned verification and loop policy:",
+    '<smell-controller-context schema="1">',
+    "This stable controller context supplements the original user message; it does not replace it.",
+    "Controller-owned verification, identity, and loop policy:",
+    "- target_identity: frozen from the original user message and enforced by the controller.",
     `- verification_mode: ${policy.verification_mode}`,
     `- allow_test_changes: ${policy.allow_test_changes}`,
+    `- refactoring_backend: ${backend}`,
     `- loop_mode: ${policy.loop.mode}`,
     `- max_continuations: ${policy.loop.max_continuations}`,
     `- no_progress_limit: ${policy.loop.no_progress_limit}`,
     `- allowed_failure_groups: ${allowed}`,
     `- sample_deadline_seconds: ${policy.loop.sample_deadline_seconds}`,
-    `- continuation_instruction: ${policy.loop.instruction}`,
     "",
     "Call smell_verify as the acceptance gate. Its loop.decision field is authoritative.",
-    "When loop.decision is continue, follow loop.instruction and call smell_verify again.",
+    "When loop.decision is continue, read loop.instruction from that tool result and call smell_verify again.",
     "When loop.decision is stop, stop and report loop.termination_reason.",
   ]
   lines.push(
@@ -2137,12 +2092,24 @@ function commandPolicyPrompt(policy: CommandPolicy, targetIdentityPrompt: string
       "- A decreased metric is IMPROVED only. PASS requires the frozen target smell to disappear plus structural and build/test preservation.",
     )
   }
-  return `${lines.join("\n")}${targetIdentityPrompt}`
+  if (backend === "idea") {
+    lines.push(
+      "",
+      "IDEA refactoring backend contract:",
+      "- Load only idea-refactor-cli for the smell-specific route.",
+      "- Use the controller-enabled IDEA tools, then call smell_verify.",
+      "- Do not invoke the underlying idea-refactor CLI through bash or use OpenCode edit/write tools.",
+    )
+  }
+  if (targetIdentityContext) lines.push(targetIdentityContext)
+  lines.push("</smell-controller-context>")
+  return lines.join("\n")
 }
 
-function newCommandLoopState(policy: CommandPolicy): CommandLoopState {
+function newCommandLoopState(policy: CommandPolicy, targetIdentityContext: string = ""): CommandLoopState {
   return {
     policy,
+    targetIdentityContext,
     startedAt: Date.now(),
     continuationCount: 0,
     capRecoveryUsed: false,
@@ -2161,6 +2128,7 @@ function commandLoopStateSnapshot(state: CommandLoopState): Record<string, unkno
       // event or runner handoff.
       task: "Continue the current smell refactoring task.",
     },
+    target_identity_context: state.targetIdentityContext,
     started_at: state.startedAt,
     continuation_count: state.continuationCount,
     cap_recovery_used: state.capRecoveryUsed,
@@ -2179,6 +2147,9 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
     const startedAt = Number(parsed.started_at)
     const continuationCount = Number(parsed.continuation_count)
     const noProgressCount = Number(parsed.no_progress_count)
+    const targetIdentityContext = parsed.target_identity_context === undefined
+      ? ""
+      : parsed.target_identity_context
     if (
       !Number.isFinite(startedAt)
       || !Number.isInteger(continuationCount)
@@ -2188,9 +2159,12 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
       || noProgressCount < 0
       || typeof parsed.cap_recovery_used !== "boolean"
       || typeof parsed.last_failure_fingerprint !== "string"
+      || typeof targetIdentityContext !== "string"
+      || targetIdentityContext.length > 32768
     ) return undefined
     return {
       policy,
+      targetIdentityContext,
       startedAt,
       continuationCount,
       capRecoveryUsed: parsed.cap_recovery_used,
@@ -2199,6 +2173,24 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
     }
   } catch {
     return undefined
+  }
+}
+
+function checkpointTargetIdentityContextFromFile(smell: string, file: string | undefined): string {
+  if (!file) return ""
+  const parsed = recordValue(JSON.parse(readFileSync(file, "utf8")))
+  const payload = recordValue(parsed?.payload) || parsed
+  return checkpointTargetIdentityPrompt(smell, payload)
+}
+
+function writeControllerContextAudit(context: string, file: string | undefined): void {
+  if (!file) return
+  const contents = `${context}\n`
+  try {
+    writeFileSync(file, contents, { encoding: "utf8", flag: "wx" })
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code
+    if (code !== "EEXIST" || readFileSync(file, "utf8") !== contents) throw error
   }
 }
 
@@ -2374,6 +2366,26 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const ideaToolsEnabled = refactoringBackend === "idea" && process.env.SMELL_ENABLE_IDEA_TOOLS === "1"
   const commandLoopStates = new Map<string, CommandLoopState>()
   const commandBaselineSeals = new Map<string, string>()
+  const restoreBatchCommandState = (sessionID: string): CommandLoopState | undefined => {
+    if (!sessionID) return undefined
+    const existing = commandLoopStates.get(sessionID)
+    if (existing) return existing
+    const serializedState = process.env[COMMAND_LOOP_STATE_ENV]
+    if (!serializedState) return undefined
+    const restored = restoreCommandLoopState(serializedState)
+    if (!restored) {
+      throw new Error(`COMMAND_POLICY_STATE_INVALID: ${COMMAND_LOOP_STATE_ENV} failed schema validation`)
+    }
+    assertRestoredCommandIdentity(restored.policy)
+    if (!restored.targetIdentityContext && restored.policy.checkpoint_required) {
+      restored.targetIdentityContext = checkpointTargetIdentityContextFromFile(
+        restored.policy.identity.smell,
+        envDefault(BASELINE_CONTEXT_FILE_ENV),
+      )
+    }
+    commandLoopStates.set(sessionID, restored)
+    return restored
+  }
   const commonShape = {
     projectRoot: tool.schema.string().describe("Absolute path to the source project root."),
     language: tool.schema
@@ -2414,19 +2426,13 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const sessionID = context?.sessionID || ""
         let commandState = commandLoopStates.get(sessionID)
         if (!commandState && sessionID) {
-          const serializedState = process.env[COMMAND_LOOP_STATE_ENV]
-          if (!serializedState) {
+          commandState = restoreBatchCommandState(sessionID)
+          if (!commandState) {
             throw new Error(
               "COMMAND_POLICY_STATE_MISSING: smell_verify requires command-owned state or "
               + `${COMMAND_LOOP_STATE_ENV} from the controller`,
             )
           }
-          commandState = restoreCommandLoopState(serializedState)
-          if (!commandState) {
-            throw new Error(`COMMAND_POLICY_STATE_INVALID: ${COMMAND_LOOP_STATE_ENV} failed schema validation`)
-          }
-          assertRestoredCommandIdentity(commandState.policy)
-          commandLoopStates.set(sessionID, commandState)
         }
         const controllerIdentity = commandState
           ? controllerIdentityFromPolicy(commandState.policy)
@@ -2713,7 +2719,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       }
     },
 
-    "command.execute.before": async (input, output) => {
+    "command.execute.before": async (input, _output) => {
       if (
         input.command !== "smell-refactor-run" &&
         input.command !== "java-refactor-run"
@@ -2753,7 +2759,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         commandBaselineSeals.set(input.sessionID, baselineSeal)
         targetIdentityPrompt = checkpointTargetIdentityPrompt(identity.smell, baselinePayload)
       }
-      commandLoopStates.set(input.sessionID, newCommandLoopState(policy))
+      commandLoopStates.set(input.sessionID, newCommandLoopState(policy, targetIdentityPrompt))
       idleRuntime.clearSession(input.sessionID)
       idleRuntime.armInitialVerification({
         sessionID: input.sessionID,
@@ -2766,18 +2772,20 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         instruction: policy.loop.instruction,
         allowTestChanges: policy.allow_test_changes,
       })
-      let prompt = commandPolicyPrompt(policy, targetIdentityPrompt)
-      if (ideaToolsEnabled && input.command === "java-refactor-run") {
-        prompt += [
-          "",
-          "Controller-owned refactoring backend: idea",
-          "- Load only idea-refactor-cli for the smell-specific route.",
-          "- Use real idea_refactor_preview and idea_refactor_apply tool calls, then smell_verify.",
-          "- Reuse proposalId and nextRequest exactly; do not invoke idea-refactor through bash.",
-          "- OpenCode edit/write tools are disabled in this backend.",
-        ].join("\n")
-      }
-      output.parts = [{ type: "text", text: prompt }] as typeof output.parts
+    },
+
+    "experimental.chat.system.transform": async (input, output) => {
+      const sessionID = typeof input.sessionID === "string" ? input.sessionID : ""
+      if (!sessionID) return
+      const state = commandLoopStates.get(sessionID) || restoreBatchCommandState(sessionID)
+      if (!state) return
+      const context = commandControllerSystemContext(
+        state.policy,
+        state.targetIdentityContext,
+        refactoringBackend,
+      )
+      if (!output.system.includes(context)) output.system.push(context)
+      writeControllerContextAudit(context, envDefault(CONTROLLER_CONTEXT_AUDIT_FILE_ENV))
     },
 
     event: async ({ event }) => {
@@ -2848,7 +2856,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   ideaDecisionsShape,
   parseCommandPolicyResult,
   checkpointTargetIdentityPrompt,
-  commandPolicyPrompt,
+  commandControllerSystemContext,
+  checkpointTargetIdentityContextFromFile,
   newCommandLoopState,
   commandLoopStateSnapshot,
   restoreCommandLoopState,
