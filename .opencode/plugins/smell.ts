@@ -295,6 +295,15 @@ function isJavaSourceIdentity(input: { language?: unknown; location?: unknown })
   return language === "java" || /\.java(?::|\b)/.test(location)
 }
 
+function usesCheapGuardProgressGate(
+  input: { language?: unknown },
+  state: CommandLoopState | undefined,
+): boolean {
+  const language = String(input.language || "").trim().toLowerCase()
+  return state?.policy.checkpoint_required === true
+    && ["python", "c", "cpp"].includes(language)
+}
+
 const MAX_STDOUT_STDERR_LEN = 4000
 
 // --- session.idle command-policy continuation -------------------------------
@@ -309,6 +318,292 @@ const SMELL_IDLE_CONTINUE_PREFIX = "[smell-auto-continue"
 const IDLE_CONTINUE_STATE_TTL_MS = 30 * 60 * 1000
 const DIRECT_BUILD_COMMAND_RE =
   /(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*(?:\.\/)?(?:mvnw|mvn|gradlew|gradle)\b/
+const CAPPED_BUILD_COMMAND_RE =
+  /^((?:(?:(?:[^\s;&|]+\/)?env|command)\s+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|'[^'\n]*'|[^\s;&|]*)\s+)*)(?:[^\s;&|]+\/)?(cmake|gmake|make|ninja)\b(.*)/
+const SHELL_LC_COMMAND_RE =
+  /^((?:(?:(?:[^\s;&|]+\/)?env|command)\s+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|'[^'\n]*'|[^\s;&|]*)\s+)*)(?:[^\s;&|]+\/)?(?:bash|sh)\s+-lc\s+(?:"([^"\n]*)"|'([^'\n]*)')/
+const CMAKE_BUILD_PARALLEL_LEVEL_RE =
+  /(?:^|\s)CMAKE_BUILD_PARALLEL_LEVEL=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s]*))/g
+const SMELL_BUILD_JOBS_ASSIGNMENT_RE =
+  /(?:^|\s)SMELL_BUILD_JOBS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s]*))/g
+const MAKEFLAGS_ASSIGNMENT_RE =
+  /(?:^|\s)MAKEFLAGS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s]*))/g
+const MFLAGS_ASSIGNMENT_RE =
+  /(?:^|\s)MFLAGS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s]*))/g
+const CONTROLLER_BUILD_JOBS_EXPRESSION = "${SMELL_BUILD_JOBS:-1}"
+
+type BuildParallelismViolation = {
+  tool: string
+  requested: number | "unbounded-or-nonliteral"
+}
+
+function controllerBuildJobLimit(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): number | undefined {
+  const raw = String(env.SMELL_BUILD_JOBS || "").trim()
+  if (!/^[1-9][0-9]*$/.test(raw)) return undefined
+  const value = Number(raw)
+  return Number.isSafeInteger(value) ? value : undefined
+}
+
+function isCappedCheckpointBuildSession(state: CommandLoopState | undefined): boolean {
+  if (state?.policy.checkpoint_required !== true) return false
+  const language = String(state.policy.identity.language || "").trim().toLowerCase()
+  return ["python", "c", "cpp", "c++"].includes(language)
+}
+
+function isControllerBuildJobsExpression(value: string): boolean {
+  return value === CONTROLLER_BUILD_JOBS_EXPRESSION
+    || value === `"${CONTROLLER_BUILD_JOBS_EXPRESSION}"`
+    || value === `'${CONTROLLER_BUILD_JOBS_EXPRESSION}'`
+}
+
+function commonHeredocDelimiter(
+  line: string,
+): { delimiter: string; stripTabs: boolean } | undefined {
+  // Recognize only the common literal-delimiter form. Quoted text before the
+  // operator is left untouched instead of turning this into a shell parser.
+  const match = line.match(
+    /^(?:<<|[^'"\n]*[^<]<<)(-)?(?!<)\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))/,
+  )
+  const delimiter = match?.[2] || match?.[3] || match?.[4]
+  return delimiter
+    ? { delimiter, stripTabs: match?.[1] === "-" }
+    : undefined
+}
+
+function withoutCommonHeredocBodies(command: string): string {
+  const lines = command.split("\n")
+  let active: { delimiter: string; stripTabs: boolean } | undefined
+  return lines.map((line) => {
+    if (active) {
+      const comparable = active.stripTabs ? line.replace(/^\t+/, "") : line
+      if (comparable === active.delimiter) active = undefined
+      return ""
+    }
+    active = commonHeredocDelimiter(line)
+    return line
+  }).join("\n")
+}
+
+function executableShellSegments(command: string): string[] {
+  const source = withoutCommonHeredocBodies(command)
+  const segments: string[] = []
+  let current = ""
+  let quote: "'" | "\"" | undefined
+  const pushCurrent = () => {
+    const segment = current.trim()
+    if (segment) segments.push(segment)
+    current = ""
+  }
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index]
+    if (char === "\\" && quote !== "'") {
+      current += char
+      if (index + 1 < source.length) {
+        current += source[index + 1]
+        index += 1
+      }
+      continue
+    }
+    if (quote) {
+      current += char
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === "'" || char === "\"") {
+      quote = char
+      current += char
+      continue
+    }
+    if (char === "#" && (!current || /\s$/.test(current))) {
+      pushCurrent()
+      while (index + 1 < source.length && source[index + 1] !== "\n") index += 1
+      continue
+    }
+    if (char === ";" || char === "&" || char === "|" || char === "\n") {
+      pushCurrent()
+      continue
+    }
+    current += char
+  }
+  pushCurrent()
+  return segments
+}
+
+function requestedParallelismViolation(
+  tool: string,
+  rawValue: string,
+  limit: number,
+): BuildParallelismViolation | undefined {
+  if (isControllerBuildJobsExpression(rawValue)) return undefined
+  const requested = /^[0-9]+$/.test(rawValue) ? Number(rawValue) : 0
+  if (Number.isSafeInteger(requested) && requested >= 1 && requested <= limit) {
+    return undefined
+  }
+  return {
+    tool,
+    requested: requested > 0 && Number.isSafeInteger(requested)
+      ? requested
+      : "unbounded-or-nonliteral",
+  }
+}
+
+function cmakeEnvironmentParallelismViolation(
+  prefix: string,
+  limit: number,
+): BuildParallelismViolation | undefined {
+  let rawValue: string | undefined
+  for (const match of prefix.matchAll(CMAKE_BUILD_PARALLEL_LEVEL_RE)) {
+    rawValue = String(match[1] ?? match[2] ?? match[3] ?? "")
+  }
+  return rawValue === undefined
+    ? undefined
+    : requestedParallelismViolation("cmake", rawValue, limit)
+}
+
+function lastEnvironmentAssignment(
+  prefix: string,
+  pattern: RegExp,
+): string | undefined {
+  let rawValue: string | undefined
+  for (const match of prefix.matchAll(pattern)) {
+    rawValue = String(match[1] ?? match[2] ?? match[3] ?? "")
+  }
+  return rawValue
+}
+
+function makeFlagsParallelismViolation(
+  tool: string,
+  prefix: string,
+  limit: number,
+): BuildParallelismViolation | undefined {
+  for (const pattern of [MAKEFLAGS_ASSIGNMENT_RE, MFLAGS_ASSIGNMENT_RE]) {
+    const rawFlags = lastEnvironmentAssignment(prefix, pattern)
+    if (rawFlags === undefined) continue
+    const tokens = rawFlags.trim().split(/\s+/).filter(Boolean)
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]
+      let rawValue: string | undefined
+      if (token === "-j" || token === "--jobs") {
+        rawValue = tokens[index + 1] || ""
+        if (rawValue) index += 1
+      } else if (token.startsWith("-j")) {
+        rawValue = token.slice(2)
+      } else if (token.startsWith("--jobs=")) {
+        rawValue = token.slice("--jobs=".length)
+      } else if (/^j[0-9]*$/.test(token)) {
+        rawValue = token.slice(1)
+      } else {
+        continue
+      }
+      const violation = requestedParallelismViolation(tool, rawValue, limit)
+      if (violation) return violation
+    }
+  }
+  return undefined
+}
+
+function prefixParallelismViolation(
+  buildTool: string,
+  prefix: string,
+  limit: number,
+): BuildParallelismViolation | undefined {
+  const controllerOverride = lastEnvironmentAssignment(
+    prefix,
+    SMELL_BUILD_JOBS_ASSIGNMENT_RE,
+  )
+  if (controllerOverride !== undefined) {
+    const violation = requestedParallelismViolation(
+      buildTool,
+      controllerOverride,
+      limit,
+    )
+    if (violation) return violation
+  }
+  if (buildTool === "cmake") {
+    const violation = cmakeEnvironmentParallelismViolation(prefix, limit)
+    if (violation) return violation
+  }
+  if (["cmake", "gmake", "make"].includes(buildTool)) {
+    return makeFlagsParallelismViolation(buildTool, prefix, limit)
+  }
+  return undefined
+}
+
+function explicitBuildParallelismViolation(
+  command: string,
+  limit: number,
+): BuildParallelismViolation | undefined {
+  const candidates = [{ command, inheritedPrefix: "" }]
+  const seen = new Set<string>()
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex]
+    const candidateKey = candidate.inheritedPrefix + "\0" + candidate.command
+    if (seen.has(candidateKey)) continue
+    seen.add(candidateKey)
+    for (const segment of executableShellSegments(candidate.command)) {
+      const shellMatch = segment.match(SHELL_LC_COMMAND_RE)
+      if (shellMatch) {
+        const nested = String(shellMatch[2] ?? shellMatch[3] ?? "").trim()
+        if (nested) {
+          candidates.push({
+            command: nested,
+            inheritedPrefix: candidate.inheritedPrefix + " " + String(shellMatch[1] || ""),
+          })
+        }
+      }
+      const match = segment.match(CAPPED_BUILD_COMMAND_RE)
+      if (!match) continue
+      const prefix = candidate.inheritedPrefix + " " + String(match[1] || "")
+      const buildTool = String(match[2] || "").toLowerCase()
+      const args = String(match[3] || "").trim().split(/\s+/).filter(Boolean)
+      if (buildTool === "cmake" && args[0] !== "--build") continue
+      const prefixViolation = prefixParallelismViolation(buildTool, prefix, limit)
+      if (prefixViolation) return prefixViolation
+      for (let index = 0; index < args.length; index += 1) {
+        const token = args[index]
+        let rawValue: string | undefined
+        if (token === "-j") {
+          const following = args[index + 1]
+          if (following && (/^[0-9]+$/.test(following) || isControllerBuildJobsExpression(following))) {
+            rawValue = following
+            index += 1
+          } else {
+            rawValue = ""
+          }
+        } else if (token.startsWith("-j")) {
+          rawValue = token.slice(2)
+        } else if (buildTool === "cmake" && token === "--parallel") {
+          const following = args[index + 1]
+          if (following && (/^[0-9]+$/.test(following) || isControllerBuildJobsExpression(following))) {
+            rawValue = following
+            index += 1
+          } else {
+            rawValue = ""
+          }
+        } else if (buildTool === "cmake" && token.startsWith("--parallel=")) {
+          rawValue = token.slice("--parallel=".length)
+        } else if (buildTool !== "cmake" && token === "--jobs") {
+          const following = args[index + 1]
+          if (following && (/^[0-9]+$/.test(following) || isControllerBuildJobsExpression(following))) {
+            rawValue = following
+            index += 1
+          } else {
+            rawValue = ""
+          }
+        } else if (buildTool !== "cmake" && token.startsWith("--jobs=")) {
+          rawValue = token.slice("--jobs=".length)
+        } else {
+          continue
+        }
+        const violation = requestedParallelismViolation(buildTool, rawValue, limit)
+        if (violation) return violation
+      }
+    }
+  }
+  return undefined
+}
 
 function shouldPluginHandleSessionIdle(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -2517,6 +2812,36 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         if (javaCheckpoint && !baselineSeal) {
           throw new Error("CHECKPOINT_CONTROLLER_SEAL_MISSING: Java checkpoint verification requires the external baseline seal")
         }
+        if (usesCheapGuardProgressGate(resolved, commandState)) {
+          const progressResult = await runBridge(worktree, [
+            "verify",
+            ...commonArgs({ ...resolved, baselineSeal }),
+            "--guard-progress-only",
+          ])
+          const progressPayload = recordValue(progressResult.json)
+          const progressPassed = Boolean(
+            progressResult.exitCode === 0
+            && progressPayload?.schema_version === "smell.guard-progress/v1"
+            && progressPayload?.success === true
+            && progressPayload?.status === "GUARD_PROGRESS_PASSED"
+            && progressPayload?.applicable === true
+            && progressPayload?.source_guard_passed === true
+            && progressPayload?.ready_for_project_full === true
+            && progressPayload?.project_full_executed === false
+          )
+          if (!progressPassed) {
+            const normalized = normalizeToolResult(name, progressResult)
+            if (commandState) {
+              // This is a source-edit timing result, not a formal verification
+              // failure. Keep the controller state observable but do not call
+              // applyCommandLoopDecision or arm idle continuation.
+              normalized.metadata.command_loop_state = toJsonSafe(
+                commandLoopStateSnapshot(commandState),
+              )
+            }
+            return normalized
+          }
+        }
         const bridgeArgs = ["verify", ...commonArgs({ ...resolved, baselineSeal }), "--output-detail", "decision"]
         if (args.noSnapshot) bridgeArgs.push("--no-snapshot")
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
@@ -2759,7 +3084,21 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           + "idea_refactor_apply instead of invoking the underlying CLI through bash.",
         )
       }
-      if (sessionID && commandLoopStates.has(sessionID) && DIRECT_BUILD_COMMAND_RE.test(command)) {
+      const commandState = sessionID
+        ? (commandLoopStates.get(sessionID) || restoreBatchCommandState(sessionID))
+        : undefined
+      const buildJobLimit = controllerBuildJobLimit()
+      if (buildJobLimit && isCappedCheckpointBuildSession(commandState)) {
+        const violation = explicitBuildParallelismViolation(command, buildJobLimit)
+        if (violation) {
+          throw new Error(
+            `SMELL_BUILD_PARALLELISM_EXCEEDED: ${violation.tool} requested ${violation.requested}; `
+            + `the controller limit is ${buildJobLimit}. Use no concurrency flag, a value at or below `
+            + "SMELL_BUILD_JOBS, or ${SMELL_BUILD_JOBS:-1}.",
+          )
+        }
+      }
+      if (sessionID && commandState && DIRECT_BUILD_COMMAND_RE.test(command)) {
         throw new Error(
           "Do not run Maven or Gradle directly during a smell-refactor command. "
           + "Call smell_verify now; it owns the pinned offline build/test command and loop decision.",

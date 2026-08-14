@@ -764,8 +764,9 @@ def prepare_checkpoint(
     evidence: str,
     *,
     expected_baseline_seal: str = "",
+    persist: bool = True,
 ) -> dict[str, Any]:
-    """Create one verify checkpoint and evaluate the generic contract."""
+    """Evaluate the generic contract and optionally persist a verify checkpoint."""
     smell = str(config.smell)
     if smell not in CHECKPOINT_SMELLS or not config.locations:
         return {"required": False, "reason": "checkpoint_not_supported"}
@@ -1070,16 +1071,25 @@ def prepare_checkpoint(
     best_partial = state.get("best_partial")
     if isinstance(best_partial, dict):
         manifest["best_partial"] = best_partial
-    _write_json(checkpoint_dir / "manifest.json", manifest)
-    _write_json(checkpoint_dir / "metrics.json", current)
-    _write_json(checkpoint_dir / "delta.json", delta)
-    # Patches must round-trip the exact bytes git emitted; surrogateescape is the
-    # same policy _run_git used to decode them, so non-UTF-8 source bytes survive.
-    (checkpoint_dir / "source.patch").write_text(patch, encoding="utf-8", errors="surrogateescape")
-    (checkpoint_dir / "production.patch").write_text(production_patch, encoding="utf-8", errors="surrogateescape")
-    state["latest"] = checkpoint_id
-    state["next_sequence"] = sequence + 1
-    _write_json(state_path, state)
+    if persist:
+        _write_json(checkpoint_dir / "manifest.json", manifest)
+        _write_json(checkpoint_dir / "metrics.json", current)
+        _write_json(checkpoint_dir / "delta.json", delta)
+        # Patches must round-trip the exact bytes git emitted; surrogateescape is the
+        # same policy _run_git used to decode them, so non-UTF-8 source bytes survive.
+        (checkpoint_dir / "source.patch").write_text(
+            patch,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+        (checkpoint_dir / "production.patch").write_text(
+            production_patch,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+        state["latest"] = checkpoint_id
+        state["next_sequence"] = sequence + 1
+        _write_json(state_path, state)
     return manifest
 
 

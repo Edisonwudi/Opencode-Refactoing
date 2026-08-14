@@ -11,6 +11,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -54,6 +56,7 @@ from smell_core.target_context import parse_target_context_json  # noqa: E402
 
 VERIFY_DECISION_SCHEMA = "smell.verify.decision/v1"
 BASELINE_DECISION_SCHEMA = "smell.baseline.decision/v1"
+GUARD_PROGRESS_SCHEMA = "smell.guard-progress/v1"
 DECISION_MAX_BYTES = 64 * 1024
 GUARD_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024
 DECISION_TEXT_LIMIT = 512
@@ -677,10 +680,120 @@ def cmd_capture_baseline(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
+    """Evaluate the frozen non-Java source Guard without build/test or snapshots."""
+    resolved = _resolve(args)
+    language = str(resolved.language or "").strip().lower()
+    applicable = bool(
+        language in {"python", "c", "cpp"}
+        and resolved.smell in CHECKPOINT_SMELLS
+        and resolved.locations
+    )
+    if not applicable:
+        return {
+            "schema_version": GUARD_PROGRESS_SCHEMA,
+            "success": True,
+            "status": "GUARD_PROGRESS_NOT_APPLICABLE",
+            "applicable": False,
+            "checkpoint_required": False,
+            "source_guard_passed": None,
+            "ready_for_project_full": True,
+            "project_full_executed": False,
+            "metric_budget": [],
+            "next_action": "",
+        }
+
+    evidence = (
+        getattr(args, "smell_evidence", "")
+        or os.environ.get("SMELL_EVIDENCE", "")
+    )
+    baseline_seal = str(
+        getattr(args, "baseline_seal", "")
+        or os.environ.get("SMELL_BASELINE_SEAL", "")
+    ).strip()
+    guard_context, checkpoint = _checkpoint_context(
+        resolved,
+        evidence,
+        baseline_seal,
+        persist=False,
+    )
+    checkpoint_payload = checkpoint if isinstance(checkpoint, dict) else {}
+    guard_results = run_smell_guards(resolved, guard_context)
+    failed_guard_count = sum(
+        1
+        for result in guard_results
+        if not isinstance(result, dict) or result.get("success") is not True
+    )
+    source_guard_passed = bool(
+        checkpoint_payload.get("required") is True
+        and guard_results
+        and failed_guard_count == 0
+    )
+    resolution_plan = (
+        checkpoint_payload.get("resolution_plan")
+        if isinstance(checkpoint_payload.get("resolution_plan"), dict)
+        else {}
+    )
+    metric_budget = _compact_metric_budget(
+        resolution_plan.get("metric_budget")
+    )
+    next_action = _guard_progress_next_action(
+        metric_budget,
+        source_guard_passed=source_guard_passed,
+    )
+    return {
+        "schema_version": GUARD_PROGRESS_SCHEMA,
+        "success": source_guard_passed,
+        "status": (
+            "GUARD_PROGRESS_PASSED"
+            if source_guard_passed
+            else "GUARD_PROGRESS_REQUIRED"
+        ),
+        "applicable": True,
+        "checkpoint_required": True,
+        "source_guard_passed": source_guard_passed,
+        "ready_for_project_full": source_guard_passed,
+        "project_full_executed": False,
+        "guard_failure_count": failed_guard_count,
+        "metric_budget": metric_budget,
+        "next_action": _bounded_text(next_action),
+    }
+
+
+def _guard_progress_next_action(
+    metric_budget: list[dict[str, Any]],
+    *,
+    source_guard_passed: bool,
+) -> str:
+    """Render editing guidance from scalar Guard budgets only."""
+    if source_guard_passed:
+        return ""
+    if not metric_budget:
+        return "restore frozen source Guard"
+    routes: list[str] = []
+    for item in metric_budget:
+        boundary_key = (
+            "passing_max"
+            if "passing_max" in item
+            else "passing_exclusive_max"
+        )
+        routes.append(
+            f"metric={item['metric']}, current={item['current']}, "
+            f"{boundary_key}={item[boundary_key]}, "
+            f"required_reduction={item['required_reduction']}"
+        )
+    return (
+        "make one narrow production edit that crosses at least one frozen "
+        "scalar Guard route: " + "; ".join(routes)
+    )
+
+
 def _checkpoint_context(
     resolved,
     evidence: str,
     baseline_seal: str = "",
+    *,
+    persist: bool = True,
 ) -> tuple[Optional[GuardRunContext], Optional[dict[str, Any]]]:
     if resolved.smell not in CHECKPOINT_SMELLS or not resolved.locations:
         return None, None
@@ -688,6 +801,7 @@ def _checkpoint_context(
         resolved,
         evidence,
         expected_baseline_seal=baseline_seal,
+        persist=persist,
     )
     if not checkpoint.get("required"):
         # A migrated smell must never fall back to the ordinary threshold
@@ -728,6 +842,8 @@ def _god_class_min_improved_reduction(resolved) -> float:
 
 
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "guard_progress_only", False):
+        return cmd_guard_progress(args)
     resolved = _resolve(args)
     evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
     build_test_required = (
@@ -820,13 +936,21 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(checkpoint, dict)
         else ""
     )
+    isolated_project_full = bool(
+        resolved.verification_mode == "project_full"
+        and resolved.language in {"python", "c", "cpp"}
+    )
+    project_full_snapshot_required = bool(
+        args.run_build_test
+        and isolated_project_full
+    )
     snapshot = (
         _snapshot_project(
             resolved.project_root,
             declared_test_paths=declared_test_paths,
             base_commit=baseline_project_commit or "HEAD",
         )
-        if args.snapshot
+        if args.snapshot or project_full_snapshot_required
         else None
     )
     change_audit = (
@@ -837,6 +961,11 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             declared_test_paths=declared_test_paths,
             base_commit=baseline_project_commit or "HEAD",
         )
+    )
+    final_diff_generated_artifact_audit = (
+        dict(change_audit.get("final_diff_generated_artifact_audit") or {})
+        if isinstance(change_audit, dict)
+        else {}
     )
     allow_test_changes = bool(
         checkpoint_test_changes.get("allow_test_changes") is True
@@ -860,17 +989,51 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
             test_changes = worktree_test_changes
     else:
         test_changes = worktree_test_changes
-    if test_changes and test_changes.get("success") is False:
-        build_test_result = _test_source_modified_result(resolved, test_changes)
-    elif (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
-        build_test_result = run_build_test_guard(
+    validation_allowed = bool(
+        (not failed_smell or improvement_pass)
+        and args.run_build_test
+        and resolved.verification_mode != "local"
+    )
+    if (
+        validation_allowed
+        and isolated_project_full
+        and isinstance(change_audit, dict)
+        and change_audit.get("success") is not True
+    ):
+        build_test_result = _final_verify_infra_failure_result(
             resolved,
-            require_test_execution=_requires_fresh_test_execution(
-                resolved,
-                test_changes=test_changes,
-                exact_dead_code_deletion=exact_dead_code_deletion,
-            ),
+            stage="capture_snapshot",
+            message="The pre-build deliverable snapshot could not be captured.",
+            base_commit=baseline_project_commit or "HEAD",
+            snapshot_change_count=int(change_audit.get("change_count") or 0),
         )
+    elif (
+        final_diff_generated_artifact_audit.get("status")
+        == "FINAL_DIFF_GENERATED_ARTIFACTS"
+    ):
+        build_test_result = _final_diff_generated_artifacts_result(
+            resolved,
+            final_diff_generated_artifact_audit,
+        )
+    elif test_changes and test_changes.get("success") is False:
+        build_test_result = _test_source_modified_result(resolved, test_changes)
+    elif validation_allowed:
+        require_test_execution = _requires_fresh_test_execution(
+            resolved,
+            test_changes=test_changes,
+            exact_dead_code_deletion=exact_dead_code_deletion,
+        )
+        if isolated_project_full:
+            build_test_result = _run_project_full_in_fresh_worktree(
+                resolved,
+                snapshot,
+                require_test_execution=require_test_execution,
+            )
+        else:
+            build_test_result = run_build_test_guard(
+                resolved,
+                require_test_execution=require_test_execution,
+            )
     behavior_valid = build_test_result is None or bool(build_test_result.get("success"))
     success = not failed_smell and (
         build_test_result is None or bool(build_test_result.get("success"))
@@ -1049,6 +1212,475 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
     }
 
 
+def _generated_artifact_path_groups(
+    audit: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    tracked: list[str] = []
+    untracked: list[str] = []
+    for item in list(audit.get("artifacts") or []):
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        target = untracked if item.get("status") == "??" else tracked
+        target.append(path)
+    return tracked, untracked
+
+
+def _final_diff_generated_artifacts_result(
+    resolved: Any,
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    tracked_paths, untracked_paths = _generated_artifact_path_groups(audit)
+    actions: list[str] = []
+    if tracked_paths:
+        actions.append(
+            "restore tracked generated paths to the frozen baseline: "
+            + ", ".join(tracked_paths)
+        )
+    if untracked_paths:
+        actions.append(
+            "remove untracked generated paths: " + ", ".join(untracked_paths)
+        )
+    message = "FINAL_DIFF_GENERATED_ARTIFACTS: " + "; ".join(actions)
+    return {
+        "type": "build_test",
+        "success": False,
+        "message": message,
+        "reason": "FINAL_DIFF_GENERATED_ARTIFACTS",
+        "verification_mode": resolved.verification_mode,
+        "build_source": resolved.build_source,
+        "test_source": resolved.test_source,
+        "sample_test_source": "dataset",
+        "test_location": resolved.sample_test_location,
+        "final_diff_generated_artifact_audit": dict(audit),
+        "details": {
+            "build": {
+                "success": False,
+                "status": "skipped_by_final_diff_generated_artifact_contract",
+                "failure_highlights": [message],
+            },
+            "test": {
+                "success": False,
+                "status": "skipped_by_final_diff_generated_artifact_contract",
+                "failure_highlights": [message],
+            },
+            "sample_test": None,
+        },
+    }
+
+
+def _final_verify_infra_failure_result(
+    resolved: Any,
+    *,
+    stage: str,
+    message: str,
+    base_commit: str = "",
+    snapshot_change_count: int = 0,
+    cleanup_success: Optional[bool] = None,
+) -> dict[str, Any]:
+    rendered = f"FINAL_VERIFY_INFRA_FAILED ({stage}): {message}"
+    isolation = {
+        "contract_version": "project-full-fresh-worktree/v1",
+        "mode": "detached_git_worktree",
+        "success": False,
+        "stage": stage,
+        "base_commit": base_commit,
+        "snapshot_change_count": int(snapshot_change_count),
+        "cleanup_success": cleanup_success,
+    }
+    sample_command = str(getattr(resolved, "sample_test_command", "") or "").strip()
+    return {
+        "type": "build_test",
+        "success": False,
+        "message": rendered,
+        "reason": "FINAL_VERIFY_INFRA_FAILED",
+        "verification_mode": resolved.verification_mode,
+        "build_source": resolved.build_source,
+        "test_source": resolved.test_source,
+        "sample_test_source": "dataset" if sample_command else "",
+        "test_location": resolved.sample_test_location,
+        "test_command_hash": (
+            hashlib.sha256(sample_command.encode("utf-8")).hexdigest()
+            if sample_command
+            else ""
+        ),
+        "verification_isolation": isolation,
+        "details": {
+            "build": None,
+            "test": None,
+            "sample_test": None,
+        },
+    }
+
+
+def _rebase_text_to_fresh_root(
+    value: Optional[str],
+    source_root: Path,
+    fresh_root: Path,
+) -> Optional[str]:
+    if value is None:
+        return None
+    sources = sorted(
+        {str(source_root), str(source_root.resolve())},
+        key=len,
+        reverse=True,
+    )
+    pattern = re.compile("|".join(re.escape(source) for source in sources))
+    return pattern.sub(lambda _match: str(fresh_root), str(value))
+
+
+def _rebase_path_to_fresh_root(
+    value: Path,
+    source_root: Path,
+    fresh_root: Path,
+) -> Path:
+    candidate = Path(value).expanduser().resolve()
+    try:
+        relative = candidate.relative_to(source_root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"verification path is outside the frozen project root: {candidate}"
+        ) from exc
+    return (fresh_root / relative).resolve()
+
+
+def _rebase_build_test_config(
+    resolved: Any,
+    fresh_root: Path,
+) -> Any:
+    source_root = Path(resolved.project_root).expanduser()
+    fresh_root = fresh_root.expanduser().resolve()
+    command_tmp = fresh_root.parent / "tmp"
+    tmux_tmp = fresh_root.parent / "tmux"
+    command_tmp.mkdir()
+    tmux_tmp.mkdir()
+
+    def command_config(value: Any) -> Any:
+        return replace(
+            value,
+            command=_rebase_text_to_fresh_root(
+                getattr(value, "command", None),
+                source_root,
+                fresh_root,
+            ),
+            script=_rebase_text_to_fresh_root(
+                getattr(value, "script", None),
+                source_root,
+                fresh_root,
+            ),
+        )
+
+    rebased_env = {
+        str(key): str(
+            _rebase_text_to_fresh_root(
+                str(value),
+                source_root,
+                fresh_root,
+            )
+        )
+        for key, value in dict(resolved.env).items()
+    }
+    rebased_env.update({
+        "TMPDIR": str(command_tmp),
+        "TMUX_TMPDIR": str(tmux_tmp),
+    })
+    return replace(
+        resolved,
+        project_root=fresh_root,
+        dataset_root=_rebase_path_to_fresh_root(
+            resolved.dataset_root,
+            source_root,
+            fresh_root,
+        ),
+        idea_project_root=_rebase_path_to_fresh_root(
+            resolved.idea_project_root,
+            source_root,
+            fresh_root,
+        ),
+        build_root=_rebase_path_to_fresh_root(
+            resolved.build_root,
+            source_root,
+            fresh_root,
+        ),
+        cwd=_rebase_path_to_fresh_root(
+            resolved.cwd,
+            source_root,
+            fresh_root,
+        ),
+        build=command_config(resolved.build),
+        test=command_config(resolved.test),
+        sample_test=command_config(resolved.sample_test),
+        env=rebased_env,
+        sample_test_location=str(
+            _rebase_text_to_fresh_root(
+                str(resolved.sample_test_location or ""),
+                source_root,
+                fresh_root,
+            )
+        ),
+        sample_test_command=str(
+            _rebase_text_to_fresh_root(
+                str(resolved.sample_test_command or ""),
+                source_root,
+                fresh_root,
+            )
+        ),
+    )
+
+
+def _run_git_with_input(
+    args: list[str],
+    cwd: Path,
+    content: str,
+) -> dict[str, Any]:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        input=content,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def _git_failure_message(result: dict[str, Any], fallback: str) -> str:
+    detail = str(result.get("stderr") or result.get("stdout") or "").strip()
+    return _bounded_text(detail or fallback, limit=1024)
+
+
+def _run_project_full_in_fresh_worktree(
+    resolved: Any,
+    snapshot: Optional[dict[str, Any]],
+    *,
+    require_test_execution: bool = False,
+) -> dict[str, Any]:
+    """Replay the frozen pre-build deliverable in one detached worktree."""
+    if not isinstance(snapshot, dict):
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="capture_snapshot",
+            message="The pre-build deliverable snapshot is unavailable.",
+        )
+    change_audit = snapshot.get("change_audit")
+    diff = snapshot.get("diff")
+    base_commit = str(snapshot.get("base_commit") or "").strip()
+    change_count = (
+        int(change_audit.get("change_count") or 0)
+        if isinstance(change_audit, dict)
+        else 0
+    )
+    if not isinstance(change_audit, dict) or change_audit.get("success") is not True:
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="capture_snapshot",
+            message="The pre-build Git change audit failed.",
+            base_commit=base_commit,
+            snapshot_change_count=change_count,
+        )
+    if (
+        not isinstance(diff, dict)
+        or diff.get("returncode") != 0
+        or not isinstance(diff.get("stdout"), str)
+    ):
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="capture_snapshot",
+            message="The replayable pre-build Git patch is unavailable.",
+            base_commit=base_commit,
+            snapshot_change_count=change_count,
+        )
+
+    source_root = Path(resolved.project_root).expanduser().resolve()
+    resolved_base = _run_git(
+        ["rev-parse", "--verify", f"{base_commit}^{{commit}}"],
+        source_root,
+    )
+    resolved_base_text = str(resolved_base.get("stdout") or "").strip()
+    if resolved_base.get("returncode") != 0 or not resolved_base_text:
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="resolve_base_commit",
+            message=_git_failure_message(
+                resolved_base,
+                "The frozen base commit could not be resolved.",
+            ),
+            base_commit=base_commit,
+            snapshot_change_count=change_count,
+        )
+
+    failure: Optional[dict[str, Any]] = None
+    build_test_result: Optional[dict[str, Any]] = None
+    cleanup_success: Optional[bool] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="smell-project-full-") as raw:
+            fresh_root = (Path(raw) / "worktree").resolve()
+            created = _run_git(
+                [
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(fresh_root),
+                    resolved_base_text,
+                ],
+                source_root,
+            )
+            worktree_created = created.get("returncode") == 0
+            if not worktree_created:
+                removed = _run_git(
+                    ["worktree", "remove", "--force", str(fresh_root)],
+                    source_root,
+                )
+                pruned = _run_git(["worktree", "prune"], source_root)
+                cleanup_success = bool(
+                    removed.get("returncode") == 0
+                    or (
+                        pruned.get("returncode") == 0
+                        and not fresh_root.exists()
+                    )
+                )
+                failure = _final_verify_infra_failure_result(
+                    resolved,
+                    stage="create_worktree",
+                    message=_git_failure_message(
+                        created,
+                        "The detached verification worktree could not be created.",
+                    ),
+                    base_commit=resolved_base_text,
+                    snapshot_change_count=change_count,
+                    cleanup_success=cleanup_success,
+                )
+            else:
+                try:
+                    patch = str(diff.get("stdout") or "")
+                    if patch:
+                        applied = _run_git_with_input(
+                            ["apply", "--binary", "--whitespace=nowarn", "-"],
+                            fresh_root,
+                            patch,
+                        )
+                        if applied.get("returncode") != 0:
+                            failure = _final_verify_infra_failure_result(
+                                resolved,
+                                stage="apply_snapshot",
+                                message=_git_failure_message(
+                                    applied,
+                                    "The pre-build deliverable patch could not be applied.",
+                                ),
+                                base_commit=resolved_base_text,
+                                snapshot_change_count=change_count,
+                            )
+                    if failure is None:
+                        try:
+                            isolated = _rebase_build_test_config(
+                                resolved,
+                                fresh_root,
+                            )
+                        except (OSError, TypeError, ValueError) as exc:
+                            failure = _final_verify_infra_failure_result(
+                                resolved,
+                                stage="resolve_verification_root",
+                                message=_bounded_text(str(exc), limit=1024),
+                                base_commit=resolved_base_text,
+                                snapshot_change_count=change_count,
+                            )
+                        else:
+                            try:
+                                build_test_result = run_build_test_guard(
+                                    isolated,
+                                    require_test_execution=require_test_execution,
+                                )
+                            except Exception:
+                                failure = _final_verify_infra_failure_result(
+                                    resolved,
+                                    stage="run_build_test_guard",
+                                    message=(
+                                        "The isolated build/test Guard raised "
+                                        "an exception."
+                                    ),
+                                    base_commit=resolved_base_text,
+                                    snapshot_change_count=change_count,
+                                )
+                finally:
+                    removed = _run_git(
+                        ["worktree", "remove", "--force", str(fresh_root)],
+                        source_root,
+                    )
+                    cleanup_success = removed.get("returncode") == 0
+                    if not cleanup_success:
+                        failure = _final_verify_infra_failure_result(
+                            resolved,
+                            stage="cleanup_worktree",
+                            message=_git_failure_message(
+                                removed,
+                                "The detached verification worktree could not be removed.",
+                            ),
+                            base_commit=resolved_base_text,
+                            snapshot_change_count=change_count,
+                            cleanup_success=False,
+                        )
+    except OSError as exc:
+        failure = _final_verify_infra_failure_result(
+            resolved,
+            stage="cleanup_worktree",
+            message=_bounded_text(str(exc), limit=1024),
+            base_commit=resolved_base_text,
+            snapshot_change_count=change_count,
+            cleanup_success=False,
+        )
+        cleanup_success = False
+
+    if cleanup_success is False:
+        _run_git(["worktree", "prune"], source_root)
+    if failure is not None:
+        isolation = failure.get("verification_isolation")
+        if isinstance(isolation, dict) and isolation.get("cleanup_success") is None:
+            isolation["cleanup_success"] = cleanup_success
+        return failure
+    if not isinstance(build_test_result, dict):
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="run_build_test_guard",
+            message="The isolated build/test Guard returned no result.",
+            base_commit=resolved_base_text,
+            snapshot_change_count=change_count,
+            cleanup_success=cleanup_success,
+        )
+
+    sample_command = str(resolved.sample_test_command or "").strip()
+    build_test_result.update({
+        "verification_mode": resolved.verification_mode,
+        "build_source": resolved.build_source,
+        "test_source": resolved.test_source,
+        "sample_test_source": "dataset" if sample_command else "",
+        "test_location": resolved.sample_test_location,
+        "test_command_hash": (
+            hashlib.sha256(sample_command.encode("utf-8")).hexdigest()
+            if sample_command
+            else ""
+        ),
+        "verification_isolation": {
+            "contract_version": "project-full-fresh-worktree/v1",
+            "mode": "detached_git_worktree",
+            "success": True,
+            "stage": "completed",
+            "base_commit": resolved_base_text,
+            "snapshot_change_count": change_count,
+            "cleanup_success": cleanup_success,
+        },
+    })
+    return build_test_result
+
+
 def cmd_resolve_command(args: argparse.Namespace) -> dict[str, Any]:
     return resolve_command_payload(
         args.arguments,
@@ -1078,6 +1710,8 @@ def _verify_status(
     if build_test_result and build_test_result.get("success") is False:
         explicit_reason = str(build_test_result.get("reason") or "")
         if explicit_reason in {
+            "FINAL_VERIFY_INFRA_FAILED",
+            "FINAL_DIFF_GENERATED_ARTIFACTS",
             "TEST_SOURCE_MODIFIED",
             "TEST_SOURCE_MIGRATION_REJECTED",
             "TEST_SOURCE_DELETED",
@@ -1145,6 +1779,8 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
     if result is None:
         return None
     details = result.get("details") or {}
+    final_artifact_audit = result.get("final_diff_generated_artifact_audit")
+    isolation = result.get("verification_isolation")
     return {
         "type": result.get("type"),
         "success": bool(result.get("success")),
@@ -1157,6 +1793,36 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
         "test_location": _bounded_text(result.get("test_location", "")),
         "test_command_hash": result.get("test_command_hash", ""),
         "test_changes": _compact_test_changes(result.get("test_changes")),
+        "final_diff_generated_artifact_audit": {
+            "success": bool(final_artifact_audit.get("success")),
+            "status": _bounded_text(final_artifact_audit.get("status"), limit=128),
+            "paths": _bounded_strings(
+                final_artifact_audit.get("paths"),
+                count=64,
+                limit=512,
+            ),
+        }
+        if isinstance(final_artifact_audit, dict)
+        else None,
+        "verification_isolation": {
+            "contract_version": _bounded_text(
+                isolation.get("contract_version"),
+                limit=128,
+            ),
+            "mode": _bounded_text(isolation.get("mode"), limit=128),
+            "success": bool(isolation.get("success")),
+            "stage": _bounded_text(isolation.get("stage"), limit=128),
+            "base_commit": _bounded_text(
+                isolation.get("base_commit"),
+                limit=128,
+            ),
+            "snapshot_change_count": int(
+                isolation.get("snapshot_change_count") or 0
+            ),
+            "cleanup_success": isolation.get("cleanup_success"),
+        }
+        if isinstance(isolation, dict)
+        else None,
         "details": {
             "build": _summarize_command_result(details.get("build")),
             "test": _summarize_command_result(details.get("test")),
@@ -1420,6 +2086,19 @@ _CONTROLLER_OUTPUT_DIRECTORIES = frozenset({
     ".smell-test-reports",
     "build-refactoragent",
 })
+_CJSON_ROOT_BUILD_PRODUCTS = frozenset({
+    "cJSON.o",
+    "cJSON_Utils.o",
+    "cJSON_test",
+})
+_CJSON_ROOT_LIBRARY_PRODUCT = re.compile(
+    r"libcjson[^/]*\.(?:a|so(?:\.\d+)*)\Z"
+)
+_RRDTOOL_TRACKED_VERIFICATION_PRODUCTS = frozenset({
+    "po/fr.po",
+    "po/hu.po",
+    "tests/graph2.output",
+})
 _AUTOTOOLS_GENERATED_NAMES = frozenset({
     "aclocal.m4",
     "ar-lib",
@@ -1515,16 +2194,21 @@ def _looks_like_cmake_generated_file(path: Path) -> bool:
 
 
 def _looks_like_autotools_generated_file(path: Path) -> bool:
-    """Recognize an untracked Autotools product from a generator marker."""
-    if _looks_like_configure_makefile(path):
-        return True
-    header = _generated_file_header(path)
+    """Recognize an Autotools product from a generator marker."""
+    return _looks_like_autotools_generated_header(_generated_file_header(path))
+
+
+def _looks_like_autotools_generated_header(header: str) -> bool:
+    """Recognize an Autotools product from its bounded provenance header."""
     folded = header.casefold()
     return bool(
         header
         and any(
             marker in folded
             for marker in (
+                "makefile.in generated by automake",
+                "makefile.  generated from makefile.in by configure",
+                "makefile generated by configure",
                 "generated by gnu autoconf",
                 "generated automatically by aclocal",
                 "generated by autoheader",
@@ -1559,6 +2243,49 @@ def _is_proven_untracked_output_directory(root: Path, pure: Path) -> bool:
         if part == "__pycache__":
             return pure.suffix == ".pyc"
     return False
+
+
+def _tracked_autotools_generated_artifact(
+    root: Path,
+    path: str,
+    *,
+    operation: str,
+    base_commit: str,
+) -> bool:
+    """Identify a visible tracked Autotools product by its own provenance."""
+    normalized = path.replace("\\", "/").strip("/")
+    pure = Path(normalized)
+    if (
+        pure.name != "Makefile.in"
+        and pure.name not in _AUTOTOOLS_GENERATED_NAMES
+    ):
+        return False
+    current_generated = bool(
+        operation != "deleted"
+        and _is_verification_generated_path(root, normalized, tracked=False)
+    )
+    if operation == "added" or current_generated:
+        return current_generated
+
+    parent = root / pure.parent
+    if pure.name == "Makefile.in":
+        belongs_to_autotools = (parent / "Makefile.am").is_file()
+    elif pure.name == "configure":
+        belongs_to_autotools = any(
+            (parent / item).is_file()
+            for item in ("configure.ac", "configure.in")
+        )
+    else:
+        belongs_to_autotools = _has_autotools_input(root, parent)
+    if not belongs_to_autotools:
+        return False
+    blob = _run_git(["show", f"{base_commit}:{normalized}"], root)
+    stdout = blob.get("stdout")
+    return bool(
+        blob.get("returncode") == 0
+        and isinstance(stdout, str)
+        and _looks_like_autotools_generated_header(stdout[:16384])
+    )
 
 
 def _is_verification_generated_path(
@@ -1828,6 +2555,92 @@ def _git_change_records(
     return result, sorted(records, key=lambda item: (item["path"], item["operation"]))
 
 
+def _final_diff_generated_artifact_audit(
+    change_audit: dict[str, Any],
+    *,
+    project_root: Path | None = None,
+) -> dict[str, Any]:
+    """Reject visible generated build/test products from the final delivery.
+
+    This is deliberately not a suffix ignore.  The paths remain ordinary
+    visible changes. Controller-owned root trees, provenance-marked tracked
+    Autotools products, known RRDtool verification products, and the narrow
+    cJSON root-level product family block final acceptance. New source, tests,
+    documentation and authored build metadata keep their existing delivery.
+    """
+    artifacts: list[dict[str, str]] = []
+    base_commit = str(change_audit.get("base_commit") or "HEAD")
+    for raw_item in list(change_audit.get("changes") or []):
+        if not isinstance(raw_item, dict):
+            continue
+        operation = str(raw_item.get("operation") or "")
+        if operation not in {"added", "changed", "deleted"}:
+            continue
+        path = str(raw_item.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        controller_owned = any(
+            path.startswith(f"{directory}/")
+            for directory in _CONTROLLER_OUTPUT_DIRECTORIES
+        )
+        cjson_root_product = bool(
+            operation in {"added", "changed"}
+            and "/" not in path
+            and (
+                path in _CJSON_ROOT_BUILD_PRODUCTS
+                or _CJSON_ROOT_LIBRARY_PRODUCT.fullmatch(path) is not None
+            )
+        )
+        tracked_autotools_product = bool(
+            project_root is not None
+            and _tracked_autotools_generated_artifact(
+                project_root,
+                path,
+                operation=operation,
+                base_commit=base_commit,
+            )
+        )
+        rrdtool_verification_product = bool(
+            project_root is not None
+            and project_root.name.casefold() == "rrdtool"
+            and path in _RRDTOOL_TRACKED_VERIFICATION_PRODUCTS
+        )
+        if not any((
+            controller_owned,
+            cjson_root_product,
+            tracked_autotools_product,
+            rrdtool_verification_product,
+        )):
+            continue
+        artifacts.append({
+            "path": path,
+            "operation": operation,
+            "status": str(raw_item.get("status") or ""),
+        })
+    artifacts.sort(key=lambda item: item["path"])
+    audit_ok = change_audit.get("success") is True
+    return {
+        "contract_version": "final-diff-generated-artifacts/v1",
+        "success": bool(audit_ok and not artifacts),
+        "status": (
+            "WORKTREE_CHANGE_AUDIT_FAILED"
+            if not audit_ok
+            else "FINAL_DIFF_GENERATED_ARTIFACTS"
+            if artifacts
+            else "FINAL_DIFF_GENERATED_ARTIFACTS_ABSENT"
+        ),
+        "reason": (
+            "WORKTREE_CHANGE_AUDIT_FAILED"
+            if not audit_ok
+            else "FINAL_DIFF_GENERATED_ARTIFACTS"
+            if artifacts
+            else ""
+        ),
+        "paths": [item["path"] for item in artifacts],
+        "artifacts": artifacts,
+    }
+
+
 def _project_change_audit(
     root: Path,
     *,
@@ -1843,7 +2656,7 @@ def _project_change_audit(
         category: [dict(item) for item in records if item["category"] == category]
         for category in ("production", "test", "build_metadata", "other")
     }
-    return {
+    audit = {
         "schema_version": "smell.worktree-change-audit/v1",
         "base_commit": base_commit,
         "success": status.get("returncode") == 0,
@@ -1857,6 +2670,10 @@ def _project_change_audit(
         "ignored_generated_count": int(status.get("ignored_generated_count") or 0),
         "ignored_generated_paths": list(status.get("ignored_generated_paths") or []),
     }
+    audit["final_diff_generated_artifact_audit"] = (
+        _final_diff_generated_artifact_audit(audit, project_root=root)
+    )
+    return audit
 
 
 def _worktree_test_change_audit(
@@ -2240,6 +3057,38 @@ def _classify_failure_pack(
         return "WORKTREE_CHANGE_AUDIT_FAILED", [
             "Final Git status/diff audit failed; resolve the repository-state error before evaluating or repairing the candidate."
         ]
+    if status == "FINAL_VERIFY_INFRA_FAILED":
+        return "FINAL_VERIFY_INFRA_FAILED", [
+            "The controller could not create, populate, resolve or clean the isolated project-full verification worktree.",
+            "Do not edit production or tests for this infrastructure failure; retry only after the verification environment is healthy.",
+        ]
+    if status == "FINAL_DIFF_GENERATED_ARTIFACTS":
+        build_test = payload.get("build_test_guard") or {}
+        audit = (
+            build_test.get("final_diff_generated_artifact_audit")
+            if isinstance(build_test, dict)
+            else None
+        )
+        tracked_paths, untracked_paths = _generated_artifact_path_groups(
+            audit if isinstance(audit, dict) else {}
+        )
+        recommendations: list[str] = []
+        if tracked_paths:
+            recommendations.append(
+                "Restore tracked generated paths to the frozen baseline: "
+                + ", ".join(tracked_paths)
+                + "."
+            )
+        if untracked_paths:
+            recommendations.append(
+                "Remove untracked generated paths: "
+                + ", ".join(untracked_paths)
+                + "."
+            )
+        recommendations.append(
+            "Keep authored source, tests, documentation and build metadata in the final diff."
+        )
+        return "FINAL_DIFF_GENERATED_ARTIFACTS", recommendations
     if status == "TEST_SOURCE_MODIFIED":
         return "TEST_SOURCE_MODIFIED", [
             "Restore test-tree changes, or start a new command with explicit controller authorization to edit tests."
@@ -2551,6 +3400,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify_parser = subparsers.add_parser("verify")
     _add_common(verify_parser)
+    verify_parser.add_argument("--guard-progress-only", action="store_true")
     verify_parser.add_argument("--skip-build-test", action="store_true")
     verify_parser.add_argument("--no-snapshot", action="store_true")
     verify_parser.add_argument("--artifact-root")

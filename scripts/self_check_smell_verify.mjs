@@ -2720,6 +2720,755 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
   }
 }
 
+async function runGuardProgressGateSelfCheck() {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "guard-progress-plugin-self-check-"))
+  const fakeBridge = path.join(tempRoot, "guard_progress_bridge.py")
+  const stateFile = path.join(tempRoot, "guard-progress-count.txt")
+  const logFile = path.join(tempRoot, "guard-progress-commands.jsonl")
+  const fakeSource = `
+import json
+import os
+import sys
+from pathlib import Path
+
+command = sys.argv[1]
+guard_progress_only = command == "verify" and "--guard-progress-only" in sys.argv
+logged_command = "guard-progress" if guard_progress_only else command
+case = json.loads(os.environ.get("SMELL_PREFLIGHT_CASE", "{}"))
+log_path = Path(os.environ["SMELL_PREFLIGHT_LOG"])
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"case": case.get("name"), "command": logged_command}) + "\\n")
+
+if command == "resolve-command":
+    payload = {
+        "task": "Continue the current smell refactoring task.",
+        "verification_mode": "project_full",
+        "allow_test_changes": False,
+        "checkpoint_required": bool(case.get("checkpoint_required")),
+        "identity": {
+            "project_root": case["project_root"],
+            "project_override_root": "",
+            "language": case["language"],
+            "smell": case["smell"],
+            "location": case["location"],
+            "target_context_json": "",
+            "verification_mode": "project_full",
+            "sample_test_location": "",
+            "sample_test_command": "",
+        },
+        "loop": {
+            "mode": "verify-failure",
+            "max_continuations": 2,
+            "no_progress_limit": 1,
+            "allowed_failure_groups": ["smell", "compile", "test"],
+            "instruction": "continue one narrow edit",
+            "sample_deadline_seconds": 1800,
+        },
+    }
+elif command == "capture-baseline":
+    payload = {
+        "success": True,
+        "status": "BASELINE_CAPTURED",
+        "baseline_seal": "controller-seal",
+        "metrics": {},
+        "resolution_plan": {"metric_budget": [case.get("budget", {})]},
+    }
+elif guard_progress_only:
+    state_path = Path(os.environ["SMELL_PREFLIGHT_STATE"])
+    count = int(state_path.read_text(encoding="utf-8") or "0") + 1
+    state_path.write_text(str(count), encoding="utf-8")
+    ready = count > int(case.get("early_calls", 0))
+    budget = dict(case.get("budget", {}))
+    if ready:
+        budget["required_reduction"] = 0
+    payload = {
+        "schema_version": "smell.guard-progress/v1",
+        "success": ready,
+        "status": "GUARD_PROGRESS_PASSED" if ready else "GUARD_PROGRESS_REQUIRED",
+        "applicable": True,
+        "checkpoint_required": True,
+        "source_guard_passed": ready,
+        "ready_for_project_full": ready,
+        "project_full_executed": False,
+        "metric_budget": [budget],
+        "next_action": "continue one narrow production edit" if not ready else "",
+    }
+    if case.get("malformed_progress"):
+        payload["project_full_executed"] = True
+elif command == "verify":
+    payload = {
+        "success": True,
+        "accepted": True,
+        "progress": True,
+        "status": "PASS",
+        "resolution": "resolved",
+        "continue_hint": "",
+        "smell_guard": {"success": True, "failure_count": 0, "results": []},
+        "build_test_guard": {"success": True},
+        "snapshot": None,
+        "artifacts": {},
+    }
+else:
+    payload = {"success": False, "status": "UNEXPECTED_COMMAND", "command": command}
+
+print(json.dumps(payload))
+`
+  await writeFile(fakeBridge, fakeSource, "utf8")
+  await writeFile(stateFile, "0", "utf8")
+  await writeFile(logFile, "", "utf8")
+  const envBefore = { ...process.env }
+  process.env.SMELL_BRIDGE_FILE = fakeBridge
+  process.env.SMELL_PREFLIGHT_STATE = stateFile
+  process.env.SMELL_PREFLIGHT_LOG = logFile
+  try {
+    const compiledFile = await compilePluginForSelfCheck(tempRoot)
+    const pluginModule = await import(
+      `${pathToFileURL(compiledFile).href}?guard_progress=${Date.now()}`
+    )
+    process.env.SMELL_BUILD_JOBS = "1"
+    const buildGateResults = []
+    const buildGateCases = [
+      {
+        name: "python",
+        language: "python",
+        blocked: [
+          "ninja -j8",
+          "ninja --jobs=8",
+          "ninja --jobs 8",
+          "ninja --jobs",
+          "command ninja --jobs=8",
+          "env NINJA_STATUS=brief ninja --jobs 8",
+          "/usr/bin/env NINJA_STATUS=brief ninja --jobs=8",
+          "bash -lc 'ninja -j8'",
+          "sh -lc 'ninja --jobs=8'",
+          'bash -lc "ninja --jobs 8"',
+        ],
+        allowed: [
+          "ninja",
+          "ninja -j1",
+          "ninja --jobs=1",
+          "ninja --jobs 1",
+          "command ninja --jobs=1",
+          "env NINJA_STATUS=brief ninja --jobs 1",
+          "bash -lc 'ninja -j1'",
+          'ninja -j${SMELL_BUILD_JOBS:-1}',
+          'ninja --jobs ${SMELL_BUILD_JOBS:-1}',
+          'ninja --jobs="${SMELL_BUILD_JOBS:-1}"',
+          "printf 'safe\\nninja --jobs=8\\n'",
+          "echo 'ninja --jobs=8'",
+          "# ninja --jobs=8",
+          "cat <<'EOF'\nninja --jobs=8\nEOF",
+          "bash -lc 'printf \"safe\\\\nninja -j8\\\\n\"'",
+        ],
+      },
+      {
+        name: "c",
+        language: "c",
+        blocked: [
+          "make -j4",
+          "/usr/bin/gmake -j 2",
+          "cd src && make -j",
+          "make --jobs=4",
+          "make --jobs 4",
+          "make --jobs",
+          "command make --jobs=4",
+          "env LC_ALL=C make --jobs 4",
+          "/usr/bin/env LC_ALL=C make --jobs=4",
+          "bash -lc 'make -j4'",
+          "sh -lc 'make --jobs 4'",
+          "MAKEFLAGS=-j8 make",
+          "MAKEFLAGS='-j 8' make",
+          "env MAKEFLAGS=--jobs=8 make",
+          "bash -lc 'MAKEFLAGS=-j8 make'",
+          "env SMELL_BUILD_JOBS=8 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+        ],
+        allowed: [
+          "make",
+          "make -j1",
+          "make --jobs=1",
+          "make --jobs 1",
+          "command make --jobs=1",
+          "env LC_ALL=C make --jobs 1",
+          "/usr/bin/env LC_ALL=C make --jobs=1",
+          "bash -lc 'make -j1'",
+          'make -j${SMELL_BUILD_JOBS:-1}',
+          'make -j"${SMELL_BUILD_JOBS:-1}"',
+          'make --jobs="${SMELL_BUILD_JOBS:-1}"',
+          "MAKEFLAGS=-j1 make",
+          "MAKEFLAGS='-j 1' make",
+          "env SMELL_BUILD_JOBS=${SMELL_BUILD_JOBS:-1} bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+          "printf 'make -j8\\n'",
+          "cat <<EOF\nmake -j8\nEOF\necho done",
+        ],
+      },
+      {
+        name: "cpp",
+        language: "cpp",
+        blocked: [
+          "cmake --build build-refactoragent -j4",
+          "cmake --build out --parallel 3",
+          "cmake --build out --parallel=2",
+          "CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out",
+          "CMAKE_BUILD_PARALLEL_LEVEL=0 cmake --build out",
+          "CMAKE_BUILD_PARALLEL_LEVEL= cmake --build out",
+          "env CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out",
+          "/usr/bin/env CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out",
+          "command cmake --build out -j4",
+          "bash -lc 'cmake --build out -j4'",
+          "sh -lc 'cmake --build out --parallel 4'",
+          'bash -lc "cmake --build out --parallel 4"',
+          "env CMAKE_BUILD_PARALLEL_LEVEL=8 bash -lc 'cmake --build out'",
+        ],
+        allowed: [
+          "cmake --build out",
+          "cmake --build out -j1",
+          "cmake --build out --parallel 1",
+          "CMAKE_BUILD_PARALLEL_LEVEL=1 cmake --build out",
+          "env CMAKE_BUILD_PARALLEL_LEVEL=1 cmake --build out",
+          "/usr/bin/env CMAKE_BUILD_PARALLEL_LEVEL=1 cmake --build out",
+          "command cmake --build out -j1",
+          "bash -lc 'cmake --build out -j1'",
+          'cmake --build out -j${SMELL_BUILD_JOBS:-1}',
+          'cmake --build out --parallel ${SMELL_BUILD_JOBS:-1}',
+          'cmake --build out --parallel "${SMELL_BUILD_JOBS:-1}"',
+          'CMAKE_BUILD_PARALLEL_LEVEL=${SMELL_BUILD_JOBS:-1} cmake --build out',
+          'env CMAKE_BUILD_PARALLEL_LEVEL="${SMELL_BUILD_JOBS:-1}" cmake --build out',
+          "env CMAKE_BUILD_PARALLEL_LEVEL=1 bash -lc 'cmake --build out'",
+          "printf '%s\\n' 'CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out'",
+        ],
+      },
+    ]
+    for (const buildCase of buildGateCases) {
+      const projectRoot = path.join(tempRoot, `build-gate-${buildCase.name}`)
+      await mkdir(projectRoot, { recursive: true })
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        name: `build-gate-${buildCase.name}`,
+        project_root: projectRoot,
+        language: buildCase.language,
+        smell: "long_method",
+        location: `sample.${buildCase.language === "python" ? "py" : "cc"}:method=target|line=1`,
+        checkpoint_required: true,
+        budget: {},
+      })
+      const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot })
+      const sessionID = `build-gate-${buildCase.name}`
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID,
+          arguments: `--verification-mode=project_full -- Project root: ${projectRoot}; Language: ${buildCase.language}; Smell type: long_method; Target location: sample.cc:method=target|line=1`,
+        },
+        { parts: [] },
+      )
+      for (const command of buildCase.blocked) {
+        let message = ""
+        try {
+          await plugin["tool.execute.before"](
+            { tool: "bash", sessionID },
+            { args: { command } },
+          )
+        } catch (error) {
+          message = String(error?.message || error)
+        }
+        assertCond(
+          `manual_build_parallel_${buildCase.name}_blocks_${command}`,
+          message.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
+          `command was not rejected: ${command}`,
+        )
+      }
+      for (const command of buildCase.allowed) {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID },
+          { args: { command } },
+        )
+      }
+      await plugin.dispose?.()
+      buildGateResults.push({
+        language: buildCase.language,
+        blocked: buildCase.blocked.length,
+        allowed: buildCase.allowed.length,
+      })
+    }
+
+    process.env.SMELL_BUILD_JOBS = "2"
+    const capTwoRoot = path.join(tempRoot, "build-gate-cap-two")
+    await mkdir(capTwoRoot, { recursive: true })
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "build-gate-cap-two",
+      project_root: capTwoRoot,
+      language: "cpp",
+      smell: "long_method",
+      location: "sample.cc:method=target|line=1",
+      checkpoint_required: true,
+      budget: {},
+    })
+    const capTwoPlugin = await pluginModule.SmellPlugin({ worktree: capTwoRoot })
+    await capTwoPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: "build-gate-cap-two",
+        arguments: `--verification-mode=project_full -- Project root: ${capTwoRoot}; Language: cpp; Smell type: long_method; Target location: sample.cc:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    for (const command of [
+      "cmake --build out --parallel 2",
+      "make --jobs=2",
+      "ninja --jobs 2",
+      "CMAKE_BUILD_PARALLEL_LEVEL=2 command cmake --build out",
+      "bash -lc 'cmake --build out --parallel 2'",
+      "MAKEFLAGS=-j2 make",
+      "env SMELL_BUILD_JOBS=2 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+    ]) {
+      await capTwoPlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "build-gate-cap-two" },
+        { args: { command } },
+      )
+    }
+    for (const command of [
+      "cmake --build out --parallel 3",
+      "make --jobs=3",
+      "ninja --jobs 3",
+      "CMAKE_BUILD_PARALLEL_LEVEL=3 command cmake --build out",
+      "bash -lc 'cmake --build out --parallel 3'",
+      "MAKEFLAGS=-j3 make",
+      "env SMELL_BUILD_JOBS=3 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+    ]) {
+      let capTwoMessage = ""
+      try {
+        await capTwoPlugin["tool.execute.before"](
+          { tool: "bash", sessionID: "build-gate-cap-two" },
+          { args: { command } },
+        )
+      } catch (error) {
+        capTwoMessage = String(error?.message || error)
+      }
+      assertCond(
+        `manual_build_parallel_cap_two_blocks_${command}`,
+        capTwoMessage.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
+        `${command} was not rejected under a two-job cap`,
+      )
+    }
+    await capTwoPlugin.dispose?.()
+
+    process.env.SMELL_BUILD_JOBS = "1"
+    const resumeRoot = path.join(tempRoot, "build-gate-resume")
+    await mkdir(resumeRoot, { recursive: true })
+    const resumeLocation = "resume.cc:method=target|line=1"
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "build-gate-resume",
+      project_root: resumeRoot,
+      language: "cpp",
+      smell: "long_method",
+      location: resumeLocation,
+      checkpoint_required: true,
+      early_calls: 1,
+      budget: {},
+    })
+    await writeFile(stateFile, "0", "utf8")
+    const initialResumePlugin = await pluginModule.SmellPlugin({ worktree: resumeRoot })
+    await initialResumePlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: "build-gate-resume-initial",
+        arguments: `--verification-mode=project_full -- Project root: ${resumeRoot}; Language: cpp; Smell type: long_method; Target location: ${resumeLocation}`,
+      },
+      { parts: [] },
+    )
+    const initialResumeResult = await initialResumePlugin.tool.smell_verify.execute(
+      {
+        projectRoot: resumeRoot,
+        smell: "long_method",
+        location: resumeLocation,
+        verificationMode: "project_full",
+      },
+      {
+        sessionID: "build-gate-resume-initial",
+        agent: "smell-refactor-agent",
+        directory: resumeRoot,
+      },
+    )
+    const resumeState = initialResumeResult.metadata?.command_loop_state
+    assertCond(
+      "manual_build_parallel_resume_state_exported",
+      Boolean(resumeState && typeof resumeState === "object"),
+      "initial checkpoint session did not export command state",
+    )
+    await initialResumePlugin.dispose?.()
+    Object.assign(process.env, {
+      SMELL_PROJECT_ROOT: resumeRoot,
+      SMELL_LANGUAGE: "cpp",
+      SMELL_SMELL: "long_method",
+      SMELL_LOCATION: resumeLocation,
+      SMELL_VERIFICATION_MODE: "project_full",
+      SMELL_COMMAND_LOOP_STATE_JSON: JSON.stringify(resumeState),
+    })
+    const resumedPlugin = await pluginModule.SmellPlugin({ worktree: resumeRoot })
+    let resumedMessage = ""
+    try {
+      await resumedPlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "build-gate-resumed" },
+        { args: { command: "cmake --build out -j4" } },
+      )
+    } catch (error) {
+      resumedMessage = String(error?.message || error)
+    }
+    assertCond(
+      "manual_build_parallel_resumed_state_blocks_four",
+      resumedMessage.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
+      "restored batch command state did not enforce the build cap",
+    )
+    await resumedPlugin.dispose?.()
+
+    process.env.SMELL_LOCATION = "other.cc:method=other|line=1"
+    const mismatchedResumePlugin = await pluginModule.SmellPlugin({ worktree: resumeRoot })
+    let mismatchMessage = ""
+    try {
+      await mismatchedResumePlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "build-gate-resume-mismatch" },
+        { args: { command: "cmake --build out -j4" } },
+      )
+    } catch (error) {
+      mismatchMessage = String(error?.message || error)
+    }
+    assertCond(
+      "manual_build_parallel_resume_identity_mismatch_fails_closed",
+      mismatchMessage.includes("COMMAND_POLICY_STATE_IDENTITY_MISMATCH"),
+      "batch identity mismatch did not fail closed",
+    )
+    await mismatchedResumePlugin.dispose?.()
+
+    process.env.SMELL_LOCATION = resumeLocation
+    process.env.SMELL_COMMAND_LOOP_STATE_JSON = '{"schema_version":3}'
+    const malformedResumePlugin = await pluginModule.SmellPlugin({ worktree: resumeRoot })
+    let malformedResumeMessage = ""
+    try {
+      await malformedResumePlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "build-gate-resume-malformed" },
+        { args: { command: "cmake --build out -j4" } },
+      )
+    } catch (error) {
+      malformedResumeMessage = String(error?.message || error)
+    }
+    assertCond(
+      "manual_build_parallel_resume_malformed_state_fails_closed",
+      malformedResumeMessage.includes("COMMAND_POLICY_STATE_INVALID"),
+      "malformed resumed command state did not fail closed",
+    )
+    await malformedResumePlugin.dispose?.()
+    for (const key of [
+      "SMELL_PROJECT_ROOT",
+      "SMELL_LANGUAGE",
+      "SMELL_SMELL",
+      "SMELL_LOCATION",
+      "SMELL_VERIFICATION_MODE",
+      "SMELL_COMMAND_LOOP_STATE_JSON",
+    ]) delete process.env[key]
+
+    process.env.SMELL_BUILD_JOBS = "1"
+    const bypassCases = [
+      { name: "java", language: "java", checkpoint_required: true },
+      { name: "noncheckpoint", language: "python", checkpoint_required: false },
+    ]
+    for (const bypass of bypassCases) {
+      const projectRoot = path.join(tempRoot, `build-gate-${bypass.name}`)
+      await mkdir(projectRoot, { recursive: true })
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        ...bypass,
+        project_root: projectRoot,
+        smell: "long_method",
+        location: bypass.language === "java" ? "Sample.java:1" : "sample.py:1",
+        budget: {},
+      })
+      const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot })
+      const sessionID = `build-gate-${bypass.name}`
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID,
+          arguments: `--verification-mode=project_full -- Project root: ${projectRoot}; Language: ${bypass.language}; Smell type: long_method; Target location: ${bypass.language === "java" ? "Sample.java:1" : "sample.py:1"}`,
+        },
+        { parts: [] },
+      )
+      for (const command of [
+        "cmake --build out -j8",
+        "make --jobs=8",
+        "bash -lc 'ninja --jobs=8'",
+        "env CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out",
+        "MAKEFLAGS=-j8 make",
+        "env SMELL_BUILD_JOBS=8 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+      ]) {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID },
+          { args: { command } },
+        )
+      }
+      if (bypass.language === "java") {
+        for (const command of ["mvn test", "./gradlew test"]) {
+          let message = ""
+          try {
+            await plugin["tool.execute.before"](
+              { tool: "bash", sessionID },
+              { args: { command } },
+            )
+          } catch (error) {
+            message = String(error?.message || error)
+          }
+          assertCond(
+            `manual_build_parallel_java_keeps_${command}`,
+            message.includes("Do not run Maven or Gradle directly"),
+            `existing Java build rule did not reject: ${command}`,
+          )
+        }
+      }
+      await plugin.dispose?.()
+    }
+    const unownedPlugin = await pluginModule.SmellPlugin({ worktree: tempRoot })
+    for (const command of [
+      "make -j8",
+      "make --jobs=8",
+      "bash -lc 'ninja --jobs=8'",
+      "env CMAKE_BUILD_PARALLEL_LEVEL=8 cmake --build out",
+      "MAKEFLAGS=-j8 make",
+      "env SMELL_BUILD_JOBS=8 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
+    ]) {
+      await unownedPlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "unowned-build-gate" },
+        { args: { command } },
+      )
+    }
+    await unownedPlugin.dispose?.()
+
+    const replayCases = [
+      {
+        name: "55",
+        language: "python",
+        smell: "long_method",
+        location: "sample55.py:method=target|line=1",
+        budget: { metric: "meaningful_line_count", current: 91, passing_max: 80, required_reduction: 11, unit: "meaningful_line_count" },
+      },
+      {
+        name: "57",
+        language: "python",
+        smell: "long_method",
+        location: "sample57.py:method=target|line=1",
+        budget: { metric: "meaningful_line_count", current: 84, passing_max: 80, required_reduction: 4, unit: "meaningful_line_count" },
+      },
+      {
+        name: "185",
+        language: "c",
+        smell: "nested_complexity",
+        location: "sample185.c:method=target|line=1",
+        budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
+      },
+    ]
+    const results = []
+    for (const replay of replayCases) {
+      const replayRoot = path.join(tempRoot, `replay-${replay.name}`)
+      await mkdir(replayRoot, { recursive: true })
+      await writeFile(stateFile, "0", "utf8")
+      await writeFile(logFile, "", "utf8")
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        ...replay,
+        project_root: replayRoot,
+        checkpoint_required: true,
+        early_calls: 2,
+      })
+      const plugin = await pluginModule.SmellPlugin({ worktree: replayRoot })
+      const sessionID = `guard-progress-${replay.name}`
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID,
+          arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${replayRoot}; Language: ${replay.language}; Smell type: ${replay.smell}; Target location: ${replay.location}`,
+        },
+        { parts: [] },
+      )
+      const toolArgs = {
+        projectRoot: replayRoot,
+        smell: replay.smell,
+        location: replay.location,
+        verificationMode: "project_full",
+      }
+      const toolContext = { sessionID, agent: "smell-refactor-agent", directory: replayRoot }
+      const earlyStates = []
+      for (let call = 0; call < 2; call += 1) {
+        const early = await plugin.tool.smell_verify.execute(toolArgs, toolContext)
+        const earlyPayload = parseJson(`guard_progress_${replay.name}_${call}`, early.output)
+        assertEqual(`guard_progress_${replay.name}_${call}_status`, earlyPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
+        assertEqual(`guard_progress_${replay.name}_${call}_full`, earlyPayload.project_full_executed, false, "project_full_executed")
+        assertEqual(`guard_progress_${replay.name}_${call}_loop_absent`, earlyPayload.loop, undefined, "loop")
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_continuation`,
+          early.metadata?.command_loop_state?.continuation_count,
+          0,
+          "continuation_count",
+        )
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_no_progress`,
+          early.metadata?.command_loop_state?.no_progress_count,
+          0,
+          "no_progress_count",
+        )
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_fingerprint`,
+          early.metadata?.command_loop_state?.last_failure_fingerprint,
+          "",
+          "last_failure_fingerprint",
+        )
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_cap`,
+          early.metadata?.command_loop_state?.cap_recovery_used,
+          false,
+          "cap_recovery_used",
+        )
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_auto_absent`,
+          early.metadata?.auto_continuation,
+          undefined,
+          "auto_continuation",
+        )
+        earlyStates.push(JSON.stringify(early.metadata?.command_loop_state))
+      }
+      assertEqual(
+        `guard_progress_${replay.name}_state_unchanged`,
+        earlyStates[1],
+        earlyStates[0],
+        "command_loop_state",
+      )
+      const beforeCross = (await readFile(logFile, "utf8"))
+        .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+      assertEqual(
+        `guard_progress_${replay.name}_premature_full_count`,
+        beforeCross.filter((item) => item.command === "verify").length,
+        0,
+        "verify count",
+      )
+      const crossed = await plugin.tool.smell_verify.execute(toolArgs, toolContext)
+      const crossedPayload = parseJson(`guard_progress_${replay.name}_crossed`, crossed.output)
+      assertEqual(`guard_progress_${replay.name}_crossed_status`, crossedPayload.status, "PASS", "status")
+      assertEqual(`guard_progress_${replay.name}_crossed_loop`, crossedPayload.loop?.decision, "stop", "loop.decision")
+      assertEqual(
+        `guard_progress_${replay.name}_crossed_continuation`,
+        crossed.metadata?.command_loop_state?.continuation_count,
+        0,
+        "continuation_count",
+      )
+      const commands = (await readFile(logFile, "utf8"))
+        .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+      assertEqual(`guard_progress_${replay.name}_preflight_count`, commands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
+      assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
+      results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })
+    }
+
+    const malformedRoot = path.join(tempRoot, "malformed-progress")
+    await mkdir(malformedRoot, { recursive: true })
+    await writeFile(stateFile, "0", "utf8")
+    await writeFile(logFile, "", "utf8")
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "malformed",
+      project_root: malformedRoot,
+      language: "python",
+      smell: "long_method",
+      location: "malformed.py:method=target|line=1",
+      checkpoint_required: true,
+      early_calls: 0,
+      malformed_progress: true,
+      budget: { metric: "meaningful_line_count", current: 80, passing_max: 80, required_reduction: 0, unit: "meaningful_line_count" },
+    })
+    const malformedPlugin = await pluginModule.SmellPlugin({ worktree: malformedRoot })
+    const malformedSession = "guard-progress-malformed"
+    await malformedPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: malformedSession,
+        arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${malformedRoot}; Language: python; Smell type: long_method; Target location: malformed.py:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    const malformed = await malformedPlugin.tool.smell_verify.execute(
+      {
+        projectRoot: malformedRoot,
+        smell: "long_method",
+        location: "malformed.py:method=target|line=1",
+        verificationMode: "project_full",
+      },
+      { sessionID: malformedSession, agent: "smell-refactor-agent", directory: malformedRoot },
+    )
+    const malformedPayload = parseJson("guard_progress_malformed", malformed.output)
+    assertEqual("guard_progress_malformed_status", malformedPayload.status, "BRIDGE_CONTRACT_INVALID", "status")
+    assertEqual("guard_progress_malformed_loop_absent", malformedPayload.loop, undefined, "loop")
+    assertEqual("guard_progress_malformed_continuation", malformed.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
+    const malformedCommands = (await readFile(logFile, "utf8"))
+      .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    assertEqual("guard_progress_malformed_preflight_count", malformedCommands.filter((item) => item.command === "guard-progress").length, 1, "guard-progress count")
+    assertEqual("guard_progress_malformed_full_count", malformedCommands.filter((item) => item.command === "verify").length, 0, "verify count")
+
+    for (const bypass of [
+      { name: "java", language: "java", smell: "long_method", location: "Sample.java:1", checkpoint_required: true },
+      { name: "noncheckpoint", language: "python", smell: "unsupported_smell", location: "sample.py:1", checkpoint_required: false },
+    ]) {
+      const bypassRoot = path.join(tempRoot, `bypass-${bypass.name}`)
+      await mkdir(bypassRoot, { recursive: true })
+      await writeFile(stateFile, "0", "utf8")
+      await writeFile(logFile, "", "utf8")
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        ...bypass,
+        project_root: bypassRoot,
+        early_calls: 2,
+        budget: {},
+      })
+      const plugin = await pluginModule.SmellPlugin({ worktree: bypassRoot })
+      const sessionID = `guard-progress-bypass-${bypass.name}`
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID,
+          arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${bypassRoot}; Language: ${bypass.language}; Smell type: ${bypass.smell}; Target location: ${bypass.location}`,
+        },
+        { parts: [] },
+      )
+      const result = await plugin.tool.smell_verify.execute(
+        {
+          projectRoot: bypassRoot,
+          smell: bypass.smell,
+          location: bypass.location,
+          verificationMode: "project_full",
+        },
+        { sessionID, agent: "smell-refactor-agent", directory: bypassRoot },
+      )
+      assertEqual(`guard_progress_${bypass.name}_status`, parseJson(`guard_progress_${bypass.name}`, result.output).status, "PASS", "status")
+      const commands = (await readFile(logFile, "utf8"))
+        .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+      assertEqual(`guard_progress_${bypass.name}_preflight_count`, commands.filter((item) => item.command === "guard-progress").length, 0, "guard-progress count")
+      assertEqual(`guard_progress_${bypass.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
+    }
+    return {
+      replayCases: results,
+      manualBuildParallelism: {
+        caps: [1, 2],
+        checkpointLanguages: buildGateResults,
+        javaBuildRulePreserved: true,
+        quotedControllerExpressionAllowed: true,
+        resumedStateEnforced: true,
+        resumedStateMismatchFailsClosed: true,
+        malformedResumedStateFailsClosed: true,
+        noncheckpointBypass: true,
+        unownedBypass: true,
+      },
+      malformedPreflightFailsClosed: true,
+      javaBypass: true,
+      noncheckpointBypass: true,
+    }
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envBefore)) delete process.env[key]
+    }
+    Object.assign(process.env, envBefore)
+    await rm(tempRoot, { recursive: true, force: true })
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.ideaProtocolOnly) {
@@ -2748,6 +3497,7 @@ async function main() {
     const ideaSkillDocs = await runIdeaSkillProtocolDocSelfCheck()
     const bridge = await runBridgeSelfCheck(fixtureRoot, artifactRoot)
     const pluginSelfCheck = await runPluginSelfCheck(fixtureRoot, artifactRoot)
+    const guardProgressGate = await runGuardProgressGateSelfCheck()
     const datasetSmoke = options.requireDataset ? await runDatasetSmokeSelfCheck(options) : null
     const report = {
       success: true,
@@ -2775,6 +3525,7 @@ async function main() {
         coversIdeaResultShape: true,
       },
       idleContinue: pluginSelfCheck.idleContinue,
+      guardProgressGate,
     }
     if (datasetSmoke) {
       report.datasetSmoke = datasetSmoke

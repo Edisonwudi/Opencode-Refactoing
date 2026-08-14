@@ -24,6 +24,16 @@ def main() -> int:
     commands = set(subparsers.choices)
     expected = {"resolve-command", "capture-baseline", "verify"}
     assert commands == expected, (commands, expected)
+    progress_args = parser.parse_args([
+        "verify",
+        "--project-root", "/tmp/project",
+        "--language", "python",
+        "--smell", "long_method",
+        "--location", "sample.py:1",
+        "--guard-progress-only",
+    ])
+    assert progress_args.func is smell_bridge.cmd_verify, progress_args
+    assert progress_args.guard_progress_only is True, progress_args
 
     build_timeout = {
         "status": "BUILD_FAILED",

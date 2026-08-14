@@ -441,6 +441,45 @@ check(
     R._runner_closure_action(empty_trace, reminder_used=True, continuations_dispatched=0, max_continuations=2),
     "stop",
 )
+guard_progress_payload = {
+    "schema_version": "smell.guard-progress/v1",
+    "success": False,
+    "status": "GUARD_PROGRESS_REQUIRED",
+    "applicable": True,
+    "checkpoint_required": True,
+    "source_guard_passed": False,
+    "ready_for_project_full": False,
+    "project_full_executed": False,
+    "metric_budget": {
+        "current": 55,
+        "passing_max": 50,
+        "required_reduction": 5,
+    },
+    "next_action": "Reduce the target method below the Guard threshold.",
+}
+guard_progress_trace = R._verification_trace(verify_event(
+    guard_progress_payload,
+    metadata={
+        "command_loop_state": {
+            "schema_version": 1,
+            "continuation_count": 0,
+            "no_progress_count": 0,
+            "last_failure_fingerprint": "",
+            "cap_recovery_used": False,
+        },
+    },
+))
+check("trace_guard_progress_required", guard_progress_trace["last_guard_progress_required"], True)
+check(
+    "guard_progress_resumes_without_loop_decision",
+    R._runner_closure_action(
+        guard_progress_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=0,
+    ),
+    "guard_progress",
+)
 continue_trace = R._verification_trace(verify_event({"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}}))
 check("trace_verify_calls", continue_trace["smell_verify_calls"], 1)
 check("trace_decision", continue_trace["last_loop_decision"], "continue")
@@ -605,6 +644,13 @@ for name, mutation in (
         "stop",
     )
 verify_resume_prompt = R._runner_continuation_prompt("verify_required", 0, 2, "repair")
+guard_progress_resume_prompt = R._runner_continuation_prompt(
+    "guard_progress",
+    0,
+    2,
+    "repair SECRET mutable instruction",
+    failure_category="GUARD_PROGRESS_REQUIRED",
+)
 continue_resume_prompt = R._runner_continuation_prompt(
     "continue",
     1,
@@ -614,6 +660,20 @@ continue_resume_prompt = R._runner_continuation_prompt(
     failure_category="BUILD_FAILED",
 )
 check_true("verify_prompt_marker", "[runner-resume verify-required]" in verify_resume_prompt)
+check_true(
+    "guard_progress_prompt_marker",
+    "[runner-resume guard-progress]" in guard_progress_resume_prompt,
+)
+check_true(
+    "guard_progress_prompt_uses_tool_result_as_source",
+    "latest smell_verify tool result" in guard_progress_resume_prompt,
+)
+check_true(
+    "guard_progress_prompt_keeps_budget_controller_owned",
+    "55" not in guard_progress_resume_prompt
+    and "SECRET" not in guard_progress_resume_prompt
+    and "GUARD_PROGRESS_REQUIRED" not in guard_progress_resume_prompt,
+)
 check_true("continue_prompt_marker", "[runner-resume continue 1/2]" in continue_resume_prompt)
 check_true(
     "continue_prompt_uses_tool_result_as_source",
@@ -773,6 +833,10 @@ check_true(
     "idea_close_follows_final_verify",
     run_sample_source.index("_run_verify(") < run_sample_source.index("_close_idea_project("),
 )
+check_true(
+    "guard_progress_does_not_consume_continuation_counter",
+    'elif action == "continue":\n            continuations_dispatched += 1' in run_sample_source,
+)
 sanitized_service = R._sanitize_idea_service_payload({
     "status": "ok",
     "token": "top-level-secret",
@@ -847,6 +911,94 @@ print(json.dumps(event))
     check("fake_continuation_rc", second.returncode, 0)
     check("fake_continuation_status", second_trace["last_status"], "PASS")
     check("fake_continuation_action", second_action, "stop")
+
+print("== fake CLI guard-progress same-session integration ==")
+with tempfile.TemporaryDirectory() as tmp:
+    fake = Path(tmp) / "fake-opencode-guard-progress"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+continued = "--session" in sys.argv
+payload = (
+    {"success": True, "status": "PASS", "loop": {"decision": "stop"}}
+    if continued
+    else {
+        "schema_version": "smell.guard-progress/v1",
+        "success": False,
+        "status": "GUARD_PROGRESS_REQUIRED",
+        "applicable": True,
+        "checkpoint_required": True,
+        "source_guard_passed": False,
+        "ready_for_project_full": False,
+        "project_full_executed": False,
+        "metric_budget": {"current": 55, "passing_max": 50, "required_reduction": 5},
+        "next_action": "Reduce the target method below the Guard threshold.",
+    }
+)
+event = {
+    "type": "tool_use",
+    "sessionID": "ses_guard_progress",
+    "part": {
+        "tool": "smell_verify",
+        "state": {
+            "status": "completed",
+            "output": json.dumps(payload),
+            "metadata": {
+                "command_loop_state": {
+                    "schema_version": 1,
+                    "continuation_count": 0,
+                    "no_progress_count": 0,
+                    "last_failure_fingerprint": "",
+                    "cap_recovery_used": False,
+                },
+            },
+        },
+    },
+}
+print(json.dumps(event))
+""",
+        encoding="utf-8",
+    )
+    os.chmod(fake, 0o755)
+    fake_args = argparse.Namespace(opencode_bin=str(fake), model="minimax/MiniMax-M2.7")
+    first = subprocess.run(
+        R._opencode_run_command(fake_args, "smell-refactor-agent"),
+        input="initial command",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    first_sid = R._parse_session_id_from_json_events(first.stdout)
+    first_trace = R._verification_trace(first.stdout)
+    first_action = R._runner_closure_action(
+        first_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=0,
+    )
+    check("guard_progress_fake_initial_sid", first_sid, "ses_guard_progress")
+    check("guard_progress_fake_initial_action", first_action, "guard_progress")
+    second_command = R._opencode_run_command(fake_args, "smell-refactor-agent", first_sid)
+    check_true(
+        "guard_progress_fake_reuses_original_session",
+        "--session" in second_command and first_sid in second_command,
+    )
+    second = subprocess.run(
+        second_command,
+        input=R._runner_continuation_prompt("guard_progress", 0, 2, "repair"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    second_trace = R._verification_trace(second.stdout)
+    second_action = R._runner_closure_action(
+        second_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=0,
+    )
+    check("guard_progress_fake_crossed_status", second_trace["last_status"], "PASS")
+    check("guard_progress_fake_crossed_action", second_action, "stop")
 
 print("== _task_prompt ==")
 # Build a minimal fake sample/args to call _task_prompt

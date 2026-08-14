@@ -1546,6 +1546,17 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         last_cap_recovery_used = loop.get("cap_recovery_used") is True
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
+    last_guard_progress_required = bool(
+        isinstance(last_payload, dict)
+        and last_payload.get("schema_version") == "smell.guard-progress/v1"
+        and last_payload.get("success") is False
+        and last_payload.get("status") == "GUARD_PROGRESS_REQUIRED"
+        and last_payload.get("applicable") is True
+        and last_payload.get("checkpoint_required") is True
+        and last_payload.get("source_guard_passed") is False
+        and last_payload.get("ready_for_project_full") is False
+        and last_payload.get("project_full_executed") is False
+    )
     return {
         "smell_verify_calls": calls,
         "verification_history": verification_history,
@@ -1553,6 +1564,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "tools_after_last_verify": tools_after_last_verify,
         "last_loop_decision": last_decision,
         "last_status": last_status,
+        "last_guard_progress_required": last_guard_progress_required,
         "last_failure_category": _failure_category_from_verify_payload(last_payload or {}),
         "last_native_diagnostics": _native_failure_diagnostics(last_payload or {}),
         "last_output_parsed": last_payload is not None,
@@ -1631,6 +1643,11 @@ def _runner_closure_action(
     """Return the next synchronous runner action for a completed OpenCode turn."""
     if int(trace.get("smell_verify_calls") or 0) == 0:
         return "stop" if reminder_used else "verify_required"
+    # Cheap Guard progress is a controller-owned editing phase, not a formal
+    # verification failure. Resume the same OpenCode session without spending
+    # the plugin continuation budget; the sample deadline remains the bound.
+    if trace.get("last_guard_progress_required") is True:
+        return "guard_progress"
     # The plugin owns all semantic continuation policy across UI and batch.
     # This is only a transport safety bound. The extra transport is available
     # only when the plugin explicitly persisted that its one cap recovery was
@@ -1664,6 +1681,15 @@ def _runner_continuation_prompt(
                 "[runner-resume verify-required]",
                 "Resume the existing task in this session and call smell_verify now.",
                 "The controller policy is unchanged; use the current source state.",
+            ]
+        )
+    if action == "guard_progress":
+        return "\n".join(
+            [
+                "[runner-resume guard-progress]",
+                "Resume the existing task in this session from the current source state.",
+                "Read metric_budget and next_action from the latest smell_verify tool result.",
+                "Make only the needed narrow production edit, then call smell_verify again.",
             ]
         )
     return "\n".join(
@@ -2391,8 +2417,12 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         if action == "verify_required":
             reminders_dispatched += 1
             reminder_used = True
-        else:
+        elif action == "continue":
             continuations_dispatched += 1
+            reminder_used = False
+        else:
+            # guard_progress is an editing-phase transport resume. It neither
+            # mutates nor consumes CommandLoopState continuation counters.
             reminder_used = False
         continuation_prompt = _runner_continuation_prompt(
             action,
