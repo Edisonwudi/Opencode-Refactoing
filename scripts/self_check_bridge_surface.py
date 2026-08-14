@@ -34,6 +34,16 @@ def main() -> int:
     ])
     assert progress_args.func is smell_bridge.cmd_verify, progress_args
     assert progress_args.guard_progress_only is True, progress_args
+    focused_args = parser.parse_args([
+        "verify",
+        "--project-root", "/tmp/project",
+        "--language", "cpp",
+        "--smell", "code_clone_type_1",
+        "--location", "sample.cc:1",
+        "--focused-preflight-only",
+    ])
+    assert focused_args.func is smell_bridge.cmd_verify, focused_args
+    assert focused_args.focused_preflight_only is True, focused_args
 
     build_timeout = {
         "status": "BUILD_FAILED",

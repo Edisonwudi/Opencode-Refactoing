@@ -248,6 +248,73 @@ def main() -> None:
         assert "Makefile" in snapshot["diff"]["stdout"], snapshot
 
         original_run_build_test_guard = smell_bridge.run_build_test_guard
+        focused_full_calls: list[bool] = []
+
+        def _unexpected_full_during_focused(*_args, **_kwargs):
+            focused_full_calls.append(True)
+            raise AssertionError("focused-only feedback must not run project_full")
+
+        try:
+            smell_bridge.run_build_test_guard = _unexpected_full_during_focused
+            focused_only_result = smell_bridge._run_project_full_in_fresh_worktree(
+                config,
+                snapshot,
+                focused_only=True,
+            )
+        finally:
+            smell_bridge.run_build_test_guard = original_run_build_test_guard
+        assert focused_full_calls == [], focused_full_calls
+        assert focused_only_result["type"] == "focused_preflight", (
+            focused_only_result
+        )
+        assert focused_only_result["status"] == "READY", focused_only_result
+        assert focused_only_result["acceptance"] is False, focused_only_result
+        assert focused_only_result["project_full_executed"] is False, (
+            focused_only_result
+        )
+        assert focused_only_result["verification_isolation"]["success"] is True, (
+            focused_only_result
+        )
+        assert focused_only_result["verification_isolation"][
+            "cleanup_success"
+        ] is True, focused_only_result
+        assert _status(root) == before, (_status(root), before)
+        assert _run(root, "git", "worktree", "list", "--porcelain") == (
+            worktrees_before
+        )
+
+        original_resolve = smell_bridge._resolve
+        original_checkpoint_context = smell_bridge._checkpoint_context
+        original_run_build_test_guard = smell_bridge.run_build_test_guard
+        try:
+            smell_bridge._resolve = lambda _args: config
+            smell_bridge._checkpoint_context = lambda *_args, **_kwargs: (
+                None,
+                {"baseline_project_commit": baseline_commit},
+            )
+            smell_bridge.run_build_test_guard = _unexpected_full_during_focused
+            focused_command_result = smell_bridge.cmd_verify(
+                SimpleNamespace(
+                    guard_progress_only=False,
+                    focused_preflight_only=True,
+                    smell_evidence="",
+                    baseline_seal="",
+                )
+            )
+        finally:
+            smell_bridge._resolve = original_resolve
+            smell_bridge._checkpoint_context = original_checkpoint_context
+            smell_bridge.run_build_test_guard = original_run_build_test_guard
+        assert focused_command_result["status"] == "READY", focused_command_result
+        assert focused_command_result["project_full_executed"] is False, (
+            focused_command_result
+        )
+        assert focused_command_result["verification_isolation"]["success"] is True, (
+            focused_command_result
+        )
+        assert _status(root) == before, (_status(root), before)
+
+        original_run_build_test_guard = smell_bridge.run_build_test_guard
         full_calls_after_failed_preflight: list[bool] = []
 
         def _unexpected_full_after_failed_preflight(*_args, **_kwargs):

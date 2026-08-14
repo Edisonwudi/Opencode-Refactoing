@@ -765,6 +765,90 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def cmd_focused_preflight_progress(args: argparse.Namespace) -> dict[str, Any]:
+    """Run only the configured focused gate in an isolated worktree.
+
+    This is editing feedback, never acceptance evidence. It deliberately
+    reuses the project-full snapshot/worktree path so build output cannot
+    mutate the candidate tree.
+    """
+    resolved = _resolve(args)
+    command = resolved.focused_preflight
+    if (
+        resolved.language not in {"python", "c", "cpp"}
+        or resolved.verification_mode != "project_full"
+        or (not command.command and not command.script)
+    ):
+        return run_focused_preflight(resolved)
+
+    evidence = (
+        getattr(args, "smell_evidence", "")
+        or os.environ.get("SMELL_EVIDENCE", "")
+    )
+    baseline_seal = str(
+        getattr(args, "baseline_seal", "")
+        or os.environ.get("SMELL_BASELINE_SEAL", "")
+    ).strip()
+    _, checkpoint = _checkpoint_context(
+        resolved,
+        evidence,
+        baseline_seal,
+        persist=False,
+    )
+    baseline_project_commit = (
+        str(checkpoint.get("baseline_project_commit") or "")
+        if isinstance(checkpoint, dict)
+        else ""
+    )
+    declared_test_paths = [
+        item.strip()
+        for item in str(resolved.sample_test_location or "").split(";")
+        if item.strip()
+    ]
+    snapshot = _snapshot_project(
+        resolved.project_root,
+        declared_test_paths=declared_test_paths,
+        base_commit=baseline_project_commit or "HEAD",
+    )
+    change_audit = (
+        snapshot.get("change_audit") if isinstance(snapshot, dict) else None
+    )
+    generated_audit = (
+        change_audit.get("final_diff_generated_artifact_audit")
+        if isinstance(change_audit, dict)
+        else None
+    )
+    if (
+        isinstance(generated_audit, dict)
+        and generated_audit.get("status") == "FINAL_DIFF_GENERATED_ARTIFACTS"
+    ):
+        return {
+            "schema_version": 1,
+            "type": "focused_preflight",
+            "success": False,
+            "status": "FAILED",
+            "acceptance": False,
+            "project_full_executed": False,
+            "cache_scope": "compiler_outputs_only",
+            "test_result_reused": False,
+            "pass_reused": False,
+            "reason": "FINAL_DIFF_GENERATED_ARTIFACTS",
+            "message": _bounded_text(generated_audit.get("message")),
+            "generated_artifact_audit": {
+                "status": "FINAL_DIFF_GENERATED_ARTIFACTS",
+                "paths": _bounded_strings(
+                    generated_audit.get("paths"), count=64, limit=512
+                ),
+            },
+            "execution": None,
+        }
+    return _run_project_full_in_fresh_worktree(
+        resolved,
+        snapshot,
+        focused_only=True,
+    )
+
+
 def _guard_progress_next_action(
     metric_budget: list[dict[str, Any]],
     *,
@@ -849,6 +933,8 @@ def _god_class_min_improved_reduction(resolved) -> float:
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "guard_progress_only", False):
         return cmd_guard_progress(args)
+    if getattr(args, "focused_preflight_only", False):
+        return cmd_focused_preflight_progress(args)
     resolved = _resolve(args)
     evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
     build_test_required = (
@@ -1475,6 +1561,7 @@ def _run_project_full_in_fresh_worktree(
     snapshot: Optional[dict[str, Any]],
     *,
     require_test_execution: bool = False,
+    focused_only: bool = False,
 ) -> dict[str, Any]:
     """Replay the frozen pre-build deliverable in one detached worktree."""
     if not isinstance(snapshot, dict):
@@ -1623,7 +1710,9 @@ def _run_project_full_in_fresh_worktree(
                                     snapshot_change_count=change_count,
                                 )
                             else:
-                                if focused_preflight_result.get("success") is False:
+                                if focused_only:
+                                    pass
+                                elif focused_preflight_result.get("success") is False:
                                     execution = focused_preflight_result.get("execution")
                                     build_test_result = {
                                         "type": "build_test",
@@ -1695,6 +1784,26 @@ def _run_project_full_in_fresh_worktree(
         if isinstance(isolation, dict) and isolation.get("cleanup_success") is None:
             isolation["cleanup_success"] = cleanup_success
         return failure
+    if focused_only:
+        if not isinstance(focused_preflight_result, dict):
+            return _final_verify_infra_failure_result(
+                resolved,
+                stage="run_focused_preflight",
+                message="The isolated focused preflight returned no result.",
+                base_commit=resolved_base_text,
+                snapshot_change_count=change_count,
+                cleanup_success=cleanup_success,
+            )
+        focused_preflight_result["verification_isolation"] = {
+            "contract_version": "focused-preflight-fresh-worktree/v1",
+            "mode": "detached_git_worktree",
+            "success": True,
+            "stage": "completed",
+            "base_commit": resolved_base_text,
+            "snapshot_change_count": change_count,
+            "cleanup_success": cleanup_success,
+        }
+        return focused_preflight_result
     if not isinstance(build_test_result, dict):
         return _final_verify_infra_failure_result(
             resolved,
@@ -3471,6 +3580,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify")
     _add_common(verify_parser)
     verify_parser.add_argument("--guard-progress-only", action="store_true")
+    verify_parser.add_argument("--focused-preflight-only", action="store_true")
     verify_parser.add_argument("--skip-build-test", action="store_true")
     verify_parser.add_argument("--no-snapshot", action="store_true")
     verify_parser.add_argument("--artifact-root")

@@ -312,8 +312,10 @@ docker run --rm \
   终态可作为证据；后两者必须与对应真实 runner invocation 同时出现。`--version`、`-v`、
   帮助输出、文件存在性和 collection-only 均不能把返回码 0 变成测试 PASS。
 - 正式验证按三段执行：source Guard 先判断目标异味是否越线；配置了重项目预检时，
-  再在同一 fresh worktree 做增量编译，并仅对已声明的项目运行固定目标测试或行为探针；最后才执行一次
-  `project_full`。前两段只提供修复反馈，`acceptance=false`，不能缓存或复用 PASS、
+  未越线的 `smell_verify` 会把当前候选重放到一次性 fresh worktree 做聚焦编译，并仅对
+  已声明的项目运行固定目标测试或行为探针；越线后才在正式 fresh worktree 执行一次
+  `project_full`。模型应在一次连贯生产编辑后调用这个受控入口，不应在候选源码树手工运行
+  重项目构建。前两段只提供修复反馈，`acceptance=false`，不能缓存或复用 PASS、
   测试结果和 JUnit。C/C++ replay matrix 只通过按镜像、语言、项目隔离的 named volume
   共享 ccache 对象；build 目录、测试输出与验收结论始终按样本隔离。
 - 最终交付快照在 build/test 前以 c000 冻结 commit 为基线采集完整 Git diff/status，

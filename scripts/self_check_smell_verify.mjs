@@ -2122,7 +2122,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertCond(
     "command_prompt_uses_frozen_verification_mode",
     sampleOptimizedPrompt.includes("verification_mode: sample_optimized")
-      && sampleOptimizedPrompt.includes("final acceptance gate under verification_mode=sample_optimized")
+      && sampleOptimizedPrompt.includes("controller-owned staged gate under verification_mode=sample_optimized")
       && !sampleOptimizedPrompt.includes("smell_verify(project_full)"),
     "controller prompt hardcoded project_full instead of the frozen verification mode",
   )
@@ -2178,10 +2178,10 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && featureTargetIdentityPrompt.includes("required_reduction=5")
       && featureTargetIdentityPrompt.includes("unit=foreign accesses")
       && featureTargetIdentityPrompt.includes("necessary planning information, not acceptance authority")
-      && featureTargetIdentityPrompt.includes("focused compile/test already provided by the language reference")
-      && featureTargetIdentityPrompt.includes("source-derived passing route")
-      && featureTargetIdentityPrompt.includes("budget indicates the projected edit is likely to cross")
-      && featureTargetIdentityPrompt.includes("call smell_verify once for final acceptance under the controller-owned verification mode")
+      && featureTargetIdentityPrompt.includes("configured isolated focused preflight")
+      && featureTargetIdentityPrompt.includes("cannot accept the sample or execute project_full")
+      && featureTargetIdentityPrompt.includes("Do not manually run a heavy project build in the candidate source tree")
+      && featureTargetIdentityPrompt.includes("same smell_verify call advances to final acceptance")
       && !featureTargetIdentityPrompt.includes("every budget boundary")
       && !featureTargetIdentityPrompt.includes("sole smell_verify"),
     "feature-envy identity prompt did not render the bounded planning budget",
@@ -2487,11 +2487,11 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         controllerContexts[0].includes("Immutable numeric edit budget")
           && controllerContexts[0].includes("required_reduction=")
           && controllerContexts[0].includes("necessary planning information, not acceptance authority")
-          && controllerContexts[0].includes("focused compile/test already provided by the language reference")
-          && controllerContexts[0].includes("source-derived passing route")
-          && controllerContexts[0].includes("budget indicates the projected edit is likely to cross")
-          && controllerContexts[0].includes("call smell_verify once for final acceptance under the controller-owned verification mode")
-          && controllerContexts[0].includes("final acceptance gate under verification_mode=project_full")
+          && controllerContexts[0].includes("configured isolated focused preflight")
+          && controllerContexts[0].includes("cannot accept the sample or execute project_full")
+          && controllerContexts[0].includes("Do not manually run a heavy project build in the candidate source tree")
+          && controllerContexts[0].includes("same smell_verify call advances to final acceptance")
+          && controllerContexts[0].includes("controller-owned staged gate under verification_mode=project_full")
           && !controllerContexts[0].includes("every budget boundary")
           && !controllerContexts[0].includes("sole smell_verify"),
         "first-turn system context did not include the bounded metric budget and verify timing",
@@ -2780,7 +2780,12 @@ from pathlib import Path
 
 command = sys.argv[1]
 guard_progress_only = command == "verify" and "--guard-progress-only" in sys.argv
-logged_command = "guard-progress" if guard_progress_only else command
+focused_preflight_only = command == "verify" and "--focused-preflight-only" in sys.argv
+logged_command = (
+    "guard-progress" if guard_progress_only
+    else "focused-preflight" if focused_preflight_only
+    else command
+)
 case = json.loads(os.environ.get("SMELL_PREFLIGHT_CASE", "{}"))
 log_path = Path(os.environ["SMELL_PREFLIGHT_LOG"])
 with log_path.open("a", encoding="utf-8") as handle:
@@ -2848,6 +2853,25 @@ elif guard_progress_only:
     }
     if case.get("malformed_progress"):
         payload["project_full_executed"] = True
+elif focused_preflight_only:
+    focused_status = case.get("focused_status", "NOT_APPLICABLE")
+    payload = {
+        "schema_version": 1,
+        "type": "focused_preflight",
+        "success": focused_status != "FAILED",
+        "status": focused_status,
+        "acceptance": False,
+        "project_full_executed": False,
+        "cache_scope": "compiler_outputs_only",
+        "test_result_reused": False,
+        "pass_reused": False,
+        "message": "focused diagnostic",
+        "execution": {
+            "success": focused_status == "READY",
+            "returncode": 17 if focused_status == "FAILED" else 0,
+            "summary_text": "compile error in changed target" if focused_status == "FAILED" else "",
+        } if focused_status != "NOT_APPLICABLE" else None,
+    }
 elif command == "verify":
     payload = {
         "success": True,
@@ -3325,6 +3349,7 @@ print(json.dumps(payload))
         language: "c",
         smell: "nested_complexity",
         location: "sample185.c:method=target|line=1",
+        focused_status: "FAILED",
         budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
       },
       {
@@ -3371,6 +3396,15 @@ print(json.dumps(payload))
         const earlyPayload = parseJson(`guard_progress_${replay.name}_${call}`, early.output)
         assertEqual(`guard_progress_${replay.name}_${call}_status`, earlyPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
         assertEqual(`guard_progress_${replay.name}_${call}_full`, earlyPayload.project_full_executed, false, "project_full_executed")
+        assertEqual(`guard_progress_${replay.name}_${call}_focused_status`, earlyPayload.focused_preflight?.status, replay.focused_status || "NOT_APPLICABLE", "focused_preflight.status")
+        assertEqual(`guard_progress_${replay.name}_${call}_focused_full`, earlyPayload.focused_preflight?.project_full_executed, false, "focused_preflight.project_full_executed")
+        if (replay.focused_status === "FAILED") {
+          assertCond(
+            `guard_progress_${replay.name}_${call}_focused_diagnostic`,
+            String(earlyPayload.next_action || "").includes("compile error in changed target"),
+            "focused failure did not replace the next action with its diagnostic",
+          )
+        }
         assertEqual(`guard_progress_${replay.name}_${call}_loop`, earlyPayload.loop?.decision, "continue", "loop.decision")
         assertEqual(
           `guard_progress_${replay.name}_${call}_continuation`,
@@ -3426,6 +3460,7 @@ print(json.dumps(payload))
       const commands = (await readFile(logFile, "utf8"))
         .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
       assertEqual(`guard_progress_${replay.name}_preflight_count`, commands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
+      assertEqual(`guard_progress_${replay.name}_focused_count`, commands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
       assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
       if (replay.language === "java") {
         for (const command of commands.filter((item) => item.command === "guard-progress")) {
@@ -3496,6 +3531,7 @@ print(json.dumps(payload))
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
     assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")
+    assertEqual("guard_progress_no_progress_focused_count", noProgressCommands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
     assertEqual("guard_progress_no_progress_full_count", noProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
 
     const malformedRoot = path.join(tempRoot, "malformed-progress")

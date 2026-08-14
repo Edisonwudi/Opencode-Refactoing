@@ -2392,8 +2392,9 @@ function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, u
       )
     }
     lines.push("- This budget is necessary planning information, not acceptance authority; final acceptance is still decided by frozen target identity, semantic closure, and the controller-owned configured build/test verification.")
-    lines.push("- During the first-edit stage, if the budget does not yet indicate that the projected edit crosses a source-derived passing route, continue with one small production edit and use the focused compile/test already provided by the language reference.")
-    lines.push("- Once the budget indicates the projected edit is likely to cross a source-derived passing route, call smell_verify once for final acceptance under the controller-owned verification mode.")
+    lines.push("- After one coherent production edit, call smell_verify. While the source Guard is still above the passing route, it runs only the configured isolated focused preflight and cannot accept the sample or execute project_full.")
+    lines.push("- Use focused_preflight diagnostics for the next narrow correction. Do not manually run a heavy project build in the candidate source tree.")
+    lines.push("- Once the source Guard crosses a passing route, the same smell_verify call advances to final acceptance under the controller-owned verification mode.")
   }
   lines.push("- The frozen target Guard and build/test result are the acceptance authority; do not scan or rewrite unrelated sources.")
   lines.push("- Read mutable remaining counts, worklists, and next actions only from the latest smell_verify tool result.")
@@ -2422,7 +2423,7 @@ function commandControllerSystemContext(
     `- sample_deadline_seconds: ${policy.loop.sample_deadline_seconds}`,
     "",
     policy.checkpoint_required
-      ? `smell_verify is the final acceptance gate under verification_mode=${policy.verification_mode}; obey the bounded-budget timing below instead of using it as an intermediate metric probe.`
+      ? `smell_verify is the controller-owned staged gate under verification_mode=${policy.verification_mode}: source Guard, optional isolated focused preflight, then final acceptance only after the Guard passes.`
       : "Call smell_verify as the acceptance gate. Its loop.decision field is authoritative.",
     "When a final verification returns loop.decision=continue, read loop.instruction from that tool result before one narrow correction.",
     "When loop.decision is stop, stop and report loop.termination_reason.",
@@ -2815,7 +2816,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   }
   const verifyTool = (name: string) =>
     tool({
-      description: "Run smell verification and configured build/test. Failed results include failure_pack for narrow repair.",
+      description: "Run the controller-owned staged Guard: source metrics, optional isolated focused preflight, and final configured build/test only after the source Guard passes.",
       args: {
         ...commonShape,
         verificationMode: tool.schema
@@ -2884,18 +2885,65 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             && progressPayload?.project_full_executed === false
           )
           if (!progressPassed) {
-            const normalized = normalizeToolResult(name, progressResult)
-            if (commandState) {
-              const progressRequired = Boolean(
-                progressPayload?.schema_version === "smell.guard-progress/v1"
-                && progressPayload?.success === false
-                && progressPayload?.status === "GUARD_PROGRESS_REQUIRED"
-                && progressPayload?.applicable === true
-                && progressPayload?.checkpoint_required === true
-                && progressPayload?.source_guard_passed === false
-                && progressPayload?.ready_for_project_full === false
-                && progressPayload?.project_full_executed === false
+            const progressRequired = Boolean(
+              progressPayload?.schema_version === "smell.guard-progress/v1"
+              && progressPayload?.success === false
+              && progressPayload?.status === "GUARD_PROGRESS_REQUIRED"
+              && progressPayload?.applicable === true
+              && progressPayload?.checkpoint_required === true
+              && progressPayload?.source_guard_passed === false
+              && progressPayload?.ready_for_project_full === false
+              && progressPayload?.project_full_executed === false
+            )
+            let renderedProgressResult = progressResult
+            if (progressRequired && progressPayload) {
+              const focusedResult = await runBridge(worktree, [
+                "verify",
+                ...commonArgs({ ...resolved, baselineSeal }),
+                "--focused-preflight-only",
+              ])
+              const focusedPayload = recordValue(focusedResult.json)
+              const focusedValid = Boolean(
+                focusedResult.exitCode === 0
+                && focusedPayload?.type === "focused_preflight"
+                && focusedPayload?.acceptance === false
+                && focusedPayload?.project_full_executed === false
+                && ["NOT_APPLICABLE", "READY", "FAILED"].includes(
+                  String(focusedPayload?.status || ""),
+                )
               )
+              if (!focusedValid) {
+                const normalized = normalizeToolResult(name, focusedResult)
+                if (commandState) {
+                  applyCommandLoopDecision(normalized, commandState)
+                  normalized.metadata.command_loop_state = toJsonSafe(
+                    commandLoopStateSnapshot(commandState),
+                  )
+                }
+                return normalized
+              }
+              progressPayload.focused_preflight = focusedPayload
+              progressPayload.focused_preflight_executed = (
+                focusedPayload?.status !== "NOT_APPLICABLE"
+              )
+              if (focusedPayload?.status === "FAILED") {
+                const execution = recordValue(focusedPayload.execution)
+                const diagnostic = typeof execution?.summary_text === "string"
+                  ? execution.summary_text
+                  : typeof focusedPayload?.message === "string"
+                  ? focusedPayload.message
+                  : "Focused preflight failed."
+                progressPayload.next_action = `Repair the focused preflight failure: ${diagnostic}`
+              }
+              renderedProgressResult = {
+                ...progressResult,
+                stdout: JSON.stringify(progressPayload),
+                stderr: [progressResult.stderr, focusedResult.stderr].filter(Boolean).join("\n"),
+                json: progressPayload,
+              }
+            }
+            const normalized = normalizeToolResult(name, renderedProgressResult)
+            if (commandState) {
               if (progressRequired) applyGuardProgressDecision(normalized, commandState)
               normalized.metadata.command_loop_state = toJsonSafe(
                 commandLoopStateSnapshot(commandState),
