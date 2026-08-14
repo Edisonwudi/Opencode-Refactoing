@@ -57,6 +57,7 @@ def analyze_feature_envy_target(
     method: Optional[str] = None,
     line: Optional[int] = None,
     expected_receiver: str = "",
+    exact_receiver_selector: bool = False,
     fold_aliases: bool = True,
 ) -> dict[str, Any]:
     """Threshold-independent Feature Envy metrics for one non-Java function.
@@ -110,12 +111,26 @@ def analyze_feature_envy_target(
         if count > dominant_count:
             dominant_receiver, dominant_count = receiver, count
     ratio = dominant_count / total if total else 0.0
-    expected_access, expected_resolved = _expected_receiver_access(
-        foreign_by_receiver,
-        snippet.signature_text,
-        language,
-        expected_receiver,
-        aliases=(extract_simple_aliases(target, language) or {}) if fold_aliases else {},
+    if exact_receiver_selector:
+        # Product target_context freezes a receiver *root name*.  Do not let a
+        # missing root silently turn into a same-spelled type or alias match.
+        # Type/evidence resolution remains available only to offline dataset
+        # migration callers that have not yet materialized the selector.
+        expected_access = foreign_by_receiver.get(str(expected_receiver).strip(), 0)
+        expected_resolved = ""
+    else:
+        expected_access, expected_resolved = _expected_receiver_access(
+            foreign_by_receiver,
+            snippet.signature_text,
+            language,
+            expected_receiver,
+            aliases=(extract_simple_aliases(target, language) or {}) if fold_aliases else {},
+        )
+    expected_ratio = expected_access / total if total else 0.0
+    expected_strict_hit = (
+        method_loc >= FEATURE_ENVY_MIN_LOC
+        and expected_access >= FEATURE_ENVY_MIN_FOREIGN_ACCESS
+        and expected_ratio >= FEATURE_ENVY_FOREIGN_RATIO
     )
     strict_hit = (
         method_loc >= FEATURE_ENVY_MIN_LOC
@@ -139,7 +154,10 @@ def analyze_feature_envy_target(
         "dominant_receiver_access": dominant_count,
         "dominant_receiver_ratio": round(ratio, 6),
         "expected_receiver_type": expected_receiver,
+        "expected_receiver_name": expected_receiver if exact_receiver_selector else "",
         "expected_receiver_access": expected_access,
+        "expected_receiver_ratio": round(expected_ratio, 6),
+        "expected_receiver_strict_hit": expected_strict_hit,
         "expected_receiver_resolved": expected_resolved,
         "strict_detector_hit": strict_hit,
     }

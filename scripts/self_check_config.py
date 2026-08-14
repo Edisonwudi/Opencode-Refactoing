@@ -18,9 +18,11 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 from smell_core.config import (  # noqa: E402
     CommandConfig,
     DefaultsConfig,
+    ProjectOverride,
     RefactorConfig,
     ResolvedRunConfig,
     load_refactor_config,
+    load_project_overrides,
     resolve_run_config,
 )
 from smell_core.guards import _run_command_config  # noqa: E402
@@ -74,6 +76,38 @@ def main() -> int:
             "run_tests": True,
         }
 
+        slow_project = ProjectOverride(
+            root=project,
+            language="python",
+            shell_timeout=1500,
+        )
+        project_minimum = resolve_run_config(
+            refactor_config=config,
+            project_overrides=[slow_project],
+            project_root=str(project),
+            smell="long_method",
+            location="sample.py:method=target|line=1",
+            cli_language="python",
+            verification_mode="project_full",
+        )
+        assert project_minimum.defaults.shell_timeout == 1500
+        with patch.dict(
+            os.environ,
+            {"MINI_SHELL_TIMEOUT": "2000"},
+            clear=False,
+        ):
+            raised_config = load_refactor_config(None)
+        explicitly_raised = resolve_run_config(
+            refactor_config=raised_config,
+            project_overrides=[slow_project],
+            project_root=str(project),
+            smell="long_method",
+            location="sample.py:method=target|line=1",
+            cli_language="python",
+            verification_mode="project_full",
+        )
+        assert explicitly_raised.defaults.shell_timeout == 2000
+
         started = time.monotonic()
         timeout_result = _run_command_config(
             CommandConfig(
@@ -118,7 +152,22 @@ def main() -> int:
         assert background_timeout["status"] == "timeout", background_timeout
         assert time.monotonic() - started < 3
 
-    print("config self-check: PASS dead_fields=0 llm_fallback=0 shell_timeout=enforced")
+        missing_overlay = temp / "missing-project-test-overlay.yaml"
+        with patch(
+            "smell_core.config.bundled_projects_overlay_path",
+            return_value=missing_overlay,
+        ):
+            try:
+                load_project_overrides(None)
+            except FileNotFoundError as exc:
+                assert "Required runtime project-test overlay is missing" in str(exc)
+            else:
+                raise AssertionError("missing runtime project-test overlay must fail closed")
+
+    print(
+        "config self-check: PASS dead_fields=0 llm_fallback=0 "
+        "shell_timeout=enforced project_test_overlay=required"
+    )
     return 0
 
 

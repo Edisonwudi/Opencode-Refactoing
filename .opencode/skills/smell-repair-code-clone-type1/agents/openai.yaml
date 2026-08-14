@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Clone Type 1 Repair"
+  short_description: "Repair exact duplicated code"
+  default_prompt: "Use $smell-repair-code-clone-type1 to repair the reported Code Clone Type 1 smell without weakening verification."

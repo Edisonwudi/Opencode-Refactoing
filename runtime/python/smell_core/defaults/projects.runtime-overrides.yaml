@@ -1,0 +1,289 @@
+schema_version: 1
+projects:
+  - root: /opt/projects/c/git
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        make clean 2>/dev/null || true
+        make -j"${SMELL_BUILD_JOBS:-1}" \
+          NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_RUST=YesPlease all
+    test:
+      command: null
+      script: |
+        python3 /agent-src/scripts/run_git_project_tests.py \
+          --project-root "${project_root}"
+  - root: /opt/projects/c/rrdtool
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        if [ -f Makefile ]; then make distclean; fi
+        autoreconf -fvi -I m4
+        ./configure \
+          --disable-docs --disable-python --disable-lua --disable-tcl \
+          --disable-ruby --disable-perl
+        make -j"${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        python3 /agent-src/scripts/run_rrdtool_project_tests.py \
+          --project-root "${project_root}"
+  - root: /opt/projects/c/curl
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        autoreconf -fi
+        ./configure --disable-shared --enable-debug --with-openssl
+        make -j"${SMELL_BUILD_JOBS:-1}"
+        make -C tests all -j"${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}/tests"
+        ulimit -n 1024
+        perl "${project_root}/tests/runtests.pl" \
+          -a -p ~flaky ~timing-dependent -j1 --min=1
+  - root: /opt/projects/c/redis
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        make clean
+        make -j"${SMELL_BUILD_JOBS:-1}" REDIS_CFLAGS=-DREDIS_TEST
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        ./src/redis-server test all
+  - root: /opt/projects/c/libssh2
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DBUILD_TESTING=ON \
+          -DRUN_DOCKER_TESTS=OFF \
+          -DRUN_SSHD_TESTS=OFF
+        cmake --build "${build_dir}" --parallel "${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-libssh2-ctest.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        ctest --test-dir "${project_root}/build-refactoragent" \
+          --output-on-failure --output-junit "${report}"
+  - root: /opt/projects/c/libuv
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DBUILD_TESTING=ON \
+          -DLIBUV_BUILD_TESTS=ON \
+          -DLIBUV_BUILD_BENCH=OFF \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build "${build_dir}" --parallel "${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        python3 /agent-src/scripts/run_libuv_project_tests.py \
+          --project-root "${project_root}" \
+          --build-dir build-refactoragent
+  - root: /opt/projects/c/tmux
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        mkdir -p "${build_dir}"
+        ./autogen.sh
+        cd "${build_dir}"
+        "${project_root}/configure" --enable-debug
+        make -j"${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        python3 /agent-src/scripts/run_tmux_project_tests.py \
+          --project-root "${project_root}" \
+          --exclude utf8-test.sh
+  - root: /opt/projects/c/nginx
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        if [ -f Makefile ]; then make clean; fi
+        ./auto/configure --with-debug
+        make -j"${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        python3 /agent-src/scripts/run_nginx_project_tests.py \
+          --project-root "${project_root}" \
+          --fixture-root /agent-src/test-fixtures/nginx-tests
+  - root: /opt/projects/c/lua
+    test:
+      command: null
+      script: |
+        python3 /agent-src/scripts/run_lua_project_tests.py --project-root "${project_root}"
+  - root: /opt/projects/cpp/CMake
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DCMake_TEST_INSTALL=OFF \
+          -DBUILD_TESTING=ON \
+          -DCMAKE_USE_OPENSSL=OFF \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build "${build_dir}" --target cmake ctest \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-cmake-selected.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        ctest --test-dir "${project_root}/build-refactoragent" \
+          -R '^(CMake\.(Version|Message|String|Math|If|While|GetProperty|CMakeMinimumRequired))$' \
+          --output-on-failure --no-tests=error \
+          --output-junit "${report}"
+  - root: /opt/projects/cpp/aria2
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        autoreconf -fi
+        mkdir -p "${build_dir}"
+        cd "${build_dir}"
+        "${project_root}/configure" \
+          --without-gnutls --with-openssl \
+          --without-libxml2 --without-libexpat --without-sqlite3 \
+          --without-libuv --disable-nls --disable-bittorrent
+        make -j"${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        python3 /agent-src/scripts/run_aria2_project_tests.py \
+          --project-root "${project_root}" \
+          --build-dir build-refactoragent
+  - root: /opt/projects/cpp/duckdb
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        revision="$(git rev-parse HEAD)"
+        ready_stamp="/tmp/refactoragent-duckdb-debug-nosan-${revision}.ready"
+        if [ ! -f "${ready_stamp}" ]; then
+          rm -rf "${build_dir}"
+        fi
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DBUILD_EXTENSIONS='' \
+          -DDUCKDB_EXTENSION_CONFIGS='' \
+          -DBUILD_UNITTESTS=ON \
+          -DENABLE_UNITTEST_CPP_TESTS=OFF \
+          -DBUILD_SHELL=OFF \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCXX_EXTRA_DEBUG=-g0 \
+          -DENABLE_SANITIZER=FALSE \
+          -DENABLE_UBSAN=0
+        cmake --build "${build_dir}" --target duckdb \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+        cmake --build "${build_dir}" --target unittest \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+        touch "${ready_stamp}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-duckdb-smoke.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        "${project_root}/build-refactoragent/test/unittest" \
+          -f "${project_root}/test/smoke_tests.list" \
+          --reporter junit \
+          --out "${report}"
+  - root: /opt/projects/cpp/rocksdb
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        revision="$(git rev-parse HEAD)"
+        ready_stamp="/tmp/refactoragent-rocksdb-debug-o0-db-basic-${revision}.ready"
+        if [ ! -f "${ready_stamp}" ]; then
+          make clean
+        fi
+        make -j"${SMELL_BUILD_JOBS:-1}" static_lib \
+          DEBUG_LEVEL=2 LIB_MODE=static EXTRA_CXXFLAGS=-g0 \
+          DISABLE_WARNING_AS_ERROR=1
+        make -j"${SMELL_BUILD_JOBS:-1}" db_basic_test \
+          DEBUG_LEVEL=2 LIB_MODE=static EXTRA_CXXFLAGS=-g0 \
+          DISABLE_WARNING_AS_ERROR=1
+        touch "${ready_stamp}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-rocksdb-db-basic.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        "${project_root}/db_basic_test" \
+          --gtest_output="xml:${report}"
+  - root: /opt/projects/cpp/OpenTTD
+    shell_timeout: 1500
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        rm -rf "${build_dir}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DOPTION_DEDICATED=ON \
+          -DOPTION_TOOLS_ONLY=OFF \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build "${build_dir}" --target openttd_test \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-openttd-unit.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        ctest --test-dir "${project_root}/build-refactoragent" \
+          -E '^regression_' \
+          --output-on-failure --no-tests=error \
+          --output-junit "${report}"

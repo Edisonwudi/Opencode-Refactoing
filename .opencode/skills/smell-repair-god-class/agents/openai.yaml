@@ -1,0 +1,4 @@
+interface:
+  display_name: "God Class Repair"
+  short_description: "Extract cohesive responsibilities from a large type"
+  default_prompt: "Use $smell-repair-god-class to repair the reported God Class smell without weakening verification."

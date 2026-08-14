@@ -170,8 +170,8 @@ Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在
 
 **dataset 与异味范围**：镜像内路径为
 `/opt/dataset/smells/<lang>/<smell>_30.csv`，权威源 CSV 在本仓库
-`dataset/nonjava/<lang>/<smell>_30.csv`（每语言 10 种异味 × 30 样本，
-**已是容器路径格式**——`/opt/projects/<lang>/<name>`，与快照 payload
+`dataset/nonjava/<lang>/<smell>_30.csv`（除 Dead Code 外，每语言每种异味
+30 样本；**已是容器路径格式**——`/opt/projects/<lang>/<name>`，与快照 payload
 逐字节一致，容器内可直接通过 `/agent-src` 挂载使用）。
 Java 数据集的权威源同样在本仓库 `dataset/java/delivery_schema/<smell>.csv`
 （对应镜像内 `/opt/dataset/java/delivery_schema/`，同为容器路径格式）。
@@ -179,12 +179,58 @@ Java 数据集的权威源同样在本仓库 `dataset/java/delivery_schema/<smel
 switch_statements、data_clumps、code_clone_type1、god_class、dead_code。
 检测层面非 Java 现已
 支持全部 10 种通用异味：feature_envy 与 mysterious_name 走 tree-sitter 通用
-检测（feature_envy 的接收者按根标识符统计，无类型解析；evidence 优先
-`envied_receiver=<名字>`，回退 `envied_type=<类型名>`);feature_envy 计数
+检测。非 Java Feature Envy 的接收者按根标识符统计，无类型解析；CSV 必须在
+`target_context_json.receiver_type` 显式冻结别名折算后的 canonical receiver root，
+运行时不从 evidence、类型名或当前 dominant receiver 回退选择。feature_envy 计数
 带别名折算：把接收者字段缓存进局部变量（`x = r->f`，含元组解包与 walrus)
 不会降低访问计数——别名后续的每次读取使用（裸名或后接属性）都折算为对
 原接收者的一次访问，重赋非别名值才解除；refused_bequest 仍
 仅 Java 支持，非 Java 暂无对应 dataset。
+
+非 Java Data Clumps 的每一行同时冻结完整关系 witness：`location` 用分号列出
+本组所有函数位置，`target_context_json.group` 保存规范化参数组。runner 对缺少
+group、少于 3 个位置或缺少方法 selector 的样本直接拒绝。运行时 Guard 只解析这些
+显式位置，不遍历项目源码。Mysterious Name 只解析显式目标文件；
+非 Java Dead Code 只判断显式目标声明是否仍存在，不在 Guard 内搜索全项目引用。
+Feature Envy c000 还冻结目标文件、parser owner/declared name、完整参数 fingerprint
+和声明起始行。验证只解析该显式目标文件，并用该文件的 production patch 做旧锚到
+当前声明的一对一映射；保留 wrapper 仅允许同一 hunk、相同 owner/name/完整参数身份
+且唯一候选的窄重锚。目标删除、跨 hunk、同 hunk 多候选、owner/name/参数身份改变
+全部 fail-closed。Mysterious Name 的 `symbol_kind` 与 `symbol_name` 同样在 CSV 的
+`target_context_json` 中冻结，不从审计 evidence 反推。三种语言默认记录
+`nonjava-target-guard/<language>/<smell>/v2` profile；Feature Envy 使用 v3，
+Mysterious Name 使用 v6，Code Clone 使用 v5。Code Clone 的局部编辑闭包只检查
+传入 production patch 中完整删除的 exact declaration，不遍历项目源码；只有模型
+确实改写了保留端点时，才允许同文件、同一固定 hunk、相同 owner/name/完整签名、
+唯一一对一的窄重锚，跨 hunk、owner 改变和多候选继续 fail-closed。
+
+Mysterious Name 的 v6 profile 中，c000 冻结 parser 声明的
+container name/owner、symbol kind/name、声明 slot 和声明行；参数只能在同一声明
+slot 一对一改名，局部变量只能在目标文件 patch 的同一 hunk 唯一一对一改名。
+同 owner/name/参数形状的完整 container cohort 也会冻结声明边界与摘要；验证时必须
+在同一目标文件 patch 中建立数量一致、唯一且全局一对一的旧锚到当前锚映射。
+新名称仍命中 too-short/low-info（例如 `n -> q`、`tmp -> data`）、改动其他声明、
+遗留旧引用、删除或改变 container owner、跨 hunk 或多候选都会 fail-closed。C/C++
+允许目标函数之外已经存在的 parser recovery，但目标函数本身必须完整可解析；c000
+会冻结文件级 recovery witness，验证时新增 recovery 仍会拒绝。
+
+Dead Code 正例另走 fail-closed 的离线语料审计：全项目引用、宏拼接、注册/回调、
+动态协议和公共 API 风险只在整理数据时检查，不进入运行时 Guard。2026-08-09
+清洗后的权威文件为各语言目录下的 `dead_code_curated.csv`，样本数分别为
+Python 30、C 16、C++ 10；旧 `dead_code_30.csv` 已移除，避免继续把宏调用、
+协议钩子、vendored/public header 方法当作正例。在非 Java 环境镜像重建前，
+Dead Code 运行必须使用 `/agent-src/dataset/nonjava/<lang>/dead_code_curated.csv`，
+不能使用旧镜像内置的 `/opt/dataset/smells/<lang>/dead_code_30.csv`。
+
+`dataset/nonjava` 只保留每种语言、每种异味的一份最终 CSV，不提交候选池、审计
+JSON、构建日志或固定 10 条子集。需要子集实验时由调用方从最终 CSV 显式选择样本，
+不再维护第二套数据文件。
+
+非 Java dataset-aligned 指标口径为：Nested Complexity 使用显式目标函数内的纯
+AST 控制流嵌套深度（3 种语言阈值均为 5）；Long Method 阈值为 Python 50、C/C++
+60；Long Parameter List 阈值为 Python 6、C 5、C++ 6；Type-1 Clone 的最小规范化
+token 数分别为 Python 17、C 18、C++ 25。上述值是冻结正例语料兼容边界，不代表已经
+完成负例误报率校准。
 
 **agent 选择**：非 Java 样本**省略 `--agent`**(runner 按 CSV 的 `language`
 列自动选用 `smell-refactor-agent`)，或显式 `--agent smell-refactor-agent`;
@@ -214,8 +260,62 @@ docker run --rm \
 注意：
 
 - 非 Java 的 build/test 配置来自镜像内 `/opt/buildenv/projects.docker.yaml`
-  （仓库内的 `defaults/projects.yaml` 是空的）；**在容器外直接跑 runner**
-  时需显式 `--projects <yaml>`。
+  （仓库内的 `defaults/projects.yaml` 是空的）；运行时仅用
+  `projects.runtime-overrides.yaml` 对已存在的精确项目 root 做窄覆盖，不复制整份
+  镜像配置。Lua 的旧 `./lua -e "print('ok')"` 已被覆盖为上游
+  `testes/all.lua` portable user suite；DuckDB 的 `duckdb --version` 已被覆盖为上游
+  `test/smoke_tests.list`（清单 253 项；固定 revision 实际调度 252 项）经原生 Catch2
+  `unittest` 执行；
+  RocksDB 的 `test -f librocksdb.a` 已被覆盖为原生 GTest `db_basic_test` suite。
+  三者都会生成 fresh JUnit 执行证据。DuckDB 使用上游 Debug/O0、关闭 sanitizer 的
+  build 内两阶段冷构建（core 后增量构建 `unittest`），两步都成功才写 ready stamp
+  并进入 test 阶段。默认 1 job、项目级 shell timeout 最低为 1500 秒，以覆盖三容器共享
+  两核时的资源放大；这只是 exact-root 预算，不会吞掉失败或重试。独占 CPU 时可用
+  `SMELL_BUILD_JOBS` 显式提高。RocksDB 同样在 build 阶段依次完成上游 Debug/O0
+  `static_lib` 与增量 `db_basic_test`，默认 1 job、exact-root timeout 1500 秒；test 阶段
+  只执行固定 GTest suite。suite 始终固定为项目级入口，不按样本选择测试。
+  C 项目的弱 smoke 也由相同的 exact-root overlay 覆盖：Curl 使用 Autotools 冷构建后
+  运行上游 `tests/runtests.pl` 非易波动套件；Redis 以 `REDIS_TEST` 编译并执行内建
+  `redis-server test all`；libssh2 运行关闭外部 Docker/sshd 依赖的原生 CTest；tmux
+  逐项执行仓库 `regress/*.sh`（不再把 GNU Make 对 BSD Makefile 的空跑当成功）。固定
+  delivery image 下仅 `utf8-test.sh` 因固定的 display-width 期望与该环境输出不一致而
+  被显式记为 skipped，
+  其余 34 项必须全部真实通过；nginx
+  使用官方 `nginx/nginx-tests` commit
+  `1502b87f5fa712ff485a1bb6baeab50153719d03` 的八文件固定行为套件。nginx fixture
+  测试以非 root 身份在可写临时目录执行；缺文件、
+  runner 不可用或真实测试失败都会直接失败，不退回 `-v`/`--version`/文件存在性检查。
+  Git 的 `git --version` 已替换为八个上游 `t/` 行为脚本，覆盖 basic、path、cat-file、
+  config、fsck、rev-parse、log 与 line-log；RRDtool 的 `rrdtool --version` 已替换为官方
+  Automake `make check`：从配置后 Makefile 的官方 `TESTS` 读取该 revision 的 28 项，
+  固定镜像内 27 项实际执行，唯一依赖镜像未提供的外部 `dc` 计算器的
+  `create-with-source-4` 被显式记为 skipped；构建生成的测试程序不会被误判为缺失源码脚本。
+  libuv 保留十二个稳定原生测试；root 容器会在启动原生测试进程前固定降权为 `nobody`，
+  而不是屏蔽项目的 root 检查，并用 JUnit 封装提供可核验的
+  非零执行证据。OpenTTD 的 `openttd -h` 已替换为 `openttd_test` 的 94 项 CTest 单元
+  套件；两项依赖外部 OpenGFX 的 gameplay regression 不在这个离线入口中，不会被冒充
+  为已执行。探索性数据额外涉及的 CMake 与 aria2 也不再使用 `--version`：CMake
+  运行八项固定且无外部能力依赖的项目原生 CTest 行为测试，aria2 运行上游 Automake/CppUnit
+  `make check`；aria2 在离线容器中通过项目配置关闭 BitTorrent/LPD 外部组播路径，不按
+  测试名事后忽略失败。aria2 所需 CppUnit 由
+  `docker/cpp-refactor-delivery/Dockerfile.project-test-dependencies` 以固定包版本构建进
+  C++ 交付镜像；正式运行仍为 `--network none`，没有运行时安装或备用测试路径。
+  fmt、nlohmann/json 与 yt-dlp 继续使用其原生 CTest/pytest。
+  当前最终 CSV 涉及的项目测试入口由三份 delivery `projects.docker.yaml` 与
+  `projects.runtime-overrides.yaml` 共同提供；交付镜像验收会直接检查解析后的命令，
+  不接受版本、帮助、文件存在或 print-only 验证。
+  **在容器外直接跑 runner** 时仍需显式 `--projects <yaml>`。
+- `project_full` 必须得到 fresh、非零且非全 skipped 的测试执行证据；原生 JUnit XML
+  或严格的 pytest、Python `unittest`、CTest、Curl `TESTDONE` 与 Redis native-test
+  终态可作为证据；后两者必须与对应真实 runner invocation 同时出现。`--version`、`-v`、
+  帮助输出、文件存在性和 collection-only 均不能把返回码 0 变成测试 PASS。
+- 最终交付快照在 build/test 前以 c000 冻结 commit 为基线采集完整 Git diff/status，
+  包含已提交、已暂存、未暂存、未跟踪生产源码及构建元数据；候选自行 commit 不能
+  隐藏改动。禁止的测试源码改动会先于构建测试 fail-closed。
+- runner 在 `result.json.attempts` 中保留每次 agent 验证与最终独立验证。同一 diff
+  若最后一次 agent 测试失败而 final 单次转绿，标记 `FLAKY_TEST_INCONCLUSIVE`；
+  若 agent 已通过而 final 仅因超时/OOM 翻红，标记 `FINAL_VERIFY_INFRA_FAILED`。
+  两者都不自动计为接受，也不会伪装成确定的代码回归。
 - 镜像内项目：python 17 个（django、requests、airflow 等）、c 11 个
   (redis、nginx、curl 等）、cpp 12 个（rocksdb、protobuf、fmt 等）。
 - 验收语义（resolved / improved、loop 预算、有效 PASS 硬规则）与 Java 完全一致。
@@ -261,7 +361,7 @@ key 来源优先级：`--opencode-api-key`（不推荐）>
   解析后的 build/test 命令与 verification 配置；controller 另持有外部
   baseline seal。会话身份、验证合同或 seal
   丢失时直接拒绝，不能退回模型参数或由 c000 自签名代替。
-- Java dataset 与产品调用统一使用 `target_context_json` 传递 selector 身份
+- dataset 与产品调用统一使用 `target_context_json` 传递需要的 selector 身份
   （如 symbol kind/name/container、receiver、参数组、父类）；字段经过同一白名单
   校验，只能选择目标，不能提供 score、threshold 或预期 verdict。CSV `evidence`
   仅保留审计展示，runner、checkpoint 和 PASS 判定均不会从中反向构造异味。
@@ -349,6 +449,9 @@ controller system context 注入。失败类别、`failure_pack`、`next_action`
 `loop.instruction` 只以最新一次 `smell_verify` 工具结果为准，自动续跑消息仅恢复
 同一 session 并提示重新验证，不复制这些可变内容。
 
+批量 runner 生成的用户任务同样只包含项目、语言、异味、目标位置和修复目标；
+backend、验证模式与测试修改策略不在用户任务中重复展示。
+
 批量运行会按 attempt 保存 `raw-user-input.txt*`、`controller-context.json*`、
 `controller-system.txt*` 与 `message-manifest.json*`；`synthetic-events.jsonl`
 单独记录 runner 注入的恢复消息。由此可以分别核对原始输入、稳定控制上下文和
@@ -432,7 +535,7 @@ docker run --rm \
 .opencode/agents/            两个公开 agent(java-refactor-agent、smell-refactor-agent)
 .opencode/commands/          java-refactor-run、smell-refactor-run(loop policy 入口)
 .opencode/plugins/smell.ts   smell_verify 工具 + loop 状态机
-.opencode/skills/            无 IDEA Java 编辑模式（IDEA 原型文件保留但默认不启用）
+.opencode/skills/            每种异味一个主 skill；按需加载 Java/Python/C/C++ reference，IDEA 机械路线独立保留
 runtime/python/bridge/       smell_bridge(verify/capture-baseline 入口)
 runtime/python/smell_core/   checkpoint contract、adapters、检测器、guards
 scripts/                     runner、自检及维护入口（见 scripts/README.md）
@@ -442,6 +545,11 @@ docker/                      mounted-source 与 delivery entrypoint
 
 自检：`npm run check`、`npm run check:self`，以及 `scripts/self_check_*.py`
 （契约、各 adapter、guard、runner 续跑、统一结构闭包等回归用例）。
+
+异味 skill 采用“主流程 + 语言 reference”组织：10 个通用异味支持
+Java/Python/C/C++，Java 特有的 `refused_bequest` 只暴露 Java reference。旧
+`java-smell-edit-patterns` 内容作为兼容归档保留，新 Java reference 与其逐字节一致；
+IDEA 后端仍按异味加载 `idea-refactor-cli` 的单个 YAML，不与语言语义规则混写。
 
 约定：实验结果、worktree、`runs/`、`node_modules/`、`images/` 都不进 Git;
 key 不进任何文件。

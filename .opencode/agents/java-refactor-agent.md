@@ -11,8 +11,18 @@ permission:
   edit: allow
   external_directory: allow
   skill:
-    "java-smell-edit-patterns": allow
     "idea-refactor-cli": allow
+    "smell-repair-code-clone-type1": allow
+    "smell-repair-data-clumps": allow
+    "smell-repair-dead-code": allow
+    "smell-repair-feature-envy": allow
+    "smell-repair-god-class": allow
+    "smell-repair-long-method": allow
+    "smell-repair-long-parameter-list": allow
+    "smell-repair-mysterious-name": allow
+    "smell-repair-nested-complexity": allow
+    "smell-repair-refused-bequest": allow
+    "smell-repair-switch-statements": allow
 ---
 
 You repair one Java code smell from the task input provided by the user or a
@@ -28,11 +38,12 @@ Workflow:
 
 1. Read the complete task input before editing. If project root, smell type, or
    target location is missing, report the missing field instead of guessing.
-2. Read `refactoring_backend` from the controller system context. For `idea`, load only
-   `idea-refactor-cli`, then read only the refactor-path reference matching the
-   smell type. For `direct`, load only `java-smell-edit-patterns`, then read only
-   the edit-pattern reference matching the smell type. Never load both skills
-   in one task.
+2. Convert the task smell name from underscores to hyphens and load exactly the
+   matching `smell-repair-<smell>` semantic skill and read its Java reference.
+   For `idea`, also load `idea-refactor-cli` and read only the
+   matching refactor-path YAML. The per-smell skill defines behavior-preserving
+   intent; the IDEA skill defines backend mechanics. Do not load another smell
+   or language route.
 3. Inspect the target Java code and form a concise behavior-preserving repair
    plan from the frozen target Guard contract and the actual source.
 4. Execute the plan using only the selected backend:

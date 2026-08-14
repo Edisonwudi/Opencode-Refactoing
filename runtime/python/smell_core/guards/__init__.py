@@ -19,27 +19,25 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..analysis import (
-    LANGUAGE_EXTENSIONS,
+    clone_normalized_token_score,
     count_meaningful_lines,
     count_parameters,
-    estimate_complexity,
+    estimate_nesting_depth,
     estimate_switch_branches,
+    explicit_target_files_parseability,
     extract_class_text,
-    extract_pair_snippets,
     extract_snippet,
     method_basename,
-    normalize_for_clone,
+    nonjava_finding_threshold,
     python_switch_metrics,
 )
 from ..config import CommandConfig, ResolvedRunConfig, interpolate_command_text
 from ..data_clumps import (
-    data_clump_group_from_evidence,
     data_clump_occurrence_threshold,
-    detect_data_clump_occurrences,
+    evaluate_data_clump_targets,
 )
-from ..feature_envy import (
-    analyze_feature_envy_target as analyze_generic_feature_envy_target,
-    feature_envy_receiver_from_evidence,
+from ..feature_envy_target_contract import (
+    FEATURE_ENVY_TARGET_CONTRACT,
 )
 from ..checkpoint_contract import checkpoint_gate_result
 from ..java_test_attestation_runner import (
@@ -299,13 +297,17 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
         elif guard_type == "code_clone_type1":
             outcomes.append(_run_code_clone_guard(config, guard, context))
         elif guard_type == "data_clumps":
-            outcomes.append(_run_data_clumps_guard(config, guard))
+            outcomes.append(_run_data_clumps_guard(config, guard, context))
         elif guard_type == "feature_envy" and config.language != "java":
-            outcomes.append(_run_generic_feature_envy_guard(config, guard))
+            outcomes.append(
+                _run_generic_feature_envy_guard(config, guard, context)
+            )
         elif guard_type == "mysterious_name":
-            outcomes.append(_run_generic_mysterious_name_guard(config, guard))
+            outcomes.append(
+                _run_generic_mysterious_name_guard(config, guard, context)
+            )
         elif guard_type == "dead_code":
-            outcomes.append(_run_dead_code_guard(config, guard))
+            outcomes.append(_run_dead_code_guard(config, guard, context))
         elif guard_type == "god_class" and config.language != "java":
             outcomes.append(_run_generic_god_class_guard(config, guard, context))
         else:
@@ -418,6 +420,39 @@ def run_build_test_guard(
                     "sample_test": None,
                 },
             }
+    if require_test_execution and not config.defaults.run_tests:
+        test_result = {
+            "label": "test",
+            "success": False,
+            "status": "test_not_executed",
+            "returncode": None,
+            "command": "",
+            "script": "",
+            "cwd": str(config.cwd),
+            "source": config.test_source,
+            "summary": [],
+            "failure_highlights": [
+                "Fresh test execution is required, but defaults.run_tests is false."
+            ],
+            "diagnostics": [],
+            "tail": [],
+            "summary_text": (
+                "Fresh test execution is required, but test execution is disabled."
+            ),
+            "output": "",
+        }
+        return {
+            "type": "build_test",
+            "success": False,
+            "reason": "TEST_EXECUTION_DISABLED",
+            "message": str(test_result["summary_text"]),
+            **metadata,
+            "details": {
+                "build": build_result,
+                "test": test_result,
+                "sample_test": None,
+            },
+        }
     if config.defaults.run_tests:
         test_cwd = config.dataset_root if config.test_source == "dataset" else config.cwd
         test_started_ns = time.time_ns()
@@ -905,6 +940,32 @@ def _fresh_test_reports(
     return reports
 
 
+def _junit_report_count(root: ET.Element, attribute: str, marker: str) -> int:
+    structural_count = (
+        len(root.findall(".//testcase"))
+        if attribute == "tests"
+        else len(root.findall(f".//testcase/{marker}"))
+    )
+    raw_root = root.attrib.get(attribute)
+    if raw_root is not None:
+        try:
+            return max(int(str(raw_root)), structural_count, 0)
+        except ValueError:
+            pass
+    suite_counts: List[int] = []
+    for suite in root.findall(".//testsuite"):
+        raw_suite = suite.attrib.get(attribute)
+        if raw_suite is None:
+            continue
+        try:
+            suite_counts.append(max(int(str(raw_suite)), 0))
+        except ValueError:
+            continue
+    if suite_counts:
+        return max(sum(suite_counts), structural_count)
+    return structural_count
+
+
 def _project_test_execution_evidence(
     config: ResolvedRunConfig,
     started_ns: int,
@@ -912,54 +973,236 @@ def _project_test_execution_evidence(
 ) -> Dict[str, object]:
     """Require fresh non-zero execution when no narrower test is pinned."""
     reports: List[str] = []
+    failed_reports: List[str] = []
     executed = 0
     skipped_total = 0
+    disabled_total = 0
     for report, root in _fresh_test_reports(config.project_root, started_ns):
-        try:
-            tests = int(str(root.attrib.get("tests") or ""))
-        except ValueError:
-            tests = len(root.findall(".//testcase"))
-        try:
-            skipped = int(str(root.attrib.get("skipped") or "0"))
-        except ValueError:
-            skipped = len(root.findall(".//testcase/skipped"))
-        non_skipped = max(tests - skipped, 0)
+        tests = _junit_report_count(root, "tests", "testcase")
+        skipped = _junit_report_count(root, "skipped", "skipped")
+        disabled = _junit_report_count(root, "disabled", "disabled")
+        failures = _junit_report_count(root, "failures", "failure")
+        errors = _junit_report_count(root, "errors", "error")
+        skipped_total += skipped
+        disabled_total += disabled
+        relative_report = str(report.relative_to(config.project_root))
+        if failures > 0 or errors > 0:
+            failed_reports.append(relative_report)
+            continue
+        non_skipped = max(tests - skipped - disabled, 0)
         if non_skipped <= 0:
             continue
-        reports.append(str(report.relative_to(config.project_root)))
+        reports.append(relative_report)
         executed += non_skipped
-        skipped_total += skipped
 
     output = str(command_result.get("output") or "") if isinstance(command_result, dict) else ""
-    console_tests = 0
-    for match in re.finditer(
-        r"Tests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*(\d+)",
-        output,
-    ):
-        console_tests += max(int(match.group(1)) - int(match.group(2)), 0)
-    junit_match = re.search(r"\bOK\s+\((\d+)\s+tests?\)", output)
-    if junit_match:
-        console_tests += int(junit_match.group(1))
+    invocation = ""
+    if isinstance(command_result, dict):
+        invocation = "\n".join(
+            str(command_result.get(field) or "") for field in ("command", "script")
+        )
+    maven_console_tests = 0
+    if re.search(r"(?:^|[\s/])mvn(?:w)?(?:\s|$)|\bmaven\b", invocation):
+        for match in re.finditer(
+            r"Tests run:\s*(\d+),\s*Failures:\s*0,\s*Errors:\s*0,\s*Skipped:\s*(\d+)",
+            output,
+        ):
+            maven_console_tests += max(
+                int(match.group(1)) - int(match.group(2)), 0
+            )
+    junit_console_tests = 0
+    if re.search(r"\b(?:JUnitCore|junit-platform|junit)\b", invocation, re.IGNORECASE):
+        junit_match = re.search(r"\bOK\s+\((\d+)\s+tests?\)", output)
+        if junit_match:
+            junit_console_tests = int(junit_match.group(1))
+    console_tests = maven_console_tests + junit_console_tests
+    language = str(getattr(config, "language", "") or "").strip().lower()
+    pytest_console_tests = (
+        _pytest_console_test_count(output) if language == "python" else 0
+    )
+    unittest_console_tests = (
+        _unittest_console_test_count(output) if language == "python" else 0
+    )
+    ctest_console_tests = (
+        _ctest_console_test_count(output) if language in {"c", "cpp"} else 0
+    )
+    curl_runtests_console_tests = (
+        _curl_runtests_console_test_count(invocation, output)
+        if language == "c"
+        else 0
+    )
+    redis_native_console_tests = (
+        _redis_native_console_test_count(invocation, output)
+        if language == "c"
+        else 0
+    )
+    console_tests += (
+        pytest_console_tests
+        + unittest_console_tests
+        + ctest_console_tests
+        + curl_runtests_console_tests
+        + redis_native_console_tests
+    )
     executed = max(executed, console_tests)
-    success = executed > 0
+    success = executed > 0 and not failed_reports
     return {
         "success": success,
         "mode": "project_full",
         "message": (
             f"Project-full verification executed {executed} non-skipped test(s)."
             if success
-            else "Project-full test command exited successfully but produced no "
-            "fresh non-skipped test execution evidence."
+            else (
+                "Project-full test command produced a fresh report containing "
+                "test failures or errors."
+                if failed_reports
+                else "Project-full test command exited successfully but produced no "
+                "fresh non-skipped test execution evidence."
+            )
         ),
         "reports": sorted(reports),
+        "failed_reports": sorted(failed_reports),
         "tests": executed,
         "skipped": skipped_total,
+        "disabled": disabled_total,
         "console_tests": console_tests,
+        "maven_console_tests": maven_console_tests,
+        "junit_console_tests": junit_console_tests,
+        "pytest_console_tests": pytest_console_tests,
+        "unittest_console_tests": unittest_console_tests,
+        "ctest_console_tests": ctest_console_tests,
+        "curl_runtests_console_tests": curl_runtests_console_tests,
+        "redis_native_console_tests": redis_native_console_tests,
     }
 
 
+def _pytest_console_test_count(output: str) -> int:
+    """Count only pytest's terminal success summaries.
+
+    Collection/progress lines are deliberately insufficient: a successful
+    project-full run must contain pytest's final ``N passed ... in Ns`` line.
+    The caller has already established a zero command return code.
+    """
+    count = 0
+    pattern = re.compile(
+        r"^(?:=+\s*)?(?P<passed>\d+)\s+passed\b.*"
+        r"\bin\s+\d+(?:\.\d+)?s"
+        r"(?:\s+\(\d+:\d{2}(?::\d{2})?\))?(?:\s*=+)?$",
+        re.IGNORECASE,
+    )
+    for raw_line in str(output or "").splitlines():
+        match = pattern.fullmatch(_clean_log_line(raw_line).strip())
+        if match:
+            count += int(match.group("passed"))
+    return count
+
+
+def _unittest_console_test_count(output: str) -> int:
+    """Count a completed Python unittest run from its strict terminal pair.
+
+    Progress lines and a bare ``OK`` are insufficient.  A successful witness
+    requires unittest's ``Ran N tests in ...s`` line followed by its terminal
+    ``OK`` line.  Tests reported as skipped are excluded so an all-skipped run
+    still fails closed.
+    """
+
+    cleaned_lines = [
+        _clean_log_line(line).strip()
+        for line in str(output or "").replace("\r", "\n").splitlines()
+    ]
+    for index, line in reversed(list(enumerate(cleaned_lines))):
+        match = re.fullmatch(
+            r"Ran\s+(?P<tests>[1-9][0-9]*)\s+tests?\s+in\s+"
+            r"[0-9]+(?:\.[0-9]+)?s",
+            line,
+        )
+        if not match:
+            continue
+        terminal = next(
+            (
+                later
+                for later in cleaned_lines[index + 1 :]
+                if re.fullmatch(r"OK(?:\s*\([^\n]*\))?", later)
+            ),
+            "",
+        )
+        if not terminal:
+            return 0
+        skipped_match = re.search(r"\bskipped=(\d+)\b", terminal)
+        skipped = int(skipped_match.group(1)) if skipped_match else 0
+        return max(int(match.group("tests")) - skipped, 0)
+    return 0
+
+
+def _ctest_console_test_count(output: str) -> int:
+    """Count ctest cases only when detailed passes and a clean summary agree."""
+    cleaned_lines = [
+        _clean_log_line(line).strip()
+        for line in str(output or "").splitlines()
+    ]
+    passed_cases = sum(
+        1
+        for line in cleaned_lines
+        if re.fullmatch(
+            r"\d+/\d+\s+Test\s+#\d+:\s+.+?\s+\.{2,}\s+Passed\s+"
+            r"\d+(?:\.\d+)?\s+sec",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+    clean_totals = [
+        int(match.group("total"))
+        for line in cleaned_lines
+        if (
+            match := re.fullmatch(
+                r"100%\s+tests\s+passed,\s+0\s+tests\s+failed\s+out\s+of\s+"
+                r"(?P<total>\d+)",
+                line,
+                flags=re.IGNORECASE,
+            )
+        )
+    ]
+    if passed_cases <= 0 or not clean_totals:
+        return 0
+    total = sum(clean_totals)
+    return passed_cases if total >= passed_cases else 0
+
+
+def _curl_runtests_console_test_count(invocation: str, output: str) -> int:
+    """Count curl's native Perl suite only from its clean terminal summary."""
+    if not re.search(
+        r"(?:^|[\s/])tests/runtests\.pl[\"']?(?:\s|$)", invocation
+    ):
+        return 0
+    counts = []
+    for raw_line in str(output or "").splitlines():
+        match = re.fullmatch(
+            r"TESTDONE:\s+(?P<passed>[1-9][0-9]*)\s+tests\s+out\s+of\s+"
+            r"(?P<total>[1-9][0-9]*)\s+reported\s+OK:\s+100%",
+            _clean_log_line(raw_line).strip(),
+        )
+        if match and match.group("passed") == match.group("total"):
+            counts.append(int(match.group("passed")))
+    return counts[-1] if counts else 0
+
+
+def _redis_native_console_test_count(invocation: str, output: str) -> int:
+    """Count Redis' compiled-in C tests, never version/smoke output."""
+    if not re.search(r"(?:^|[\s/])redis-server\s+test\s+all(?:\s|$)", invocation):
+        return 0
+    counts = []
+    for raw_line in str(output or "").splitlines():
+        match = re.fullmatch(
+            r"Tests:\s+(?P<passed>[1-9][0-9]*)\s+passed,\s+0\s+failed,\s+"
+            r"(?P<total>[1-9][0-9]*)\s+total",
+            _clean_log_line(raw_line).strip(),
+        )
+        if match and match.group("passed") == match.group("total"):
+            counts.append(int(match.group("passed")))
+    return counts[-1] if counts else 0
+
+
 def _run_long_method_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    max_lines = int(guard.get("max_lines", 60))
+    max_lines = nonjava_finding_threshold(config.language, "long_method", 60) - 1
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -979,7 +1222,7 @@ def _run_long_method_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
 
 
 def _run_long_parameter_list_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    max_params = int(guard.get("max_params", 5))
+    max_params = nonjava_finding_threshold(config.language, "long_parameter_list", 6) - 1
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -999,7 +1242,7 @@ def _run_long_parameter_list_guard(config: ResolvedRunConfig, guard: Dict[str, o
 
 
 def _run_nested_complexity_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    max_complexity = int(guard.get("max_complexity", 20))
+    max_depth = nonjava_finding_threshold(config.language, "nested_complexity", 5) - 1
     snippet = extract_snippet(config.locations[0], config.language)
     if not snippet:
         return {
@@ -1008,13 +1251,13 @@ def _run_nested_complexity_guard(config: ResolvedRunConfig, guard: Dict[str, obj
             "message": "Unable to resolve the target method or function body.",
             "details": None,
         }
-    complexity = estimate_complexity(snippet, config.language)
-    success = complexity <= max_complexity
+    depth = estimate_nesting_depth(snippet, config.language)
+    success = depth <= max_depth
     return {
         "type": "nested_complexity",
         "success": success,
-        "message": f"Target has estimated complexity {complexity} (threshold {max_complexity}).",
-        "details": {"complexity": complexity, "max_complexity": max_complexity},
+        "message": f"Target has control-flow nesting depth {depth} (passing maximum {max_depth}).",
+        "details": {"max_nesting_depth": depth, "passing_max": max_depth},
     }
 
 
@@ -1041,31 +1284,112 @@ def _run_switch_statements_guard(config: ResolvedRunConfig, guard: Dict[str, obj
     }
 
 
-def _run_data_clumps_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
-    evidence = str(guard.get("evidence") or "").strip()
-    target_group = data_clump_group_from_evidence(evidence)
+def _run_data_clumps_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext] = None,
+) -> Dict[str, object]:
+    target_group = str((config.target_context or {}).get("group") or "").strip()
     if not target_group:
         return {
             "type": "data_clumps",
             "success": False,
-            "message": "data_clumps guard: missing group=... evidence; cannot validate the clump family.",
-            "details": {"detector": "generic_parameter_group_detector"},
+            "message": "data_clumps guard: missing target_context.group; cannot validate explicit occurrences.",
+            "details": {"detector": "explicit_target_parameter_group_guard"},
         }
-    analysis = detect_data_clump_occurrences(
+    if (
+        context is not None
+        and context.checkpoint_required
+        and context.checkpoint_smell == "data_clumps"
+    ):
+        current = context.current_metrics
+        identity_ok = current.get("target_patch_identity_ok") is True
+        finding_present = current.get("finding_present") is True
+        success = bool(
+            current.get("ok") is True
+            and identity_ok
+            and current.get("target_missing") is not True
+            and not finding_present
+        )
+        return {
+            "type": "data_clumps",
+            "success": success,
+            "message": (
+                "data_clumps guard: reused the accepted checkpoint target-local verdict."
+                if success
+                else (
+                    "data_clumps guard: checkpoint target identity or finding "
+                    "closure is not satisfied."
+                )
+            ),
+            "details": {
+                "detector": "checkpoint_target_local_data_clumps_guard",
+                "group": target_group,
+                "target_missing": bool(current.get("target_missing")),
+                "target_patch_identity_ok": identity_ok,
+                "target_patch_identity_failures": list(
+                    current.get("target_patch_identity_failures") or []
+                ),
+                "occurrence_count": int(
+                    (current.get("objectives") or {}).get("occurrence_count") or 0
+                ),
+                "continuity_occurrence_count": int(
+                    current.get("continuity_occurrence_count") or 0
+                ),
+                "inline_copy_expansions": list(
+                    current.get("inline_copy_expansions") or []
+                ),
+                "scope_mode": "explicit_target_locations",
+            },
+        }
+    analysis = evaluate_data_clump_targets(
         config.project_root,
         language=config.language,
-        evidence=evidence,
-        limit=20,
+        group=target_group,
+        targets=config.locations,
     )
     if not analysis.get("success"):
         return {
             "type": "data_clumps",
             "success": False,
-            "message": f"data_clumps guard: generic detector unavailable: {analysis.get('error', '')}",
+            "message": f"data_clumps guard: explicit target evaluation unavailable: {analysis.get('error', '')}",
             "details": {
-                "detector": "generic_parameter_group_detector",
+                "detector": "explicit_target_parameter_group_guard",
                 "group": target_group,
                 "error": analysis.get("error", ""),
+                "target_missing": bool(analysis.get("unresolved_targets")),
+                "unresolved_targets": list(
+                    analysis.get("unresolved_targets") or []
+                ),
+                "target_identity_collision": bool(
+                    analysis.get("target_identity_collision")
+                ),
+                "target_identity_collisions": list(
+                    analysis.get("target_identity_collisions") or []
+                ),
+                "scope_mode": "explicit_target_locations",
+                "scope_files": list(analysis.get("scope_files") or []),
+            },
+        }
+    unresolved_targets = list(analysis.get("unresolved_targets") or [])
+    if unresolved_targets:
+        first = unresolved_targets[0]
+        return {
+            "type": "data_clumps",
+            "success": False,
+            "message": (
+                "data_clumps guard: a frozen explicit target cannot be resolved; "
+                "an occurrence-count decrease is not accepted as repair."
+            ),
+            "details": {
+                "detector": "explicit_target_parameter_group_guard",
+                "group": target_group,
+                "target_missing": True,
+                "unresolved_targets": unresolved_targets,
+                "file": first.get("file"),
+                "method": first.get("method"),
+                "scope_mode": "explicit_target_locations",
+                "scope_files": list(analysis.get("scope_files") or []),
             },
         }
     occurrence_count = int(analysis.get("occurrence_count") or 0)
@@ -1077,12 +1401,12 @@ def _run_data_clumps_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
             "type": "data_clumps",
             "success": False,
             "message": (
-                "data_clumps guard: generic parameter detector still reports "
+                "data_clumps guard: explicit target locations still report "
                 f"group={target_group} across {occurrence_count} occurrence(s). "
                 f"first remaining: {first.get('file')}#{first.get('method')}."
             ),
             "details": {
-                "detector": "generic_parameter_group_detector",
+                "detector": "explicit_target_parameter_group_guard",
                 "group": target_group,
                 "occurrence_count": occurrence_count,
                 "occurrence_threshold": threshold,
@@ -1092,6 +1416,27 @@ def _run_data_clumps_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
                 "method": first.get("method"),
                 "begin_line": first.get("begin_line"),
                 "evidence": first.get("evidence"),
+                "scope_mode": "explicit_target_locations",
+                "scope_files": list(analysis.get("scope_files") or []),
+            },
+        }
+    if isinstance(config.finding_contract, dict) and config.finding_contract:
+        return {
+            "type": "data_clumps",
+            "success": False,
+            "message": (
+                "data_clumps guard: a frozen checkpoint exists, but no matching "
+                "target-patch identity verdict was supplied; resolution fails closed."
+            ),
+            "details": {
+                "detector": "explicit_target_parameter_group_guard",
+                "group": target_group,
+                "occurrence_count": occurrence_count,
+                "occurrence_threshold": threshold,
+                "target_patch_identity_ok": False,
+                "error": "checkpoint_target_patch_identity_unavailable",
+                "scope_mode": "explicit_target_locations",
+                "scope_files": list(analysis.get("scope_files") or []),
             },
         }
     return {
@@ -1102,60 +1447,102 @@ def _run_data_clumps_guard(config: ResolvedRunConfig, guard: Dict[str, object]) 
             f"({occurrence_count}/{threshold})."
         ),
         "details": {
-            "detector": "generic_parameter_group_detector",
+            "detector": "explicit_target_parameter_group_guard",
             "group": target_group,
             "occurrence_count": occurrence_count,
             "occurrence_threshold": threshold,
+            "scope_mode": "explicit_target_locations",
+            "scope_files": list(analysis.get("scope_files") or []),
         },
     }
 
 
-def _run_generic_feature_envy_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+def _run_generic_feature_envy_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext] = None,
+) -> Dict[str, object]:
+    del guard
     target = config.locations[0] if config.locations else None
     if target is None:
         return {
             "type": "feature_envy",
             "success": False,
             "message": "feature_envy guard: missing target location.",
-            "details": {"detector": "tree_sitter_generic"},
+            "details": {
+                "detector": "tree_sitter_generic",
+                "contract": FEATURE_ENVY_TARGET_CONTRACT,
+            },
         }
-    evidence = str(guard.get("evidence") or "")
-    expected_receiver = feature_envy_receiver_from_evidence(evidence)
-    try:
-        profile = analyze_generic_feature_envy_target(
-            config.project_root,
-            language=config.language,
-            target_file=target.file_path,
-            method=target.method,
-            line=target.line,
-            expected_receiver=expected_receiver,
-        )
-    except Exception as exc:
+    if (
+        context is None
+        or not context.checkpoint_required
+        or context.checkpoint_smell != "feature_envy"
+    ):
         return {
             "type": "feature_envy",
             "success": False,
-            "message": f"feature_envy guard: generic detector unavailable: {exc}",
-            "details": {"detector": "tree_sitter_generic", "error": str(exc)},
+            "message": (
+                "feature_envy guard: a frozen checkpoint target and target-local "
+                "patch identity are required; no evidence/dominant-receiver "
+                "fallback is allowed."
+            ),
+            "details": {
+                "detector": "tree_sitter_generic",
+                "contract": FEATURE_ENVY_TARGET_CONTRACT,
+                "error": "feature_envy_checkpoint_contract_required",
+            },
         }
-    if not profile.get("ok"):
+    snapshot = dict(context.current_metrics or {})
+    identity_ok = snapshot.get("target_patch_identity_ok") is True
+    target_missing = snapshot.get("target_missing") is True
+    identity_collision = snapshot.get("target_identity_collision") is True
+    finding_present = snapshot.get("finding_present")
+    snapshot_valid = bool(
+        snapshot.get("ok") is True
+        and identity_ok
+        and not target_missing
+        and not identity_collision
+        and isinstance(finding_present, bool)
+    )
+    if not snapshot_valid:
         return {
             "type": "feature_envy",
-            "success": True,
-            "message": "feature_envy guard: the reported target no longer resolves.",
-            "details": {"detector": "tree_sitter_generic", "error": profile.get("error", "")},
+            "success": False,
+            "message": (
+                "feature_envy guard: the frozen declaration and receiver could "
+                "not be mapped one-to-one in the explicit target-file patch."
+            ),
+            "details": {
+                "detector": "tree_sitter_generic",
+                "contract": FEATURE_ENVY_TARGET_CONTRACT,
+                "target_missing": target_missing,
+                "target_identity_collision": identity_collision,
+                "target_patch_identity_ok": identity_ok,
+                "target_patch_identity_failures": list(
+                    snapshot.get("target_patch_identity_failures") or []
+                ),
+                "error": snapshot.get("error", ""),
+                "current_metrics": snapshot,
+            },
         }
-    dominant = str(profile.get("dominant_receiver_type") or "")
-    dominant_count = int(profile.get("dominant_receiver_access") or 0)
-    ratio = float(profile.get("dominant_receiver_ratio") or 0.0)
+    dominant = str(snapshot.get("dominant_receiver_type") or "")
+    dominant_count = int(snapshot.get("dominant_receiver_access") or 0)
+    ratio = float(snapshot.get("dominant_receiver_ratio") or 0.0)
     details = {
         "detector": "tree_sitter_generic",
+        "contract": FEATURE_ENVY_TARGET_CONTRACT,
         "dominant_receiver": dominant,
         "dominant_receiver_access": dominant_count,
         "dominant_receiver_ratio": ratio,
-        "method_loc": profile.get("method_loc"),
-        "strict_detector_hit": bool(profile.get("strict_detector_hit")),
+        "expected_receiver": snapshot.get("expected_receiver_name"),
+        "expected_receiver_access": snapshot.get("expected_receiver_access"),
+        "method_loc": snapshot.get("method_loc"),
+        "strict_detector_hit": bool(snapshot.get("strict_detector_hit")),
+        "target_patch_identity_ok": identity_ok,
+        "current_metrics": snapshot,
     }
-    if profile.get("strict_detector_hit"):
+    if finding_present:
         return {
             "type": "feature_envy",
             "success": False,
@@ -1170,14 +1557,19 @@ def _run_generic_feature_envy_guard(config: ResolvedRunConfig, guard: Dict[str, 
         "type": "feature_envy",
         "success": True,
         "message": (
-            f"feature_envy guard: strict detector no longer flags the target "
+            f"feature_envy guard: the frozen target declaration remains unique "
+            f"and the strict detector no longer flags that code location "
             f"(dominant receiver '{dominant}' {dominant_count} access(es), ratio {ratio:.0%})."
         ),
         "details": details,
     }
 
 
-def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+def _run_generic_mysterious_name_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext],
+) -> Dict[str, object]:
     target = config.locations[0] if config.locations else None
     if target is None:
         return {
@@ -1186,8 +1578,6 @@ def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[st
             "message": "mysterious_name guard: missing target location.",
             "details": {"detector": "tree_sitter_generic"},
         }
-    from ..checkpoint_adapters import capture_metric_snapshot
-
     identity = (
         config.finding_contract.get("entity_identity")
         if isinstance(config.finding_contract, dict)
@@ -1197,7 +1587,27 @@ def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[st
     selector = config.target_context if isinstance(config.target_context, dict) else {}
     kind = str(identity.get("symbol_kind") or selector.get("symbol_kind") or "")
     name = str(identity.get("symbol_name") or selector.get("symbol_name") or "")
-    snapshot = capture_metric_snapshot(config, "")
+    if (
+        context is None
+        or context.checkpoint_required is not True
+        or context.checkpoint_smell != "mysterious_name"
+        or not isinstance(context.checkpoint, dict)
+    ):
+        return {
+            "type": "mysterious_name",
+            "success": False,
+            "message": (
+                "mysterious_name guard: frozen checkpoint context is required; "
+                "live spelling disappearance is not successor evidence."
+            ),
+            "details": {
+                "detector": "checkpoint_contract",
+                "error": "MN_FROZEN_CHECKPOINT_REQUIRED",
+            },
+        }
+    snapshot = context.checkpoint.get("current_metrics")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
     if not snapshot.get("ok"):
         return {
             "type": "mysterious_name",
@@ -1206,6 +1616,30 @@ def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[st
             "details": {
                 "detector": "tree_sitter_generic",
                 "error": snapshot.get("error", ""),
+            },
+        }
+    violations = list(snapshot.get("guard_violations") or [])
+    successor = snapshot.get("successor_contract")
+    successor_status = (
+        str(successor.get("status") or "")
+        if isinstance(successor, dict)
+        else ""
+    )
+    if violations or successor_status != "accepted":
+        return {
+            "type": "mysterious_name",
+            "success": False,
+            "message": (
+                "mysterious_name guard: the frozen symbol has no valid unique "
+                "target-local successor."
+            ),
+            "details": {
+                "detector": "checkpoint_contract",
+                "target_kind": kind,
+                "target_name": name,
+                "successor_contract": successor,
+                "guard_violations": violations,
+                "current_metrics": snapshot,
             },
         }
     if snapshot.get("finding_present") is True:
@@ -1227,18 +1661,24 @@ def _run_generic_mysterious_name_guard(config: ResolvedRunConfig, guard: Dict[st
         "type": "mysterious_name",
         "success": True,
         "message": (
-            f"mysterious_name guard: detector no longer reports {kind or 'identifier'} "
-            f"'{name}' at {target.project_path}."
+            f"mysterious_name guard: {kind or 'identifier'} '{name}' has one "
+            f"non-suspicious successor at {target.project_path}."
         ),
         "details": {
             "detector": "tree_sitter_generic",
             "target_kind": kind,
             "target_name": name,
+            "successor_contract": successor,
+            "current_metrics": snapshot,
         },
     }
 
 
-def _run_dead_code_guard(config: ResolvedRunConfig, guard: Dict[str, object]) -> Dict[str, object]:
+def _run_dead_code_guard(
+    config: ResolvedRunConfig,
+    guard: Dict[str, object],
+    context: Optional[GuardRunContext] = None,
+) -> Dict[str, object]:
     target = config.locations[0] if config.locations else None
     if target is None:
         return {
@@ -1255,8 +1695,9 @@ def _run_dead_code_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
             "message": "dead_code guard: unable to resolve the reported member name.",
             "details": {"detector": "generic_dead_code_guard", "target_found": None},
         }
+    absence_allowed = dead_code_checkpoint_absence_allowed(context)
     if not target.file_path.exists():
-        return _dead_code_target_removed_result(name)
+        return _dead_code_target_removed_result(name, absence_allowed=absence_allowed)
     try:
         snippet = extract_snippet(target, config.language)
     except Exception as exc:
@@ -1267,32 +1708,7 @@ def _run_dead_code_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
             "details": {"detector": "generic_dead_code_guard", "target": name, "target_found": None},
         }
     if snippet is None:
-        return _dead_code_target_removed_result(name)
-    references = _find_dead_code_references(
-        config.project_root,
-        config.language,
-        target.file_path,
-        name,
-        snippet.start_line,
-        snippet.end_line,
-    )
-    if references:
-        return {
-            "type": "dead_code",
-            "success": False,
-            "message": (
-                f"dead_code guard: reported target `{name}` still exists and has "
-                f"{len(references)} project-local reference(s); safe delete is blocked."
-            ),
-            "details": {
-                "detector": "generic_dead_code_guard",
-                "target": name,
-                "target_found": True,
-                "reference_count": len(references),
-                "references": references[:20],
-                "references_truncated": len(references) > 20,
-            },
-        }
+        return _dead_code_target_removed_result(name, absence_allowed=absence_allowed)
     return {
         "type": "dead_code",
         "success": False,
@@ -1301,23 +1717,51 @@ def _run_dead_code_guard(config: ResolvedRunConfig, guard: Dict[str, object]) ->
             "detector": "generic_dead_code_guard",
             "target": name,
             "target_found": True,
-            "reference_count": 0,
-            "references": [],
+            "scope_mode": "explicit_target_locations",
         },
     }
 
 
-def _dead_code_target_removed_result(name: str) -> Dict[str, object]:
+def dead_code_checkpoint_absence_allowed(
+    context: Optional[GuardRunContext],
+) -> bool:
+    if (
+        context is None
+        or not context.checkpoint_required
+        or context.checkpoint_smell != "dead_code"
+    ):
+        return False
+    evidence = context.current_metrics.get("target_absence_evidence")
+    return bool(
+        context.current_metrics.get("target_absence_allowed") is True
+        and isinstance(evidence, dict)
+        and evidence.get("contract") == "exact-target-declaration-deletion-v2"
+        and evidence.get("allowed") is True
+    )
+
+
+def _dead_code_target_removed_result(
+    name: str,
+    *,
+    absence_allowed: bool = False,
+) -> Dict[str, object]:
     return {
         "type": "dead_code",
-        "success": True,
-        "message": f"dead_code guard: reported target `{name}` no longer resolves.",
+        "success": absence_allowed,
+        "message": (
+            f"dead_code guard: exact checkpoint deletion evidence authorizes `{name}` absence."
+            if absence_allowed
+            else (
+                f"dead_code guard: target `{name}` no longer resolves, but no exact "
+                "checkpoint deletion evidence authorizes its absence."
+            )
+        ),
         "details": {
             "detector": "generic_dead_code_guard",
             "target": name,
             "target_found": False,
-            "reference_count": 0,
-            "references": [],
+            "target_absence_allowed": absence_allowed,
+            "scope_mode": "explicit_target_locations",
         },
     }
 
@@ -1337,103 +1781,115 @@ def _dead_code_target_name(config: ResolvedRunConfig, guard: Dict[str, object]) 
     return ""
 
 
-def _find_dead_code_references(
-    project_root: Path,
-    language: str,
-    target_file: Path,
-    target_name: str,
-    target_start_line: int,
-    target_end_line: int,
-) -> list[dict[str, object]]:
-    references: list[dict[str, object]] = []
-    pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(target_name)}(?![A-Za-z0-9_])")
-    for source_path in _iter_dead_code_source_files(project_root, language):
-        try:
-            raw_text = source_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line_number, line in enumerate(_strip_comments_preserving_lines(raw_text, language), start=1):
-            if source_path == target_file and target_start_line <= line_number <= target_end_line:
-                continue
-            if not pattern.search(line):
-                continue
-            references.append(
-                {
-                    "file": str(source_path.relative_to(project_root)),
-                    "line": line_number,
-                    "text": line.strip(),
-                }
-            )
-    return references
-
-
-def _iter_dead_code_source_files(project_root: Path, language: str):
-    extensions = LANGUAGE_EXTENSIONS.get(language, set())
-    if not extensions:
-        return
-    ignored_dirs = {
-        ".git",
-        ".hg",
-        ".svn",
-        ".idea",
-        ".pytest_cache",
-        "node_modules",
-        "build",
-        "dist",
-        "target",
-    }
-    for path in sorted(project_root.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in extensions:
-            continue
-        if any(part in ignored_dirs for part in path.relative_to(project_root).parts[:-1]):
-            continue
-        yield path
-
-
-def _strip_comments_preserving_lines(text: str, language: str) -> list[str]:
-    if language == "python":
-        return [line.split("#", 1)[0] for line in text.splitlines()]
-    lines: list[str] = []
-    in_block = False
-    for raw_line in text.splitlines():
-        index = 0
-        cleaned = ""
-        while index < len(raw_line):
-            if in_block:
-                end = raw_line.find("*/", index)
-                if end < 0:
-                    index = len(raw_line)
-                    continue
-                in_block = False
-                index = end + 2
-                continue
-            line_comment = raw_line.find("//", index)
-            block_comment = raw_line.find("/*", index)
-            if line_comment >= 0 and (block_comment < 0 or line_comment < block_comment):
-                cleaned += raw_line[index:line_comment]
-                break
-            if block_comment >= 0:
-                cleaned += raw_line[index:block_comment]
-                in_block = True
-                index = block_comment + 2
-                continue
-            cleaned += raw_line[index:]
-            break
-        lines.append(cleaned)
-    return lines
-
-
 def _run_code_clone_guard(
     config: ResolvedRunConfig,
     guard: Dict[str, object],
     context: Optional[GuardRunContext] = None,
 ) -> Dict[str, object]:
-    first, second = extract_pair_snippets(config.locations, config.language)
+    if (
+        context is not None
+        and context.checkpoint_required
+        and context.checkpoint_smell == "code_clone_type1"
+    ):
+        metrics = dict(context.current_metrics or {})
+        identity_ok = metrics.get("target_patch_identity_ok") is True
+        finding_present = metrics.get("finding_present")
+        absence_allowed = metrics.get("target_absence_allowed") is True
+        guard_violations = list(metrics.get("guard_violations") or [])
+        target_resolved = (
+            metrics.get("target_missing") is not True or absence_allowed
+        )
+        snapshot_valid = (
+            metrics.get("ok") is True
+            and identity_ok
+            and isinstance(finding_present, bool)
+            and target_resolved
+            and not guard_violations
+        )
+        success = snapshot_valid and finding_present is False
+        return {
+            "type": "code_clone_type1",
+            "success": success,
+            "message": (
+                (
+                    "The identical frozen clone endpoints were consolidated into "
+                    "one exact production-hunk implementation."
+                    if absence_allowed
+                    else "The checkpoint-authoritative clone endpoints retain their frozen "
+                    "declaration identity and no longer form a type-1 clone."
+                )
+                if success
+                else (
+                    "The checkpoint-authoritative clone endpoints still form a "
+                    "type-1 clone."
+                    if snapshot_valid and finding_present is True
+                    else "The frozen clone declaration identity could not be verified."
+                )
+            ),
+            "details": {
+                "detector": "checkpoint_current_metrics",
+                "target_patch_identity_ok": identity_ok,
+                "target_patch_identity_contract": metrics.get(
+                    "target_patch_identity_contract"
+                ),
+                "target_patch_identity_failures": list(
+                    metrics.get("target_patch_identity_failures") or []
+                ),
+                "target_missing": metrics.get("target_missing") is True,
+                "target_absence_allowed": absence_allowed,
+                "clone_consolidation": dict(
+                    metrics.get("clone_consolidation") or {}
+                ),
+                "clone_related_occurrence_closure": dict(
+                    metrics.get("clone_related_occurrence_closure") or {}
+                ),
+                "guard_violations": guard_violations,
+                "finding_present": finding_present,
+                "clone_token_count": (metrics.get("objectives") or {}).get(
+                    "clone_token_count"
+                ),
+            },
+        }
+    if len(config.locations) >= 2:
+        parseability = explicit_target_files_parseability(
+            list(config.locations[:2]),
+            config.language,
+        )
+        if parseability.get("ok") is not True:
+            return {
+                "type": "code_clone_type1",
+                "success": False,
+                "message": (
+                    "One or more explicit clone target files are missing or "
+                    "syntactically incomplete; clone disappearance is not accepted."
+                ),
+                "details": {
+                    "detector": "tree_sitter_generic",
+                    "target_resolution": "source_not_parseable",
+                    "source_file_parseability": parseability,
+                },
+            }
+        first_target, second_target = config.locations[:2]
+        first = (
+            extract_snippet(first_target, config.language)
+            if first_target.file_path.is_file()
+            else None
+        )
+        second = (
+            extract_snippet(second_target, config.language)
+            if second_target.file_path.is_file()
+            else None
+        )
+    else:
+        first, second = None, None
     if len(config.locations) >= 2 and (not first or not second):
         return {
             "type": "code_clone_type1",
-            "success": True,
-            "message": "One or both original clone targets no longer resolve after refactoring.",
+            "success": False,
+            "message": (
+                "One or both frozen clone targets no longer resolve; target "
+                "disappearance is not accepted without checkpoint identity evidence."
+            ),
             "details": {
                 "target_resolution": "partial" if first or second else "none",
                 "first_found": first is not None,
@@ -1452,20 +1908,37 @@ def _run_code_clone_guard(
                 "second_found": second is not None,
             },
         }
-    first_normalized = normalize_for_clone(first.body_text, config.language)
-    second_normalized = normalize_for_clone(second.body_text, config.language)
-    still_clone = bool(first_normalized) and first_normalized == second_normalized
+    first_normalized, second_normalized, clone_token_count = clone_normalized_token_score(
+        first.body_text,
+        second.body_text,
+        config.language,
+    )
+    threshold = nonjava_finding_threshold(
+        config.language,
+        "code_clone_type1",
+        30,
+    )
+    normalized_bodies_equal = bool(first_normalized) and first_normalized == second_normalized
+    still_clone = clone_token_count >= threshold
     return {
         "type": "code_clone_type1",
         "success": not still_clone,
         "message": (
-            "The target blocks still normalize to the same implementation."
+            "The target blocks still form a normalized type-1 clone at or above "
+            f"the {threshold}-token threshold."
             if still_clone
-            else "The target blocks no longer normalize to the same implementation."
+            else (
+                "The matching target blocks are below the normalized token threshold."
+                if normalized_bodies_equal
+                else "The target blocks no longer normalize to the same implementation."
+            )
         ),
         "details": {
             "first_length": len(first_normalized),
             "second_length": len(second_normalized),
+            "clone_token_count": clone_token_count,
+            "finding_min_tokens": threshold,
+            "normalized_bodies_equal": normalized_bodies_equal,
         },
     }
 
@@ -1880,7 +2353,13 @@ def _build_script_command(script: str, label: str) -> tuple:
     suffix = ".cmd" if os.name == "nt" else ".sh"
     temp_dir = Path(tempfile.mkdtemp(prefix=f"smell-core-{label}-"))
     script_path = temp_dir / f"{label}{suffix}"
-    script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
+    script_body = script if script.endswith("\n") else script + "\n"
+    if os.name != "nt":
+        # Project scripts are verification transactions.  A failed build/test
+        # step must not be hidden by a later command (for example, a stamp or
+        # report-writing command) that exits successfully.
+        script_body = "set -e\n" + script_body
+    script_path.write_text(script_body, encoding="utf-8")
     if os.name != "nt":
         script_path.chmod(0o700)
         return f"sh {script_path}", True

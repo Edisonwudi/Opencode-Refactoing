@@ -42,6 +42,13 @@ def main() -> int:
         subprocess.run(["git", "config", "user.name", "Self Check"], cwd=project, check=True)
         subprocess.run(["git", "add", "demo.py"], cwd=project, check=True)
         subprocess.run(["git", "commit", "-qm", "baseline"], cwd=project, check=True)
+        baseline_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
         common = (
             "--project-root", str(project),
             "--language", "python",
@@ -56,6 +63,8 @@ def main() -> int:
         target.write_text(source(2), encoding="utf-8")
         reduced = run(project, "verify", *common, "--skip-build-test")
         assert reduced["success"] is True, reduced
+        assert reduced["checkpoint"]["baseline_project_commit"] == baseline_commit, reduced
+        assert reduced["snapshot"]["base_commit"] == baseline_commit, reduced
         delta = reduced["checkpoint"]["delta"]
         assert delta["has_production_diff"] is True and delta["metric_progress"] is True, reduced
 

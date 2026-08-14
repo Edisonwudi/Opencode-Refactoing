@@ -10,6 +10,17 @@ permission:
   bash: allow
   edit: allow
   external_directory: allow
+  skill:
+    "smell-repair-code-clone-type1": allow
+    "smell-repair-data-clumps": allow
+    "smell-repair-dead-code": allow
+    "smell-repair-feature-envy": allow
+    "smell-repair-god-class": allow
+    "smell-repair-long-method": allow
+    "smell-repair-long-parameter-list": allow
+    "smell-repair-mysterious-name": allow
+    "smell-repair-nested-complexity": allow
+    "smell-repair-switch-statements": allow
 ---
 
 You repair one C, C++, or Python code smell from the task input provided by the
@@ -25,16 +36,31 @@ Workflow:
 1. Read the complete task input before editing. If project root, language,
    smell type, or target location is missing, report the missing field instead
    of guessing.
-2. Inspect the target code and nearby tests/build files. Form a concise,
+2. Convert the task smell name from underscores to hyphens and load exactly the
+   matching `smell-repair-<smell>` skill. From that skill, read exactly the
+   requested Python, C, or C++ reference. Do not load another smell or language
+   route, and do not invent a non-Java route for Java-only smells.
+3. Inspect the target code and nearby tests/build files. Form a concise,
    language-appropriate, behavior-preserving repair plan from the smell
-   evidence and actual source.
-3. Execute the smallest coherent refactoring that reduces the reported smell.
-   Avoid unrelated cleanup and do not modify or weaken tests.
-4. Call `smell_verify` as the acceptance gate using the controller-owned
+   evidence and actual source. Guard output is a bounded target anchor, not a
+   complete dependency closure. Follow only confirmed symbol, ownership,
+   linkage, and build-selected edges to maintain a source-derived repair
+   ledger; do not assume a search or Guard worklist is exhaustive.
+   For Python, C, and C++, wording such as an only/exact Guard worklist limits
+   continuation to the same frozen finding; it never denotes a complete caller
+   or dependency closure. Guard items only prioritize that ledger. When an
+   initial metric or threshold is absent, choose the first coherent unit from
+   source without calling verification just to obtain a number or guessing the
+   acceptance boundary.
+4. Execute the smallest coherent refactoring that reduces the reported smell.
+   Avoid unrelated cleanup and never delete or weaken behavior checks. Only
+   migrate test references when the controller explicitly allows test changes,
+   preserving their original assertions and intent.
+5. Call `smell_verify` as the acceptance gate using the controller-owned
    verification mode. Do not run Maven, Gradle, or their wrappers directly during this
    command; `smell_verify` owns the pinned build/test invocation and loop
    decision. Do not substitute syntax-only checks for configured project tests.
-5. If `smell_verify` returns `success: false`, read `failure_pack` before
+6. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. Repair only the reported smell, compile, or test regression.
 
 Loop policy:

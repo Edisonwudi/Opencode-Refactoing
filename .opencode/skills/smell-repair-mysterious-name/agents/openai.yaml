@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mysterious Name Repair"
+  short_description: "Rename one unclear source identifier"
+  default_prompt: "Use $smell-repair-mysterious-name to repair the reported Mysterious Name smell without weakening verification."

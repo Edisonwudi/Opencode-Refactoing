@@ -11,7 +11,7 @@ const root = path.resolve(path.dirname(scriptFile), "..")
 const pluginFile = path.join(root, ".opencode", "plugins", "smell.ts")
 const bridgeFile = path.join(root, "runtime", "python", "bridge", "smell_bridge.py")
 const datasetRunnerFile = path.join(root, "scripts", "run_smell_dataset.py")
-const sampleTestCommand = "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'"
+const sampleTestCommand = "java -cp target/test-classes SelfCheckSampleBehaviorTest"
 
 function parseArgs(argv) {
   const options = {
@@ -277,7 +277,9 @@ async function runDatasetSmokeSelfCheck(options) {
 async function makeFixtureProject() {
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "smell-verify-self-check-project-"))
   const sourceDir = path.join(fixtureRoot, "src", "main", "java")
+  const testSourceDir = path.join(fixtureRoot, "src", "test", "java")
   await mkdir(sourceDir, { recursive: true })
+  await mkdir(testSourceDir, { recursive: true })
   await writeFile(
     path.join(sourceDir, "SelfCheckSample.java"),
     [
@@ -293,22 +295,45 @@ async function makeFixtureProject() {
     "utf8",
   )
   await writeFile(
+    path.join(testSourceDir, "SelfCheckSampleBehaviorTest.java"),
+    [
+      "import java.lang.reflect.Modifier;",
+      "import java.nio.file.Files;",
+      "import java.nio.file.Path;",
+      "",
+      "public class SelfCheckSampleBehaviorTest {",
+      "  public static void main(String[] args) throws Exception {",
+      "    var method = SelfCheckSample.class.getDeclaredMethod(\"add\", int.class, int.class);",
+      "    if (!Modifier.isPublic(method.getModifiers())) {",
+      "      throw new AssertionError(\"add must remain public\");",
+      "    }",
+      "    var report = Path.of(\".smell-test-reports\", \"TEST-SelfCheckSampleBehaviorTest.xml\");",
+      "    Files.createDirectories(report.getParent());",
+      "    Files.writeString(report, \"<testsuite name='SelfCheckSampleBehaviorTest' tests='1' failures='0' errors='0' skipped='0'><testcase name='publicAdd'/></testsuite>\\n\");",
+      "    System.out.println(\"OK (1 test)\");",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8",
+  )
+  await writeFile(
     path.join(fixtureRoot, "projects.yaml"),
     [
       "projects:",
       `- root: ${JSON.stringify(fixtureRoot)}`,
       "  language: java",
       "  build:",
-      "    command: \"true\"",
+      "    command: \"mkdir -p target/test-classes && javac -d target/test-classes src/main/java/SelfCheckSample.java src/test/java/SelfCheckSampleBehaviorTest.java\"",
       "  test:",
-      "    command: \"true\"",
+      `    command: ${JSON.stringify(sampleTestCommand)}`,
       "",
     ].join("\n"),
     "utf8",
   )
   for (const args of [
     ["init", "-q"],
-    ["add", "src/main/java/SelfCheckSample.java", "projects.yaml"],
+    ["add", "src/main/java/SelfCheckSample.java", "src/test/java/SelfCheckSampleBehaviorTest.java", "projects.yaml"],
     ["-c", "user.name=smell-self-check", "-c", "user.email=self-check@example.invalid", "commit", "-qm", "baseline"],
   ]) {
     const result = await run("git", args, { cwd: fixtureRoot })
@@ -2007,7 +2032,9 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     !routeLockedPrompt.includes("Smell evidence: parents=Packet")
       && !routeLockedPrompt.includes("Mandatory Refused Bequest route lock:")
       && routeLockedPrompt.includes("Baseline capture must uniquely confirm the requested smell at the supplied target")
-      && routeLockedPrompt.includes("context selects the entity but never supplies a verdict"),
+      && routeLockedPrompt.includes("context selects the entity but never supplies a verdict")
+      && routeLockedPrompt.includes("substantive production-source refactoring")
+      && !routeLockedPrompt.includes("production-Java"),
     "dataset route metadata entered the command contract",
   )
   assertCond(

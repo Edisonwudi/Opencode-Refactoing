@@ -57,7 +57,6 @@ from smell_core.feature_envy import (  # noqa: E402
     _parameter_type_map,
     _simple_type_name,
     analyze_feature_envy_target,
-    feature_envy_receiver_from_evidence,
 )
 from smell_core.mysterious_name import (  # noqa: E402
     detect_mysterious_names,
@@ -170,6 +169,7 @@ REVIEW_EXCLUSIONS = {
     ("c", "curl", "src/tool_getparam.c", 2455),           # opt_string: pure option dispatch
     ("c", "libuv", "src/win/pipe.c", 1578),               # uv__pipe_write_data: misplaced ownership
     ("c", "lua", "ldo.c", 1153),                          # luaD_protectedparser: thin wrapper
+    ("c", "lua", "lcode.c", 1357),                       # luaK_indexed: envied_type=expdesc ambiguously names t and k
     ("cpp", "duckdb", "third_party/mbedtls/library/sha1.cpp", 65),  # anonymous local struct receiver
     ("cpp", "protobuf-29.3", "third_party/abseil-cpp/absl/debugging/internal/demangle.cc", 27),  # namespace misparse
     ("cpp", "rocksdb", "tools/db_bench_tool.cc", 4488),   # InitializeOptionsFromFlags: FLAGS fill
@@ -206,6 +206,7 @@ REVIEW_EXCLUSIONS = {
 FIELDNAMES = [
     "sample_id", "language", "smell_type", "project_name", "project_path", "file",
     "method", "begin_line", "end_line", "metric_value", "location", "is_test", "evidence",
+    "target_context_json",
 ]
 
 
@@ -539,6 +540,7 @@ def _envy_candidate(language, project, root, rel, name, snippet, function_node, 
         "end_line": snippet.end_line,
         "metric_value": dominant_count,
         "evidence": evidence,
+        "receiver_name": dominant_receiver,
     }
 
 
@@ -670,13 +672,29 @@ def validate_envy(candidate: dict) -> bool:
     target_file = root / candidate["file"]
     if not target_file.is_file():
         return False
+    receiver = str(candidate.get("receiver_name") or "").strip()
+    if not receiver:
+        # Old scan caches predate target_context materialization. Recompute the
+        # root from this one already-selected declaration, never from evidence.
+        current = analyze_feature_envy_target(
+            root,
+            language=candidate["language"],
+            target_file=target_file,
+            method=candidate["method"],
+            line=candidate["begin_line"],
+        )
+        receiver = str(current.get("dominant_receiver_type") or "").strip()
+        if not receiver:
+            return False
+        candidate["receiver_name"] = receiver
     profile = analyze_feature_envy_target(
         root,
         language=candidate["language"],
         target_file=target_file,
         method=candidate["method"],
         line=candidate["begin_line"],
-        expected_receiver=feature_envy_receiver_from_evidence(candidate["evidence"]),
+        expected_receiver=receiver,
+        exact_receiver_selector=True,
     )
     return bool(
         profile.get("ok")
@@ -808,11 +826,26 @@ def write_csv(path: Path, language: str, smell: str, rows: list[dict]) -> None:
     """Write rows in container (image) path format; candidates stay local."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=FIELDNAMES,
+            lineterminator="\n",
+        )
         writer.writeheader()
         for index, candidate in enumerate(rows, start=1):
             container_root = _container_project_root(language, candidate["project_name"])
             container_file = f"{container_root}/{candidate['file']}"
+            if smell == "feature_envy":
+                target_context = {
+                    "receiver_type": str(candidate["receiver_name"]),
+                }
+            else:
+                # Preserve the established Mysterious Name selector schema;
+                # this builder does not add or reinterpret its contract.
+                target_context = {
+                    "symbol_kind": str(candidate["finding_kind"]),
+                    "symbol_name": str(candidate["finding_name"]),
+                }
             writer.writerow({
                 "sample_id": index,
                 "language": language,
@@ -827,6 +860,12 @@ def write_csv(path: Path, language: str, smell: str, rows: list[dict]) -> None:
                 "location": f"{container_file}:method={candidate['method']}|line={candidate['begin_line']}",
                 "is_test": 0,
                 "evidence": candidate["evidence"],
+                "target_context_json": json.dumps(
+                    target_context,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ),
             })
 
 

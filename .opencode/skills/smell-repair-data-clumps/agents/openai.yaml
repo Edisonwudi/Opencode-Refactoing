@@ -1,0 +1,4 @@
+interface:
+  display_name: "Data Clumps Repair"
+  short_description: "Repair repeated parameter groups"
+  default_prompt: "Use $smell-repair-data-clumps to repair the reported Data Clumps smell without weakening verification."

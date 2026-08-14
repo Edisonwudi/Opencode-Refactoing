@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feature Envy Repair"
+  short_description: "Move receiver-heavy behavior to its owner"
+  default_prompt: "Use $smell-repair-feature-envy to repair the reported Feature Envy smell without weakening verification."

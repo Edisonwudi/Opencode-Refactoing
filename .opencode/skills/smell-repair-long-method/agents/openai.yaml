@@ -1,0 +1,4 @@
+interface:
+  display_name: "Long Method Repair"
+  short_description: "Extract cohesive slices from a long callable"
+  default_prompt: "Use $smell-repair-long-method to repair the reported Long Method smell without weakening verification."

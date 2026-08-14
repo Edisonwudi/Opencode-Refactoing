@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -26,6 +29,32 @@ LANGUAGE_EXTENSIONS = {
     "c": C_EXTENSIONS,
     "cpp": CPP_EXTENSIONS,
 }
+
+NONJAVA_DATASET_THRESHOLDS = {
+    "python": {
+        "long_method": 50,
+        "long_parameter_list": 6,
+        "nested_complexity": 5,
+        "code_clone_type1": 17,
+    },
+    "c": {
+        "long_method": 60,
+        "long_parameter_list": 5,
+        "nested_complexity": 5,
+        "code_clone_type1": 18,
+    },
+    "cpp": {
+        "long_method": 60,
+        "long_parameter_list": 6,
+        "nested_complexity": 5,
+        "code_clone_type1": 25,
+    },
+}
+
+
+def nonjava_finding_threshold(language: str, smell: str, default: int) -> int:
+    """Return the frozen corpus threshold for one non-Java language/smell."""
+    return int(NONJAVA_DATASET_THRESHOLDS.get(language, {}).get(smell, default))
 
 FUNCTION_NODE_TYPES = {
     "python": {"function_definition"},
@@ -83,6 +112,16 @@ class SourceSnippet:
     body_text: str
     parameter_count: Optional[int] = None
     complexity_hint: Optional[int] = None
+    # Parser-derived declaration identity. These values are never copied from
+    # a caller selector, so a same-name declaration under another owner cannot
+    # impersonate the selected function after a refactoring.
+    declared_name: str = ""
+    owner_qualified_name: str = ""
+    # Parser-derived complete declaration boundary.  For Python this includes
+    # a surrounding ``decorated_definition`` so a decorator cannot be left
+    # behind and silently reassigned when the selected function is deleted.
+    declaration_start_line: int = 0
+    declaration_text: str = ""
 
 
 @dataclass
@@ -93,6 +132,10 @@ class FunctionSignature:
     name: str
     signature_text: str
     parameter_fingerprints: list[str]
+    owner_qualified_name: str = ""
+    owner_kind: str = ""
+    declaration_start_line: int = 0
+    declaration_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,6 +178,11 @@ def method_basename(method: Optional[str]) -> Optional[str]:
     for separator in ("::", "."):
         if separator in text:
             text = text.rsplit(separator, 1)[-1].strip()
+    # C++ conversion and symbolic operator names legitimately contain spaces.
+    # Treat the full ``operator ...`` spelling as the declaration name instead
+    # of reducing ``operator !=`` to just ``!=``.
+    if text.startswith("operator "):
+        return text
     if " " in text:
         text = text.rsplit(" ", 1)[-1].strip()
     return text or None
@@ -179,6 +227,75 @@ def count_meaningful_lines(text: str, language: str) -> int:
 def normalize_for_clone(text: str, language: str) -> str:
     cleaned = strip_comments(text, language)
     return re.sub(r"\s+", "", cleaned)
+
+
+_CLONE_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
+
+
+def clone_normalized_tokens(text: str, language: str) -> tuple[str, ...]:
+    """Return the shared type-1 normalized token sequence for one body."""
+    return tuple(_CLONE_TOKEN_PATTERN.findall(normalize_for_clone(text, language)))
+
+
+def clone_normalized_tokens_with_lines(
+    text: str,
+    language: str,
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Return shared clone tokens with one-based source-line provenance."""
+    if language == "python":
+        cleaned = _strip_python_comments(text)
+    else:
+        cleaned = re.sub(
+            r"/\*.*?\*/",
+            lambda match: re.sub(r"[^\n]", " ", match.group(0)),
+            text,
+            flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r"//.*",
+            lambda match: " " * len(match.group(0)),
+            cleaned,
+        )
+    normalized_chars: list[str] = []
+    normalized_lines: list[int] = []
+    source_line = 1
+    for char in cleaned:
+        if char == "\n":
+            source_line += 1
+        elif not char.isspace():
+            normalized_chars.append(char)
+            normalized_lines.append(source_line)
+    normalized = "".join(normalized_chars)
+    return tuple(
+        (
+            match.group(0),
+            tuple(sorted(set(normalized_lines[match.start() : match.end()]))),
+        )
+        for match in _CLONE_TOKEN_PATTERN.finditer(normalized)
+    )
+
+
+def clone_normalized_token_score(
+    first_text: str,
+    second_text: str,
+    language: str,
+) -> tuple[str, str, int]:
+    """Return normalized clone bodies and their exact shared token score.
+
+    A type-1 clone has a non-zero score only when both normalized bodies are
+    identical.  Checkpoint and ordinary Guards share this helper so threshold
+    changes cannot leave them with different notions of the current clone.
+    """
+    first_normalized = normalize_for_clone(first_text, language)
+    second_normalized = normalize_for_clone(second_text, language)
+    first_tokens = clone_normalized_tokens(first_text, language)
+    second_tokens = clone_normalized_tokens(second_text, language)
+    score = (
+        len(first_tokens)
+        if first_tokens and first_tokens == second_tokens
+        else 0
+    )
+    return first_normalized, second_normalized, score
 
 
 def split_top_level_params(signature: str) -> List[str]:
@@ -228,6 +345,22 @@ def count_parameters(signature_text: str, language: str) -> int:
     return _count_parameters_from_node(function_node, language, source_bytes)
 
 
+def signature_parameter_fingerprints(signature_text: str, language: str) -> list[str]:
+    """Return the detector-normalized parameters for one explicit signature.
+
+    Target Guards use this helper after the caller has already selected a
+    concrete function.  It deliberately parses only the supplied signature;
+    project-wide function discovery remains an offline detector concern.
+    """
+    wrapped_source = _wrap_signature_source(signature_text, language)
+    if wrapped_source is None:
+        return []
+    function_node, source_bytes = _find_first_function_node(wrapped_source, language)
+    if function_node is None:
+        return []
+    return _parameter_fingerprints_from_node(function_node, language, source_bytes)
+
+
 def estimate_complexity(snippet: SourceSnippet, language: str) -> int:
     if snippet.complexity_hint is not None:
         return snippet.complexity_hint
@@ -248,6 +381,62 @@ def estimate_complexity(snippet: SourceSnippet, language: str) -> int:
     if body_node is None:
         return _estimate_complexity_from_text(snippet.body_text, language)
     return _estimate_complexity_from_node(body_node, language, source_bytes)
+
+
+def estimate_nesting_depth(snippet: SourceSnippet, language: str) -> int:
+    """Maximum control-flow nesting depth in one explicit function body.
+
+    This is the metric used by the frozen non-Java dataset. Nested function,
+    class, and lambda bodies are separate targets and therefore do not widen
+    the current function's score.
+    """
+    wrapped_source = _wrap_body_source(snippet.body_text, language)
+    if wrapped_source is None:
+        return 0
+    function_node, _ = _find_first_function_node(wrapped_source, language)
+    if function_node is None:
+        return 0
+    body_node = function_node.child_by_field_name("body")
+    if body_node is None:
+        return 0
+    control_types = {
+        "python": {
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "except_clause",
+        },
+        "c": {
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_statement",
+        },
+        "cpp": {
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_statement",
+            "catch_clause",
+        },
+    }.get(language, set())
+    nested_scope_types = {
+        "function_definition",
+        "lambda",
+        "class_definition",
+    }
+
+    def visit(node: Node, depth: int, *, root: bool = False) -> int:
+        if not root and node.type in nested_scope_types:
+            return depth
+        current = depth + (1 if node.type in control_types else 0)
+        return max(
+            [current, *(visit(child, current) for child in node.named_children)]
+        )
+
+    return visit(body_node, 0, root=True)
 
 
 def java_cognitive_complexity_from_text(
@@ -315,40 +504,338 @@ def extract_snippet(target: LocationTarget, language: str) -> Optional[SourceSni
     return _build_source_snippet(function_node, source_bytes, language)
 
 
+def extract_snippet_candidates(
+    target: LocationTarget,
+    language: str,
+) -> List[Tuple[SourceSnippet, bool]]:
+    """Return same-name declarations from one explicit target file.
+
+    The boolean is the parseability of that declaration subtree, not of the
+    surrounding translation unit.  C/C++ amalgamated sources can contain
+    tree-sitter recovery nodes around unrelated preprocessor constructs; a
+    Target Guard must not let those target-external nodes widen its decision.
+    """
+    source_bytes = target.file_path.read_bytes()
+    root = _parse_tree(target.file_path, language, source_bytes)
+    function_nodes = [
+        node
+        for node in _iter_nodes(root)
+        if node.type in FUNCTION_NODE_TYPES.get(language, set())
+    ]
+    method_name = method_basename(target.method)
+    if method_name:
+        function_nodes = [
+            node
+            for node in function_nodes
+            if _extract_declared_name(node, language, source_bytes)
+            == method_name
+        ]
+    elif target.line is not None:
+        containing = [
+            node
+            for node in function_nodes
+            if _node_contains_line(node, target.line)
+        ]
+        if containing:
+            function_nodes = containing
+
+    candidates: List[Tuple[SourceSnippet, bool]] = []
+    for node in function_nodes:
+        snippet = _build_source_snippet(node, source_bytes, language)
+        if snippet is None:
+            continue
+        candidates.append((snippet, node_subtree_parseable(node)))
+    candidates.sort(key=lambda item: (
+        abs(item[0].start_line - int(target.line or item[0].start_line)),
+        item[0].end_line - item[0].start_line,
+        item[0].start_line,
+    ))
+    return candidates
+
+
+def node_subtree_parseable(node: Node) -> bool:
+    """Whether one selected AST subtree contains no recovery nodes."""
+    return not bool(node.has_error) and not any(
+        child.type == "ERROR" or child.is_missing
+        for child in _iter_nodes(node)
+    )
+
+
+def _syntax_issue_witnesses(node: Node, source_bytes: bytes) -> list[dict[str, object]]:
+    """Return stable witnesses for tree-sitter recovery inside one AST scope.
+
+    Line numbers are deliberately excluded so an unchanged macro recovery can
+    move when lines are inserted above it.  The exact source line, recovered
+    token bytes, and bounded ancestor shape still make a newly introduced
+    syntax problem distinguishable without a second parser or project scan.
+    """
+    source_lines = source_bytes.splitlines()
+    witnesses: list[dict[str, object]] = []
+    for issue in _iter_nodes(node):
+        if issue.type != "ERROR" and not issue.is_missing:
+            continue
+        row = int(issue.start_point[0])
+        line_bytes = source_lines[row] if 0 <= row < len(source_lines) else b""
+        issue_bytes = source_bytes[issue.start_byte : issue.end_byte]
+        parents: list[str] = []
+        parent = issue.parent
+        while parent is not None and len(parents) < 4:
+            parents.append(str(parent.type))
+            parent = parent.parent
+        witnesses.append(
+            {
+                "node_type": str(issue.type),
+                "is_missing": bool(issue.is_missing),
+                "node_text_sha256": hashlib.sha256(issue_bytes).hexdigest(),
+                "source_line_sha256": hashlib.sha256(line_bytes).hexdigest(),
+                "ancestor_types": parents,
+            }
+        )
+    witnesses.sort(
+        key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+    )
+    return witnesses
+
+
+def source_syntax_issue_witnesses(
+    file_path: Path,
+    language: str,
+) -> list[dict[str, object]]:
+    """Parse one explicit file and freeze its existing recovery witnesses."""
+    source_path = Path(file_path).expanduser().resolve()
+    if not source_path.is_file():
+        return []
+    source_bytes = source_path.read_bytes()
+    root = _parse_tree(source_path, language, source_bytes)
+    return _syntax_issue_witnesses(root, source_bytes)
+
+
+def syntax_issue_witness_additions(
+    baseline: object,
+    current: object,
+) -> list[dict[str, object]]:
+    """Return syntax-recovery witnesses present beyond the frozen multiset."""
+    before = baseline if isinstance(baseline, list) else []
+    after = current if isinstance(current, list) else []
+
+    def canonical(item: object) -> str:
+        if not isinstance(item, dict):
+            return ""
+        # The complete line digest is diagnostic only. Formatting or renaming
+        # surrounding a parser-recovery token must not turn an already-frozen
+        # C/C++ grammar limitation into a new semantic regression. Multiplicity
+        # still detects a newly added recovery node with the same shape.
+        identity = {
+            "node_type": item.get("node_type"),
+            "is_missing": item.get("is_missing"),
+            "node_text_sha256": item.get("node_text_sha256"),
+            "ancestor_types": item.get("ancestor_types"),
+        }
+        return json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+
+    remaining = Counter(canonical(item) for item in before if isinstance(item, dict))
+    additions: list[dict[str, object]] = []
+    for item in after:
+        if not isinstance(item, dict):
+            continue
+        key = canonical(item)
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            additions.append(dict(item))
+    return additions
+
+
+def source_file_parseable(file_path: Path, language: str) -> bool:
+    """Whether one caller-selected source file has a complete syntax tree.
+
+    Dead Code deletion closure needs to distinguish an absent declaration from
+    a parser that merely lost the target.  This helper parses exactly the file
+    supplied by the caller; it never performs source discovery.
+    """
+    source_path = Path(file_path).expanduser().resolve()
+    if not source_path.is_file():
+        return False
+    return not source_syntax_issue_witnesses(source_path, language)
+
+
+def explicit_target_files_parseability(
+    targets: List[LocationTarget],
+    language: str,
+) -> dict[str, object]:
+    """Parse only the distinct files named by explicit target locations."""
+    files: list[dict[str, object]] = []
+    seen: set[Path] = set()
+    for target in targets:
+        source_path = target.file_path.expanduser().resolve()
+        if source_path in seen:
+            continue
+        seen.add(source_path)
+        error = ""
+        try:
+            parseable = source_file_parseable(source_path, language)
+        except Exception as exc:
+            parseable = False
+            error = f"{type(exc).__name__}: {exc}"
+        files.append({
+            "file": str(target.project_path).replace("\\", "/"),
+            "exists": source_path.is_file(),
+            "parseable": parseable,
+            "error": error,
+        })
+    return {
+        "ok": bool(files) and all(item["parseable"] is True for item in files),
+        "files": files,
+    }
+
+
 def extract_pair_snippets(targets: List[LocationTarget], language: str) -> Tuple[Optional[SourceSnippet], Optional[SourceSnippet]]:
     if len(targets) < 2:
         return None, None
     return extract_snippet(targets[0], language), extract_snippet(targets[1], language)
 
 
-def extract_class_text(target: LocationTarget, language: str) -> Optional[str]:
-    """Return the labeled class body, or the C translation unit used as its module surrogate."""
+def extract_class_definition_candidate_records(
+    target: LocationTarget,
+    language: str,
+) -> list[dict[str, object]]:
+    """Return parser-proven class definitions for one explicit target.
+
+    C++ ``class_specifier`` nodes also represent forward declarations.  Those
+    nodes have no ``body`` field and are not class definitions, so they cannot
+    stand in for a frozen God Class.  A simple-name selector is intentionally
+    left ambiguous when the file contains multiple body-bearing definitions;
+    a qualified selector can disambiguate lexical namespace/class owners.
+    """
     if not target.file_path.is_file():
-        return None
+        return []
     source_bytes = target.file_path.read_bytes()
     if language == "c":
         # C datasets use `class=<module>` for file-level god-class candidates.
-        return _decode(source_bytes)
+        root = _parse_tree(target.file_path, language, source_bytes)
+        issues = _syntax_issue_witnesses(root, source_bytes)
+        return [
+            {
+                "text": _decode(source_bytes),
+                "parseable": not issues,
+                "syntax_issue_witnesses": issues,
+                "declared_name": str(target.class_name or ""),
+            }
+        ]
     node_types = {
         "python": {"class_definition"},
         "cpp": {"class_specifier", "struct_specifier"},
     }.get(language, set())
     if not node_types:
-        return None
+        return []
     root = _parse_tree(target.file_path, language, source_bytes)
-    candidates = [node for node in _iter_nodes(root) if node.type in node_types]
-    class_name = str(target.class_name or "").rsplit(".", 1)[-1]
-    if class_name:
-        named = []
+    candidates = [
+        node
+        for node in _iter_nodes(root)
+        if node.type in node_types
+        and node.child_by_field_name("body") is not None
+    ]
+    requested = str(target.class_name or "").strip()
+    if requested:
+        separator = "::" if language == "cpp" else "."
+        requested = requested.replace(".", separator)
+        requested_is_qualified = separator in requested
+        named: list[Node] = []
         for node in candidates:
             name_node = node.child_by_field_name("name")
-            name = _node_text(source_bytes, name_node).strip() if name_node is not None else ""
-            if name.rsplit("::", 1)[-1] == class_name:
+            declared = (
+                _node_text(source_bytes, name_node).strip()
+                if name_node is not None
+                else ""
+            )
+            owner_parts: list[str] = []
+            current = node.parent
+            owner_types = (
+                {"namespace_definition", "class_specifier", "struct_specifier"}
+                if language == "cpp"
+                else {"class_definition"}
+            )
+            while current is not None:
+                if current.type in owner_types:
+                    owner_node = current.child_by_field_name("name")
+                    owner_name = (
+                        _node_text(source_bytes, owner_node).strip()
+                        if owner_node is not None
+                        else ""
+                    )
+                    if owner_name:
+                        owner_parts.append(owner_name)
+                current = current.parent
+            owner_parts.reverse()
+            qualified = separator.join([*owner_parts, declared])
+            if (
+                requested_is_qualified
+                and (qualified == requested or declared == requested)
+            ) or (
+                not requested_is_qualified
+                and declared.rsplit("::", 1)[-1] == requested
+            ):
                 named.append(node)
-        if named:
-            candidates = named
-    node = _select_best_node(candidates, target.line)
-    return _node_text(source_bytes, node) if node is not None else None
+        candidates = named
+    candidates.sort(key=lambda node: (_node_start_line(node), node.start_byte))
+    records: list[dict[str, object]] = []
+    for node in candidates:
+        issues = _syntax_issue_witnesses(node, source_bytes)
+        name_node = node.child_by_field_name("name")
+        records.append(
+            {
+                "text": _node_text(source_bytes, node),
+                "parseable": not issues,
+                "syntax_issue_witnesses": issues,
+                "declared_name": (
+                    _node_text(source_bytes, name_node).strip()
+                    if name_node is not None
+                    else ""
+                ),
+            }
+        )
+    return records
+
+
+def extract_class_definition_candidates(
+    target: LocationTarget,
+    language: str,
+) -> list[tuple[str, bool]]:
+    """Compatibility projection of the richer class candidate records."""
+    return [
+        (str(record["text"]), bool(record["parseable"]))
+        for record in extract_class_definition_candidate_records(target, language)
+    ]
+
+
+def extract_class_definition_texts(
+    target: LocationTarget,
+    language: str,
+) -> list[str]:
+    """Return only syntax-valid body-bearing target class definitions."""
+    return [
+        text
+        for text, parseable in extract_class_definition_candidates(target, language)
+        if parseable
+    ]
+
+
+def extract_class_text(target: LocationTarget, language: str) -> Optional[str]:
+    """Return exactly one body-bearing target class definition.
+
+    This compatibility wrapper deliberately returns ``None`` for both missing
+    and ambiguous targets.  Metric adapters that need a diagnostic distinction
+    consume :func:`extract_class_definition_candidates` directly.
+    """
+    candidates = extract_class_definition_texts(target, language)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def iter_function_signatures(project_root: Path, language: str) -> list[FunctionSignature]:
@@ -357,36 +844,100 @@ def iter_function_signatures(project_root: Path, language: str) -> list[Function
         return []
     signatures: list[FunctionSignature] = []
     for source_path in sorted(_iter_source_files(project_root, extensions)):
-        source_bytes = source_path.read_bytes()
-        root = _parse_tree(source_path, language, source_bytes)
-        for node in _iter_nodes(root):
-            if node.type not in FUNCTION_NODE_TYPES.get(language, set()):
+        signatures.extend(function_signatures_in_file(source_path, language))
+    return signatures
+
+
+def function_signatures_in_file(file_path: Path, language: str) -> list[FunctionSignature]:
+    """Return function signatures from exactly one caller-selected source file."""
+    source_path = Path(file_path).expanduser().resolve()
+    source_bytes = source_path.read_bytes()
+    root = _parse_tree(source_path, language, source_bytes)
+    return _function_signatures_from_tree(
+        root,
+        source_bytes,
+        language,
+        file_path=source_path,
+    )
+
+
+def function_signatures_in_text(
+    source_text: str,
+    language: str,
+    *,
+    file_path: Path | None = None,
+    start_line: int = 1,
+) -> list[FunctionSignature]:
+    """Parse functions from one caller-supplied target-patch text block.
+
+    This is the in-memory counterpart to :func:`function_signatures_in_file`.
+    It performs no file or project discovery; ``start_line`` only translates
+    tree-sitter's block-local coordinates back to current-file line numbers.
+    """
+    source_path = Path(file_path) if file_path is not None else Path("<target-patch>")
+    source_bytes = source_text.encode("utf-8", errors="surrogateescape")
+    root = _parse_tree(source_path, language, source_bytes)
+    return _function_signatures_from_tree(
+        root,
+        source_bytes,
+        language,
+        file_path=source_path,
+        line_offset=max(0, int(start_line) - 1),
+    )
+
+
+def _function_signatures_from_tree(
+    root: Node,
+    source_bytes: bytes,
+    language: str,
+    *,
+    file_path: Path,
+    line_offset: int = 0,
+) -> list[FunctionSignature]:
+    signatures: list[FunctionSignature] = []
+    for node in _iter_nodes(root):
+        if node.type not in FUNCTION_NODE_TYPES.get(language, set()):
+            continue
+        snippet = _build_source_snippet(node, source_bytes, language)
+        if snippet is None:
+            # Java interface/abstract declarations have no body but are still
+            # product-visible method signatures (notably for LPL).
+            if language != "java":
                 continue
-            snippet = _build_source_snippet(node, source_bytes, language)
-            if snippet is None:
-                # Java interface/abstract declarations have no body but are
-                # still product-visible method signatures (notably for LPL).
-                if language != "java":
-                    continue
-                body_node = node.child_by_field_name("body")
-                signature_end = body_node.start_byte if body_node is not None else node.end_byte
-                signature_text = _decode(
-                    source_bytes[node.start_byte:signature_end]
-                ).rstrip().removesuffix(";")
-            else:
-                signature_text = snippet.signature_text
-            name = _extract_declared_name(node, language, source_bytes) or ""
-            fingerprints = _parameter_fingerprints_from_node(node, language, source_bytes)
-            signatures.append(
-                FunctionSignature(
-                    file_path=source_path,
-                    start_line=_node_start_line(node),
-                    end_line=_node_end_line(node),
-                    name=name,
-                    signature_text=signature_text,
-                    parameter_fingerprints=fingerprints,
-                )
+            body_node = node.child_by_field_name("body")
+            signature_end = body_node.start_byte if body_node is not None else node.end_byte
+            signature_text = _decode(
+                source_bytes[node.start_byte:signature_end]
+            ).rstrip().removesuffix(";")
+        else:
+            signature_text = snippet.signature_text
+        name = _extract_declared_name(node, language, source_bytes) or ""
+        fingerprints = _parameter_fingerprints_from_node(node, language, source_bytes)
+        declaration_node = _complete_declaration_node(node, language)
+        signatures.append(
+            FunctionSignature(
+                file_path=file_path,
+                start_line=_node_start_line(node) + line_offset,
+                end_line=_node_end_line(node) + line_offset,
+                name=name,
+                signature_text=signature_text,
+                parameter_fingerprints=fingerprints,
+                owner_qualified_name=(
+                    snippet.owner_qualified_name
+                    if snippet is not None
+                    else ""
+                ),
+                owner_kind=_actual_function_owner_kind(
+                    node,
+                    language,
+                    source_bytes,
+                ),
+                declaration_start_line=(
+                    _node_start_line(declaration_node) + line_offset
+                ),
+                declaration_text=_node_text(source_bytes, declaration_node),
             )
+        )
     return signatures
 
 
@@ -808,6 +1359,105 @@ def _extract_declared_name(node: Node, language: str, source_bytes: bytes) -> Op
     return _node_text(source_bytes, name_node).strip() if name_node is not None else None
 
 
+def _actual_function_owner(
+    node: Node,
+    language: str,
+    source_bytes: bytes,
+) -> str:
+    """Return the AST-declared enclosing owner for one function node."""
+    explicit_owner = ""
+    if language == "cpp":
+        declarator = node.child_by_field_name("declarator")
+        # Follow only the declarator spine that names the function. Walking
+        # every descendant also visits qualified parameter types such as
+        # ``std::ostream`` and can incorrectly append ``::std`` to the lexical
+        # class owner of an inline constructor.
+        while declarator is not None:
+            if declarator.type == "qualified_identifier":
+                qualified = _node_text(source_bytes, declarator).strip()
+                if "::" in qualified:
+                    explicit_owner = qualified.rsplit("::", 1)[0].strip()
+                break
+            nested = declarator.child_by_field_name("declarator")
+            if nested is None or nested == declarator:
+                break
+            declarator = nested
+
+    owner_parts: list[str] = []
+    current = node.parent
+    while current is not None:
+        owner_name = ""
+        if language == "python" and current.type in {
+            "class_definition",
+            "function_definition",
+        }:
+            name_node = current.child_by_field_name("name")
+            owner_name = (
+                _node_text(source_bytes, name_node).strip()
+                if name_node is not None
+                else ""
+            )
+        elif language == "cpp" and current.type in {
+            "namespace_definition",
+            "class_specifier",
+            "struct_specifier",
+            "union_specifier",
+        }:
+            name_node = current.child_by_field_name("name")
+            owner_name = (
+                _node_text(source_bytes, name_node).strip()
+                if name_node is not None
+                else ""
+            )
+        if owner_name:
+            owner_parts.append(owner_name)
+        current = current.parent
+    owner_parts.reverse()
+    separator = "::" if language == "cpp" else "."
+    enclosing_owner = separator.join(owner_parts)
+    if not explicit_owner:
+        return enclosing_owner
+    if not enclosing_owner or explicit_owner == enclosing_owner:
+        return explicit_owner
+    if explicit_owner.startswith(f"{enclosing_owner}::"):
+        return explicit_owner
+    return f"{enclosing_owner}::{explicit_owner}"
+
+
+def _actual_function_owner_kind(
+    node: Node,
+    language: str,
+    source_bytes: bytes,
+) -> str:
+    """Return the nearest parser-derived owner category for one function."""
+    current = node.parent
+    while current is not None:
+        if language == "python":
+            if current.type == "class_definition":
+                return "class"
+            if current.type == "function_definition":
+                return "function"
+        elif language == "cpp":
+            if current.type in {
+                "class_specifier",
+                "struct_specifier",
+                "union_specifier",
+            }:
+                return "class"
+            if current.type == "namespace_definition":
+                return "namespace"
+        current = current.parent
+    if language == "cpp" and _actual_function_owner(
+        node,
+        language,
+        source_bytes,
+    ):
+        # Out-of-class qualified definitions have no lexical owner node. The
+        # caller still verifies the qualified owner name from the real source.
+        return "qualified"
+    return ""
+
+
 def _find_declarator_name_node(node: Node) -> Optional[Node]:
     if node.type in {"identifier", "field_identifier", "destructor_name", "operator_name"}:
         return node
@@ -870,6 +1520,7 @@ def _build_source_snippet(node: Node, source_bytes: bytes, language: str) -> Opt
         signature_end += 1
     signature_text = _decode(source_bytes[node.start_byte:signature_end]).rstrip()
     body_text = _extract_body_text(body_node, source_bytes, language)
+    declaration_node = _complete_declaration_node(node, language)
     return SourceSnippet(
         start_line=_node_start_line(node),
         end_line=_node_end_line(node),
@@ -877,7 +1528,24 @@ def _build_source_snippet(node: Node, source_bytes: bytes, language: str) -> Opt
         body_text=body_text,
         parameter_count=_count_parameters_from_node(node, language, source_bytes),
         complexity_hint=_estimate_complexity_from_node(body_node, language, source_bytes),
+        declared_name=_extract_declared_name(node, language, source_bytes) or "",
+        owner_qualified_name=_actual_function_owner(node, language, source_bytes),
+        declaration_start_line=_node_start_line(declaration_node),
+        declaration_text=_node_text(source_bytes, declaration_node),
     )
+
+
+def _complete_declaration_node(node: Node, language: str) -> Node:
+    """Return the parser node that carries the complete selected declaration."""
+
+    parent = node.parent
+    if (
+        language == "python"
+        and parent is not None
+        and parent.type == "decorated_definition"
+    ):
+        return parent
+    return node
 
 
 def _extract_body_text(body_node: Node, source_bytes: bytes, language: str) -> str:

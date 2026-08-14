@@ -34,6 +34,7 @@ from bridge.smell_bridge import (  # noqa: E402
 def _long_method(statements: int) -> str:
     body = "\n".join(f"    consume({index});" for index in range(statements))
     return (
+        "package example;\n"
         "class Fixture {\n"
         "  void target() {\n"
         f"{body}\n"
@@ -74,13 +75,18 @@ def _bridge(
             "--smell",
             "long_method",
             "--location",
-            "Fixture.java:method=target|line=2",
+            "Fixture.java:method=target|line=3",
             "--projects",
             str(project / "projects.yaml"),
             "--verification-mode",
             "project_full",
+            "--sample-test-location",
+            "src/test/java/example/FixtureBehaviorTest.java",
             "--sample-test-command",
-            "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'",
+            "mkdir -p target/test-classes && "
+            "javac -d target/test-classes Fixture.java "
+            "src/test/java/example/FixtureBehaviorTest.java && "
+            "java -cp target/test-classes example.FixtureBehaviorTest",
         ],
         ROOT,
         env,
@@ -544,14 +550,34 @@ def main() -> int:
         project = Path(temp_dir)
         source = project / "Fixture.java"
         source.write_text(_long_method(65), encoding="utf-8")
+        behavior_test = project / "src/test/java/example/FixtureBehaviorTest.java"
+        behavior_test.parent.mkdir(parents=True)
+        behavior_test.write_text(
+            "package example;\n"
+            "import java.nio.file.Files;\n"
+            "import java.nio.file.Path;\n"
+            "public class FixtureBehaviorTest {\n"
+            "  public static void main(String[] args) throws Exception {\n"
+            "    new Fixture().target();\n"
+            "    Files.createDirectories(Path.of(\".smell-test-reports\"));\n"
+            "    Files.writeString(\n"
+            "        Path.of(\".smell-test-reports/TEST-FixtureBehaviorTest.xml\"),\n"
+            "        \"<testsuite tests=\\\"1\\\" failures=\\\"0\\\" errors=\\\"0\\\" skipped=\\\"0\\\">\"\n"
+            "            + \"<testcase classname=\\\"example.FixtureBehaviorTest\\\" name=\\\"target\\\"/>\"\n"
+            "            + \"</testsuite>\\n\");\n"
+            "    System.out.println(\"OK (1 test)\");\n"
+            "  }\n"
+            "}\n",
+            encoding="utf-8",
+        )
         (project / "projects.yaml").write_text(
             "projects:\n"
             f"- root: {json.dumps(str(project))}\n"
             "  language: java\n"
             "  build:\n"
-            "    command: \"true\"\n"
+            "    command: \"mkdir -p target/test-classes && javac -d target/test-classes Fixture.java src/test/java/example/FixtureBehaviorTest.java\"\n"
             "  test:\n"
-            "    command: \"true\"\n",
+            "    command: \"java -cp target/test-classes example.FixtureBehaviorTest\"\n",
             encoding="utf-8",
         )
         env = os.environ.copy()

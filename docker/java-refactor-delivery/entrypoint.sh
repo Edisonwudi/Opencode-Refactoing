@@ -43,8 +43,18 @@ ensure_local_hostname() {
 }
 
 ensure_local_hostname
-check_maven_offline_settings
-check_maven_offline_repository
+if [[ -e "$MAVEN_OFFLINE_SETTINGS" || -e "$MAVEN_OFFLINE_REPOSITORY" ]]; then
+  [[ -f "$MAVEN_OFFLINE_SETTINGS" ]] || {
+    echo "Maven offline settings are incomplete: $MAVEN_OFFLINE_SETTINGS" >&2
+    exit 70
+  }
+  [[ -d "$MAVEN_OFFLINE_REPOSITORY" ]] || {
+    echo "Maven offline repository is incomplete: $MAVEN_OFFLINE_REPOSITORY" >&2
+    exit 70
+  }
+  check_maven_offline_settings
+  check_maven_offline_repository
+fi
 
 prepare_opencode_auth_json_for_run_user() {
   local source="${OPENCODE_AUTH_JSON:-}"

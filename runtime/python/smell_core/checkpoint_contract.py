@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from .analysis import syntax_issue_witness_additions
 from .java.catalog_identity import (
     clone_catalog_additions_in_impact_cone,
     feature_envy_catalog_additions_in_impact_cone,
@@ -300,11 +301,57 @@ def checkpoint_feedback_highlights(checkpoint: Mapping[str, Any] | None) -> list
         action = resolution_plan_next_action(checkpoint.get("resolution_plan"))
         if action:
             objective_line += "; NEXT " + action
+        residual = _guard_residual_feedback(checkpoint.get("resolution_plan"))
+        if residual:
+            objective_line += "; " + residual
         best_partial = _best_partial_feedback(checkpoint)
         if best_partial:
             objective_line += "; " + best_partial
         highlights.append(objective_line)
     return highlights
+
+
+def _guard_residual_feedback(value: Any) -> str:
+    """Render a bounded post-edit Guard residual, never a dependency guess.
+
+    Resolution plans contain only entities already returned by the selected
+    target Guard.  Showing a small preview helps the repair loop inspect the
+    remaining source without claiming that the Guard discovered a complete
+    cross-project call or declaration closure.
+    """
+    if not isinstance(value, Mapping):
+        return ""
+    remaining = _integer(value.get("remaining_work_count"))
+    worklist = value.get("worklist")
+    if remaining is None or remaining <= 0 or not isinstance(worklist, list):
+        return ""
+    rendered: list[str] = []
+    for item in worklist:
+        if not isinstance(item, Mapping) or item.get("kind") == "frozen_finding":
+            continue
+        kind = str(item.get("kind") or "residual")
+        file_name = str(item.get("file") or item.get("source_file") or "")
+        line = _integer(item.get("line")) or _integer(item.get("begin_line"))
+        location = file_name + (f":{line}" if file_name and line else "")
+        identity = str(
+            item.get("method")
+            or item.get("signature")
+            or item.get("member")
+            or item.get("cluster_id")
+            or item.get("name")
+            or ""
+        )
+        details = "#".join(part for part in (location, identity) if part)
+        rendered.append(kind + (f"@{details}" if details else ""))
+        if len(rendered) == 3:
+            break
+    if not rendered:
+        return ""
+    complete = str(bool(value.get("worklist_complete"))).lower()
+    return (
+        f"CHECKPOINT_RESIDUAL remaining={remaining} "
+        f"preview_complete={complete} items=" + ",".join(rendered)
+    )
 
 
 def _best_partial_feedback(checkpoint: Mapping[str, Any]) -> str:
@@ -362,7 +409,7 @@ def _semantic_contract_delta(
 ) -> dict[str, Any]:
     """Compare route-independent semantic contracts captured by adapters."""
     guard_violations = current.get("guard_violations")
-    if isinstance(guard_violations, list):
+    if isinstance(guard_violations, list) and guard_violations:
         regressions = [
             str(item.get("code") or item.get("message") or item)
             if isinstance(item, Mapping)
@@ -375,6 +422,21 @@ def _semantic_contract_delta(
             "scope": "target_plus_changed_production_files",
             "regressions": regressions,
         }
+    if (
+        "target_syntax_issue_witnesses" in baseline
+        and "target_syntax_issue_witnesses" in current
+    ):
+        syntax_additions = syntax_issue_witness_additions(
+            baseline.get("target_syntax_issue_witnesses"),
+            current.get("target_syntax_issue_witnesses"),
+        )
+        if syntax_additions:
+            return {
+                "applicable": True,
+                "scope": "frozen_explicit_target_parser_recovery",
+                "new_syntax_issue_witnesses": syntax_additions,
+                "regressions": ["TARGET_SYNTAX_RECOVERY_REGRESSION"],
+            }
     if smell == "feature_envy":
         if current.get("finding_present") is True:
             return {"applicable": False, "regressions": []}
@@ -461,9 +523,14 @@ def _semantic_contract_delta(
                 source_method = str(item.get("source_method") or "")
                 before_count = _integer(item.get("baseline_occurrences")) or 0
                 after_count = _integer(item.get("current_occurrences")) or 0
+                expansion_reason = str(item.get("reason") or "")
                 regressions.append(
-                    "inlined_body_window_expanded:"
-                    f"{source_file}#{source_method}:{before_count}->{after_count}"
+                    (
+                        "inlined_body_window_relocated:"
+                        if expansion_reason == "source_window_relocated"
+                        else "inlined_body_window_expanded:"
+                    )
+                    + f"{source_file}#{source_method}:{before_count}->{after_count}"
                 )
         return {
             "applicable": True,

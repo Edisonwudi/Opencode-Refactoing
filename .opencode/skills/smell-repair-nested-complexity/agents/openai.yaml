@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nested Complexity Repair"
+  short_description: "Flatten deeply nested control flow"
+  default_prompt: "Use $smell-repair-nested-complexity to repair the reported Nested Complexity smell without weakening verification."

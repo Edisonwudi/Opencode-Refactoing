@@ -1,0 +1,4 @@
+interface:
+  display_name: "Long Parameter List Repair"
+  short_description: "Replace excessive parameters with cohesive APIs"
+  default_prompt: "Use $smell-repair-long-parameter-list to repair the reported Long Parameter List smell without weakening verification."

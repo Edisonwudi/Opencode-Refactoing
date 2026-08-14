@@ -173,6 +173,49 @@ with tempfile.TemporaryDirectory() as tmp:
     else:
         failures.append("missing_method_selector_fails_fast: invalid row was accepted")
 
+    data_clumps = Path(tmp) / "data-clumps.csv"
+    data_clumps.write_text(
+        "sample_id,language,smell_type,project_name,project_path,location,target_context_json\n"
+        + '1,python,data_clumps,p,/tmp/p,src/a.py:method=a|line=1,"{}"\n',
+        encoding="utf-8",
+    )
+    try:
+        R._load_samples(data_clumps)
+    except ValueError as exc:
+        check_true("data_clumps_group_required", "target_context_json.group" in str(exc))
+    else:
+        failures.append("data_clumps_group_required: invalid row was accepted")
+    explicit_context = json.dumps({"group": "int:start|int:end|int:retry"}).replace('"', '""')
+    data_clumps.write_text(
+        "sample_id,language,smell_type,project_name,project_path,location,target_context_json\n"
+        + "1,python,data_clumps,p,/tmp/p,"
+        + '"src/a.py:method=a|line=1;src/b.py:method=b|line=1",'
+        + f'"{explicit_context}"\n',
+        encoding="utf-8",
+    )
+    try:
+        R._load_samples(data_clumps)
+    except ValueError as exc:
+        check_true("data_clumps_three_locations_required", "at least three" in str(exc))
+    else:
+        failures.append("data_clumps_three_locations_required: invalid row was accepted")
+
+    mysterious = Path(tmp) / "mysterious-name.csv"
+    mysterious.write_text(
+        "sample_id,language,smell_type,project_name,project_path,location,target_context_json\n"
+        + '1,python,mysterious_name,p,/tmp/p,src/a.py:method=a|line=1,"{}"\n',
+        encoding="utf-8",
+    )
+    try:
+        R._load_samples(mysterious)
+    except ValueError as exc:
+        check_true(
+            "mysterious_name_selector_required",
+            "target_context_json.symbol_kind" in str(exc),
+        )
+    else:
+        failures.append("mysterious_name_selector_required: invalid row was accepted")
+
 print("== single time budget ==")
 check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)
 check("pass_is_accepted", R._is_accepted_status("PASS"), True)
@@ -828,11 +871,29 @@ check("prompt_excludes_raw_dataset_evidence", "oracle_score=99" in prompt_plain,
 roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "project_full"))
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
-check_true("prompt_freezes_test_policy", "Test changes: forbidden" in prompt_plain)
-check_true("prompt_freezes_direct_backend", "Refactoring backend: direct" in prompt_plain)
+check_true(
+    "prompt_excludes_controller_policy",
+    all(
+        marker not in prompt_plain
+        for marker in ("Refactoring backend:", "Verification mode:", "Test changes:")
+    ),
+)
 idea_args = argparse.Namespace(**{**vars(args), "refactoring_backend": "idea"})
 idea_prompt = R._task_prompt(sample, idea_args, "project_full")
-check_true("prompt_freezes_idea_backend", "Refactoring backend: idea" in idea_prompt)
+check("task_prompt_backend_neutral", idea_prompt, prompt_plain)
+grouped_sample = Sample(
+    sample_id="grouped",
+    language="c",
+    smell="data_clumps",
+    project_name="p",
+    project_root=Path("/tmp/p"),
+    location="src/a.c:method=alpha|line=10;src/b.c:method=beta|line=20",
+    evidence="",
+    raw={},
+)
+grouped_prompt = R._task_prompt(grouped_sample, args, "project_full")
+check_true("grouped_prompt_uses_target_locations", "listed target locations" in grouped_prompt)
+check("grouped_prompt_avoids_java_method_wording", "target methods" in grouped_prompt, False)
 initial_controller_state = R._initial_command_loop_state(
     sample,
     args,
@@ -972,7 +1033,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
 allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
 allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")
 allowed_roundtrip = parse_command_policy(R._command_arguments(allowed_prompt, allowed_args, "project_full"))
-check_true("prompt_allows_sha_audited_tests", "explicitly allowed" in allowed_prompt and "SHA-audited" in allowed_prompt)
+check("task_prompt_test_policy_neutral", allowed_prompt, prompt_plain)
 check("command_roundtrip_allows_test_changes", allowed_roundtrip.allow_test_changes, True)
 
 refused = Sample(
@@ -990,15 +1051,20 @@ refused = Sample(
 )
 refused_prompt = R._task_prompt(refused, args, "project_full")
 check("runner_prompt_has_no_smell_protocol", "Refused Bequest structural protocol:" in refused_prompt, False)
-refused_skill = (
-    ROOT
-    / ".opencode"
-    / "skills"
-    / "java-smell-edit-patterns"
-    / "references"
-    / "edit-patterns"
-    / "refused_bequest.md"
-).read_text(encoding="utf-8")
+
+
+def primary_java_skill_reference(smell_name: str) -> Path:
+    return (
+        ROOT
+        / ".opencode"
+        / "skills"
+        / f"smell-repair-{smell_name.replace('_', '-')}"
+        / "references"
+        / "java.md"
+    )
+
+
+refused_skill = primary_java_skill_reference("refused_bequest").read_text(encoding="utf-8")
 check_true("refused_skill_maps_callers", "production callers" in refused_skill)
 check_true("refused_skill_rejects_relocation", "Never relocate an empty, throwing, null-returning" in refused_skill)
 check_true(
@@ -1021,15 +1087,7 @@ check_true(
     and "scatter downcasts" in refused_skill,
 )
 
-feature_envy_skill = (
-    ROOT
-    / ".opencode"
-    / "skills"
-    / "java-smell-edit-patterns"
-    / "references"
-    / "edit-patterns"
-    / "feature_envy.md"
-).read_text(encoding="utf-8")
+feature_envy_skill = primary_java_skill_reference("feature_envy").read_text(encoding="utf-8")
 check_true(
     "feature_envy_skill_closes_receiver_operation",
     "at most one semantically named receiver operation" in feature_envy_skill
@@ -1058,15 +1116,7 @@ check_true(
         for term in ("mock", "spy", "test double", "test-visible", "wanted but not invoked")
     ),
 )
-data_clumps_skill = (
-    ROOT
-    / ".opencode"
-    / "skills"
-    / "java-smell-edit-patterns"
-    / "references"
-    / "edit-patterns"
-    / "data_clumps.md"
-).read_text(encoding="utf-8")
+data_clumps_skill = primary_java_skill_reference("data_clumps").read_text(encoding="utf-8")
 check_true(
     "data_clumps_skill_uses_declaration_budget",
     "projected occurrences = N - migrated old declarations" in data_clumps_skill
@@ -1102,7 +1152,7 @@ check_true(
     and "cross-domain bag" in data_clumps_skill,
 )
 
-edit_patterns = (
+legacy_edit_patterns = (
     ROOT
     / ".opencode"
     / "skills"
@@ -1110,7 +1160,7 @@ edit_patterns = (
     / "references"
     / "edit-patterns"
 )
-lpl_skill = (edit_patterns / "long_parameter_list.md").read_text(encoding="utf-8")
+lpl_skill = primary_java_skill_reference("long_parameter_list").read_text(encoding="utf-8")
 check_true(
     "lpl_skill_covers_complete_signature_shapes",
     "Complete-signature migration protocol" in lpl_skill
@@ -1126,7 +1176,7 @@ check_true(
     and "preserve an old abstract root as a fallback" in lpl_skill,
 )
 
-god_class_skill = (edit_patterns / "god_class.md").read_text(encoding="utf-8")
+god_class_skill = primary_java_skill_reference("god_class").read_text(encoding="utf-8")
 check_true(
     "god_class_skill_completes_profile_in_cohesive_stages",
     "Profile-closure protocol" in god_class_skill
@@ -1136,14 +1186,14 @@ check_true(
     and "next cohesive cluster" in god_class_skill,
 )
 
-long_method_skill = (edit_patterns / "long_method.md").read_text(encoding="utf-8")
+long_method_skill = primary_java_skill_reference("long_method").read_text(encoding="utf-8")
 check_true(
     "long_method_skill_has_ncss_fast_path",
     "AST-NCSS fast-path closure" in long_method_skill
     and "smallest cohesive set" in long_method_skill
     and "`smell_verify` once" in long_method_skill,
 )
-switch_skill = (edit_patterns / "switch_statements.md").read_text(encoding="utf-8")
+switch_skill = primary_java_skill_reference("switch_statements").read_text(encoding="utf-8")
 check_true(
     "switch_skill_has_zero_switch_fast_path",
     "Zero-switch fast-path closure" in switch_skill
@@ -1161,22 +1211,42 @@ residual_contracts = {
     "dead_code": ("residual", "declaration is returned, delete that exact entity"),
 }
 for smell_name, required_texts in residual_contracts.items():
-    skill_text = (edit_patterns / f"{smell_name}.md").read_text(encoding="utf-8")
+    skill_text = primary_java_skill_reference(smell_name).read_text(encoding="utf-8")
     check_true(
         f"{smell_name}_skill_has_exact_residual_closure",
         all(required_text in skill_text for required_text in required_texts),
     )
 
-index_text = (edit_patterns / "index.md").read_text(encoding="utf-8")
+index_text = (legacy_edit_patterns / "index.md").read_text(encoding="utf-8")
 check_true(
     "edit_pattern_index_matches_expanded_routes",
     "[`code_clone_type1.md`](code_clone_type1.md) | 7" in index_text
     and "[`feature_envy.md`](feature_envy.md) | 5" in index_text
     and "[`long_parameter_list.md`](long_parameter_list.md) | 4" in index_text,
 )
+java_smells = (
+    "code_clone_type1",
+    "data_clumps",
+    "dead_code",
+    "feature_envy",
+    "god_class",
+    "long_method",
+    "long_parameter_list",
+    "mysterious_name",
+    "nested_complexity",
+    "refused_bequest",
+    "switch_statements",
+)
+for smell_name in java_smells:
+    check(
+        f"{smell_name}_legacy_java_route_preserved",
+        primary_java_skill_reference(smell_name).read_bytes(),
+        (legacy_edit_patterns / f"{smell_name}.md").read_bytes(),
+    )
+
 noidea_skill_text = "\n".join(
-    path.read_text(encoding="utf-8")
-    for path in sorted((ROOT / ".opencode" / "skills" / "java-smell-edit-patterns").rglob("*.md"))
+    primary_java_skill_reference(smell_name).read_text(encoding="utf-8")
+    for smell_name in java_smells
 )
 check_true(
     "noidea_skill_has_no_idea_operation_fallback",

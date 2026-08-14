@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dead Code Repair"
+  short_description: "Remove an exact unused declaration"
+  default_prompt: "Use $smell-repair-dead-code to repair the reported Dead Code smell without weakening verification."

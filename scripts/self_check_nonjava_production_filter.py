@@ -269,12 +269,165 @@ def check_god_class_min_reduction() -> None:
     print("  scenario god-class-floor: marginal=IMPROVED split=IMPROVED detector_clear=PASS")
 
 
+def _cpp_god_class(name: str, fields: int = 110) -> str:
+    members = "\n".join(f"    int value_{index};" for index in range(fields))
+    return f"class {name} {{\npublic:\n{members}\n}};\n"
+
+
+def check_god_class_requires_unique_definition() -> None:
+    with tempfile.TemporaryDirectory(prefix="god-class-definition-") as raw:
+        project = Path(raw)
+        source = project / "big.cpp"
+        original = _cpp_god_class("Big")
+        source.write_text(original, encoding="utf-8")
+        init_repo(project)
+        git(project, "add", ".")
+        git(project, "commit", "-qm", "baseline")
+        common = (
+            "--project-root", str(project),
+            "--language", "cpp",
+            "--smell", "god_class",
+            "--location", f"{source}:class=Big|line=1",
+        )
+        baseline = run_bridge(project, "capture-baseline", *common)
+        assert baseline["success"] is True, baseline
+        baseline_loc = baseline["metrics"]["objectives"]["class_loc"]
+
+        # A forward declaration at the frozen line is not a one-line class
+        # definition and must not hide the unchanged body-bearing definition.
+        source.write_text("class Big;\n" + original, encoding="utf-8")
+        current = run_bridge(project, "verify", *common, "--skip-build-test")
+        metrics = current["checkpoint"]["current_metrics"]
+        assert current["success"] is False, current
+        assert metrics["target_match_count"] == 1, metrics
+        assert metrics["objectives"]["class_loc"] == baseline_loc, metrics
+        assert current["checkpoint"]["delta"]["reason"] == "NO_STRUCTURAL_PROGRESS", current
+
+        source.write_text(
+            "class Big {\npublic:\n    int value int other;\n};\n",
+            encoding="utf-8",
+        )
+        malformed = run_bridge(project, "verify", *common, "--skip-build-test")
+        malformed_metrics = malformed["checkpoint"]["current_metrics"]
+        assert malformed["success"] is False, malformed
+        assert malformed["checkpoint"]["delta"]["reason"] == (
+            "SEMANTIC_CONTRACT_REGRESSION"
+        ), malformed
+        assert malformed_metrics["target_match_count"] == 1, malformed_metrics
+        assert malformed_metrics["target_parseable_match_count"] == 0, (
+            malformed_metrics
+        )
+
+    with tempfile.TemporaryDirectory(prefix="god-class-ambiguous-") as raw:
+        project = Path(raw)
+        source = project / "ambiguous.cpp"
+        source.write_text(
+            "namespace Left {\n" + _cpp_god_class("Big") + "}\n"
+            "namespace Right {\n" + _cpp_god_class("Big") + "}\n",
+            encoding="utf-8",
+        )
+        init_repo(project)
+        git(project, "add", ".")
+        git(project, "commit", "-qm", "baseline")
+        ambiguous = run_bridge(
+            project,
+            "capture-baseline",
+            "--project-root", str(project),
+            "--language", "cpp",
+            "--smell", "god_class",
+            "--location", f"{source}:class=Big|line=2",
+        )
+        assert ambiguous["success"] is False, ambiguous
+        assert "target_class_definition_ambiguous" in ambiguous["error"], ambiguous
+    print(
+        "  scenario god-class-definition: forward_decl=ignored "
+        "malformed=fail_closed ambiguous=fail_closed"
+    )
+
+
+def _c_god_class_with_parser_recovery() -> str:
+    members = "\n".join(f"int value_{index};" for index in range(110))
+    return (
+        "#define UNUSED(value) value\n"
+        "int module_entry(int UNUSED(*value)) { return *value; }\n"
+        f"{members}\n"
+    )
+
+
+def _cpp_god_class_with_parser_recovery() -> str:
+    members = "\n".join(f"    int value_{index};" for index in range(110))
+    return (
+        "#define UNUSED(value) value\n"
+        "class Big {\npublic:\n"
+        "    int method(int UNUSED(*value)) { return *value; }\n"
+        f"{members}\n"
+        "};\n"
+    )
+
+
+def check_god_class_frozen_parser_recovery() -> None:
+    cases = (
+        ("c", "module.c", "module", _c_god_class_with_parser_recovery()),
+        ("cpp", "big.cpp", "Big", _cpp_god_class_with_parser_recovery()),
+    )
+    for language, filename, class_name, original in cases:
+        with tempfile.TemporaryDirectory(prefix=f"god-class-recovery-{language}-") as raw:
+            project = Path(raw)
+            source = project / filename
+            source.write_text(original, encoding="utf-8")
+            init_repo(project)
+            git(project, "add", ".")
+            git(project, "commit", "-qm", "baseline")
+            common = (
+                "--project-root", str(project),
+                "--language", language,
+                "--smell", "god_class",
+                "--location", f"{source}:class={class_name}|line=1",
+            )
+            baseline = run_bridge(project, "capture-baseline", *common)
+            assert baseline["success"] is True, baseline
+            assert baseline["metrics"]["parser_recovery_required"] is True, baseline
+            assert baseline["metrics"]["target_syntax_issue_witnesses"], baseline
+
+            retained_source = original.replace("int value_0;\n", "", 1)
+            retained_source = retained_source.replace(
+                "(int UNUSED(*value))",
+                "( int UNUSED(*value) )",
+                1,
+            )
+            source.write_text(retained_source, encoding="utf-8")
+            retained = run_bridge(project, "verify", *common, "--skip-build-test")
+            assert retained["success"] is False, retained
+            semantic = retained["checkpoint"]["delta"]["semantic_contract"]
+            assert semantic.get("regressions") == [], retained
+
+            if language == "c":
+                malformed = original + "\nint newly_broken( {\n"
+            else:
+                malformed = original.replace(
+                    "};\n",
+                    "    int newly_broken() { return (1 + ); }\n};\n",
+                )
+            source.write_text(malformed, encoding="utf-8")
+            rejected = run_bridge(project, "verify", *common, "--skip-build-test")
+            assert rejected["success"] is False, rejected
+            assert rejected["checkpoint"]["delta"]["reason"] == (
+                "SEMANTIC_CONTRACT_REGRESSION"
+            ), rejected
+    print(
+        "  scenario god-class-parser-recovery: frozen_c_cpp=accepted "
+        "new_syntax_error=rejected"
+    )
+
+
 def main() -> int:
     print("Non-Java production filter / switch metric self-check")
     check_cpp_header_is_production()
     check_build_dir_not_production()
     check_python_switch_metric()
     check_god_class_min_reduction()
+    check_god_class_requires_unique_definition()
+    check_god_class_frozen_parser_recovery()
     print("Non-Java production filter / switch metric self-check passed")
     return 0
 

@@ -37,6 +37,45 @@ def _class_source(methods: int, controls: int, padding: int) -> str:
     return f"class Smelly {{\n{body}\n{pad}\n}}\n"
 
 
+def _write_project_verification(root: Path) -> None:
+    """Install a real, tiny project-wide compile/test contract for the fixture."""
+    (root / "project_behavior_test.py").write_text(
+        "import unittest\n"
+        "from pathlib import Path\n"
+        "class ProjectBehaviorTest(unittest.TestCase):\n"
+        "    def test_all_production_sources_compile_as_java_types(self):\n"
+        "        sources = sorted(Path('.').glob('*.java'))\n"
+        "        self.assertTrue(sources, 'no Java production source')\n"
+        "        for source in sources:\n"
+        "            text = source.read_text(encoding='utf-8')\n"
+        "            self.assertTrue(\n"
+        "                'class ' in text or 'interface ' in text,\n"
+        "                f'unexpected Java source: {source}',\n"
+        "            )\n"
+        "        reports = Path('.smell-test-reports')\n"
+        "        reports.mkdir(parents=True, exist_ok=True)\n"
+        "        (reports / 'TEST-ProjectBehaviorTest.xml').write_text(\n"
+        "            '<testsuite tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\">'\n"
+        "            '<testcase classname=\"ProjectBehaviorTest\" name=\"production_sources\"/>'\n"
+        "            '</testsuite>\\n',\n"
+        "            encoding='utf-8',\n"
+        "        )\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+        encoding="utf-8",
+    )
+    (root / "projects.yaml").write_text(
+        "projects:\n"
+        f"- root: {json.dumps(str(root))}\n"
+        "  language: java\n"
+        "  build:\n"
+        "    command: \"javac *.java\"\n"
+        "  test:\n"
+        "    command: \"python3 -m unittest -v project_behavior_test.py\"\n",
+        encoding="utf-8",
+    )
+
+
 def _bridge(
     project: Path,
     subcommand: str,
@@ -65,7 +104,7 @@ def _bridge(
         "--verification-mode",
         "project_full",
         "--sample-test-command",
-        "printf 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\\n'",
+        "python3 project_behavior_test.py",
     ]
     if target_context:
         cmd += ["--target-context-json", json.dumps(target_context, sort_keys=True)]
@@ -120,16 +159,7 @@ def _refused_bequest_baseline_delta_case() -> None:
         root = Path(tmp)
         source = root / "Fixture.java"
         source.write_text(REFUSED_BASELINE, encoding="utf-8")
-        (root / "projects.yaml").write_text(
-            "projects:\n"
-            f"- root: {json.dumps(str(root))}\n"
-            "  language: java\n"
-            "  build:\n"
-            "    command: \"true\"\n"
-            "  test:\n"
-            "    command: \"true\"\n",
-            encoding="utf-8",
-        )
+        _write_project_verification(root)
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "."], cwd=root, check=True)
         subprocess.run(
@@ -184,16 +214,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="improvement-gate-") as tmp:
         root = Path(tmp)
         (root / "Smelly.java").write_text(_class_source(12, 3, 60), encoding="utf-8")
-        (root / "projects.yaml").write_text(
-            "projects:\n"
-            f"- root: {json.dumps(str(root))}\n"
-            "  language: java\n"
-            "  build:\n"
-            "    command: \"true\"\n"
-            "  test:\n"
-            "    command: \"true\"\n",
-            encoding="utf-8",
-        )
+        _write_project_verification(root)
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "."], cwd=root, check=True)
         subprocess.run(

@@ -13,6 +13,7 @@ from typing import Any
 
 from .checkpoint_adapters import (
     CHECKPOINT_SMELLS,
+    authorize_dead_code_target_absence,
     capture_metric_snapshot,
     detector_profile_for,
 )
@@ -385,6 +386,11 @@ def _finding_contract(smell: str, metrics: dict[str, Any], target_context: Any) 
         contract["baseline_occurrence_contract"] = json.loads(
             json.dumps(occurrence_contract, sort_keys=True, ensure_ascii=True)
         )
+    target_anchors = metrics.get("target_anchor_contract")
+    if smell == "code_clone_type1" and isinstance(target_anchors, list):
+        contract["baseline_target_anchors"] = json.loads(
+            json.dumps(target_anchors, sort_keys=True, ensure_ascii=True)
+        )
     return contract
 
 
@@ -704,18 +710,50 @@ def _is_production_source(
     )
 
 
-def _diff_patch(root: Path, base_commit: str, paths: list[str] | None = None) -> str:
+def _diff_patch(
+    root: Path,
+    base_commit: str,
+    paths: list[str] | None = None,
+    *,
+    fail_closed: bool = False,
+) -> str | None:
     if paths is not None and not paths:
-        return ""
+        return None if fail_closed else ""
     pathspec = list(paths or [])
-    args = ["diff", "--binary", base_commit, "--", *pathspec]
+    # Freeze the patch shape: repository/user diff.context, textconv and
+    # external diff drivers must not redefine identity hunk boundaries.
+    diff_options = [
+        "--binary",
+        "--unified=3",
+        "--inter-hunk-context=0",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--diff-algorithm=myers",
+        "--no-indent-heuristic",
+    ]
+    args = ["diff", *diff_options, base_commit, "--", *pathspec]
     tracked = _run_git(root, args) if base_commit else None
+    if fail_closed and (tracked is None or tracked.returncode != 0):
+        return None
     chunks = [tracked.stdout.rstrip("\n")] if tracked and tracked.returncode == 0 and tracked.stdout else []
     candidates = pathspec if paths is not None else _changed_paths(root, base_commit)
     for path in candidates:
-        if _git_text(root, ["ls-files", "--", path]):
+        listed = _run_git(root, ["ls-files", "--", path])
+        if fail_closed and listed.returncode != 0:
+            return None
+        if listed.returncode == 0 and listed.stdout.strip():
             continue
-        result = _run_git(root, ["diff", "--no-index", "--binary", "--", "/dev/null", path])
+        result = _run_git(
+            root,
+            ["diff", "--no-index", *diff_options, "--", "/dev/null", path],
+        )
+        if fail_closed and (
+            result.returncode not in {0, 1}
+            or (not result.stdout and not (root / path).is_file())
+        ):
+            return None
         if result.stdout:
             chunks.append(result.stdout.rstrip("\n"))
     return "\n".join(chunks) + ("\n" if chunks else "")
@@ -862,10 +900,76 @@ def prepare_checkpoint(
                 source_layout=java_source_layout,
             )
         ]
+    baseline_commit = str(baseline.get("project_commit") or "")
+    patch = _diff_patch(root, baseline_commit)
+    production_patch = _diff_patch(root, baseline_commit, production_sources)
     # Scope is frozen before evaluation.  Java Guard adapters therefore cannot
     # accidentally discover the repository while trying to establish diff
-    # context.
-    current = capture_metric_snapshot(config, evidence)
+    # context.  Non-Java Data Clumps receives added hunks only from the same
+    # caller-selected target files.  Clone consolidation may additionally
+    # inspect the bounded production-only edit hunks so two identical target
+    # declarations can move to one shared implementation without discovering
+    # or scanning project source.
+    nonjava_target_patch: str | None = None
+    if not is_java and smell in {
+        "data_clumps",
+        "code_clone_type1",
+        "feature_envy",
+        "mysterious_name",
+    }:
+        target_patch_paths = (
+            sorted({
+                target.file_path.resolve().relative_to(root).as_posix()
+                for target in config.locations
+            })
+            if smell in {"data_clumps", "feature_envy", "mysterious_name"}
+            else sorted(production_sources)
+        )
+        nonjava_target_patch = _diff_patch(
+            root,
+            str(baseline.get("project_commit") or ""),
+            target_patch_paths,
+            fail_closed=True,
+        )
+    current = capture_metric_snapshot(
+        config,
+        evidence,
+        changed_patch=nonjava_target_patch,
+        compatibility_patch=(
+            production_patch
+            if not is_java and smell == "data_clumps"
+            else None
+        ),
+    )
+    if not is_java and smell == "dead_code":
+        # Dead Code may cross from a present frozen declaration to an absent
+        # declaration only with byte-exact old-line evidence from that one
+        # caller-selected production file.  The adapter receives this bounded
+        # context; it does not discover or search the project.
+        target_production_patch = ""
+        if len(config.locations) == 1:
+            try:
+                target_relative = (
+                    config.locations[0]
+                    .file_path.resolve()
+                    .relative_to(root)
+                    .as_posix()
+                )
+            except (OSError, ValueError):
+                target_relative = ""
+            if target_relative and target_relative in production_sources:
+                target_production_patch = _diff_patch(
+                    root,
+                    baseline_commit,
+                    [target_relative],
+                )
+        current = authorize_dead_code_target_absence(
+            config,
+            baseline_metrics,
+            current,
+            production_patch=target_production_patch,
+            changed_production_source_files=production_sources,
+        )
     expected_detector = str(
         finding_contract.get("guard_rule_id")
         or finding_contract.get("detector_id")
@@ -932,12 +1036,6 @@ def prepare_checkpoint(
         current_metrics=current,
         delta=delta,
     )
-    patch = _diff_patch(root, str(baseline.get("project_commit") or ""))
-    production_patch = _diff_patch(
-        root,
-        str(baseline.get("project_commit") or ""),
-        production_sources,
-    )
     manifest = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "contract_version": CHECKPOINT_CONTRACT_VERSION,
@@ -947,9 +1045,11 @@ def prepare_checkpoint(
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "required": True,
         "smell": smell,
+        "verification_mode": str(getattr(config, "verification_mode", "") or ""),
         "location": location,
         "adapter": baseline.get("adapter", smell),
         "baseline_checkpoint": "c000",
+        "baseline_project_commit": baseline_commit,
         "changed_files": changed,
         "changed_production_source_files": production_sources,
         "production_diff": has_production_diff,
@@ -1007,11 +1107,39 @@ def finalize_checkpoint(
         manifest.get("guard_contract")
         or str(profile.get("language") or "") == "java"
     )
+    current_metrics = manifest.get("current_metrics")
+    target_absence_evidence = (
+        current_metrics.get("target_absence_evidence")
+        if isinstance(current_metrics, Mapping)
+        else None
+    )
+    nonjava_dead_code_absence = bool(
+        manifest.get("smell") == "dead_code"
+        and not java_product_contract
+        and isinstance(current_metrics, Mapping)
+        and current_metrics.get("target_missing") is True
+    )
+    exact_dead_code_deletion = bool(
+        nonjava_dead_code_absence
+        and current_metrics.get("target_absence_allowed") is True
+        and isinstance(target_absence_evidence, Mapping)
+        and target_absence_evidence.get("contract")
+        == "exact-target-declaration-deletion-v2"
+        and target_absence_evidence.get("allowed") is True
+    )
     accepted = bool(
         verify_payload.get("status") == "PASS"
         and resolution == "resolved"
         and verify_payload.get("success") is True
         and verify_payload.get("accepted") is True
+        and (
+            not nonjava_dead_code_absence
+            or (
+                exact_dead_code_deletion
+                and manifest.get("verification_mode") == "project_full"
+                and build_test_success is True
+            )
+        )
         and (not java_product_contract or build_test_success is True)
     )
     manifest["accepted"] = accepted

@@ -734,6 +734,46 @@ def main() -> int:
             "migrate at least 3 occurrence(s) from the frozen scoped occurrence witness"
         in clump_feedback[-1]
     ), clump_feedback
+    assert any(
+        "CHECKPOINT_RESIDUAL " in item
+        and "remaining=5" in item
+        and "src/Tile1.java:41" in item
+        for item in clump_feedback
+    ), clump_feedback
+
+    # An adapter may expose an empty high-confidence violation list while the
+    # smell-specific continuity contract still has actionable residuals.  The
+    # generic Guard must continue into that contract instead of treating the
+    # empty list as an authoritative semantic pass.
+    empty_violation_clump = evaluate_checkpoint_contract(
+        {
+            "ok": True,
+            "finding_present": True,
+            "objectives": {"occurrence_count": 5},
+        },
+        {
+            "ok": True,
+            "finding_present": False,
+            "objectives": {"occurrence_count": 2},
+            "guard_violations": [],
+            "continuity_ok": True,
+            "continuity_occurrence_count": 4,
+            "passing_max": 2,
+            "continuity_occurrences": [
+                {"file": "src/Residual.c", "method": "apply"},
+            ],
+            "inline_copy_analysis_ok": True,
+            "inline_copy_expansions": [],
+        },
+        has_production_diff=True,
+        smell="data_clumps",
+    )
+    assert empty_violation_clump.reason == "SEMANTIC_CONTRACT_REGRESSION", (
+        empty_violation_clump
+    )
+    assert empty_violation_clump.semantic_contract_delta["regressions"] == [
+        "parameter_group_remains:src/Residual.c#apply"
+    ], empty_violation_clump
 
     saved_feedback = checkpoint_feedback_highlights({
         "required": True,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,58 @@ def main() -> int:
             )
             == "project_full"
         )
+
+        feature_envy_dataset = root / "python-feature-envy.csv"
+        feature_envy_fields = [
+            "sample_id",
+            "language",
+            "smell_type",
+            "project_name",
+            "project_path",
+            "location",
+            "target_context_json",
+        ]
+        feature_envy_row = {
+            "sample_id": "fe-1",
+            "language": "python",
+            "smell_type": "feature_envy",
+            "project_name": "demo",
+            "project_path": str(project),
+            "location": f"{source}:method=f|line=1",
+            "target_context_json": "",
+        }
+        with feature_envy_dataset.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=feature_envy_fields,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerow(feature_envy_row)
+        try:
+            runner._load_samples(feature_envy_dataset)
+        except ValueError as exc:
+            assert "non-Java feature_envy rows require" in str(exc), exc
+        else:
+            raise AssertionError(
+                "non-Java feature_envy rows without receiver context must fail closed"
+            )
+        feature_envy_row["target_context_json"] = json.dumps(
+            {"receiver_type": "order"},
+            separators=(",", ":"),
+        )
+        with feature_envy_dataset.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=feature_envy_fields,
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerow(feature_envy_row)
+        feature_envy_sample = runner._load_samples(feature_envy_dataset)[0]
+        assert feature_envy_sample.target_context == {"receiver_type": "order"}
+        print("  ok   non-Java feature_envy requires explicit receiver context")
+
         focused_dataset = root / "focused.csv"
         with focused_dataset.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(

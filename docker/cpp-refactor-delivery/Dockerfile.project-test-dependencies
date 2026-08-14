@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=opencode-smell-cpp-refactor-env:0.1.1-amd64-delivery-20260721
+FROM ${BASE_IMAGE}
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libcppunit-1.15-0=1.15.1-4build1 \
+       libcppunit-dev=1.15.1-4build1 \
+    && rm -rf /var/lib/apt/lists/*

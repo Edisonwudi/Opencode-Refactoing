@@ -1,0 +1,4 @@
+interface:
+  display_name: "Switch Statements Repair"
+  short_description: "Replace switch-heavy target dispatch"
+  default_prompt: "Use $smell-repair-switch-statements to repair the reported Switch Statements smell without weakening verification."

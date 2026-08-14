@@ -38,6 +38,7 @@ from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noq
 from smell_core.resolution_plan import resolution_plan_next_action  # noqa: E402
 from smell_core.guards import (  # noqa: E402
     GuardRunContext,
+    dead_code_checkpoint_absence_allowed,
     god_class_relative_reduction,
     run_build_test_guard,
     run_smell_guards,
@@ -668,6 +669,10 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     evidence = getattr(args, "smell_evidence", "") or os.environ.get("SMELL_EVIDENCE", "")
     build_test_required = (
         resolved.language == "java"
+        or (
+            resolved.language in {"python", "c", "cpp"}
+            and resolved.smell == "dead_code"
+        )
         or os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
     )
     if build_test_required and (
@@ -720,27 +725,86 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         and isinstance(getattr(guard_context, "current_metrics", None), dict)
         and guard_context.current_metrics.get("finding_present") is True
     )
+    exact_dead_code_deletion = bool(
+        resolved.language in {"python", "c", "cpp"}
+        and resolved.smell == "dead_code"
+        and dead_code_checkpoint_absence_allowed(guard_context)
+    )
     # God-class (non-Java) additionally requires a meaningful reduction: its
     # ordinary guard only checks measurability, so a token extraction of a few
     # lines would otherwise pass both the guard and this gate.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
         improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
     build_test_result = None
-    test_changes = (
+    checkpoint_test_changes = (
         dict(checkpoint.get("test_changes") or {})
         if isinstance(checkpoint, dict)
         else {}
     )
+    # Snapshot before executing build/test commands. This records the model's
+    # complete deliverable (including build metadata and forbidden test edits)
+    # without admitting tracked files dirtied by the verification process.
+    declared_test_paths = [
+        item.strip()
+        for item in str(resolved.sample_test_location or "").split(";")
+        if item.strip()
+    ]
+    baseline_project_commit = (
+        str(checkpoint.get("baseline_project_commit") or "")
+        if isinstance(checkpoint, dict)
+        else ""
+    )
+    snapshot = (
+        _snapshot_project(
+            resolved.project_root,
+            declared_test_paths=declared_test_paths,
+            base_commit=baseline_project_commit or "HEAD",
+        )
+        if args.snapshot
+        else None
+    )
+    change_audit = (
+        snapshot.get("change_audit")
+        if isinstance(snapshot, dict)
+        else _project_change_audit(
+            resolved.project_root,
+            declared_test_paths=declared_test_paths,
+            base_commit=baseline_project_commit or "HEAD",
+        )
+    )
+    allow_test_changes = bool(
+        checkpoint_test_changes.get("allow_test_changes") is True
+        if checkpoint_test_changes
+        else os.environ.get("SMELL_ALLOW_TEST_CHANGES") == "1"
+    )
+    worktree_test_changes = _worktree_test_change_audit(
+        change_audit if isinstance(change_audit, dict) else {},
+        allow_test_changes=allow_test_changes,
+    )
+    if checkpoint_test_changes:
+        test_changes = checkpoint_test_changes
+        # The Java c000 contract remains authoritative for semantic API
+        # migration checks. The full worktree audit is an additional boundary
+        # for conventional test paths that were not part of its source layout.
+        test_changes["worktree_change_audit"] = worktree_test_changes
+        if (
+            test_changes.get("success") is not False
+            and worktree_test_changes.get("success") is False
+        ):
+            test_changes = worktree_test_changes
+    else:
+        test_changes = worktree_test_changes
     if test_changes and test_changes.get("success") is False:
         build_test_result = _test_source_modified_result(resolved, test_changes)
     elif (not failed_smell or improvement_pass) and args.run_build_test and resolved.verification_mode != "local":
         build_test_result = run_build_test_guard(
             resolved,
-            require_test_execution=bool(
-                test_changes.get("allow_test_changes") is True
+            require_test_execution=_requires_fresh_test_execution(
+                resolved,
+                test_changes=test_changes,
+                exact_dead_code_deletion=exact_dead_code_deletion,
             ),
         )
-    snapshot = _snapshot_project(resolved.project_root) if args.snapshot else None
     behavior_valid = build_test_result is None or bool(build_test_result.get("success"))
     success = not failed_smell and (
         build_test_result is None or bool(build_test_result.get("success"))
@@ -827,6 +891,25 @@ def _verified_improvement(metric_improvement: bool, behavior_valid: bool) -> boo
     return bool(metric_improvement and behavior_valid)
 
 
+def _requires_fresh_test_execution(
+    resolved: Any,
+    *,
+    test_changes: dict[str, Any],
+    exact_dead_code_deletion: bool,
+) -> bool:
+    """Define the test-evidence boundary independently of smell detection.
+
+    ``project_full`` means a real project test suite ran; a version/help/file
+    smoke cannot satisfy that mode. Other modes keep their existing narrow
+    requirements for authorized test migration and exact dead-code deletion.
+    """
+    return bool(
+        str(getattr(resolved, "verification_mode", "")) == "project_full"
+        or test_changes.get("allow_test_changes") is True
+        or exact_dead_code_deletion
+    )
+
+
 def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[str, Any]:
     changed_paths = [
         str(item.get("path") or "")
@@ -835,7 +918,12 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
         if isinstance(item, dict) and item.get("path")
     ]
     reason = str(audit.get("reason") or audit.get("status") or "TEST_SOURCE_MODIFIED")
-    if reason == "VERIFICATION_CONFIG_MODIFIED":
+    if reason == "WORKTREE_CHANGE_AUDIT_FAILED":
+        message = (
+            "WORKTREE_CHANGE_AUDIT_FAILED: final Git status could not be audited; "
+            "do not accept or repair the candidate until repository state is readable."
+        )
+    elif reason == "VERIFICATION_CONFIG_MODIFIED":
         config_paths = [
             str(item.get("path") or "")
             for group in (
@@ -928,6 +1016,7 @@ def _verify_status(
             "TEST_SOURCE_MIGRATION_REJECTED",
             "TEST_SOURCE_DELETED",
             "VERIFICATION_CONFIG_MODIFIED",
+            "WORKTREE_CHANGE_AUDIT_FAILED",
         }:
             return explicit_reason
         if build_test_result.get("verification_mode") == "sample_optimized":
@@ -946,8 +1035,12 @@ def _verify_status(
         if build.get("success") is False:
             return "BUILD_FAILED"
         if test.get("success") is False:
+            if test.get("status") == "test_not_executed":
+                return "TEST_EVIDENCE_MISSING"
             return "TEST_FAILED"
         if sample_test.get("success") is False:
+            if sample_test.get("status") == "test_not_executed":
+                return "SAMPLE_TEST_EVIDENCE_MISSING"
             return "TEST_FAILED"
         return "BUILD_TEST_FAILED"
     if improvement_pass:
@@ -1012,8 +1105,23 @@ def _summarize_snapshot(
 ) -> Optional[dict[str, Any]]:
     if snapshot is None:
         return None
+    change_audit = snapshot.get("change_audit")
+    audit_summary = None
+    if isinstance(change_audit, dict):
+        audit_summary = {
+            "schema_version": change_audit.get("schema_version"),
+            "success": bool(change_audit.get("success")),
+            "change_count": int(change_audit.get("change_count") or 0),
+            "category_counts": dict(change_audit.get("category_counts") or {}),
+            "ignored_untracked_count": int(
+                change_audit.get("ignored_untracked_count") or 0
+            ),
+        }
     return {
         "project_root": snapshot.get("project_root"),
+        "scope": snapshot.get("scope"),
+        "base_commit": snapshot.get("base_commit"),
+        "change_audit": audit_summary,
         "status": _summarize_command_result(snapshot.get("status")),
         "diff_stat": _summarize_command_result(snapshot.get("diff_stat")),
         "artifacts": {
@@ -1220,7 +1328,7 @@ def _run_git(args: list[str], cwd: Path) -> dict[str, Any]:
 
 
 def _git_untracked_files(root: Path, pathspecs: list[str] | None = None) -> list[str]:
-    args = ["ls-files", "--others", "--exclude-standard"]
+    args = ["ls-files", "--others", "--exclude-standard", "-z"]
     if pathspecs:
         args.extend(["--", *pathspecs])
     result = _run_git(args, root)
@@ -1229,7 +1337,11 @@ def _git_untracked_files(root: Path, pathspecs: list[str] | None = None) -> list
     stdout = result.get("stdout")
     if not isinstance(stdout, str):
         return []
-    return [line for line in stdout.splitlines() if line and not _is_ignored_untracked_path(line)]
+    return [
+        path
+        for path in stdout.split("\0")
+        if path and not _is_ignored_untracked_path(path)
+    ]
 
 
 def _is_ignored_untracked_path(path: str) -> bool:
@@ -1273,20 +1385,271 @@ def _is_ignored_untracked_path(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in ignored_prefixes)
 
 
-def _git_status_snapshot(root: Path) -> dict[str, Any]:
-    result = _run_git(["status", "--short", "--untracked-files=all"], root)
+_SOURCE_SUFFIXES = frozenset({
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+    ".java", ".kt", ".kts", ".groovy", ".scala", ".py", ".pyi",
+    ".go", ".rs", ".js", ".jsx", ".ts", ".tsx", ".lua", ".rb",
+    ".php", ".swift", ".m", ".mm", ".cs",
+})
+_TEST_DIRECTORY_NAMES = frozenset({
+    "test", "tests", "unittest", "unittests",
+    "unit-test", "unit-tests", "unit_test", "unit_tests", "integration-test",
+    "integration-tests", "integration_test", "integration_tests",
+    "functional-test", "functional-tests", "functional_test", "functional_tests",
+})
+_BUILD_METADATA_NAMES = frozenset({
+    "makefile", "gnumakefile", "cmakelists.txt", "meson.build",
+    "meson_options.txt", "configure", "configure.ac", "configure.in",
+    "makefile.am", "makefile.in", "makefile.inc", "pom.xml", "build.xml", "build.gradle",
+    "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    "gradle.properties", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd",
+    "build", "build.bazel", "workspace", "workspace.bazel", "module.bazel",
+    "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+    "pnpm-lock.yaml", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini",
+    "cargo.toml", "cargo.lock", "go.mod", "go.sum", "composer.json",
+    "composer.lock", "gemfile", "gemfile.lock",
+})
+_BUILD_METADATA_SUFFIXES = (".cmake", ".mk", ".mak", ".gradle")
+
+
+def _is_explicit_test_path(path: str) -> bool:
+    """Classify only conventional, unambiguous test paths.
+
+    The final audit is a safety boundary, not a test detector.  Exact directory
+    components and conventional test-source basenames are sufficient for the
+    known edit behavior without turning arbitrary occurrences of ``test`` into
+    policy violations.
+    """
+    normalized = path.replace("\\", "/").strip("/")
+    pure = Path(normalized)
+    parts = tuple(part.casefold() for part in pure.parts[:-1])
+    if any(part in _TEST_DIRECTORY_NAMES for part in parts):
+        return True
+    stem = pure.stem.casefold()
+    suffix = pure.suffix.casefold()
+    if suffix not in _SOURCE_SUFFIXES:
+        return False
+    return bool(
+        stem.startswith(("test_", "test-"))
+        or stem.endswith((
+            "_test", "-test", "_tests", "-tests", "_unittest", "_spec", "-spec",
+        ))
+    )
+
+
+def _is_build_metadata_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").strip("/")
+    pure = Path(normalized)
+    name = pure.name.casefold()
+    parts = tuple(part.casefold() for part in pure.parts[:-1])
+    if name in _BUILD_METADATA_NAMES:
+        return True
+    if name.endswith(_BUILD_METADATA_SUFFIXES):
+        return True
+    if name.startswith("requirements") and name.endswith((".txt", ".in")):
+        return True
+    return any(part in {"cmake", "build-aux", "build_aux", "gradle"} for part in parts)
+
+
+def _normalized_declared_test_paths(root: Path, values: list[str] | None) -> set[str]:
+    normalized: set[str] = set()
+    for raw in values or []:
+        candidate = Path(str(raw).strip()).expanduser()
+        if not str(candidate):
+            continue
+        try:
+            relative = (
+                candidate.resolve().relative_to(root.resolve())
+                if candidate.is_absolute()
+                else candidate
+            )
+        except (OSError, ValueError):
+            continue
+        rendered = relative.as_posix()
+        if rendered and ".." not in relative.parts:
+            normalized.add(rendered)
+    return normalized
+
+
+def _change_category(path: str, declared_test_paths: set[str]) -> str:
+    if path in declared_test_paths or _is_explicit_test_path(path):
+        return "test"
+    if _is_build_metadata_path(path):
+        return "build_metadata"
+    if Path(path).suffix.casefold() in _SOURCE_SUFFIXES:
+        return "production"
+    return "other"
+
+
+def _git_change_records(
+    root: Path,
+    *,
+    declared_test_paths: list[str] | None = None,
+    base_commit: str = "HEAD",
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Classify every path changed since the controller-frozen c000 commit."""
+    result = _run_git(
+        [
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            base_commit,
+            "--",
+        ],
+        root,
+    )
+    stdout = result.get("stdout")
+    if result.get("returncode") != 0 or not isinstance(stdout, str):
+        return result, []
+    records: list[dict[str, str]] = []
+    ignored = 0
+    declared = _normalized_declared_test_paths(root, declared_test_paths)
+    fields = stdout.split("\0")
+    for index in range(0, len(fields) - 1, 2):
+        status = fields[index]
+        path = fields[index + 1].replace("\\", "/")
+        if not status or not path:
+            continue
+        if status.startswith("D"):
+            operation = "deleted"
+        elif status.startswith("A"):
+            operation = "added"
+        else:
+            operation = "changed"
+        records.append({
+            "path": path,
+            "operation": operation,
+            "status": status,
+            "category": _change_category(path, declared),
+        })
+
+    untracked = _run_git(
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        root,
+    )
+    untracked_stdout = untracked.get("stdout")
+    if untracked.get("returncode") != 0 or not isinstance(untracked_stdout, str):
+        return {
+            **result,
+            "returncode": untracked.get("returncode"),
+            "stderr": untracked.get("stderr"),
+        }, []
+    for raw_path in untracked_stdout.split("\0"):
+        path = raw_path.replace("\\", "/")
+        if not path:
+            continue
+        if _is_ignored_untracked_path(path):
+            ignored += 1
+            continue
+        records.append({
+            "path": path,
+            "operation": "added",
+            "status": "??",
+            "category": _change_category(path, declared),
+        })
+    result["ignored_untracked_count"] = ignored
+    return result, sorted(records, key=lambda item: (item["path"], item["operation"]))
+
+
+def _project_change_audit(
+    root: Path,
+    *,
+    declared_test_paths: list[str] | None = None,
+    base_commit: str = "HEAD",
+) -> dict[str, Any]:
+    status, records = _git_change_records(
+        root,
+        declared_test_paths=declared_test_paths,
+        base_commit=base_commit,
+    )
+    categories = {
+        category: [dict(item) for item in records if item["category"] == category]
+        for category in ("production", "test", "build_metadata", "other")
+    }
+    return {
+        "schema_version": "smell.worktree-change-audit/v1",
+        "base_commit": base_commit,
+        "success": status.get("returncode") == 0,
+        "status_returncode": status.get("returncode"),
+        "change_count": len(records),
+        "changes": records,
+        "categories": categories,
+        "category_counts": {key: len(value) for key, value in categories.items()},
+        "ignored_untracked_count": int(status.get("ignored_untracked_count") or 0),
+    }
+
+
+def _worktree_test_change_audit(
+    change_audit: dict[str, Any],
+    *,
+    allow_test_changes: bool,
+) -> dict[str, Any]:
+    categories = change_audit.get("categories") or {}
+    test_records = categories.get("test") if isinstance(categories, dict) else []
+    if not isinstance(test_records, list):
+        test_records = []
+    groups = {
+        operation: [
+            {"path": str(item.get("path") or "")}
+            for item in test_records
+            if isinstance(item, dict) and item.get("operation") == operation
+        ]
+        for operation in ("added", "changed", "deleted")
+    }
+    modified = any(groups.values())
+    success = bool(change_audit.get("success")) and (
+        allow_test_changes or not modified
+    )
+    status = (
+        "WORKTREE_CHANGE_AUDIT_FAILED"
+        if not change_audit.get("success")
+        else "TEST_SOURCE_CHANGE_ALLOWED"
+        if modified and allow_test_changes
+        else "TEST_SOURCE_MODIFIED"
+        if modified
+        else "TEST_SOURCE_UNCHANGED"
+    )
+    return {
+        "contract_version": "worktree-change-audit/v1",
+        "success": success,
+        "status": status,
+        "reason": "" if success else status,
+        "mode": "explicit_test_changes" if allow_test_changes else "immutable",
+        "allow_test_changes": allow_test_changes,
+        "modified": modified,
+        "test_source_modified": modified,
+        **groups,
+        "change_count": sum(len(value) for value in groups.values()),
+    }
+
+
+def _git_status_snapshot(root: Path, *, base_commit: str = "HEAD") -> dict[str, Any]:
+    result = _run_git(
+        [
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            base_commit,
+            "--",
+        ],
+        root,
+    )
     stdout = result.get("stdout")
     if not isinstance(stdout, str):
         return result
     filtered_lines: list[str] = []
     ignored_lines: list[str] = []
-    for line in stdout.splitlines():
-        status = line[:2]
-        path = line[3:] if len(line) > 3 else ""
-        if status == "??" and _is_ignored_untracked_path(path):
-            ignored_lines.append(line)
-            continue
-        filtered_lines.append(line)
+    filtered_lines.extend(stdout.splitlines())
+    for path in _git_untracked_files(root):
+        if _is_ignored_untracked_path(path):
+            ignored_lines.append(f"??\t{path}")
+        else:
+            filtered_lines.append(f"??\t{path}")
     result["stdout"] = ("\n".join(filtered_lines) + "\n") if filtered_lines else ""
     result["ignored_untracked_count"] = len(ignored_lines)
     return result
@@ -1295,7 +1658,12 @@ def _git_status_snapshot(root: Path) -> dict[str, Any]:
 def _diff_untracked_files(root: Path, paths: list[str], *, stat: bool = False) -> str:
     chunks: list[str] = []
     for path in paths:
-        args = ["diff", "--no-index"]
+        args = [
+            "diff", "--no-index", "--no-ext-diff", "--no-textconv",
+            "--inter-hunk-context=0", "--unified=3",
+            "--src-prefix=a/", "--dst-prefix=b/",
+            "--diff-algorithm=myers", "--no-indent-heuristic",
+        ]
         if stat:
             args.append("--stat")
         else:
@@ -1310,24 +1678,61 @@ def _diff_untracked_files(root: Path, paths: list[str], *, stat: bool = False) -
     return ("\n".join(chunks) + "\n") if chunks else ""
 
 
-def _git_diff_with_untracked(root: Path, args: list[str], pathspecs: list[str]) -> dict[str, Any]:
+def _git_diff_with_untracked(
+    root: Path,
+    args: list[str],
+) -> dict[str, Any]:
     result = _run_git(args, root)
     tracked_diff = result.get("stdout")
     if not isinstance(tracked_diff, str):
         tracked_diff = ""
-    untracked_files = _git_untracked_files(root, pathspecs)
+    untracked_files = _git_untracked_files(root)
     untracked_diff = _diff_untracked_files(root, untracked_files, stat="--stat" in args)
     result["stdout"] = tracked_diff + untracked_diff
     result["untracked_files"] = untracked_files
     return result
 
 
-def _snapshot_project(root: Path) -> dict[str, Any]:
+def _snapshot_project(
+    root: Path,
+    *,
+    declared_test_paths: list[str] | None = None,
+    base_commit: str = "HEAD",
+) -> dict[str, Any]:
+    """Capture the complete pre-verification deliverable patch and path audit."""
     return {
         "project_root": str(root),
-        "status": _git_status_snapshot(root),
-        "diff_stat": _git_diff_with_untracked(root, ["diff", "--stat"], []),
-        "diff": _git_diff_with_untracked(root, ["diff", "--binary"], []),
+        "scope": "full_worktree_pre_verification",
+        "base_commit": base_commit,
+        "change_audit": _project_change_audit(
+            root,
+            declared_test_paths=declared_test_paths,
+            base_commit=base_commit,
+        ),
+        "status": _git_status_snapshot(root, base_commit=base_commit),
+        # The c000 commit remains stable even if the candidate creates a local
+        # commit. Build metadata therefore stays in the same replayable patch
+        # as staged, unstaged and committed production changes.
+        "diff_stat": _git_diff_with_untracked(
+            root,
+            [
+                "diff", "--no-ext-diff", "--no-textconv",
+                "--inter-hunk-context=0", "--unified=3",
+                "--src-prefix=a/", "--dst-prefix=b/",
+                "--diff-algorithm=myers", "--no-indent-heuristic",
+                base_commit, "--stat",
+            ],
+        ),
+        "diff": _git_diff_with_untracked(
+            root,
+            [
+                "diff", "--no-ext-diff", "--no-textconv",
+                "--inter-hunk-context=0", "--unified=3", "--binary",
+                "--src-prefix=a/", "--dst-prefix=b/",
+                "--diff-algorithm=myers", "--no-indent-heuristic",
+                base_commit,
+            ],
+        ),
     }
 
 
@@ -1470,6 +1875,29 @@ def _timed_out_build_test_step(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _test_not_executed_failure(
+    result: dict[str, Any],
+    *,
+    sample_level: bool,
+) -> tuple[str, list[str]]:
+    failure_text = " ".join(
+        str(item) for item in (result.get("failure_highlights") or [])
+    )
+    if (
+        sample_level
+        and "Pinned sample test location does not identify a test class" in failure_text
+    ):
+        return "SAMPLE_TEST_EVIDENCE_INVALID", [
+            "The configured test command passed, but the pinned test-file evidence is invalid.",
+            "This dataset/configuration defect cannot be repaired by editing production code.",
+        ]
+    category = "SAMPLE_TEST_EVIDENCE_MISSING" if sample_level else "TEST_EVIDENCE_MISSING"
+    return category, [
+        "The configured test stage did not execute a verifiable test suite.",
+        "Treat this as a verification configuration/evidence problem; do not repair production code or weaken tests.",
+    ]
+
+
 def _classify_failure_pack(
     payload: Optional[dict[str, Any]],
     text: str,
@@ -1487,6 +1915,10 @@ def _classify_failure_pack(
     if status == "VERIFICATION_CONFIG_MODIFIED":
         return "VERIFICATION_CONFIG_MODIFIED", [
             "Restore the controller-frozen build/test discovery configuration; production refactoring must not weaken verification."
+        ]
+    if status == "WORKTREE_CHANGE_AUDIT_FAILED":
+        return "WORKTREE_CHANGE_AUDIT_FAILED", [
+            "Final Git status/diff audit failed; resolve the repository-state error before evaluating or repairing the candidate."
         ]
     if status == "TEST_SOURCE_MODIFIED":
         return "TEST_SOURCE_MODIFIED", [
@@ -1520,6 +1952,16 @@ def _classify_failure_pack(
             "The sample test command exited successfully, but no fresh structured test report was retained.",
             "Treat this as a verification configuration problem; do not repair production code or weaken tests.",
         ]
+    if status == "TEST_EVIDENCE_MISSING":
+        smell_guard = payload.get("smell_guard") or {}
+        if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+            return "SMELL_GUARD_FAILED", [
+                "Smell guard did not pass; continue the refactoring while the controller fixes project test evidence."
+            ]
+        return "TEST_EVIDENCE_MISSING", [
+            "The project test stage did not retain evidence that a real test suite executed.",
+            "Treat this as a verification configuration/evidence problem; do not repair production code.",
+        ]
     if status == "SAMPLE_TEST_FAILED":
         test_changes = payload.get("test_changes") or {}
         if isinstance(test_changes, dict) and test_changes.get("status") in {
@@ -1527,6 +1969,7 @@ def _classify_failure_pack(
             "TEST_SOURCE_MIGRATION_REJECTED",
             "TEST_SOURCE_DELETED",
             "VERIFICATION_CONFIG_MODIFIED",
+            "WORKTREE_CHANGE_AUDIT_FAILED",
         }:
             return "SAMPLE_TEST_FAILED", [
                 "TEST_SOURCE_MODIFIED: restore the test-tree changes frozen as immutable at c000."
@@ -1543,18 +1986,10 @@ def _classify_failure_pack(
             ):
                 test = details["sample_test"]
             test_status = str(test.get("status") or "") if isinstance(test, dict) else ""
-            failure_text = " ".join(
-                str(item)
-                for item in (test.get("failure_highlights") or [])
-            ) if isinstance(test, dict) else ""
             if (
                 test_status == "test_not_executed"
-                and "Pinned sample test location does not identify a test class" in failure_text
             ):
-                return "SAMPLE_TEST_EVIDENCE_INVALID", [
-                    "The configured test command passed, but the pinned test-file evidence is invalid.",
-                    "This dataset/configuration defect cannot be repaired by editing production code.",
-                ]
+                return _test_not_executed_failure(test, sample_level=True)
             return "SAMPLE_TEST_FAILED", [
                 "The sample-level test command failed; fix the regression or report the blocker explicitly.",
             ]
@@ -1565,6 +2000,7 @@ def _classify_failure_pack(
         "TEST_SOURCE_MIGRATION_REJECTED",
         "TEST_SOURCE_DELETED",
         "VERIFICATION_CONFIG_MODIFIED",
+        "WORKTREE_CHANGE_AUDIT_FAILED",
     }:
         policy_status = str(test_changes.get("status") or "")
         if policy_status in {"TEST_SOURCE_MIGRATION_REJECTED", "TEST_SOURCE_DELETED"}:
@@ -1574,8 +2010,6 @@ def _classify_failure_pack(
         return "TEST_BEHAVIOR_REGRESSION", [
             "TEST_SOURCE_MODIFIED: restore the test-tree changes frozen as immutable at c000."
         ]
-    if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
-        return "SMELL_GUARD_FAILED", ["Smell guard did not pass; continue the refactoring rather than repairing tests."]
     build_test = payload.get("build_test_guard") or {}
     if isinstance(build_test, dict):
         details = build_test.get("details") or {}
@@ -1590,9 +2024,30 @@ def _classify_failure_pack(
                 ]
             return "BUILD_COMPILE_ERROR", ["Inspect the build log and fix the build failure before retrying verification."]
         if isinstance(test, dict) and test.get("success") is False:
-            status = "TEST_FAILED"
+            if str(test.get("status") or "") == "test_not_executed":
+                if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+                    return "SMELL_GUARD_FAILED", [
+                        "Smell guard did not pass; continue the refactoring while the controller fixes project test evidence."
+                    ]
+                return _test_not_executed_failure(test, sample_level=False)
+            return "TEST_BEHAVIOR_REGRESSION", [
+                "The structured project test stage failed; inspect its assertions and repair the behavior regression.",
+            ]
         if isinstance(sample_test, dict) and sample_test.get("success") is False:
-            status = "TEST_FAILED"
+            if str(sample_test.get("status") or "") == "test_not_executed":
+                if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+                    return "SMELL_GUARD_FAILED", [
+                        "Smell guard did not pass; continue the refactoring while the controller fixes sample test evidence."
+                    ]
+                return _test_not_executed_failure(sample_test, sample_level=True)
+            return "SAMPLE_TEST_FAILED", [
+                "The structured sample test stage failed; repair the regression without weakening the test.",
+            ]
+    # A concrete build or test failure is the immediate repair target even if
+    # the smell objective is also incomplete. Only route back to the smell
+    # guard when verification did not report a more fundamental failure.
+    if isinstance(smell_guard, dict) and smell_guard.get("success") is False:
+        return "SMELL_GUARD_FAILED", ["Smell guard did not pass; continue the refactoring rather than repairing tests."]
     lowered = text.lower()
     if _looks_like_dependency_resolution_failure(text):
         return "BUILD_DEPENDENCY_RESOLUTION", [
@@ -1608,6 +2063,16 @@ def _classify_failure_pack(
         return "BUILD_COMPILE_ERROR", ["Fix the compile error in production/test source before retrying verification."]
     if any(marker in lowered for marker in ("stale_draft", "selectionkind", "selection kind", "needs_more_info", "operationcandidates")):
         return "IDEA_SELECTION_OR_DRAFT_FAILED", ["Re-locate from fresh file contents or choose a smaller valid operation selection."]
+    # Top-level structured outcomes outrank incidental words in logs (for
+    # example a test function whose name contains ``timeout``). Free-text
+    # timeout matching below is only a diagnostic fallback when no build/test
+    # stage reported an authoritative outcome.
+    if status == "BUILD_FAILED":
+        return "BUILD_COMPILE_ERROR", ["Inspect the build log and fix the build failure before retrying verification."]
+    if status == "TEST_FAILED":
+        return "TEST_BEHAVIOR_REGRESSION", ["Treat the structured test failure as a behavior regression."]
+    if status == "SAMPLE_TEST_FAILED":
+        return "SAMPLE_TEST_FAILED", ["The sample-level test command failed; inspect its structured result."]
     if any(marker in lowered for marker in ("timeout", "modal", "dialog", "frontmost_window", "timed_out")):
         return "TIMEOUT_OR_MODAL_SUSPECTED", ["Inspect timeout diagnostics and IDEA window artifacts before retrying the same operation."]
     if status == "TEST_FAILED" or " failed" in lowered or "assertionerror" in lowered:
@@ -1673,6 +2138,10 @@ def _build_failure_pack(
         "cannot find symbol",
         "Compilation failure",
         "FAILED",
+        "Segmentation fault",
+        "core dumped",
+        "fatal error: Killed",
+        "ninja: build stopped",
         "AssertionError",
         "STALE_DRAFT",
         "selectionKind",

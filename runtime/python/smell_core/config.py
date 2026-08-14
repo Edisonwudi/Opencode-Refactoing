@@ -124,6 +124,7 @@ class ProjectOverride:
     language: Optional[str] = None
     env: Dict[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
+    shell_timeout: Optional[int] = None
     roots: ProjectRootsConfig = field(default_factory=ProjectRootsConfig)
     build: CommandConfig = field(default_factory=CommandConfig)
     test: CommandConfig = field(default_factory=CommandConfig)
@@ -134,11 +135,18 @@ class ProjectOverride:
         language = _normalize_language(data.get("language"))
         env = {str(k): str(v) for k, v in (data.get("env", {}) or {}).items()}
         smells = {name: dict(cfg or {}) for name, cfg in (data.get("smells", {}) or {}).items()}
+        shell_timeout_raw = data.get("shell_timeout")
+        shell_timeout = (
+            int(shell_timeout_raw) if shell_timeout_raw is not None else None
+        )
+        if shell_timeout is not None and shell_timeout < 1:
+            raise ValueError("Project shell_timeout must be a positive integer")
         return cls(
             root=Path(str(data["root"])).expanduser().resolve(),
             language=language,
             env=env,
             cwd=_clean_optional_string(data.get("cwd")),
+            shell_timeout=shell_timeout,
             roots=ProjectRootsConfig.from_dict(data.get("roots")),
             build=CommandConfig.from_dict(data.get("build")),
             test=CommandConfig.from_dict(data.get("test")),
@@ -252,6 +260,14 @@ def bundled_projects_config_path() -> Path:
     return Path(resources.files("smell_core.defaults").joinpath("projects.yaml"))
 
 
+def bundled_projects_overlay_path() -> Path:
+    return Path(
+        resources.files("smell_core.defaults").joinpath(
+            "projects.runtime-overrides.yaml"
+        )
+    )
+
+
 def load_refactor_config(path: Optional[str]) -> RefactorConfig:
     source = Path(path).expanduser().resolve() if path else bundled_refactor_config_path()
     data = _load_yaml(source)
@@ -275,7 +291,61 @@ def _apply_defaults_env_overrides(defaults: DefaultsConfig) -> DefaultsConfig:
 def load_project_overrides(path: Optional[str]) -> List[ProjectOverride]:
     source = Path(path).expanduser().resolve() if path else bundled_projects_config_path()
     data = _load_yaml(source)
-    return [ProjectOverride.from_dict(entry) for entry in data.get("projects", [])]
+    entries = [copy.deepcopy(entry) for entry in data.get("projects", [])]
+    overlay_path = bundled_projects_overlay_path()
+    if not overlay_path.is_file():
+        raise FileNotFoundError(
+            f"Required runtime project-test overlay is missing: {overlay_path}"
+        )
+    overlay_data = _load_yaml(overlay_path)
+    if overlay_data.get("schema_version") != 1:
+        raise ValueError(
+            "projects.runtime-overrides.yaml must declare schema_version: 1"
+        )
+    overlays = overlay_data.get("projects")
+    if not isinstance(overlays, list) or not overlays:
+        raise ValueError(
+            "projects.runtime-overrides.yaml must define a non-empty projects list"
+        )
+    overlay_roots: set[Path] = set()
+    for overlay in overlays:
+        if not isinstance(overlay, dict) or not str(overlay.get("root") or "").strip():
+            raise ValueError("Runtime project-test overlay entry is missing root")
+        overlay_root = Path(str(overlay["root"])).expanduser().resolve()
+        if overlay_root in overlay_roots:
+            raise ValueError(
+                f"Runtime project-test overlay defines duplicate root: {overlay_root}"
+            )
+        overlay_roots.add(overlay_root)
+        matches = [
+            index
+            for index, entry in enumerate(entries)
+            if Path(str(entry["root"])).expanduser().resolve() == overlay_root
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"projects.yaml defines duplicate root for runtime overlay: {overlay_root}"
+            )
+        if not matches:
+            continue
+        index = matches[0]
+        entries[index] = _merge_project_override_entry(entries[index], overlay)
+    return [ProjectOverride.from_dict(entry) for entry in entries]
+
+
+def _merge_project_override_entry(
+    base: Dict[str, Any], overlay: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Apply one narrow runtime override without copying the full image config."""
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if key == "root":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_project_override_entry(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
 def resolve_run_config(
@@ -359,6 +429,15 @@ def resolve_run_config(
         canonical = str(override.root.resolve())
         execution = str(project_root_path)
         resolved_env = {key: str(value).replace(canonical, execution) for key, value in resolved_env.items()}
+    resolved_defaults = copy.deepcopy(refactor_config.defaults)
+    if override and override.shell_timeout is not None:
+        resolved_defaults = replace(
+            resolved_defaults,
+            shell_timeout=max(
+                resolved_defaults.shell_timeout,
+                override.shell_timeout,
+            ),
+        )
     return ResolvedRunConfig(
         project_root=project_root_path,
         dataset_root=dataset_root,
@@ -367,7 +446,7 @@ def resolve_run_config(
         smell=smell,
         language=language,
         locations=locations,
-        defaults=copy.deepcopy(refactor_config.defaults),
+        defaults=resolved_defaults,
         build=build,
         test=test,
         sample_test=sample_test,

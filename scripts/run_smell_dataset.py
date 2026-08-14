@@ -31,6 +31,10 @@ from smell_core.loop_policy import (  # noqa: E402
     resolve_command_payload,
 )
 from smell_core.location import split_location_descriptors  # noqa: E402
+from smell_core.feature_envy_target_contract import (  # noqa: E402
+    FeatureEnvyTargetContractError,
+    explicit_receiver_name,
+)
 from smell_core.target_context import parse_target_context_json  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
@@ -212,6 +216,7 @@ def _load_samples(dataset: Path) -> list[Sample]:
         samples: list[Sample] = []
         for row in reader:
             smell = str(row["smell_type"] or "").strip()
+            language = str(row["language"] or "java").strip().lower()
             location = str(row["location"] or "").strip()
             if smell in {
                 "long_method",
@@ -223,18 +228,52 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     f"{smell} dataset location must contain an explicit method selector: "
                     f"{location!r}"
                 )
+            target_context = _dataset_target_context(row)
+            if language != "java" and smell == "feature_envy":
+                try:
+                    explicit_receiver_name(target_context)
+                except FeatureEnvyTargetContractError as exc:
+                    raise ValueError(
+                        "non-Java feature_envy rows require an explicit receiver "
+                        f"root in target_context_json.receiver_type: {exc}"
+                    ) from exc
+            if language != "java" and smell == "data_clumps":
+                if not str(target_context.get("group") or "").strip():
+                    raise ValueError(
+                        "non-Java data_clumps rows require target_context_json.group"
+                    )
+                occurrence_locations = split_location_descriptors(location)
+                if len(occurrence_locations) < 3:
+                    raise ValueError(
+                        "non-Java data_clumps rows require at least three explicit "
+                        f"occurrence locations; got {len(occurrence_locations)}"
+                    )
+                if any(":method=" not in item for item in occurrence_locations):
+                    raise ValueError(
+                        "non-Java data_clumps occurrence locations require explicit "
+                        "method selectors"
+                    )
+            if language != "java" and smell == "mysterious_name":
+                if not str(target_context.get("symbol_kind") or "").strip():
+                    raise ValueError(
+                        "non-Java mysterious_name rows require target_context_json.symbol_kind"
+                    )
+                if not str(target_context.get("symbol_name") or "").strip():
+                    raise ValueError(
+                        "non-Java mysterious_name rows require target_context_json.symbol_name"
+                    )
             verification_mode = str(row.get("verification_mode") or "").strip()
             samples.append(
                 Sample(
                     sample_id=str(row["sample_id"]),
-                    language=str(row["language"] or "java"),
+                    language=language,
                     smell=smell,
                     project_name=str(row["project_name"]),
                     project_root=Path(row["project_path"]).expanduser().resolve(),
                     location=location,
                     evidence=_dataset_evidence(row),
                     raw={str(k): str(v) for k, v in row.items()},
-                    target_context=_dataset_target_context(row),
+                    target_context=target_context,
                     test_location=str(row.get("test_file") or "").strip(),
                     test_command=str(row.get("test_command") or "").strip(),
                     verification_mode=verification_mode,
@@ -676,19 +715,343 @@ def _prepare_opencode_home(sample_dir: Path) -> dict[str, str]:
     }
 
 
-def _failure_category_from_verify_payload(payload: dict[str, Any]) -> str:
-    """Read failure_pack.failure_category from a verify payload.
+_VERIFY_STEP_NAMES = ("build", "test", "sample_test")
+_NATIVE_DIAGNOSTIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("NATIVE_SEGMENTATION_FAULT", re.compile(r"\bsegmentation fault\b", re.IGNORECASE)),
+    ("NATIVE_CORE_DUMP", re.compile(r"\bcore dumped\b", re.IGNORECASE)),
+    (
+        "NATIVE_COMPILER_KILLED",
+        re.compile(
+            r"(?:fatal error:\s*killed|killed signal terminated program)",
+            re.IGNORECASE,
+        ),
+    ),
+    ("NINJA_FAILED_EDGE", re.compile(r"\bFAILED:\s+\S", re.IGNORECASE)),
+    (
+        "NINJA_BUILD_STOPPED",
+        re.compile(r"\bninja:\s+build stopped\b", re.IGNORECASE),
+    ),
+)
 
-    The single source of truth is smell_bridge.py::_classify_failure_pack; the
-    category string is carried in verify.json's failure_pack.failure_category.
-    Returns "" when the payload has no classifiable failure_pack.
+
+def _build_test_details(payload: dict[str, Any]) -> dict[str, Any]:
+    guard = payload.get("build_test_guard") if isinstance(payload, dict) else None
+    details = guard.get("details") if isinstance(guard, dict) else None
+    return details if isinstance(details, dict) else {}
+
+
+def _diagnostic_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_diagnostic_text(item) for item in value)
+    if isinstance(value, dict):
+        return "\n".join(_diagnostic_text(item) for item in value.values())
+    return str(value)
+
+
+def _step_diagnostic_text(step: dict[str, Any]) -> str:
+    # Do not inspect command/script fields: target names and package names may
+    # legitimately contain words such as "timeout" or "failed".
+    return "\n".join(
+        _diagnostic_text(step.get(key))
+        for key in (
+            "summary_text",
+            "summary",
+            "failure_highlights",
+            "tail",
+            "message",
+            "error",
+            "stderr",
+            "stdout",
+        )
+        if step.get(key) is not None
+    )
+
+
+def _step_failed(step: Any) -> bool:
+    if not isinstance(step, dict):
+        return False
+    status = str(step.get("status") or "").strip().casefold()
+    return (
+        step.get("success") is False
+        or status in {"fail", "failed", "error", "timeout", "timed_out"}
+        or (isinstance(step.get("returncode"), int) and step["returncode"] != 0)
+    )
+
+
+def _step_infra_kind(step: Any) -> str:
+    """Return a conservative resource cause for one structured build/test step."""
+    if not isinstance(step, dict) or not _step_failed(step):
+        return ""
+    status = str(step.get("status") or "").strip().casefold()
+    returncode = step.get("returncode")
+    text = _step_diagnostic_text(step)
+    if (
+        status in {"timeout", "timed_out"}
+        or returncode == 124
+        or re.search(r"\b(?:build|test|command) timed out after\b", text, re.IGNORECASE)
+    ):
+        return "timeout"
+    if re.search(
+        r"(?:\bout of memory\b|\boom[- ]kill(?:er|ed)?\b|cannot allocate memory|"
+        r"fatal error:\s*killed|killed signal terminated program)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "oom"
+    if returncode in {-9, 137}:
+        return "resource"
+    return ""
+
+
+def _failed_build_test_steps(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    details = _build_test_details(payload)
+    return [
+        (name, details[name])
+        for name in _VERIFY_STEP_NAMES
+        if isinstance(details.get(name), dict) and _step_failed(details[name])
+    ]
+
+
+def _native_failure_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract generic native build/test signals without copying raw log text."""
+    diagnostics: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for step_name, step in _failed_build_test_steps(payload):
+        text = _step_diagnostic_text(step)
+        for category, pattern in _NATIVE_DIAGNOSTIC_PATTERNS:
+            key = (step_name, category)
+            if key in seen or not pattern.search(text):
+                continue
+            seen.add(key)
+            diagnostics.append({"step": step_name, "category": category})
+    return diagnostics
+
+
+def _structured_failure_category(payload: dict[str, Any]) -> str:
+    """Prefer structured build/test evidence over smell-only repair advice."""
+    failed_steps = _failed_build_test_steps(payload)
+    verify_status = str(payload.get("status") or "").strip()
+    guard = payload.get("build_test_guard")
+    reason = str(guard.get("reason") or "") if isinstance(guard, dict) else ""
+    evidence_missing_reasons = {
+        "test_not_executed",
+        "test_evidence_missing",
+        "no_tests_collected",
+    }
+    for step_name, step in failed_steps:
+        if step_name != "build":
+            continue
+        infra_kind = _step_infra_kind(step)
+        return {
+            "timeout": "BUILD_TIMEOUT",
+            "oom": "BUILD_OOM",
+            "resource": "BUILD_RESOURCE_EXHAUSTED",
+        }.get(infra_kind, "BUILD_COMPILE_ERROR")
+    for step_name, step in failed_steps:
+        if step_name not in {"test", "sample_test"}:
+            continue
+        step_status = str(step.get("status") or "").strip().casefold()
+        if (
+            verify_status == "TEST_EVIDENCE_MISSING"
+            or step_status in evidence_missing_reasons
+            or reason.strip().casefold() in evidence_missing_reasons
+        ):
+            return (
+                "SAMPLE_TEST_EVIDENCE_MISSING"
+                if step_name == "sample_test"
+                else "TEST_EVIDENCE_MISSING"
+            )
+        infra_kind = _step_infra_kind(step)
+        if infra_kind:
+            return {
+                "timeout": "TEST_TIMEOUT",
+                "oom": "TEST_OOM",
+                "resource": "TEST_RESOURCE_EXHAUSTED",
+            }[infra_kind]
+        return "TEST_BEHAVIOR_REGRESSION"
+
+    if verify_status == "BUILD_FAILED":
+        return "BUILD_COMPILE_ERROR"
+    if verify_status in {"TEST_FAILED", "TEST_EVIDENCE_MISSING"}:
+        if (
+            verify_status == "TEST_EVIDENCE_MISSING"
+            or reason.strip().casefold() in evidence_missing_reasons
+        ):
+            return "TEST_EVIDENCE_MISSING"
+        return "TEST_BEHAVIOR_REGRESSION"
+    return ""
+
+
+def _failure_category_from_verify_payload(payload: dict[str, Any]) -> str:
+    """Return a stage-aware failure category for runner trace and summaries.
+
+    A structured build/test failure has higher repair priority than a stale or
+    smell-only failure_pack category. The bridge payload remains unmodified.
     """
     if not isinstance(payload, dict):
         return ""
+    structured = _structured_failure_category(payload)
+    if structured:
+        return structured
     pack = payload.get("failure_pack")
     if not isinstance(pack, dict):
         return ""
     return str(pack.get("failure_category") or "").strip()
+
+
+def _verify_infra_failure_category(payload: dict[str, Any]) -> str:
+    category = _structured_failure_category(payload)
+    if category in {
+        "BUILD_TIMEOUT",
+        "BUILD_OOM",
+        "BUILD_RESOURCE_EXHAUSTED",
+        "TEST_TIMEOUT",
+        "TEST_OOM",
+        "TEST_RESOURCE_EXHAUSTED",
+    }:
+        return category
+    return ""
+
+
+def _verify_diff_path(payload: dict[str, Any]) -> Path | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[Any] = []
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, dict):
+        candidates.append(artifacts.get("diff"))
+    pack = payload.get("failure_pack")
+    if isinstance(pack, dict) and isinstance(pack.get("artifact_paths"), dict):
+        candidates.append(pack["artifact_paths"].get("diff"))
+    snapshot = payload.get("snapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("artifacts"), dict):
+        candidates.append(snapshot["artifacts"].get("diff"))
+    for candidate in candidates:
+        if candidate:
+            path = Path(str(candidate))
+            if path.is_file():
+                return path
+    return None
+
+
+def _verify_diff_sha256(payload: dict[str, Any]) -> str:
+    path = _verify_diff_path(payload)
+    if path is None:
+        return ""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _accepted_verify_pass(payload: dict[str, Any], verify_returncode: int = 0) -> bool:
+    return _compute_status(0, verify_returncode, payload) == "PASS"
+
+
+def _compact_verify_attempt(
+    payload: dict[str, Any],
+    *,
+    verify_source: str,
+    verify_returncode: int,
+) -> dict[str, Any]:
+    status = _compute_status(0, verify_returncode, payload)
+    failed_build_test_steps = [name for name, _ in _failed_build_test_steps(payload)]
+    return {
+        "verify_source": verify_source,
+        "verify_returncode": verify_returncode,
+        "verify_payload": payload,
+        "reported_status": str(payload.get("status") or ""),
+        "status": status,
+        "success": payload.get("success") is True,
+        "accepted": _accepted_verify_pass(payload, verify_returncode),
+        "resolution": str(payload.get("resolution") or ""),
+        "progress": bool(payload.get("progress")) or status == "PASS",
+        "failure_category": _failure_category_from_verify_payload(payload),
+        "failed_build_test_steps": failed_build_test_steps,
+        "diff_sha256": _verify_diff_sha256(payload),
+        "native_diagnostics": _native_failure_diagnostics(payload),
+    }
+
+
+def _verification_attempt_history(
+    agent_attempts: list[dict[str, Any]],
+    final_attempt: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Preserve every parsed agent verify before the independent final verify."""
+    return [*agent_attempts, final_attempt]
+
+
+def _reconcile_final_verify_status(
+    raw_status: str,
+    verify_payload: dict[str, Any],
+    agent_attempts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Reconcile only same-diff lifecycle contradictions around final verify.
+
+    A final timeout/OOM after an agent PASS becomes an independent infra state.
+    A final PASS immediately after a structured agent TEST_FAILED becomes flaky
+    and requires confirmation. Neither exceptional state is accepted here.
+    """
+    infra_category = _verify_infra_failure_category(verify_payload)
+    final_diff_sha256 = _verify_diff_sha256(verify_payload)
+    last_agent = agent_attempts[-1] if agent_attempts else None
+    last_agent_pass = bool(
+        isinstance(last_agent, dict)
+        and last_agent.get("verify_source") == "agent"
+        and last_agent.get("status") == "PASS"
+        and last_agent.get("accepted") is True
+    )
+    agent_diff_sha256 = (
+        str(last_agent.get("diff_sha256") or "") if isinstance(last_agent, dict) else ""
+    )
+    same_diff = bool(
+        last_agent_pass
+        and final_diff_sha256
+        and agent_diff_sha256
+        and final_diff_sha256 == agent_diff_sha256
+    )
+    last_agent_same_diff_test_failure = bool(
+        isinstance(last_agent, dict)
+        and last_agent.get("verify_source") == "agent"
+        and last_agent.get("reported_status") == "TEST_FAILED"
+        and str(last_agent.get("failure_category") or "").startswith("TEST_")
+        and any(
+            step_name in {"test", "sample_test"}
+            for step_name in (last_agent.get("failed_build_test_steps") or [])
+        )
+        and final_diff_sha256
+        and str(last_agent.get("diff_sha256") or "") == final_diff_sha256
+    )
+    audit = {
+        "raw_status": raw_status,
+        "infra_category": infra_category,
+        "last_agent_pass": last_agent_pass,
+        "same_diff_as_last_agent_pass": same_diff,
+        "last_agent_same_diff_test_failure": last_agent_same_diff_test_failure,
+        "final_diff_sha256": final_diff_sha256,
+        "last_agent_diff_sha256": agent_diff_sha256,
+        "confirmation_required": bool(
+            (raw_status == "PASS" and last_agent_same_diff_test_failure)
+            or (
+                raw_status in {"BUILD_FAILED", "TEST_FAILED", "VERIFY_FAILED"}
+                and infra_category
+                and same_diff
+            )
+        ),
+    }
+    if raw_status == "PASS" and last_agent_same_diff_test_failure:
+        return "FLAKY_TEST_INCONCLUSIVE", audit
+    if raw_status in {"BUILD_FAILED", "TEST_FAILED", "VERIFY_FAILED"} and infra_category and same_diff:
+        return "FINAL_VERIFY_INFRA_FAILED", audit
+    return raw_status, audit
 
 
 def _compute_status(opencode_returncode: int, verify_returncode: int, verify_payload: dict[str, Any]) -> str:
@@ -799,6 +1162,9 @@ def _task_prompt(
     args: argparse.Namespace,
     verification_mode: str,
 ) -> str:
+    # Backend, verification, and test-change policy travel through command flags
+    # and controller system context; the user task remains backend-neutral.
+    _ = args, verification_mode
     target_count = len(split_location_descriptors(sample.location))
     lines = [
         f"Project root: {sample.project_root}",
@@ -806,22 +1172,11 @@ def _task_prompt(
         f"Smell type: {sample.smell}",
         f"Target location: {sample.location}",
     ]
-    lines.extend(
-        [
-            f"Refactoring backend: {getattr(args, 'refactoring_backend', 'direct')}",
-            f"Verification mode: {verification_mode}",
-            (
-                "Test changes: explicitly allowed; all changed test files are SHA-audited and the frozen build/test contract remains mandatory."
-                if getattr(args, "allow_test_changes", False)
-                else "Test changes: forbidden for this dataset run."
-            ),
-        ]
-    )
     lines.append("")
     if target_count > 1:
         lines.append(
             f"Repair this grouped {sample.language} smell across all {target_count} listed "
-            "target methods in one cohesive refactoring. Partial target removal is not accepted. "
+            "target locations in one cohesive refactoring. Partial target removal is not accepted. "
             "Preserve behavior. Call smell_verify as the final acceptance gate."
         )
     else:
@@ -1102,6 +1457,7 @@ def _parse_session_id_from_json_events(events_text: str) -> str:
 def _verification_trace(events_text: str) -> dict[str, Any]:
     """Summarize completed smell_verify calls from one OpenCode JSON stream."""
     calls = 0
+    verification_history: list[dict[str, Any]] = []
     tools_after_last_verify = 0
     last_payload: dict[str, Any] | None = None
     last_decision = ""
@@ -1148,7 +1504,11 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         # A malformed newer verify must not leave an older payload reusable.
         last_payload = None
         metadata = state.get("metadata")
+        verify_returncode = 0
         if isinstance(metadata, dict):
+            metadata_exit_code = metadata.get("exitCode")
+            if isinstance(metadata_exit_code, int):
+                verify_returncode = metadata_exit_code
             meta_loop = metadata.get("loop")
             if isinstance(meta_loop, dict):
                 last_decision = str(meta_loop.get("decision") or "")
@@ -1168,6 +1528,18 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             last_payload = payload
+            verification_history.append(
+                {
+                    "verification_call": calls - 1,
+                    "event_id": str(part.get("callID") or event.get("id") or ""),
+                    "event_timestamp": event.get("timestamp"),
+                    **_compact_verify_attempt(
+                        payload,
+                        verify_source="agent",
+                        verify_returncode=verify_returncode,
+                    ),
+                }
+            )
     loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
@@ -1176,9 +1548,13 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         last_status = str(last_payload.get("status") or "")
     return {
         "smell_verify_calls": calls,
+        "verification_history": verification_history,
+        "verification_history_count": len(verification_history),
         "tools_after_last_verify": tools_after_last_verify,
         "last_loop_decision": last_decision,
         "last_status": last_status,
+        "last_failure_category": _failure_category_from_verify_payload(last_payload or {}),
+        "last_native_diagnostics": _native_failure_diagnostics(last_payload or {}),
         "last_output_parsed": last_payload is not None,
         "last_payload": last_payload,
         "last_cap_recovery_used": last_cap_recovery_used,
@@ -1925,6 +2301,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     # when the completed event stream proves verification closure is missing.
     model_deadline = time.monotonic() + _opencode_timeout_seconds(args.sample_deadline)
     controller_attempts: list[dict[str, Any]] = []
+    agent_verification_history: list[dict[str, Any]] = []
+    seen_agent_verification_ids: set[str] = set()
     session_id = ""
     continuation_prompt = ""
     command_loop_state: dict[str, Any] | None = _initial_command_loop_state(
@@ -1963,10 +2341,30 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             trace = _verification_trace(events_path.read_text(encoding="utf-8"))
         except OSError:
             trace = _verification_trace("")
+        trace_history = trace.get("verification_history")
+        if isinstance(trace_history, list):
+            for record in trace_history:
+                if not isinstance(record, dict):
+                    continue
+                event_id = str(record.get("event_id") or "")
+                if event_id and event_id in seen_agent_verification_ids:
+                    continue
+                if event_id:
+                    seen_agent_verification_ids.add(event_id)
+                agent_verification_history.append(
+                    {
+                        "attempt": len(agent_verification_history),
+                        "controller_attempt": attempt_index,
+                        "controller_suffix": attempt_suffix,
+                        "opencode_returncode": opencode_returncode,
+                        "session_id": session_id,
+                        **record,
+                    }
+                )
         trace_summary = {
             key: value
             for key, value in trace.items()
-            if key != "last_payload"
+            if key not in {"last_payload", "verification_history"}
         }
         controller_attempts.append(
             {
@@ -2047,7 +2445,15 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     )
     if idea_protocol is not None and idea_protocol["success"] is not True:
         final_status = "IDEA_PROTOCOL_FAILED"
+    final_verify_raw_status = final_status
+    final_status, final_verify_audit = _reconcile_final_verify_status(
+        final_verify_raw_status,
+        verify_payload,
+        agent_verification_history,
+    )
     resolution = str(verify_payload.get("resolution") or "")
+    if final_status in {"FINAL_VERIFY_INFRA_FAILED", "FLAKY_TEST_INCONCLUSIVE"}:
+        resolution = "unresolved"
     accepted = _is_accepted_status(final_status)
     progress = bool(verify_payload.get("progress")) or accepted
     loop_payload = verify_payload.get("loop")
@@ -2057,25 +2463,44 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         else ""
     )
     last = {
-        "attempt": attempt_index,
+        **_compact_verify_attempt(
+            verify_payload,
+            verify_source=final_verify_source,
+            verify_returncode=verify_returncode,
+        ),
+        "attempt": len(agent_verification_history),
+        "controller_attempt": attempt_index,
         "opencode_returncode": opencode_returncode,
-        "verify_returncode": verify_returncode,
-        "verify_payload": verify_payload,
         "status": final_status,
-        "failure_category": _failure_category_from_verify_payload(verify_payload),
-        "verify_source": final_verify_source,
+        "reported_status": str(verify_payload.get("status") or ""),
+        "accepted": accepted,
+        "resolution": resolution,
+        "failure_category": (
+            "FLAKY_TEST_INCONCLUSIVE"
+            if final_status == "FLAKY_TEST_INCONCLUSIVE"
+            else (
+                str(final_verify_audit.get("infra_category") or "")
+                if final_status == "FINAL_VERIFY_INFRA_FAILED"
+                else _failure_category_from_verify_payload(verify_payload)
+            )
+        ),
         "session_id": session_id,
         "is_continuation": attempt_index > 0,
         "opencode_timed_out": opencode_returncode == 124,
         "opencode_failure_category": opencode_failure_category,
+        "raw_status": final_verify_raw_status,
+        "final_verify_audit": final_verify_audit,
     }
-    attempts = [last]
+    attempts = _verification_attempt_history(agent_verification_history, last)
     note = (
         f"loop_policy={args.loop_mode}:{args.loop_max};"
         f"runner_continuations={continuations_dispatched};"
         f"verify_reminders={reminders_dispatched};"
         f"opencode_timed_out={str(opencode_returncode == 124).lower()};"
-        f"final_verify_source={final_verify_source}"
+        f"final_verify_source={final_verify_source};"
+        f"final_verify_raw_status={final_verify_raw_status};"
+        f"final_verify_infra_category={final_verify_audit.get('infra_category') or ''};"
+        f"agent_verifications={len(agent_verification_history)}"
     )
 
     row = {
@@ -2090,6 +2515,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "refactoring_backend": getattr(args, "refactoring_backend", "direct"),
         "agent": agent,
         "status": final_status,
+        "failure_category": last["failure_category"],
         "resolution": resolution,
         "accepted": accepted,
         "progress": progress,
@@ -2098,6 +2524,16 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "opencode_timed_out": opencode_returncode == 124,
         "opencode_failure_category": opencode_failure_category,
         "verify_returncode": last["verify_returncode"],
+        "final_verify_raw_status": final_verify_raw_status,
+        "final_verify_infra_category": final_verify_audit.get("infra_category") or "",
+        "same_diff_as_last_agent_pass": final_verify_audit.get(
+            "same_diff_as_last_agent_pass"
+        )
+        is True,
+        "last_agent_same_diff_test_failure": final_verify_audit.get(
+            "last_agent_same_diff_test_failure"
+        )
+        is True,
         "duration_seconds": f"{time.time() - started:.1f}",
         "sample_dir": str(sample_dir),
         "note": note,
@@ -2106,6 +2542,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         **row,
         "attempts": attempts,
         "controller_attempts": controller_attempts,
+        "agent_verification_count": len(agent_verification_history),
+        "final_verify_audit": final_verify_audit,
         "revision_audit": revision_audit,
         "dataset_audit": dataset_audit,
         "baseline_capture": baseline_capture,

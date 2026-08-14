@@ -2088,7 +2088,7 @@ function commandControllerSystemContext(
       "",
       "Target Guard checkpoint contract:",
       "- Baseline capture must uniquely confirm the requested smell at the supplied target; context selects the entity but never supplies a verdict.",
-      "- An unchanged baseline can never pass; make a substantive production-Java refactoring.",
+      "- An unchanged baseline can never pass; make a substantive production-source refactoring.",
       "- A decreased metric is IMPROVED only. PASS requires the frozen target smell to disappear plus structural and build/test preservation.",
     )
   }
@@ -2096,7 +2096,7 @@ function commandControllerSystemContext(
     lines.push(
       "",
       "IDEA refactoring backend contract:",
-      "- Load only idea-refactor-cli for the smell-specific route.",
+      "- Load the exact smell-repair-<task-smell-with-hyphens> semantic skill and idea-refactor-cli backend skill; read only the current smell's Java and IDEA routes.",
       "- Use the controller-enabled IDEA tools, then call smell_verify.",
       "- Do not invoke the underlying idea-refactor CLI through bash or use OpenCode edit/write tools.",
     )

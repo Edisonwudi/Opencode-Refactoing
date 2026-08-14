@@ -260,9 +260,9 @@ def proc(d, tmp):
     return q
 """
 PYTHON_NAME_AFTER = """\
-def proc(discount, total):
-    result = discount + total
-    return result
+def proc(discount, tmp):
+    q = discount + tmp
+    return q
 """
 PYTHON_NAME_SCOPED_BEFORE = """\
 def proc(d, tmp):
@@ -397,7 +397,7 @@ def main() -> int:
             C_ENVY_BEFORE,
             C_ENVY_AFTER,
             "demo.c:method=total_price|line=9",
-            "envied_type=Order; foreign_access=5",
+            "envied_receiver=order; foreign_access=5",
             "expected_receiver_access",
         ),
         "python/mysterious_name_scoped": _case(
@@ -441,7 +441,7 @@ def main() -> int:
             C_ENVY_BEFORE,
             C_ENVY_CHEAT_AFTER,
             "demo.c:method=total_price|line=9",
-            "envied_type=Order; foreign_access=5",
+            "envied_receiver=order; foreign_access=5",
             "expected_receiver_access",
         ),
         "c/feature_envy[bare-gamed]": _case_expect_fail(
@@ -451,7 +451,7 @@ def main() -> int:
             C_ENVY_BEFORE,
             C_ENVY_BARE_CHEAT_AFTER,
             "demo.c:method=total_price|line=9",
-            "envied_type=Order; foreign_access=5",
+            "envied_receiver=order; foreign_access=5",
             "expected_receiver_access",
         ),
     }

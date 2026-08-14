@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refused Bequest Repair"
+  short_description: "Repair a rejecting Java inheritance contract"
+  default_prompt: "Use $smell-repair-refused-bequest to repair the reported Refused Bequest smell without weakening verification."

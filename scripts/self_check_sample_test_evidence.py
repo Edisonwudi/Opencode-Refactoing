@@ -759,23 +759,234 @@ public final class Result {
         print("  ok   unrelated successful tests still fail closed")
 
         project_zero = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root),
+            SimpleNamespace(project_root=root, language="java"),
             time.time_ns(),
             _command_result("mvn test", "BUILD SUCCESS\n"),
         )
         assert project_zero["success"] is False, project_zero
         print("  ok   project-full exit zero with no executed test fails closed")
 
+        printed_junit = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            time.time_ns(),
+            _command_result("printf", "OK (1 test)\n"),
+        )
+        assert printed_junit["success"] is False, printed_junit
+        real_junit_console = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            time.time_ns(),
+            _command_result(
+                "java org.junit.runner.JUnitCore ExampleTest",
+                "JUnit version 4.13.2\n.\nOK (1 test)\n",
+            ),
+        )
+        assert real_junit_console["success"] is True, real_junit_console
+        assert real_junit_console["junit_console_tests"] == 1
+        printed_maven = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            time.time_ns(),
+            _command_result(
+                "printf",
+                "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n",
+            ),
+        )
+        assert printed_maven["success"] is False, printed_maven
+        real_maven_console = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            time.time_ns(),
+            _command_result(
+                "mvn test",
+                "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n",
+            ),
+        )
+        assert real_maven_console["success"] is True, real_maven_console
+        assert real_maven_console["maven_console_tests"] == 1
+        print("  ok   console summaries are bound to their real test runners")
+
+        masked_failure_marker = root / "masked-build-failure"
+        masked_failure = _run_command_config(
+            CommandConfig(
+                script=(
+                    "false\n"
+                    f"printf reached > {masked_failure_marker}\n"
+                )
+            ),
+            cwd=root,
+            env={},
+            label="build",
+            project_root=root,
+        )
+        assert masked_failure["success"] is False, masked_failure
+        assert not masked_failure_marker.exists(), masked_failure
+        print("  ok   project scripts stop at the first failed command")
+
         project_started_ns = time.time_ns()
         _write_report(root, "ProjectFullBehaviorTest", 2)
         project_executed = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root),
+            SimpleNamespace(project_root=root, language="java"),
             project_started_ns,
             _command_result("mvn test", "BUILD SUCCESS\n"),
         )
         assert project_executed["success"] is True, project_executed
         assert project_executed["tests"] == 2, project_executed
         print("  ok   project-full requires fresh non-zero test execution")
+
+        failed_report_started_ns = time.time_ns()
+        failed_report = (
+            root
+            / "target"
+            / "surefire-reports"
+            / "TEST-example.ProjectFullFailureTest.xml"
+        )
+        failed_report.write_text(
+            '<testsuite name="example.ProjectFullFailureTest" tests="1" '
+            'failures="1" errors="0" skipped="0">'
+            '<testcase name="fails"><failure message="boom"/></testcase>'
+            '</testsuite>\n',
+            encoding="utf-8",
+        )
+        project_failed_report = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            failed_report_started_ns,
+            _command_result("mvn test", "BUILD SUCCESS\n"),
+        )
+        assert project_failed_report["success"] is False, project_failed_report
+        assert project_failed_report["failed_reports"] == [
+            "target/surefire-reports/TEST-example.ProjectFullFailureTest.xml"
+        ], project_failed_report
+        nested_failure_started_ns = time.time_ns()
+        nested_failure_report = (
+            root
+            / "target"
+            / "surefire-reports"
+            / "TEST-example.NestedProjectFailureTest.xml"
+        )
+        nested_failure_report.write_text(
+            '<testsuites><testsuite name="nested" tests="1" failures="1" '
+            'errors="0" skipped="0"><testcase name="fails">'
+            '<failure message="boom"/></testcase></testsuite></testsuites>\n',
+            encoding="utf-8",
+        )
+        nested_failed_report = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="java"),
+            nested_failure_started_ns,
+            _command_result("mvn test", "BUILD SUCCESS\n"),
+        )
+        assert nested_failed_report["success"] is False, nested_failed_report
+        assert nested_failed_report["failed_reports"] == [
+            "target/surefire-reports/TEST-example.NestedProjectFailureTest.xml"
+        ], nested_failed_report
+        print("  ok   fresh JUnit failures override a zero command return code")
+
+        python_executed = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="python"),
+            time.time_ns(),
+            _command_result(
+                "python -m pytest -q tests/unit",
+                ".................. [100%]\n"
+                "18 passed, 1 warning in 1.44s\n",
+            ),
+        )
+        assert python_executed["success"] is True, python_executed
+        assert python_executed["tests"] == 18, python_executed
+        assert python_executed["pytest_console_tests"] == 18, python_executed
+        python_elapsed_suffix = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="python"),
+            time.time_ns(),
+            _command_result(
+                "python -m pytest -q tests/unit",
+                "528 passed, 12 skipped, 10 warnings in 93.27s (0:01:33)\n",
+            ),
+        )
+        assert python_elapsed_suffix["success"] is True, python_elapsed_suffix
+        assert python_elapsed_suffix["tests"] == 528, python_elapsed_suffix
+        assert python_elapsed_suffix["pytest_console_tests"] == 528, (
+            python_elapsed_suffix
+        )
+        python_collection_only = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="python"),
+            time.time_ns(),
+            _command_result(
+                "python -m pytest --collect-only",
+                "collected 18 items\n18 tests collected in 0.12s\n",
+            ),
+        )
+        assert python_collection_only["success"] is False, python_collection_only
+        python_unittest = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="python"),
+            time.time_ns(),
+            _command_result(
+                "python -m unittest -v test_fixture.py",
+                "test_one (test_fixture.Case.test_one) ... ok\n"
+                "test_two (test_fixture.Case.test_two) ... ok\n\n"
+                "----------------------------------------------------------------------\n"
+                "Ran 2 tests in 0.001s\n\nOK\n",
+            ),
+        )
+        assert python_unittest["success"] is True, python_unittest
+        assert python_unittest["unittest_console_tests"] == 2, python_unittest
+        python_unittest_all_skipped = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="python"),
+            time.time_ns(),
+            _command_result(
+                "python -m unittest -v test_fixture.py",
+                "Ran 2 tests in 0.001s\n\nOK (skipped=2)\n",
+            ),
+        )
+        assert python_unittest_all_skipped["success"] is False, (
+            python_unittest_all_skipped
+        )
+        print(
+            "  ok   Python accepts completed pytest/unittest summaries, "
+            "not collection or all-skipped output"
+        )
+
+        ctest_output = (
+            "1/1 Test #1: cjson_test .................   Passed    0.01 sec\n"
+            "100% tests passed, 0 tests failed out of 1\n"
+        )
+        c_executed = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="c"),
+            time.time_ns(),
+            _command_result("ctest --output-on-failure", ctest_output),
+        )
+        assert c_executed["success"] is True, c_executed
+        assert c_executed["tests"] == 1, c_executed
+        assert c_executed["ctest_console_tests"] == 1, c_executed
+        c_no_tests = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="c"),
+            time.time_ns(),
+            _command_result(
+                "ctest --output-on-failure",
+                "No tests were found!!!\n",
+            ),
+        )
+        assert c_no_tests["success"] is False, c_no_tests
+        print("  ok   C accepts detailed ctest passes, not a zero-test exit")
+
+        cpp_ctest_output = (
+            "1/2 Test #1: parser_test ................   Passed    0.02 sec\n"
+            "2/2 Test #2: emitter_test ...............   Passed    0.03 sec\n"
+            "100% tests passed, 0 tests failed out of 2\n"
+        )
+        cpp_executed = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="cpp"),
+            time.time_ns(),
+            _command_result("ctest --output-on-failure", cpp_ctest_output),
+        )
+        assert cpp_executed["success"] is True, cpp_executed
+        assert cpp_executed["tests"] == 2, cpp_executed
+        assert cpp_executed["ctest_console_tests"] == 2, cpp_executed
+        cpp_summary_only = _project_test_execution_evidence(
+            SimpleNamespace(project_root=root, language="cpp"),
+            time.time_ns(),
+            _command_result(
+                "ctest --output-on-failure",
+                "100% tests passed, 0 tests failed out of 0\n",
+            ),
+        )
+        assert cpp_summary_only["success"] is False, cpp_summary_only
+        print("  ok   C++ accepts ctest cases plus summary, not an empty summary")
 
     _check_delivery_dataset_contracts()
 

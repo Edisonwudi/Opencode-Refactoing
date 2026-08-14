@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,8 +45,107 @@ def main() -> int:
         assert failure_pack["retryable"] is False, failure_pack
         assert failure_pack["repair_contract"]["repair_agent_may_edit"] is False
 
+    structured_test_failure = {
+        "status": "TEST_FAILED",
+        "build_test_guard": {
+            "details": {
+                "test": {
+                    "success": False,
+                    "status": "failed",
+                    "returncode": 1,
+                }
+            }
+        },
+    }
+    category, _ = smell_bridge._classify_failure_pack(
+        structured_test_failure,
+        "FAILED test_timeout_header_is_preserved",
+    )
+    assert category == "TEST_BEHAVIOR_REGRESSION", category
+
+    build_and_smell_failure = {
+        "status": "BUILD_FAILED",
+        "smell_guard": {"success": False},
+        "build_test_guard": {
+            "details": {
+                "build": {
+                    "success": False,
+                    "status": "failed",
+                    "returncode": 1,
+                }
+            }
+        },
+    }
+    category, _ = smell_bridge._classify_failure_pack(
+        build_and_smell_failure,
+        "error: helper has not been declared",
+    )
+    assert category == "BUILD_COMPILE_ERROR", category
+    native_pack = smell_bridge._build_failure_pack(
+        build_and_smell_failure,
+        {},
+    )
+    # Inline payloads have no native log here; the pattern contract is checked
+    # directly so future artifact-backed traces retain these universal signals.
+    native_patterns = [
+        "Segmentation fault",
+        "core dumped",
+        "fatal error: Killed",
+        "ninja: build stopped",
+    ]
+    native_text = "\n".join(native_patterns)
+    highlights = smell_bridge._highlight_patterns(
+        native_text,
+        native_patterns,
+        context=0,
+        limit=len(native_patterns),
+    )
+    assert len(highlights) == len(native_patterns), (native_pack, highlights)
+
+    test_not_executed = {
+        "status": "TEST_EVIDENCE_MISSING",
+        "build_test_guard": {
+            "details": {
+                "test": {
+                    "success": False,
+                    "status": "test_not_executed",
+                    "returncode": 0,
+                }
+            }
+        },
+    }
+    category, _ = smell_bridge._classify_failure_pack(
+        test_not_executed,
+        "command returned 0",
+    )
+    assert category == "TEST_EVIDENCE_MISSING", category
+    failure_pack = smell_bridge._build_failure_pack(test_not_executed, {})
+    assert failure_pack["failure_group"] == "", failure_pack
+    assert failure_pack["repair_contract"]["repair_agent_may_edit"] is False
+
+    assert smell_bridge._verify_status(
+        False,
+        {"success": True},
+        test_not_executed["build_test_guard"] | {
+            "success": False,
+            "verification_mode": "project_full",
+        },
+    ) == "TEST_EVIDENCE_MISSING"
+
+    assert smell_bridge._requires_fresh_test_execution(
+        SimpleNamespace(verification_mode="project_full"),
+        test_changes={},
+        exact_dead_code_deletion=False,
+    ) is True
+    assert smell_bridge._requires_fresh_test_execution(
+        SimpleNamespace(verification_mode="auto"),
+        test_changes={},
+        exact_dead_code_deletion=False,
+    ) is False
+
     print(
         "bridge-surface self-check: PASS commands=3 legacy_context_commands=0 "
+        "structured_status_precedes_text build_precedes_smell project_full=fresh-tests "
         "timeout_classification=nonrepairable"
     )
     return 0
