@@ -3560,6 +3560,8 @@ print(json.dumps(payload))
       location: "sample185.c:method=target|line=1",
       checkpoint_required: true,
       early_calls: 99,
+      focused_status: "READY",
+      focused_progress_each_call: true,
       budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
     })
     const noProgressPlugin = await pluginModule.SmellPlugin({ worktree: noProgressRoot })
@@ -3602,6 +3604,18 @@ print(json.dumps(payload))
     assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "GUARD_PROGRESS_NO_PROGRESS", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
     assertEqual("guard_progress_no_progress_continuation_unchanged", secondNoProgress.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
+    const latchedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
+      noProgressToolArgs,
+      noProgressContext,
+    )
+    const latchedNoProgressPayload = parseJson(
+      "guard_progress_no_progress_latched",
+      latchedNoProgress.output,
+    )
+    assertEqual("guard_progress_no_progress_latched_status", latchedNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
+    assertEqual("guard_progress_no_progress_latched_decision", latchedNoProgressPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "GUARD_PROGRESS_NO_PROGRESS", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
     assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")

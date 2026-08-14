@@ -257,6 +257,24 @@ def main() -> int:
         )
         assert persisted_audit["reused"] is True, persisted_audit
 
+        read_only_trace = {
+            **trace,
+            "tools_after_last_verify": 1,
+            "tool_attempts_after_last_verify": 1,
+            "completed_tools_after_last_verify": ["todowrite"],
+            "attempted_tools_after_last_verify": ["todowrite"],
+        }
+        read_only_payload, read_only_audit = R._agent_project_full_receipt(
+            sample,
+            sample_dir,
+            "project_full",
+            0,
+            read_only_trace,
+            history,
+        )
+        assert read_only_payload is payload, read_only_payload
+        assert read_only_audit["reused"] is True, read_only_audit
+
         expired_rc, expired, expired_audit = R._runner_final_verify(
             sample,
             sample_dir,

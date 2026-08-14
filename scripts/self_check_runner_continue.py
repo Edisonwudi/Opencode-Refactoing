@@ -651,6 +651,23 @@ check(
 )
 check("trace_keeps_last_payload", pass_trace["last_payload"]["status"], "PASS")
 check("trace_no_tools_after_final_verify", pass_trace["tools_after_last_verify"], 0)
+read_only_after_verify = R._verification_trace(
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}})
+    + "\n"
+    + json.dumps({
+        "type": "tool_use",
+        "part": {
+            "tool": "todowrite",
+            "state": {"status": "completed", "output": "done"},
+        },
+    })
+)
+check("trace_counts_read_only_after_verify", read_only_after_verify["tools_after_last_verify"], 1)
+check(
+    "trace_names_read_only_after_verify",
+    read_only_after_verify["completed_tools_after_last_verify"],
+    ["todowrite"],
+)
 check(
     "agent_project_full_receipt_path_exists",
     hasattr(R, "_agent_project_full_receipt"),
@@ -669,6 +686,11 @@ edited_after_verify = R._verification_trace(
     + post_verify_tool
 )
 check("trace_counts_tools_after_verify", edited_after_verify["tools_after_last_verify"], 1)
+check(
+    "trace_names_tools_after_verify",
+    edited_after_verify["completed_tools_after_last_verify"],
+    ["edit"],
+)
 check(
     "trace_counts_tool_attempts_after_verify",
     edited_after_verify["tool_attempts_after_last_verify"],

@@ -2289,9 +2289,22 @@ def _agent_project_full_receipt(
         return reject("NOT_PROJECT_FULL")
     if opencode_returncode != 0:
         return reject("OPENCODE_NONZERO")
-    if int(last_trace.get("tools_after_last_verify") or 0) != 0:
+    read_only_tools = {"glob", "grep", "read", "todowrite"}
+    completed_after = last_trace.get("completed_tools_after_last_verify")
+    attempted_after = last_trace.get("attempted_tools_after_last_verify")
+    completed_count = int(last_trace.get("tools_after_last_verify") or 0)
+    attempted_count = int(last_trace.get("tool_attempts_after_last_verify") or 0)
+    if completed_count and (
+        not isinstance(completed_after, list)
+        or len(completed_after) != completed_count
+        or any(str(tool) not in read_only_tools for tool in completed_after)
+    ):
         return reject("TOOLS_AFTER_LAST_VERIFY")
-    if int(last_trace.get("tool_attempts_after_last_verify") or 0) != 0:
+    if attempted_count and (
+        not isinstance(attempted_after, list)
+        or len(attempted_after) != attempted_count
+        or any(str(tool) not in read_only_tools for tool in attempted_after)
+    ):
         return reject("TOOL_ATTEMPT_AFTER_LAST_VERIFY")
     if (
         last_trace.get("last_output_parsed") is not True
@@ -2444,6 +2457,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     verification_history: list[dict[str, Any]] = []
     tools_after_last_verify = 0
     tool_attempts_after_last_verify = 0
+    completed_tools_after_last_verify: list[str] = []
+    attempted_tools_after_last_verify: list[str] = []
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_termination_reason = ""
@@ -2479,6 +2494,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             direct_edit_calls += 1
         if calls and tool_name != "smell_verify":
             tool_attempts_after_last_verify += 1
+            attempted_tools_after_last_verify.append(tool_name)
         if calls and tool_name == "smell_verify":
             # A newer verification attempt supersedes the older receipt even
             # when the tool itself errors or is cancelled before producing a
@@ -2494,10 +2510,13 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         if part.get("tool") != "smell_verify":
             if calls:
                 tools_after_last_verify += 1
+                completed_tools_after_last_verify.append(tool_name)
             continue
         calls += 1
         tools_after_last_verify = 0
         tool_attempts_after_last_verify = 0
+        completed_tools_after_last_verify = []
+        attempted_tools_after_last_verify = []
         # A malformed newer verify must not leave an older payload reusable.
         last_payload = None
         metadata = state.get("metadata")
@@ -2564,6 +2583,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "verification_history_count": len(verification_history),
         "tools_after_last_verify": tools_after_last_verify,
         "tool_attempts_after_last_verify": tool_attempts_after_last_verify,
+        "completed_tools_after_last_verify": completed_tools_after_last_verify,
+        "attempted_tools_after_last_verify": attempted_tools_after_last_verify,
         "last_loop_decision": last_decision,
         "last_loop_termination_reason": last_termination_reason,
         "last_status": last_status,

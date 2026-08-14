@@ -2733,7 +2733,9 @@ function applyGuardProgressDecision(
         ? {
             status: focused.status,
             returncode: focusedExecution?.returncode,
-            summary_text: focusedExecution?.summary_text,
+            summary_text: focused.status === "FAILED"
+              ? focusedExecution?.summary_text
+              : "",
           }
         : null,
     }))
@@ -2878,6 +2880,57 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const baselineSeal = commandBaselineSeals.get(sessionID) || envDefault("SMELL_BASELINE_SEAL")
         if (javaCheckpoint && !baselineSeal) {
           throw new Error("CHECKPOINT_CONTROLLER_SEAL_MISSING: Java checkpoint verification requires the external baseline seal")
+        }
+        if (
+          commandState
+          && commandState.lastFailureFingerprint.startsWith("guard-progress:")
+          && commandState.noProgressCount >= commandState.policy.loop.no_progress_limit
+        ) {
+          const elapsedSeconds = Math.max(
+            0,
+            Math.floor((Date.now() - commandState.startedAt) / 1000),
+          )
+          const loop = {
+            decision: "stop",
+            termination_reason: "GUARD_PROGRESS_NO_PROGRESS",
+            continuation: commandState.continuationCount,
+            max_continuations: commandState.policy.loop.max_continuations,
+            cap_recovery_used: commandState.capRecoveryUsed,
+            remaining: Math.max(
+              0,
+              commandState.policy.loop.max_continuations - commandState.continuationCount,
+            ),
+            no_progress_count: commandState.noProgressCount,
+            no_progress_limit: commandState.policy.loop.no_progress_limit,
+            elapsed_seconds: elapsedSeconds,
+            sample_deadline_seconds: commandState.policy.loop.sample_deadline_seconds,
+            failure_category: "GUARD_PROGRESS_REQUIRED",
+            failure_group: "smell",
+            instruction: "",
+          }
+          const payload = {
+            schema_version: "smell.guard-progress/v1",
+            success: false,
+            status: "GUARD_PROGRESS_REQUIRED",
+            applicable: true,
+            checkpoint_required: true,
+            source_guard_passed: false,
+            ready_for_project_full: false,
+            project_full_executed: false,
+            next_action: "",
+            loop,
+          }
+          const normalized = normalizeToolResult(name, {
+            exitCode: 0,
+            stdout: JSON.stringify(payload),
+            stderr: "",
+            json: payload,
+          })
+          normalized.metadata.loop = toJsonSafe(loop)
+          normalized.metadata.command_loop_state = toJsonSafe(
+            commandLoopStateSnapshot(commandState),
+          )
+          return normalized
         }
         if (usesCheapGuardProgressGate(resolved, commandState)) {
           const progressResult = await runBridge(worktree, [
