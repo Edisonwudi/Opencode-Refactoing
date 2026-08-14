@@ -10,9 +10,9 @@ Covers four integration gaps found by the non-Java checkpoint audit:
 3. Python has no switch statement; the switch_statements objective must count
    dispatch branches (if/elif chains, match statements) via tree-sitter, not
    the word "case" inside ``#`` comments.
-4. A god-class repair must reduce class_loc by at least
-   ``min_relative_reduction`` vs the immutable baseline; a token extraction
-   below the floor must fail both the ordinary guard and the improvement gate.
+4. God Class finding/PASS uses one source-derived multi-metric predicate.  The
+   5% relative reduction is only the minimum for an ``IMPROVED`` continuation;
+   a smaller edit may still PASS when it crosses the actual finding boundary.
 """
 from __future__ import annotations
 
@@ -211,6 +211,10 @@ def _py_god_class(methods: int, padding: int = 8) -> str:
     for index in range(methods):
         lines.append(f"    def m{index}(self, v):")
         lines.append(f"        value = v + {index}")
+        lines.append("        if value > 0:")
+        lines.append("            value -= 1")
+        lines.append("        if value > 1:")
+        lines.append("            value -= 1")
         for n in range(padding):
             lines.append(f"        value += {n}")
         lines.append("        return value")
@@ -234,7 +238,7 @@ def check_god_class_min_reduction() -> None:
         )
         baseline = run_bridge(project, "capture-baseline", *common)
         assert baseline["success"] is True, baseline
-        baseline_loc = float(baseline["metrics"]["objectives"]["class_loc"])
+        baseline_loc = float(baseline["metrics"]["objectives"]["loc"])
         assert baseline_loc > 100, baseline
 
         # Token extraction (<5% of the class) must be rejected by the guard
@@ -250,28 +254,81 @@ def check_god_class_min_reduction() -> None:
         assert "IMPROVED, not PASS" in guard["message"], guard
         delta = marginal["checkpoint"]["delta"]
         assert delta["metric_progress"] is True, delta  # contract still sees the progress
-        reduction = delta["objectives"]["class_loc"]["relative_reduction"]
+        reduction = delta["objectives"]["loc"]["relative_reduction"]
         assert 0 < reduction < 0.05, delta
 
-        # A real split is IMPROVED while the product detector still reports
-        # the same class finding.
-        lines = _py_god_class(11).splitlines()
-        body = "\n".join(lines[:-12]) + "\n"
-        source.write_text(body + "\n", encoding="utf-8")
+        # A cohesive extraction above the progress floor is IMPROVED while the
+        # same multi-metric finding remains.
+        source.write_text(_py_god_class(10), encoding="utf-8")
         improved = run_bridge(project, "verify", *common, "--skip-build-test")
         assert improved["success"] is False and improved["status"] == "IMPROVED", improved
-        reduction = improved["checkpoint"]["delta"]["objectives"]["class_loc"]["relative_reduction"]
+        reduction = improved["checkpoint"]["delta"]["objectives"]["loc"]["relative_reduction"]
         assert reduction >= 0.05, reduction
 
         source.write_text(_py_god_class(8), encoding="utf-8")
         repaired = run_bridge(project, "verify", *common, "--skip-build-test")
         assert repaired["success"] is True and repaired.get("resolution") == "resolved", repaired
-    print("  scenario god-class-floor: marginal=IMPROVED split=IMPROVED detector_clear=PASS")
+    print("  scenario god-class-floor: marginal=below-progress-floor split=IMPROVED detector_clear=PASS")
+
+
+def _py_god_class_boundary(field_count: int) -> str:
+    lines = ["class Big:"]
+    lines.extend(f"    value_{index} = {index}" for index in range(field_count))
+    for index in range(10):
+        lines.extend([
+            f"    def m{index}(self, value):",
+            "        if value > 0: value -= 1",
+            "        if value > 1: value -= 1",
+            "        value += 1",
+            "        return value",
+        ])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def check_god_class_pass_uses_finding_boundary() -> None:
+    with tempfile.TemporaryDirectory(prefix="god-class-boundary-") as raw:
+        project = Path(raw)
+        source = project / "big.py"
+        source.write_text(_py_god_class_boundary(49), encoding="utf-8")
+        init_repo(project)
+        git(project, "add", ".")
+        git(project, "commit", "-qm", "baseline")
+        common = (
+            "--project-root", str(project),
+            "--language", "python",
+            "--smell", "god_class",
+            "--location", f"{source}:class=Big|line=1",
+        )
+        baseline = run_bridge(project, "capture-baseline", *common)
+        assert baseline["success"] is True, baseline
+        objectives = baseline["metrics"]["objectives"]
+        assert objectives == {
+            "loc": 100.0,
+            "nof": 49.0,
+            "nom": 10.0,
+            "wmc": 20.0,
+        }, objectives
+
+        # Removing one field is only a 1% LOC reduction, but it removes the
+        # second triggered signal (LOC) and therefore crosses the real product
+        # predicate.  The 5% IMPROVED floor must not veto this PASS.
+        source.write_text(_py_god_class_boundary(48), encoding="utf-8")
+        repaired = run_bridge(project, "verify", *common, "--skip-build-test")
+        assert repaired["success"] is True, repaired
+        loc_delta = repaired["checkpoint"]["delta"]["objectives"]["loc"]
+        assert 0 < loc_delta["relative_reduction"] < 0.05, loc_delta
+    print("  scenario god-class-boundary: loc 100->99 under 5%=PASS")
 
 
 def _cpp_god_class(name: str, fields: int = 110) -> str:
     members = "\n".join(f"    int value_{index};" for index in range(fields))
-    return f"class {name} {{\npublic:\n{members}\n}};\n"
+    methods = "\n".join(
+        f"    int method_{index}(int value) {{ "
+        "if (value > 0) value--; if (value > 1) value--; return value; }"
+        for index in range(10)
+    )
+    return f"class {name} {{\npublic:\n{members}\n{methods}\n}};\n"
 
 
 def check_god_class_requires_unique_definition() -> None:
@@ -291,7 +348,7 @@ def check_god_class_requires_unique_definition() -> None:
         )
         baseline = run_bridge(project, "capture-baseline", *common)
         assert baseline["success"] is True, baseline
-        baseline_loc = baseline["metrics"]["objectives"]["class_loc"]
+        baseline_loc = baseline["metrics"]["objectives"]["loc"]
 
         # A forward declaration at the frozen line is not a one-line class
         # definition and must not hide the unchanged body-bearing definition.
@@ -300,7 +357,7 @@ def check_god_class_requires_unique_definition() -> None:
         metrics = current["checkpoint"]["current_metrics"]
         assert current["success"] is False, current
         assert metrics["target_match_count"] == 1, metrics
-        assert metrics["objectives"]["class_loc"] == baseline_loc, metrics
+        assert metrics["objectives"]["loc"] == baseline_loc, metrics
         assert current["checkpoint"]["delta"]["reason"] == "NO_STRUCTURAL_PROGRESS", current
 
         source.write_text(
@@ -347,20 +404,30 @@ def check_god_class_requires_unique_definition() -> None:
 
 def _c_god_class_with_parser_recovery() -> str:
     members = "\n".join(f"int value_{index};" for index in range(110))
+    methods = "\n".join(
+        f"int method_{index}(int value) {{ "
+        "if (value > 0) value--; if (value > 1) value--; return value; }"
+        for index in range(10)
+    )
     return (
         "#define UNUSED(value) value\n"
         "int module_entry(int UNUSED(*value)) { return *value; }\n"
-        f"{members}\n"
+        f"{members}\n{methods}\n"
     )
 
 
 def _cpp_god_class_with_parser_recovery() -> str:
     members = "\n".join(f"    int value_{index};" for index in range(110))
+    methods = "\n".join(
+        f"    int method_{index}(int value) {{ "
+        "if (value > 0) value--; if (value > 1) value--; return value; }"
+        for index in range(10)
+    )
     return (
         "#define UNUSED(value) value\n"
         "class Big {\npublic:\n"
         "    int method(int UNUSED(*value)) { return *value; }\n"
-        f"{members}\n"
+        f"{members}\n{methods}\n"
         "};\n"
     )
 
@@ -426,6 +493,7 @@ def main() -> int:
     check_build_dir_not_production()
     check_python_switch_metric()
     check_god_class_min_reduction()
+    check_god_class_pass_uses_finding_boundary()
     check_god_class_requires_unique_definition()
     check_god_class_frozen_parser_recovery()
     print("Non-Java production filter / switch metric self-check passed")

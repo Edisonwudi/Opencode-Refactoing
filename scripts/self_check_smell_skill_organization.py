@@ -150,6 +150,16 @@ require(
     "When an initial metric or threshold is absent" in generic_agent_flat,
     "generic agent requires unavailable initial Guard metrics",
 )
+require(
+    "current`, passing boundary, and `required_reduction` scalars" in generic_agent_flat
+    and "not a caller or dependency closure" in generic_agent_flat,
+    "generic agent does not treat the baseline metric budget as bounded scalar planning input",
+)
+require(
+    "If the source projection is still outside the numeric budget, continue the same repair without calling `smell_verify`" in generic_agent_flat
+    and "Once the source projection reaches a passing route" in generic_agent_flat,
+    "generic agent does not defer project_full verification until the projected edit reaches a passing route",
+)
 require("load exactly the\n   matching `smell-repair-<smell>` semantic skill" in java_agent, "Java agent lacks exact-smell loading")
 require("and read its Java reference" in java_agent, "Java route is not reference-scoped")
 require("also load `idea-refactor-cli`" in java_agent, "Java IDEA mechanics route was lost")

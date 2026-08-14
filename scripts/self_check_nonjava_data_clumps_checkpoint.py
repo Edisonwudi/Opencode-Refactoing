@@ -1353,10 +1353,12 @@ def _check_frozen_patch_anchor_beats_nearest_same_name() -> None:
         assert current["target_patch_identity_failures"] == [], current
         assert current["target_missing"] is False, current
         assert current["continuity_ok"] is True, current
-        assert checkpoint["delta"]["metric_progress"] is False, checkpoint
-        assert checkpoint["delta"]["reason"] == (
-            "SEMANTIC_CONTRACT_REGRESSION"
-        ), checkpoint
+        assert current["declaration_migration_mode"] == "api_abi_migration", current
+        assert current["project_full_required"] is True, current
+        assert current["compatibility_contract"]["ok"] is True, current
+        assert current["compatibility_contract"]["authorized_migrations"], current
+        assert checkpoint["delta"]["metric_progress"] is True, checkpoint
+        assert checkpoint["delta"]["semantic_contract_preserved"] is True, checkpoint
 
 
 def _check_invalid_ast_identity_baseline_rejected() -> None:

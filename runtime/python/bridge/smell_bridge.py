@@ -6,6 +6,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -255,6 +256,64 @@ def _compact_resolution_plan(value: Any) -> Optional[dict[str, Any]]:
     # channel carries only its cardinality and next action.
     if isinstance(value.get("worklist"), list):
         output["worklist_count"] = len(value["worklist"])
+    return output or None
+
+
+def _compact_metric_budget(value: Any) -> list[dict[str, Any]]:
+    """Keep only bounded scalar planning inputs for the first edit."""
+    if not isinstance(value, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for raw_item in value:
+        if not isinstance(raw_item, dict):
+            continue
+        metric = _bounded_text(raw_item.get("metric"), limit=96)
+        unit = _bounded_text(raw_item.get("unit"), limit=48)
+        boundary_key = (
+            "passing_max"
+            if raw_item.get("passing_max") is not None
+            else "passing_exclusive_max"
+        )
+        if raw_item.get(boundary_key) is None:
+            continue
+        allowed_keys = (
+            "metric",
+            "current",
+            boundary_key,
+            "required_reduction",
+            "unit",
+        )
+        compact: dict[str, Any] = {"metric": metric, "unit": unit}
+        for key in ("current", boundary_key, "required_reduction"):
+            raw_value = raw_item.get(key)
+            if isinstance(raw_value, bool) or isinstance(raw_value, int):
+                compact[key] = raw_value
+            elif isinstance(raw_value, float) and math.isfinite(raw_value):
+                compact[key] = raw_value
+            elif isinstance(raw_value, str) and raw_value.strip():
+                compact[key] = _bounded_text(raw_value, limit=96)
+        if not metric or not unit or any(key not in compact for key in allowed_keys):
+            continue
+        output.append({key: compact[key] for key in allowed_keys})
+        if len(output) >= 12:
+            break
+    return output
+
+
+def _compact_baseline_resolution_plan(value: Any) -> Optional[dict[str, Any]]:
+    """Expose immutable route constraints and numeric budget, never closure lists."""
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    for key in ("route_family", "detector_blocker"):
+        if value.get(key) not in (None, ""):
+            output[key] = _bounded_text(value.get(key), limit=128)
+    forbidden = _bounded_strings(value.get("forbidden"), count=4, limit=256)
+    if forbidden:
+        output["forbidden"] = forbidden
+    metric_budget = _compact_metric_budget(value.get("metric_budget"))
+    if metric_budget:
+        output["metric_budget"] = metric_budget
     return output or None
 
 
@@ -540,7 +599,9 @@ def _baseline_decision_payload(
         "checkpoint_id": baseline.get("checkpoint_id"),
         "adapter": baseline.get("adapter"),
         "metrics": _compact_metrics(baseline.get("metrics")),
-        "resolution_plan": _compact_resolution_plan(baseline.get("resolution_plan")),
+        "resolution_plan": _compact_baseline_resolution_plan(
+            baseline.get("resolution_plan")
+        ),
         "test_change_policy": _compact_contract_summary(baseline.get("test_change_contract")),
         "verification_policy": _compact_contract_summary(baseline.get("verification_contract")),
         "baseline_seal": baseline_seal,
@@ -653,12 +714,14 @@ def _checkpoint_context(
     return context, checkpoint
 
 
-def _god_class_min_reduction(resolved) -> float:
-    """Minimum relative class_loc reduction required of a non-Java god-class repair."""
+def _god_class_min_improved_reduction(resolved) -> float:
+    """Minimum relative metric reduction required only for IMPROVED."""
     for guard in resolved.profile.guards:
         if str(guard.get("type", "")).strip() == "god_class":
             try:
-                return float(guard.get("min_relative_reduction", 0.05))
+                return float(
+                    guard.get("min_improved_relative_reduction", 0.05)
+                )
             except (TypeError, ValueError):
                 return 0.05
     return 0.05
@@ -671,7 +734,7 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         resolved.language == "java"
         or (
             resolved.language in {"python", "c", "cpp"}
-            and resolved.smell == "dead_code"
+            and resolved.smell in {"dead_code", "data_clumps"}
         )
         or os.environ.get("SMELL_REQUIRE_BUILD_TEST") == "1"
     )
@@ -730,11 +793,14 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         and resolved.smell == "dead_code"
         and dead_code_checkpoint_absence_allowed(guard_context)
     )
-    # God-class (non-Java) additionally requires a meaningful reduction: its
-    # ordinary guard only checks measurability, so a token extraction of a few
-    # lines would otherwise pass both the guard and this gate.
+    # God-class PASS is owned entirely by the source-derived multi-metric
+    # finding predicate. While that same finding remains, require a meaningful
+    # reduction before granting another IMPROVED continuation.
     if improvement_pass and resolved.smell == "god_class" and resolved.language != "java":
-        improvement_pass = god_class_relative_reduction(guard_context) >= _god_class_min_reduction(resolved)
+        improvement_pass = (
+            god_class_relative_reduction(guard_context)
+            >= _god_class_min_improved_reduction(resolved)
+        )
     build_test_result = None
     checkpoint_test_changes = (
         dict(checkpoint.get("test_changes") or {})
@@ -1113,8 +1179,14 @@ def _summarize_snapshot(
             "success": bool(change_audit.get("success")),
             "change_count": int(change_audit.get("change_count") or 0),
             "category_counts": dict(change_audit.get("category_counts") or {}),
+            "ignored_tracked_count": int(
+                change_audit.get("ignored_tracked_count") or 0
+            ),
             "ignored_untracked_count": int(
                 change_audit.get("ignored_untracked_count") or 0
+            ),
+            "ignored_generated_count": int(
+                change_audit.get("ignored_generated_count") or 0
             ),
         }
     return {
@@ -1340,49 +1412,232 @@ def _git_untracked_files(root: Path, pathspecs: list[str] | None = None) -> list
     return [
         path
         for path in stdout.split("\0")
-        if path and not _is_ignored_untracked_path(path)
+        if path and not _is_verification_generated_path(root, path, tracked=False)
     ]
 
 
-def _is_ignored_untracked_path(path: str) -> bool:
-    if path in {"opencode.json"}:
+_CONTROLLER_OUTPUT_DIRECTORIES = frozenset({
+    ".smell-test-reports",
+    "build-refactoragent",
+})
+_AUTOTOOLS_GENERATED_NAMES = frozenset({
+    "aclocal.m4",
+    "ar-lib",
+    "compile",
+    "config.cache",
+    "config.guess",
+    "config.h",
+    "config.h.in",
+    "config.h.in~",
+    "config.log",
+    "config.status",
+    "config.sub",
+    "configure",
+    "depcomp",
+    "install-sh",
+    "libtool",
+    "ltmain.sh",
+    "missing",
+    "mkinstalldirs",
+    "test-driver",
+    "ylwrap",
+})
+_AUTOTOOLS_INPUT_NAMES = frozenset({
+    "configure.ac",
+    "configure.in",
+    "Makefile.am",
+})
+_LIBTOOL_GENERATED_MACROS = frozenset({
+    "libtool.m4",
+    "ltoptions.m4",
+    "ltsugar.m4",
+    "ltversion.m4",
+    "lt~obsolete.m4",
+})
+
+
+def _has_autotools_input(root: Path, directory: Path) -> bool:
+    """Return whether *directory* belongs to an Autotools source tree."""
+    # Keep both paths lexical. macOS maps /var to /private/var; resolving only
+    # the root would make an in-tree build-aux directory look unrelated.
+    root = root.absolute()
+    candidate = directory.absolute()
+    while True:
+        if any((candidate / name).is_file() for name in _AUTOTOOLS_INPUT_NAMES):
+            return True
+        if candidate == root or root not in candidate.parents:
+            return False
+        candidate = candidate.parent
+
+
+def _looks_like_configure_makefile(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            header = handle.read(8192)
+    except OSError:
+        return False
+    return bool(
+        "Makefile.in generated by automake" in header
+        or "Makefile.  Generated from Makefile.in by configure" in header
+        or "Makefile generated by configure" in header
+    )
+
+
+def _generated_file_header(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            return handle.read(16384)
+    except OSError:
+        return ""
+
+
+def _looks_like_cmake_generated_file(path: Path) -> bool:
+    """Recognize an untracked CMake product from its own provenance marker."""
+    header = _generated_file_header(path)
+    return bool(
+        header
+        and any(
+            marker in header
+            for marker in (
+                "# This is the CMakeCache file.",
+                "# CMake generated Testfile for",
+                "# Install script for directory:",
+                "# CMAKE generated file: DO NOT EDIT!",
+                "# Generated by \"Ninja\" Generator, CMake Version",
+                "# This file is generated by cmake",
+            )
+        )
+    )
+
+
+def _looks_like_autotools_generated_file(path: Path) -> bool:
+    """Recognize an untracked Autotools product from a generator marker."""
+    if _looks_like_configure_makefile(path):
         return True
-    parts = Path(path).parts
-    if ".idea-refactoring" in parts:
+    header = _generated_file_header(path)
+    folded = header.casefold()
+    return bool(
+        header
+        and any(
+            marker in folded
+            for marker in (
+                "generated by gnu autoconf",
+                "generated automatically by aclocal",
+                "generated by autoheader",
+                "generated by configure",
+                "generated by automake",
+                "automake helper",
+                "generated by libtoolize",
+            )
+        )
+    )
+
+
+def _is_proven_untracked_output_directory(root: Path, pure: Path) -> bool:
+    parts = pure.parts
+    if any(part in _CONTROLLER_OUTPUT_DIRECTORIES for part in parts):
         return True
-    ignored_parts = {
-        "build-refactoragent",
-        "build",
-        "CMakeFiles",
-        "Testing",
-        "__pycache__",
-    }
-    if any(part in ignored_parts or fnmatch.fnmatch(part, "cmake-build-*") for part in parts):
+    for index, part in enumerate(parts):
+        output_root = root.joinpath(*parts[:index])
+        if fnmatch.fnmatch(part, "cmake-build-*"):
+            output_root = output_root / part
+            return any(
+                _looks_like_cmake_generated_file(output_root / marker)
+                for marker in ("CMakeCache.txt", "build.ninja")
+            )
+        if part in {"CMakeFiles", "Testing"}:
+            return any(
+                _looks_like_cmake_generated_file(output_root / marker)
+                for marker in ("CMakeCache.txt", "build.ninja")
+            )
+        if part in {"autom4te.cache", ".deps", ".libs"}:
+            return _has_autotools_input(root, output_root)
+        if part == "__pycache__":
+            return pure.suffix == ".pyc"
+    return False
+
+
+def _is_verification_generated_path(
+    root: Path,
+    path: str,
+    *,
+    tracked: bool,
+) -> bool:
+    """Filter only controller-owned or provenance-marked untracked products.
+
+    Every tracked modification remains in the change audit because this
+    snapshot runs before the final controller build and cannot attribute such
+    a change to a focused check. Untracked CMake and Autotools products require
+    a local generator marker; source-owned build metadata stays deliverable.
+    """
+    if not tracked and path in {"opencode.json"}:
         return True
-    ignored_names = (
-        "*.o",
-        "*.obj",
-        "*.a",
-        "*.dylib",
-        "*.so",
-        "*.dll",
-        "*.exe",
-        "*.ninja",
-        "*.pc",
+    normalized = path.replace("\\", "/").lstrip("/")
+    pure = Path(normalized)
+    parts = pure.parts
+    # A tracked modification is candidate-owned and must remain auditable.
+    # Snapshotting happens before the final controller build, so neither a
+    # familiar filename nor a project name can prove that a tracked change was
+    # produced by a focused check rather than by the candidate.
+    if tracked:
+        return False
+    if not tracked and ".idea-refactoring" in parts:
+        return True
+    if _is_proven_untracked_output_directory(root, pure):
+        return True
+    cmake_generated_names = frozenset({
         "CMakeCache.txt",
         "CTestTestfile.cmake",
         "DartConfiguration.tcl",
         "cmake_install.cmake",
         "cmake_uninstall.cmake",
-    )
-    if any(fnmatch.fnmatch(Path(path).name, pattern) for pattern in ignored_names):
+        "build.ninja",
+        "rules.ninja",
+    })
+    candidate = root / pure
+    if (
+        pure.name in cmake_generated_names
+        and _looks_like_cmake_generated_file(candidate)
+    ):
         return True
     ignored_prefixes = (
         ".smell-artifacts/",
         ".idea/",
         ".opencode/",
     )
-    return any(path.startswith(prefix) for prefix in ignored_prefixes)
+    if not tracked and any(normalized.startswith(prefix) for prefix in ignored_prefixes):
+        return True
+
+    parent = candidate.parent
+    name = pure.name
+    if name == "Makefile":
+        return _looks_like_configure_makefile(candidate)
+    if name == "Makefile.in":
+        return (
+            (parent / "Makefile.am").is_file()
+            and _looks_like_autotools_generated_file(candidate)
+        )
+    if name == "configure":
+        # A nested project-authored script called configure is not enough;
+        # autoconf emits it beside configure.ac/configure.in.
+        return any(
+            (parent / item).is_file()
+            for item in ("configure.ac", "configure.in")
+        ) and _looks_like_autotools_generated_file(candidate)
+    if name in _AUTOTOOLS_GENERATED_NAMES:
+        return (
+            _has_autotools_input(root, parent)
+            and _looks_like_autotools_generated_file(candidate)
+        )
+    if fnmatch.fnmatch(name, "stamp-h*") and _has_autotools_input(root, parent):
+        return True
+    if name in _LIBTOOL_GENERATED_MACROS and pure.parent.name == "m4":
+        return _has_autotools_input(root, parent)
+    return False
 
 
 _SOURCE_SUFFIXES = frozenset({
@@ -1392,7 +1647,7 @@ _SOURCE_SUFFIXES = frozenset({
     ".php", ".swift", ".m", ".mm", ".cs",
 })
 _TEST_DIRECTORY_NAMES = frozenset({
-    "test", "tests", "unittest", "unittests",
+    "test", "tests", "testing", "unittest", "unittests",
     "unit-test", "unit-tests", "unit_test", "unit_tests", "integration-test",
     "integration-tests", "integration_test", "integration_tests",
     "functional-test", "functional-tests", "functional_test", "functional_tests",
@@ -1404,12 +1659,16 @@ _BUILD_METADATA_NAMES = frozenset({
     "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
     "gradle.properties", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd",
     "build", "build.bazel", "workspace", "workspace.bazel", "module.bazel",
+    "cmakecache.txt", "ctesttestfile.cmake", "dartconfiguration.tcl",
+    "cmake_install.cmake", "cmake_uninstall.cmake",
     "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
     "pnpm-lock.yaml", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini",
     "cargo.toml", "cargo.lock", "go.mod", "go.sum", "composer.json",
     "composer.lock", "gemfile", "gemfile.lock",
 })
-_BUILD_METADATA_SUFFIXES = (".cmake", ".mk", ".mak", ".gradle")
+_BUILD_METADATA_SUFFIXES = (
+    ".cmake", ".mk", ".mak", ".gradle", ".ninja", ".pc",
+)
 
 
 def _is_explicit_test_path(path: str) -> bool:
@@ -1443,6 +1702,12 @@ def _is_build_metadata_path(path: str) -> bool:
     name = pure.name.casefold()
     parts = tuple(part.casefold() for part in pure.parts[:-1])
     if name in _BUILD_METADATA_NAMES:
+        return True
+    if name in {item.casefold() for item in _AUTOTOOLS_GENERATED_NAMES}:
+        return True
+    if name in {item.casefold() for item in _LIBTOOL_GENERATED_MACROS}:
+        return True
+    if fnmatch.fnmatch(name, "stamp-h*"):
         return True
     if name.endswith(_BUILD_METADATA_SUFFIXES):
         return True
@@ -1505,13 +1770,17 @@ def _git_change_records(
     if result.get("returncode") != 0 or not isinstance(stdout, str):
         return result, []
     records: list[dict[str, str]] = []
-    ignored = 0
+    ignored_tracked: list[str] = []
+    ignored_untracked: list[str] = []
     declared = _normalized_declared_test_paths(root, declared_test_paths)
     fields = stdout.split("\0")
     for index in range(0, len(fields) - 1, 2):
         status = fields[index]
         path = fields[index + 1].replace("\\", "/")
         if not status or not path:
+            continue
+        if _is_verification_generated_path(root, path, tracked=True):
+            ignored_tracked.append(path)
             continue
         if status.startswith("D"):
             operation = "deleted"
@@ -1541,8 +1810,8 @@ def _git_change_records(
         path = raw_path.replace("\\", "/")
         if not path:
             continue
-        if _is_ignored_untracked_path(path):
-            ignored += 1
+        if _is_verification_generated_path(root, path, tracked=False):
+            ignored_untracked.append(path)
             continue
         records.append({
             "path": path,
@@ -1550,7 +1819,12 @@ def _git_change_records(
             "status": "??",
             "category": _change_category(path, declared),
         })
-    result["ignored_untracked_count"] = ignored
+    result["ignored_tracked_count"] = len(ignored_tracked)
+    result["ignored_untracked_count"] = len(ignored_untracked)
+    result["ignored_generated_count"] = len(ignored_tracked) + len(ignored_untracked)
+    result["ignored_generated_paths"] = sorted(
+        {*ignored_tracked, *ignored_untracked}
+    )
     return result, sorted(records, key=lambda item: (item["path"], item["operation"]))
 
 
@@ -1578,7 +1852,10 @@ def _project_change_audit(
         "changes": records,
         "categories": categories,
         "category_counts": {key: len(value) for key, value in categories.items()},
+        "ignored_tracked_count": int(status.get("ignored_tracked_count") or 0),
         "ignored_untracked_count": int(status.get("ignored_untracked_count") or 0),
+        "ignored_generated_count": int(status.get("ignored_generated_count") or 0),
+        "ignored_generated_paths": list(status.get("ignored_generated_paths") or []),
     }
 
 
@@ -1626,7 +1903,20 @@ def _worktree_test_change_audit(
     }
 
 
-def _git_status_snapshot(root: Path, *, base_commit: str = "HEAD") -> dict[str, Any]:
+def _git_status_snapshot(
+    root: Path,
+    *,
+    base_commit: str = "HEAD",
+    paths: list[str] | None = None,
+) -> dict[str, Any]:
+    if paths is not None and not paths:
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "ignored_untracked_count": 0,
+        }
+    pathspec = list(paths or [])
     result = _run_git(
         [
             "diff",
@@ -1635,7 +1925,7 @@ def _git_status_snapshot(root: Path, *, base_commit: str = "HEAD") -> dict[str, 
             "--no-ext-diff",
             "--no-textconv",
             base_commit,
-            "--",
+            "--", *pathspec,
         ],
         root,
     )
@@ -1643,15 +1933,11 @@ def _git_status_snapshot(root: Path, *, base_commit: str = "HEAD") -> dict[str, 
     if not isinstance(stdout, str):
         return result
     filtered_lines: list[str] = []
-    ignored_lines: list[str] = []
     filtered_lines.extend(stdout.splitlines())
-    for path in _git_untracked_files(root):
-        if _is_ignored_untracked_path(path):
-            ignored_lines.append(f"??\t{path}")
-        else:
-            filtered_lines.append(f"??\t{path}")
+    for path in _git_untracked_files(root, pathspec or None):
+        filtered_lines.append(f"??\t{path}")
     result["stdout"] = ("\n".join(filtered_lines) + "\n") if filtered_lines else ""
-    result["ignored_untracked_count"] = len(ignored_lines)
+    result["ignored_untracked_count"] = 0
     return result
 
 
@@ -1681,12 +1967,22 @@ def _diff_untracked_files(root: Path, paths: list[str], *, stat: bool = False) -
 def _git_diff_with_untracked(
     root: Path,
     args: list[str],
+    *,
+    paths: list[str] | None = None,
 ) -> dict[str, Any]:
-    result = _run_git(args, root)
+    if paths is not None and not paths:
+        return {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "untracked_files": [],
+        }
+    pathspec = list(paths or [])
+    result = _run_git([*args, "--", *pathspec], root)
     tracked_diff = result.get("stdout")
     if not isinstance(tracked_diff, str):
         tracked_diff = ""
-    untracked_files = _git_untracked_files(root)
+    untracked_files = _git_untracked_files(root, pathspec or None)
     untracked_diff = _diff_untracked_files(root, untracked_files, stat="--stat" in args)
     result["stdout"] = tracked_diff + untracked_diff
     result["untracked_files"] = untracked_files
@@ -1700,16 +1996,38 @@ def _snapshot_project(
     base_commit: str = "HEAD",
 ) -> dict[str, Any]:
     """Capture the complete pre-verification deliverable patch and path audit."""
+    change_audit = _project_change_audit(
+        root,
+        declared_test_paths=declared_test_paths,
+        base_commit=base_commit,
+    )
+    deliverable_paths = [
+        str(item.get("path") or "")
+        for item in change_audit.get("changes") or []
+        if isinstance(item, dict) and item.get("path")
+    ]
+    status = _git_status_snapshot(
+        root,
+        base_commit=base_commit,
+        paths=deliverable_paths,
+    )
+    status.update({
+        "ignored_tracked_count": int(
+            change_audit.get("ignored_tracked_count") or 0
+        ),
+        "ignored_untracked_count": int(
+            change_audit.get("ignored_untracked_count") or 0
+        ),
+        "ignored_generated_count": int(
+            change_audit.get("ignored_generated_count") or 0
+        ),
+    })
     return {
         "project_root": str(root),
         "scope": "full_worktree_pre_verification",
         "base_commit": base_commit,
-        "change_audit": _project_change_audit(
-            root,
-            declared_test_paths=declared_test_paths,
-            base_commit=base_commit,
-        ),
-        "status": _git_status_snapshot(root, base_commit=base_commit),
+        "change_audit": change_audit,
+        "status": status,
         # The c000 commit remains stable even if the candidate creates a local
         # commit. Build metadata therefore stays in the same replayable patch
         # as staged, unstaged and committed production changes.
@@ -1722,6 +2040,7 @@ def _snapshot_project(
                 "--diff-algorithm=myers", "--no-indent-heuristic",
                 base_commit, "--stat",
             ],
+            paths=deliverable_paths,
         ),
         "diff": _git_diff_with_untracked(
             root,
@@ -1732,6 +2051,7 @@ def _snapshot_project(
                 "--diff-algorithm=myers", "--no-indent-heuristic",
                 base_commit,
             ],
+            paths=deliverable_paths,
         ),
     }
 

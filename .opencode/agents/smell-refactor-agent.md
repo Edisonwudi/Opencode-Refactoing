@@ -51,15 +51,23 @@ Workflow:
    or dependency closure. Guard items only prioritize that ledger. When an
    initial metric or threshold is absent, choose the first coherent unit from
    source without calling verification just to obtain a number or guessing the
-   acceptance boundary.
-4. Execute the smallest coherent refactoring that reduces the reported smell.
+   acceptance boundary. When the controller supplies an immutable numeric edit
+   budget, use only its `current`, passing boundary, and
+   `required_reduction` scalars to size the first coherent edit. Those scalars
+   are planning input, not a caller or dependency closure.
+4. Execute the smallest set of coherent production slices projected to cross a
+   source-derived passing route. After each slice, run the language reference's
+   focused compile or test. If the source projection is still outside the
+   numeric budget, continue the same repair without calling `smell_verify`.
    Avoid unrelated cleanup and never delete or weaken behavior checks. Only
    migrate test references when the controller explicitly allows test changes,
    preserving their original assertions and intent.
-5. Call `smell_verify` as the acceptance gate using the controller-owned
-   verification mode. Do not run Maven, Gradle, or their wrappers directly during this
-   command; `smell_verify` owns the pinned build/test invocation and loop
-   decision. Do not substitute syntax-only checks for configured project tests.
+5. Once the source projection reaches a passing route—or, when no numeric
+   budget exists, after the first coherent repair—call `smell_verify` as the
+   acceptance gate using the controller-owned verification mode. Do not run
+   Maven, Gradle, or their wrappers directly during this command;
+   `smell_verify` owns the pinned build/test invocation and loop decision. Do
+   not substitute syntax-only checks for configured project tests.
 6. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. Repair only the reported smell, compile, or test regression.
 

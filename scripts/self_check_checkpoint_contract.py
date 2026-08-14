@@ -340,6 +340,102 @@ def main() -> int:
         assert plan["next_action"], plan
         assert plan["authority"] == "target_guard_and_frozen_checkpoint", plan
 
+    long_method_budget = build_resolution_plan(
+        "long_method",
+        finding_contract={"finding_id": "long-method-budget"},
+        baseline_metrics={
+            "ok": True,
+            "finding_present": True,
+            "objectives": {"ast_ncss": 70},
+            "guard_profile": {
+                "metric": "meaningful_line_count",
+                "finding_min": 50,
+            },
+        },
+    )["metric_budget"]
+    assert long_method_budget == [{
+        "metric": "meaningful_line_count",
+        "current": 70,
+        "passing_max": 49,
+        "required_reduction": 21,
+        "unit": "meaningful_line_count",
+    }], long_method_budget
+    clone_budget = build_resolution_plan(
+        "code_clone_type1",
+        finding_contract={"finding_id": "clone-budget"},
+        baseline_metrics={
+            "ok": True,
+            "finding_present": True,
+            "objectives": {"clone_token_count": 42},
+            "guard_profile": {"finding_min_tokens": 24},
+        },
+    )["metric_budget"]
+    assert clone_budget == [{
+        "metric": "clone_token_count",
+        "current": 42,
+        "passing_max": 23,
+        "required_reduction": 19,
+        "unit": "clone_token_count",
+    }], clone_budget
+    scalar_budget_cases = {
+        "nested_complexity": (
+            {"cognitive_complexity": 8},
+            {"metric": "max_nesting_depth", "finding_min": 5},
+            ("max_nesting_depth", 8, 4, 4),
+        ),
+        "long_parameter_list": (
+            {"parameter_count": 8},
+            {"finding_min": 6},
+            ("parameter_count", 8, 5, 3),
+        ),
+        "data_clumps": (
+            {"occurrence_count": 5},
+            {"min_occurrences": 3},
+            ("occurrence_count", 5, 2, 3),
+        ),
+        "switch_statements": (
+            {"switch_count": 2},
+            {},
+            ("switch_count", 2, 0, 2),
+        ),
+        "mysterious_name": (
+            {"target_suspicious_name_present": 1},
+            {},
+            ("target_suspicious_name_present", 1, 0, 1),
+        ),
+        "dead_code": (
+            {"unused_private_finding_present": 1},
+            {},
+            ("unused_private_finding_present", 1, 0, 1),
+        ),
+    }
+    scalar_budgets = []
+    for smell, (objectives, profile, expected) in scalar_budget_cases.items():
+        budget = build_resolution_plan(
+            smell,
+            finding_contract={"finding_id": f"{smell}-budget"},
+            baseline_metrics={
+                "ok": True,
+                "finding_present": True,
+                "objectives": objectives,
+                "guard_profile": profile,
+            },
+        )["metric_budget"]
+        metric, current, passing_max, required_reduction = expected
+        assert budget == [{
+            "metric": metric,
+            "current": current,
+            "passing_max": passing_max,
+            "required_reduction": required_reduction,
+            "unit": metric,
+        }], (smell, budget)
+        scalar_budgets.append(budget)
+    for budget in (long_method_budget, clone_budget, *scalar_budgets):
+        assert all(
+            not ({"worklist", "files", "callers", "next_action"} & set(item))
+            for item in budget
+        ), budget
+
     resolved_envy = build_resolution_plan(
         "feature_envy",
         finding_contract={"finding_id": "envy", "entity_identity": {"method": "target"}},
@@ -354,6 +450,12 @@ def main() -> int:
             "finding_present": False,
             "objectives": {"envy_access_diff": 1, "expected_receiver_access": 8},
             "detector_profile": {"finding_min_exclusive": 1},
+            "guard_receiver_access": 3,
+            "guard_receiver_access_passing_max": 3,
+            "guard_receiver_access_required_reduction": 0,
+            "guard_receiver_ratio": 0.5,
+            "guard_receiver_ratio_finding_min": 0.6,
+            "guard_receiver_ratio_required_access_reduction": 0,
         },
     )
     assert resolved_envy["resolved"] is True, resolved_envy
@@ -361,6 +463,60 @@ def main() -> int:
     assert [item["name"] for item in resolved_envy["objective_deficits"]] == [
         "envy_access_diff"
     ], resolved_envy
+    assert resolved_envy["metric_budget"] == [
+        {
+            "metric": "receiver_access",
+            "current": 3,
+            "passing_max": 3,
+            "required_reduction": 0,
+            "unit": "receiver_access",
+        },
+        {
+            "metric": "receiver_access_for_ratio_lt_0.6",
+            "current": 3,
+            "passing_max": 3,
+            "required_reduction": 0,
+            "unit": "receiver_access",
+        },
+    ], resolved_envy
+    for item in resolved_envy["metric_budget"]:
+        assert item["current"] - item["required_reduction"] == item["passing_max"], item
+
+    unresolved_envy = build_resolution_plan(
+        "feature_envy",
+        finding_contract={"finding_id": "envy-budget"},
+        baseline_metrics={
+            "ok": True,
+            "finding_present": True,
+            "objectives": {"expected_receiver_access": 8},
+            "guard_receiver_access": 8,
+            "guard_receiver_access_passing_max": 3,
+            "guard_receiver_access_required_reduction": 5,
+            "guard_receiver_ratio": 0.8,
+            "guard_receiver_ratio_finding_min": 0.6,
+            "guard_receiver_ratio_required_access_reduction": 3,
+        },
+    )
+    assert unresolved_envy["metric_budget"] == [
+        {
+            "metric": "receiver_access",
+            "current": 8,
+            "passing_max": 3,
+            "required_reduction": 5,
+            "unit": "receiver_access",
+        },
+        {
+            "metric": "receiver_access_for_ratio_lt_0.6",
+            "current": 8,
+            "passing_max": 5,
+            "required_reduction": 3,
+            "unit": "receiver_access",
+        },
+    ], unresolved_envy["metric_budget"]
+    assert all(
+        item["current"] - item["required_reduction"] == item["passing_max"]
+        for item in unresolved_envy["metric_budget"]
+    ), unresolved_envy["metric_budget"]
 
     large_lpl = build_resolution_plan(
         "long_parameter_list",
@@ -444,14 +600,43 @@ def main() -> int:
                 "methods": [{"signature": "post(Order)"}, {"signature": "settle()"}],
             }],
             "god_class_profile": {
-                "mandatory": [],
-                "signals": [],
+                "mandatory": [
+                    {"name": "nom", "value": 20, "boundary": 5, "matched": True},
+                    {"name": "wmc", "value": 70, "boundary": 20, "matched": True},
+                ],
+                "signals": [
+                    {"name": "nom", "value": 20, "boundary": 10, "matched": True},
+                    {"name": "wmc", "value": 70, "boundary": 30, "matched": True},
+                    {"name": "loc", "value": 500, "boundary": 100, "matched": True},
+                ],
+                "triggered_signals": ["nom", "wmc", "loc", "strong_nom_wmc"],
+                "min_signals": 2,
             },
         },
     )
     assert "god-responsibility-orders" in god_plan["next_action"], god_plan
     assert "post(Order)" in god_plan["next_action"], god_plan
     assert god_plan["worklist"][1]["field_names"] == ["orders", "ledger"], god_plan
+    assert god_plan["metric_budget"] == [
+        {
+            "metric": "god_class_mandatory_nom",
+            "current": 20,
+            "passing_max": 4,
+            "required_reduction": 16,
+            "unit": "nom",
+        },
+        {
+            "metric": "god_class_mandatory_wmc",
+            "current": 70,
+            "passing_max": 19,
+            "required_reduction": 51,
+            "unit": "wmc",
+        },
+    ], god_plan["metric_budget"]
+    assert all(
+        "signal" not in item["metric"] and item["unit"] != "signals"
+        for item in god_plan["metric_budget"]
+    ), god_plan["metric_budget"]
 
     evidence_missing_build_test = {
         "success": False,

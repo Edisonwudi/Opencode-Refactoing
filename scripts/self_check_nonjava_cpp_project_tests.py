@@ -87,6 +87,22 @@ def _assert_aria2_contract(script: str, test_script: str) -> None:
     assert "--version" not in test_script
 
 
+def _assert_protobuf_contract(script: str, test_script: str) -> None:
+    external_build_dir = "/tmp/refactoragent-protobuf-29.3-build"
+    assert f'build_dir="{external_build_dir}"' in script
+    assert 'cmake -S "${project_root}" -B "${build_dir}"' in script
+    assert "-Dprotobuf_BUILD_TESTS=ON" in script
+    assert "-Dprotobuf_BUILD_CONFORMANCE=OFF" in script
+    assert "--target protoc lite-test upb-test --parallel 1" in script
+    assert "$(nproc)" not in script
+    assert "SMELL_BUILD_JOBS" not in script
+    assert "${project_root}/build-refactoragent" not in script
+    assert f'ctest --test-dir "{external_build_dir}"' in test_script
+    assert "-R '^(lite-test|upb-test)$'" in test_script
+    assert "--output-on-failure --parallel 1" in test_script
+    assert "${project_root}/build-refactoragent" not in test_script
+
+
 def _assert_aria2_runner(temp: Path) -> None:
     project = temp / "aria2"
     build = project / "build-refactoragent"
@@ -222,17 +238,26 @@ def main() -> int:
             "  - root: /opt/projects/cpp/aria2\n"
             "    language: cpp\n"
             "    test:\n"
-            "      command: aria2c --version\n",
+            "      command: aria2c --version\n"
+            "  - root: /opt/projects/cpp/protobuf-29.3\n"
+            "    language: cpp\n"
+            "    build:\n"
+            "      command: old-protobuf-build\n"
+            "    test:\n"
+            "      command: protoc --version\n",
             encoding="utf-8",
         )
         overrides = load_project_overrides(str(projects))
-        assert len(overrides) == 6
+        assert len(overrides) == 7
         duckdb = next(item for item in overrides if item.root.name == "duckdb")
         rocksdb = next(item for item in overrides if item.root.name == "rocksdb")
         other = next(item for item in overrides if item.root.name == "other")
         openttd = next(item for item in overrides if item.root.name == "OpenTTD")
         cmake = next(item for item in overrides if item.root.name == "CMake")
         aria2 = next(item for item in overrides if item.root.name == "aria2")
+        protobuf = next(
+            item for item in overrides if item.root.name == "protobuf-29.3"
+        )
 
         assert duckdb.build.command is None
         assert duckdb.test.command is None
@@ -260,12 +285,19 @@ def main() -> int:
         assert aria2.test.command is None
         assert aria2.shell_timeout == 1500
         _assert_aria2_contract(aria2.build.script or "", aria2.test.script or "")
+        assert protobuf.build.command is None
+        assert protobuf.test.command is None
+        assert protobuf.shell_timeout == 1800
+        _assert_protobuf_contract(
+            protobuf.build.script or "", protobuf.test.script or ""
+        )
         _assert_aria2_runner(temp)
         _assert_fresh_junit_evidence(temp / "junit-fixture")
 
     print(
         "non-Java C++ project-test self-check: PASS "
-        "cmake=8-native-ctest aria2=make-check duckdb=upstream-smoke "
+        "cmake=8-native-ctest aria2=make-check "
+        "protobuf=external-build-single-job duckdb=upstream-smoke "
         "rocksdb=db_basic_test openttd=94-unit-ctest evidence=native-junit"
     )
     return 0

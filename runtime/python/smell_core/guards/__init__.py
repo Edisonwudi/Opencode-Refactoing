@@ -25,7 +25,6 @@ from ..analysis import (
     estimate_nesting_depth,
     estimate_switch_branches,
     explicit_target_files_parseability,
-    extract_class_text,
     extract_snippet,
     method_basename,
     nonjava_finding_threshold,
@@ -282,7 +281,7 @@ def run_smell_guards(config: ResolvedRunConfig, context: Optional[GuardRunContex
                         "metric_delta": context.checkpoint.get("delta"),
                     },
                 })
-            if checkpoint_failure is not None:
+            if checkpoint_failure is not None or guard_type == "god_class":
                 continue
 
         # --- Language-agnostic smell types ---
@@ -327,56 +326,43 @@ def _run_generic_god_class_guard(
     guard: Dict[str, object],
     context: Optional[GuardRunContext],
 ) -> Dict[str, object]:
-    text = extract_class_text(config.locations[0], config.language) if config.locations else None
-    loc = count_meaningful_lines(text or "", config.language)
-    checkpoint_ready = bool(context and context.checkpoint_required)
-    # A god-class repair must move a meaningful share of the class out; a token
-    # extraction of a few lines is not a repair.  The reduction is the one the
-    # checkpoint contract computed against the immutable baseline.
-    min_reduction = float(guard.get("min_relative_reduction", 0.05))
-    relative_reduction = god_class_relative_reduction(context)
-    reduction_ok = relative_reduction >= min_reduction
-    success = text is not None and checkpoint_ready and reduction_ok
-    if success:
-        message = (
-            f"Class metric reduced to {loc} LOC "
-            f"(-{relative_reduction:.1%} vs baseline, threshold {min_reduction:.0%})."
-        )
-    elif not reduction_ok:
-        message = (
-            f"god_class guard: class metric reduction {relative_reduction:.1%} is below the "
-            f"required {min_reduction:.0%}; move a cohesive responsibility cluster out of the class."
-        )
-    else:
-        message = "God-class verification requires a measurable target and the checkpoint reduction contract."
+    del config, guard
+    checkpoint_ready = bool(
+        context
+        and context.checkpoint_required
+        and context.checkpoint_smell == "god_class"
+    )
     return {
         "type": "god_class",
-        "success": success,
-        "message": message,
+        "success": False,
+        "message": (
+            "god_class verification requires the frozen checkpoint finding "
+            "contract; no independent LOC or relative-reduction fallback is allowed."
+        ),
         "details": {
-            "class_loc": loc,
             "checkpoint_required": checkpoint_ready,
-            "relative_reduction": round(relative_reduction, 6),
-            "min_relative_reduction": min_reduction,
+            "guard": "checkpoint_contract",
         },
     }
 
 
 def god_class_relative_reduction(context: Optional[GuardRunContext]) -> float:
-    """Relative class_loc reduction from the checkpoint delta (0 when unavailable)."""
+    """Largest relative reduction among non-Java finding-predicate metrics."""
     delta = getattr(context, "metric_delta", None) if context is not None else None
     if not isinstance(delta, dict):
         return 0.0
     objectives = delta.get("objectives")
     if not isinstance(objectives, dict):
         return 0.0
-    values = objectives.get("class_loc")
-    if not isinstance(values, dict):
-        return 0.0
-    reduction = values.get("relative_reduction")
-    if isinstance(reduction, bool) or not isinstance(reduction, (int, float)):
-        return 0.0
-    return max(0.0, float(reduction))
+    reductions = []
+    for metric in ("nom", "wmc", "loc"):
+        values = objectives.get(metric)
+        if not isinstance(values, dict):
+            continue
+        reduction = values.get("relative_reduction")
+        if isinstance(reduction, (int, float)) and not isinstance(reduction, bool):
+            reductions.append(float(reduction))
+    return max((0.0, *reductions))
 
 
 def run_build_test_guard(
@@ -1305,11 +1291,19 @@ def _run_data_clumps_guard(
         current = context.current_metrics
         identity_ok = current.get("target_patch_identity_ok") is True
         finding_present = current.get("finding_present") is True
+        migration_requires_project_full = bool(
+            current.get("project_full_required")
+        )
+        migration_verification_ok = bool(
+            not migration_requires_project_full
+            or config.verification_mode == "project_full"
+        )
         success = bool(
             current.get("ok") is True
             and identity_ok
             and current.get("target_missing") is not True
             and not finding_present
+            and migration_verification_ok
         )
         return {
             "type": "data_clumps",
@@ -1318,8 +1312,14 @@ def _run_data_clumps_guard(
                 "data_clumps guard: reused the accepted checkpoint target-local verdict."
                 if success
                 else (
-                    "data_clumps guard: checkpoint target identity or finding "
-                    "closure is not satisfied."
+                    "data_clumps guard: controlled declaration migration requires "
+                    "verification_mode=project_full."
+                    if migration_requires_project_full
+                    and not migration_verification_ok
+                    else (
+                        "data_clumps guard: checkpoint target identity or finding "
+                        "closure is not satisfied."
+                    )
                 )
             ),
             "details": {
@@ -1339,6 +1339,12 @@ def _run_data_clumps_guard(
                 "inline_copy_expansions": list(
                     current.get("inline_copy_expansions") or []
                 ),
+                "declaration_migration_mode": current.get(
+                    "declaration_migration_mode"
+                ),
+                "project_full_required": migration_requires_project_full,
+                "verification_mode": config.verification_mode,
+                "migration_verification_ok": migration_verification_ok,
                 "scope_mode": "explicit_target_locations",
             },
         }
@@ -1526,15 +1532,41 @@ def _run_generic_feature_envy_guard(
                 "current_metrics": snapshot,
             },
         }
-    dominant = str(snapshot.get("dominant_receiver_type") or "")
-    dominant_count = int(snapshot.get("dominant_receiver_access") or 0)
-    ratio = float(snapshot.get("dominant_receiver_ratio") or 0.0)
+    dominant = str(
+        snapshot.get("guard_receiver_name")
+        or snapshot.get("dominant_receiver_type")
+        or ""
+    )
+    dominant_count = int(
+        snapshot.get("guard_receiver_access")
+        or snapshot.get("dominant_receiver_access")
+        or 0
+    )
+    ratio = float(
+        snapshot.get("guard_receiver_ratio")
+        or snapshot.get("dominant_receiver_ratio")
+        or 0.0
+    )
+    access_reduction = int(
+        snapshot.get("guard_receiver_access_required_reduction") or 0
+    )
+    ratio_reduction = int(
+        snapshot.get("guard_receiver_ratio_required_access_reduction") or 0
+    )
+    required_reduction = int(
+        snapshot.get("guard_required_receiver_access_reduction") or 0
+    )
+    pass_when = str(snapshot.get("guard_receiver_pass_when") or "")
     details = {
         "detector": "tree_sitter_generic",
         "contract": FEATURE_ENVY_TARGET_CONTRACT,
         "dominant_receiver": dominant,
         "dominant_receiver_access": dominant_count,
         "dominant_receiver_ratio": ratio,
+        "receiver_access_required_reduction": access_reduction,
+        "receiver_ratio_required_access_reduction": ratio_reduction,
+        "required_receiver_access_reduction": required_reduction,
+        "receiver_pass_when": pass_when,
         "expected_receiver": snapshot.get("expected_receiver_name"),
         "expected_receiver_access": snapshot.get("expected_receiver_access"),
         "method_loc": snapshot.get("method_loc"),
@@ -1548,8 +1580,10 @@ def _run_generic_feature_envy_guard(
             "success": False,
             "message": (
                 f"feature_envy guard: target still accesses foreign receiver '{dominant}' "
-                f"{dominant_count} time(s) ({ratio:.0%} of member accesses); move that logic "
-                "to the envied receiver or reduce the accesses below the detector thresholds."
+                f"{dominant_count} time(s) at ratio {ratio:.3f}. "
+                f"Reduce receiver accesses by at least {required_reduction}: "
+                f"the access-count route needs {access_reduction}, while the ratio route "
+                f"needs {ratio_reduction}. Passing condition: {pass_when}."
             ),
             "details": details,
         }

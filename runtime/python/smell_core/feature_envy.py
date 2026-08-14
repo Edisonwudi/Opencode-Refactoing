@@ -31,6 +31,9 @@ from .location import LocationTarget
 FEATURE_ENVY_MIN_LOC = 5
 FEATURE_ENVY_MIN_FOREIGN_ACCESS = 4
 FEATURE_ENVY_FOREIGN_RATIO = 0.6
+FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT = (
+    "baseline-capped-current-member-access-v1"
+)
 
 _LOCAL_RECEIVERS = {
     "python": {"self", "cls"},
@@ -49,6 +52,123 @@ def feature_envy_receiver_from_evidence(evidence: str) -> str:
     return ""
 
 
+def feature_envy_metric_budget(
+    *,
+    method_loc: int,
+    receiver_access: int,
+    total_member_access: int,
+    ratio_denominator_cap: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return the exact detector predicate and both receiver-side deficits.
+
+    Feature Envy remains present only while all three finding conditions hold.
+    Consequently the receiver-side pass condition is an OR: either access is
+    below four or the ratio is strictly below 0.6.  The ratio denominator is
+    capped at the frozen baseline member-access count.  Current source may use
+    fewer accesses, but newly added unrelated member/self accesses cannot
+    dilute the ratio.
+
+    ``receiver_ratio_required_access_reduction`` is the smallest receiver
+    access reduction that crosses the ratio boundary while other current
+    accesses stay unchanged.  It is deliberately expressed in the same unit
+    as ``receiver_access_required_reduction`` so the minimum required by the
+    OR predicate is unambiguous.
+    """
+    loc = max(0, int(method_loc))
+    access = max(0, int(receiver_access))
+    total = max(access, int(total_member_access))
+    cap = total if ratio_denominator_cap is None else max(0, int(ratio_denominator_cap))
+    denominator = _feature_envy_ratio_denominator(access, total, cap)
+    ratio = access / denominator if denominator else 0.0
+
+    access_passing_max = FEATURE_ENVY_MIN_FOREIGN_ACCESS - 1
+    access_required = max(0, access - access_passing_max)
+    ratio_required = _feature_envy_ratio_access_reduction(
+        receiver_access=access,
+        total_member_access=total,
+        ratio_denominator_cap=cap,
+    )
+    method_loc_passing_max = FEATURE_ENVY_MIN_LOC - 1
+    method_loc_required = max(0, loc - method_loc_passing_max)
+    receiver_passes = bool(
+        access <= access_passing_max or ratio < FEATURE_ENVY_FOREIGN_RATIO
+    )
+    finding_present = bool(loc >= FEATURE_ENVY_MIN_LOC and not receiver_passes)
+    required_receiver_reduction = (
+        0 if loc < FEATURE_ENVY_MIN_LOC else min(access_required, ratio_required)
+    )
+    ratio_text = f"{FEATURE_ENVY_FOREIGN_RATIO:g}"
+    return {
+        "method_loc": loc,
+        "method_loc_finding_min": FEATURE_ENVY_MIN_LOC,
+        "method_loc_passing_max": method_loc_passing_max,
+        "method_loc_required_reduction": method_loc_required,
+        "receiver_access": access,
+        "receiver_access_finding_min": FEATURE_ENVY_MIN_FOREIGN_ACCESS,
+        "receiver_access_passing_max": access_passing_max,
+        "receiver_access_required_reduction": access_required,
+        "receiver_ratio": round(ratio, 6),
+        "receiver_ratio_finding_min": FEATURE_ENVY_FOREIGN_RATIO,
+        "receiver_ratio_passing_operator": "<",
+        "receiver_ratio_denominator": denominator,
+        "receiver_ratio_denominator_cap": cap,
+        "receiver_ratio_required_access_reduction": ratio_required,
+        "required_receiver_access_reduction": required_receiver_reduction,
+        "receiver_pass_when": (
+            f"receiver_access <= {access_passing_max} OR "
+            f"receiver_ratio < {ratio_text}"
+        ),
+        "finding_when": (
+            f"method_loc >= {FEATURE_ENVY_MIN_LOC} AND "
+            f"receiver_access >= {FEATURE_ENVY_MIN_FOREIGN_ACCESS} AND "
+            f"receiver_ratio >= {ratio_text}"
+        ),
+        "pass_when": (
+            f"method_loc <= {method_loc_passing_max} OR "
+            f"receiver_access <= {access_passing_max} OR "
+            f"receiver_ratio < {ratio_text}"
+        ),
+        "finding_present": finding_present,
+    }
+
+
+def _feature_envy_ratio_denominator(
+    receiver_access: int,
+    total_member_access: int,
+    ratio_denominator_cap: int,
+) -> int:
+    """Cap denominator growth without producing a ratio greater than one."""
+    return max(
+        int(receiver_access),
+        min(int(total_member_access), int(ratio_denominator_cap)),
+    )
+
+
+def _feature_envy_ratio_access_reduction(
+    *,
+    receiver_access: int,
+    total_member_access: int,
+    ratio_denominator_cap: int,
+) -> int:
+    """Smallest integer receiver-access reduction that makes ratio < 0.6."""
+    for reduction in range(receiver_access + 1):
+        projected_access = receiver_access - reduction
+        projected_total = max(0, total_member_access - reduction)
+        projected_denominator = _feature_envy_ratio_denominator(
+            projected_access,
+            projected_total,
+            ratio_denominator_cap,
+        )
+        projected_ratio = (
+            projected_access / projected_denominator
+            if projected_denominator
+            else 0.0
+        )
+        if projected_ratio < FEATURE_ENVY_FOREIGN_RATIO:
+            return reduction
+    return receiver_access
+
+
 def analyze_feature_envy_target(
     project_root: Path,
     *,
@@ -59,6 +179,7 @@ def analyze_feature_envy_target(
     expected_receiver: str = "",
     exact_receiver_selector: bool = False,
     fold_aliases: bool = True,
+    ratio_denominator_cap: Optional[int] = None,
 ) -> dict[str, Any]:
     """Threshold-independent Feature Envy metrics for one non-Java function.
 
@@ -110,7 +231,7 @@ def analyze_feature_envy_target(
     for receiver, count in sorted(foreign_by_receiver.items()):
         if count > dominant_count:
             dominant_receiver, dominant_count = receiver, count
-    ratio = dominant_count / total if total else 0.0
+    raw_ratio = dominant_count / total if total else 0.0
     if exact_receiver_selector:
         # Product target_context freezes a receiver *root name*.  Do not let a
         # missing root silently turn into a same-spelled type or alias match.
@@ -126,17 +247,23 @@ def analyze_feature_envy_target(
             expected_receiver,
             aliases=(extract_simple_aliases(target, language) or {}) if fold_aliases else {},
         )
-    expected_ratio = expected_access / total if total else 0.0
-    expected_strict_hit = (
-        method_loc >= FEATURE_ENVY_MIN_LOC
-        and expected_access >= FEATURE_ENVY_MIN_FOREIGN_ACCESS
-        and expected_ratio >= FEATURE_ENVY_FOREIGN_RATIO
+    raw_expected_ratio = expected_access / total if total else 0.0
+    dominant_budget = feature_envy_metric_budget(
+        method_loc=method_loc,
+        receiver_access=dominant_count,
+        total_member_access=total,
+        ratio_denominator_cap=ratio_denominator_cap,
     )
-    strict_hit = (
-        method_loc >= FEATURE_ENVY_MIN_LOC
-        and dominant_count >= FEATURE_ENVY_MIN_FOREIGN_ACCESS
-        and ratio >= FEATURE_ENVY_FOREIGN_RATIO
+    expected_budget = feature_envy_metric_budget(
+        method_loc=method_loc,
+        receiver_access=expected_access,
+        total_member_access=total,
+        ratio_denominator_cap=ratio_denominator_cap,
     )
+    ratio = float(dominant_budget["receiver_ratio"])
+    expected_ratio = float(expected_budget["receiver_ratio"])
+    expected_strict_hit = bool(expected_budget["finding_present"])
+    strict_hit = bool(dominant_budget["finding_present"])
     return {
         "ok": True,
         "detector": "tree_sitter_generic",
@@ -149,14 +276,33 @@ def analyze_feature_envy_target(
         "total_member_access": total,
         "local_access": local_access,
         "alias_folded_access": (len(accesses) - len(raw_accesses)) if fold_aliases else 0,
+        "ratio_denominator_contract": FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT,
+        "ratio_denominator_cap": int(
+            dominant_budget["receiver_ratio_denominator_cap"]
+        ),
+        "ratio_denominator": int(dominant_budget["receiver_ratio_denominator"]),
+        "ratio_denominator_growth_ignored": max(
+            0,
+            total - int(dominant_budget["receiver_ratio_denominator_cap"]),
+        ),
         "foreign_by_type": dict(sorted(foreign_by_receiver.items())),
         "dominant_receiver_type": dominant_receiver,
         "dominant_receiver_access": dominant_count,
-        "dominant_receiver_ratio": round(ratio, 6),
+        "raw_dominant_receiver_ratio": round(raw_ratio, 6),
+        "dominant_receiver_ratio": ratio,
+        "feature_envy_budget": {
+            "receiver_name": dominant_receiver,
+            **dominant_budget,
+        },
         "expected_receiver_type": expected_receiver,
         "expected_receiver_name": expected_receiver if exact_receiver_selector else "",
         "expected_receiver_access": expected_access,
-        "expected_receiver_ratio": round(expected_ratio, 6),
+        "raw_expected_receiver_ratio": round(raw_expected_ratio, 6),
+        "expected_receiver_ratio": expected_ratio,
+        "expected_receiver_budget": {
+            "receiver_name": str(expected_receiver or ""),
+            **expected_budget,
+        },
         "expected_receiver_strict_hit": expected_strict_hit,
         "expected_receiver_resolved": expected_resolved,
         "strict_detector_hit": strict_hit,

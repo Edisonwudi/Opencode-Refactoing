@@ -18,7 +18,10 @@ from .analysis import (
     method_basename,
     signature_parameter_fingerprints,
 )
-from .feature_envy import analyze_feature_envy_target
+from .feature_envy import (
+    FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT,
+    analyze_feature_envy_target,
+)
 from .target_patch_identity import (
     FEATURE_ENVY_WRAPPER_REANCHOR_CONTRACT,
     ast_declaration_identity,
@@ -26,9 +29,10 @@ from .target_patch_identity import (
 )
 
 
-FEATURE_ENVY_TARGET_CONTRACT = "explicit-receiver-declaration-continuity-v2"
+FEATURE_ENVY_TARGET_CONTRACT = "explicit-receiver-declaration-continuity-v4"
 _NONJAVA_LANGUAGES = frozenset({"python", "c", "cpp"})
 _RECEIVER_NAME_RE = re.compile(r"[A-Za-z_]\w*\Z")
+_RATIO_DENOMINATOR_CAP_KEY = "baseline_member_access_count"
 
 
 class FeatureEnvyTargetContractError(ValueError):
@@ -327,6 +331,15 @@ def _profile_snapshot(
     receiver: str,
     identity: dict[str, Any],
 ) -> dict[str, Any]:
+    frozen_ratio_cap = identity.get(_RATIO_DENOMINATOR_CAP_KEY)
+    baseline_capture = frozen_ratio_cap is None
+    ratio_cap = (
+        int(frozen_ratio_cap)
+        if isinstance(frozen_ratio_cap, int)
+        and not isinstance(frozen_ratio_cap, bool)
+        and frozen_ratio_cap >= 0
+        else None
+    )
     try:
         profile = analyze_feature_envy_target(
             Path(config.project_root),
@@ -336,6 +349,7 @@ def _profile_snapshot(
             line=target.line,
             expected_receiver=receiver,
             exact_receiver_selector=True,
+            ratio_denominator_cap=ratio_cap,
         )
     except Exception as exc:
         return _failure(
@@ -351,6 +365,30 @@ def _profile_snapshot(
             receiver,
             identity,
         )
+    finding_identity = dict(identity)
+    if ratio_cap is None:
+        ratio_cap = int(profile.get("total_member_access") or 0)
+        finding_identity.update({
+            _RATIO_DENOMINATOR_CAP_KEY: ratio_cap,
+            "ratio_denominator_contract": (
+                FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT
+            ),
+        })
+    budget = dict(profile.get("feature_envy_budget") or {})
+    expected_receiver_finding = bool(
+        profile.get("expected_receiver_strict_hit")
+    )
+    # c000 must freeze the same receiver that owns both the objective and the
+    # admitted finding.  Otherwise an unrelated explicit receiver can be
+    # paired with a dominant-receiver finding, leaving a zero or irrelevant
+    # objective that can never describe the requested repair.  Verification
+    # remains stricter: after a valid c000, any newly dominant foreign receiver
+    # still keeps the target finding alive instead of authorizing relocation.
+    finding_present = bool(
+        expected_receiver_finding
+        if baseline_capture
+        else profile.get("strict_detector_hit")
+    )
     return {
         **profile,
         "adapter": "feature_envy",
@@ -363,14 +401,39 @@ def _profile_snapshot(
                 profile.get("expected_receiver_access") or 0
             )
         },
+        "guard_receiver_name": str(budget.get("receiver_name") or ""),
+        "guard_receiver_access": int(budget.get("receiver_access") or 0),
+        "guard_receiver_access_finding_min": int(
+            budget.get("receiver_access_finding_min") or 0
+        ),
+        "guard_receiver_access_passing_max": int(
+            budget.get("receiver_access_passing_max") or 0
+        ),
+        "guard_receiver_access_required_reduction": int(
+            budget.get("receiver_access_required_reduction") or 0
+        ),
+        "guard_receiver_ratio": float(budget.get("receiver_ratio") or 0.0),
+        "guard_receiver_ratio_finding_min": float(
+            budget.get("receiver_ratio_finding_min") or 0.0
+        ),
+        "guard_receiver_ratio_required_access_reduction": int(
+            budget.get("receiver_ratio_required_access_reduction") or 0
+        ),
+        "guard_required_receiver_access_reduction": int(
+            budget.get("required_receiver_access_reduction") or 0
+        ),
+        "guard_receiver_pass_when": str(budget.get("receiver_pass_when") or ""),
+        "guard_finding_when": str(budget.get("finding_when") or ""),
+        "guard_pass_when": str(budget.get("pass_when") or ""),
+        "selector_receiver_finding_present": expected_receiver_finding,
         # The current declaration must be free of Feature Envy at this exact
         # code location, even if a different receiver became dominant.
-        "finding_present": bool(profile.get("strict_detector_hit")),
-        "candidate_count": 1 if profile.get("strict_detector_hit") else 0,
+        "finding_present": finding_present,
+        "candidate_count": 1 if finding_present else 0,
         "target_match_count": 1,
         "target_missing": False,
         "target_identity_collision": False,
-        "finding_identity": identity,
+        "finding_identity": finding_identity,
     }
 
 

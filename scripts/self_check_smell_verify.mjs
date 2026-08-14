@@ -373,9 +373,8 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
   if (baseline.exitCode !== 0) {
     throw new SelfCheckError("bridge_capture_baseline", "Unable to capture fixture baseline.", baseline)
   }
-  const baselineSeal = String(
-    parseJson("bridge_capture_baseline", baseline.stdout).baseline_seal || "",
-  )
+  const baselinePayload = parseJson("bridge_capture_baseline", baseline.stdout)
+  const baselineSeal = String(baselinePayload.baseline_seal || "")
   if (!baselineSeal) {
     throw new SelfCheckError(
       "bridge_capture_baseline",
@@ -383,6 +382,53 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
       baseline,
     )
   }
+  const baselinePlan = baselinePayload.resolution_plan || {}
+  for (const forbiddenKey of ["worklist", "worklist_count", "files", "callers", "next_action"]) {
+    assertCond(
+      `bridge_baseline_plan_omits_${forbiddenKey}`,
+      !Object.prototype.hasOwnProperty.call(baselinePlan, forbiddenKey),
+      `baseline resolution_plan leaked ${forbiddenKey}`,
+    )
+  }
+  const budgetSurface = await run(
+    "python3",
+    [
+      "-c",
+      [
+        "import importlib.util, json, sys",
+        "from pathlib import Path",
+        "bridge = Path(sys.argv[1]).resolve()",
+        "sys.path.insert(0, str(bridge.parents[1]))",
+        "spec = importlib.util.spec_from_file_location('smell_bridge_budget_check', bridge)",
+        "module = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(module)",
+        "value = {'route_family':'bounded-route','next_action':'leak','worklist':[{'file':'Leak.java'}],'files':['Leak.java'],'callers':['leak()'],'metric_budget':[{'metric':'method_lines','current':91,'passing_max':80,'passing_exclusive_max':999,'required_reduction':11,'unit':'lines','file':'Leak.java','caller':'leak()'}]}",
+        "print(json.dumps(module._compact_baseline_resolution_plan(value), sort_keys=True))",
+      ].join("; "),
+      bridgeFile,
+    ],
+    { cwd: fixtureRoot, env },
+  )
+  assertEqual("bridge_metric_budget_surface_rc", budgetSurface.exitCode, 0, "exitCode")
+  const compactBudgetPlan = parseJson("bridge_metric_budget_surface", budgetSurface.stdout)
+  assertEqual(
+    "bridge_metric_budget_plan_keys",
+    Object.keys(compactBudgetPlan).sort().join(","),
+    "metric_budget,route_family",
+    "keys",
+  )
+  assertEqual(
+    "bridge_metric_budget_item_keys",
+    Object.keys(compactBudgetPlan.metric_budget?.[0] || {}).sort().join(","),
+    "current,metric,passing_max,required_reduction,unit",
+    "keys",
+  )
+  assertEqual(
+    "bridge_metric_budget_prefers_inclusive_boundary",
+    compactBudgetPlan.metric_budget?.[0]?.passing_max,
+    80,
+    "passing_max",
+  )
   await writeFile(
     sourceFile,
     [
@@ -422,6 +468,8 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
     status: payload.status,
     success: payload.success,
     artifactKeys: Object.keys(payload.artifacts || {}).sort(),
+    baselineResolutionPlanKeys: Object.keys(baselinePlan).sort(),
+    metricBudgetSurface: compactBudgetPlan.metric_budget,
   }
 }
 
@@ -2037,6 +2085,17 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && !routeLockedPrompt.includes("production-Java"),
     "dataset route metadata entered the command contract",
   )
+  const sampleOptimizedPrompt = hooks.commandControllerSystemContext({
+    ...state.policy,
+    verification_mode: "sample_optimized",
+  })
+  assertCond(
+    "command_prompt_uses_frozen_verification_mode",
+    sampleOptimizedPrompt.includes("verification_mode: sample_optimized")
+      && sampleOptimizedPrompt.includes("final acceptance gate under verification_mode=sample_optimized")
+      && !sampleOptimizedPrompt.includes("smell_verify(project_full)"),
+    "controller prompt hardcoded project_full instead of the frozen verification mode",
+  )
   assertCond(
     "checkpoint_target_identity_prompt_hook",
     typeof hooks?.checkpointTargetIdentityPrompt === "function",
@@ -2051,7 +2110,21 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       route_family: "close-one-receiver-collaboration",
       next_action: "close the complete document receiver collaboration",
       worklist: [{ kind: "receiver_cluster", field: "document", envied_type: "example.Document" }],
+      files: ["src/Leaked.java"],
+      callers: ["leakedCaller()"],
       forbidden: ["move the finding to another method in the same source owner"],
+      metric_budget: [
+        {
+          metric: "envy_access_count",
+          current: 9,
+          passing_exclusive_max: 5,
+          required_reduction: 5,
+          unit: "foreign accesses",
+          file: "src/Leaked.java",
+          caller: "leakedCaller()",
+          next_action: "leaked budget action",
+        },
+      ],
     },
     metrics: {
       method: "render()",
@@ -2068,12 +2141,29 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     "feature-envy Guard identity missing from prompt",
   )
   assertCond(
-    "checkpoint_target_identity_has_no_metric_coaching",
-    !featureTargetIdentityPrompt.includes("envy_access_count")
-      && !featureTargetIdentityPrompt.includes("envy_access_diff")
-      && !featureTargetIdentityPrompt.includes("threshold")
-      && !featureTargetIdentityPrompt.includes("PASS target"),
-    "feature-envy identity prompt leaked metric coaching",
+    "checkpoint_target_identity_has_bounded_metric_budget",
+    featureTargetIdentityPrompt.includes("metric=envy_access_count")
+      && featureTargetIdentityPrompt.includes("current=9")
+      && featureTargetIdentityPrompt.includes("passing_exclusive_max=5")
+      && featureTargetIdentityPrompt.includes("required_reduction=5")
+      && featureTargetIdentityPrompt.includes("unit=foreign accesses")
+      && featureTargetIdentityPrompt.includes("necessary planning information, not acceptance authority")
+      && featureTargetIdentityPrompt.includes("focused compile/test already provided by the language reference")
+      && featureTargetIdentityPrompt.includes("source-derived passing route")
+      && featureTargetIdentityPrompt.includes("budget indicates the projected edit is likely to cross")
+      && featureTargetIdentityPrompt.includes("call smell_verify once for final acceptance under the controller-owned verification mode")
+      && !featureTargetIdentityPrompt.includes("every budget boundary")
+      && !featureTargetIdentityPrompt.includes("sole smell_verify"),
+    "feature-envy identity prompt did not render the bounded planning budget",
+  )
+  assertCond(
+    "checkpoint_target_identity_budget_omits_closure_lists",
+    !featureTargetIdentityPrompt.includes("src/Leaked.java")
+      && !featureTargetIdentityPrompt.includes("leakedCaller()")
+      && !featureTargetIdentityPrompt.includes("leaked budget action")
+      && !featureTargetIdentityPrompt.includes("close the complete document receiver collaboration")
+      && !featureTargetIdentityPrompt.includes("envy_access_diff"),
+    "feature-envy baseline prompt leaked mutable closure or raw metric fields",
   )
   const dataClumpsContractPrompt = hooks.checkpointTargetIdentityPrompt("data_clumps", {
     guard_contract: {
@@ -2361,6 +2451,28 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
           && controllerContexts[0].includes("Controller-owned verification, identity, and loop policy")
           && !controllerContexts[0].includes("Sample test command:"),
         "stable controller context was not appended separately",
+      )
+      assertCond(
+        "controller_system_context_has_first_edit_budget",
+        controllerContexts[0].includes("Immutable numeric edit budget")
+          && controllerContexts[0].includes("required_reduction=")
+          && controllerContexts[0].includes("necessary planning information, not acceptance authority")
+          && controllerContexts[0].includes("focused compile/test already provided by the language reference")
+          && controllerContexts[0].includes("source-derived passing route")
+          && controllerContexts[0].includes("budget indicates the projected edit is likely to cross")
+          && controllerContexts[0].includes("call smell_verify once for final acceptance under the controller-owned verification mode")
+          && controllerContexts[0].includes("final acceptance gate under verification_mode=project_full")
+          && !controllerContexts[0].includes("every budget boundary")
+          && !controllerContexts[0].includes("sole smell_verify"),
+        "first-turn system context did not include the bounded metric budget and verify timing",
+      )
+      assertCond(
+        "controller_system_context_omits_mutable_baseline_closure",
+        !controllerContexts[0].includes("worklist_count")
+          && !controllerContexts[0].includes("next_action")
+          && !controllerContexts[0].includes("src/Leaked.java")
+          && !controllerContexts[0].includes("leakedCaller()"),
+        "first-turn system context leaked mutable closure details",
       )
       const frozenControllerContext = controllerContexts[0]
       assertEqual(

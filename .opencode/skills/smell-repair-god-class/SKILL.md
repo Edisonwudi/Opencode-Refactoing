@@ -22,7 +22,7 @@ Read exactly one language route. The Java IDEA backend adds one mechanics refere
 2. Build a field/global-to-function/method cohesion map using shared invariants, lifecycle, and existing owners.
 3. Select the smallest ordered set of real responsibility clusters projected to clear the whole profile.
 4. Move each cluster with its state, maintaining behavior, construction, and callers; remove superseded source members and valueless wrappers.
-5. Call `smell_verify` after a coherent stage. On `IMPROVED`, recompute only the returned remaining deficit and continue the planned extraction.
+5. Complete the selected clusters until the source projection reaches one complete passing route, using the language reference's focused checks between clusters; then call `smell_verify`. On `IMPROVED`, recompute only the returned remaining deficit and continue the planned extraction.
 
 ## Verification contract
 

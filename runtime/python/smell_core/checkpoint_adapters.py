@@ -38,6 +38,10 @@ from .data_clumps import (
     evaluate_data_clump_checkpoint_contract,
     evaluate_data_clump_targets,
 )
+from .data_clump_migration import (
+    DATA_CLUMP_DECLARATION_MIGRATION_CONTRACT,
+    DATA_CLUMP_PROJECT_FULL_CLOSURE_CONTRACT,
+)
 from .feature_envy_target_contract import (
     FEATURE_ENVY_TARGET_CONTRACT,
     feature_envy_target_snapshot,
@@ -46,6 +50,7 @@ from .feature_envy import (
     FEATURE_ENVY_FOREIGN_RATIO,
     FEATURE_ENVY_MIN_FOREIGN_ACCESS,
     FEATURE_ENVY_MIN_LOC,
+    FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT,
 )
 from .mysterious_name import (
     MYSTERIOUS_NAME_CONTAINER_CONTINUITY_CONTRACT,
@@ -79,6 +84,10 @@ from .guard_scope import (
     read_current_bytes,
     validate_guard_analysis_scope,
 )
+from .god_class import (
+    nonjava_god_class_metrics,
+    nonjava_god_class_product_profile,
+)
 from .java.source_layout import standard_test_root
 from .java.catalog_identity import CATALOG_IDENTITY_SCHEMA
 from .java.semantic_detector import god_class_product_profile
@@ -87,10 +96,11 @@ from .loop_policy import CHECKPOINT_SMELLS
 
 
 NONJAVA_TARGET_GUARD_PROFILE_VERSION = 2
+DATA_CLUMPS_TARGET_GUARD_PROFILE_VERSION = 4
 CODE_CLONE_TARGET_GUARD_PROFILE_VERSION = 5
 MYSTERIOUS_NAME_TARGET_GUARD_PROFILE_VERSION = 6
-FEATURE_ENVY_TARGET_GUARD_PROFILE_VERSION = 3
-GOD_CLASS_TARGET_GUARD_PROFILE_VERSION = 5
+FEATURE_ENVY_TARGET_GUARD_PROFILE_VERSION = 5
+GOD_CLASS_TARGET_GUARD_PROFILE_VERSION = 6
 DEAD_CODE_TARGET_GUARD_PROFILE_VERSION = 3
 CLONE_RELATED_OCCURRENCE_CLOSURE_CONTRACT = (
     "frozen-complete-declaration-removed-occurrence-closure-v1"
@@ -427,7 +437,7 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
             # it does not use Designite's Java type-resolution semantics.
             detector_specific = {
                 "definition": (
-                    "tree-sitter-explicit-target-dominant-receiver-root-v1"
+                    "tree-sitter-explicit-target-access-and-ratio-predicate-v2"
                 ),
                 "metric": "alias-folded-expected-receiver-member-access",
                 "receiver_identity": "canonical-root-identifier",
@@ -437,6 +447,9 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
                 ),
                 "finding_min_receiver_ratio": FEATURE_ENVY_FOREIGN_RATIO,
                 "alias_folding": "simple-local-alias-root-provenance-v1",
+                "ratio_denominator_contract": (
+                    FEATURE_ENVY_RATIO_DENOMINATOR_CONTRACT
+                ),
                 "candidate_evaluation": "one-explicit-target-declaration-only",
                 "source_parseability_contract": (
                     "explicit-target-declaration-subtree-no-errors-v1"
@@ -471,6 +484,13 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
                     "target-added-lines-v2"
                 ),
                 "compatibility_contract": TARGET_LOCAL_COMPATIBILITY_CONTRACT,
+                "declaration_migration_contract": (
+                    DATA_CLUMP_DECLARATION_MIGRATION_CONTRACT
+                ),
+                "migration_closure_contract": (
+                    DATA_CLUMP_PROJECT_FULL_CLOSURE_CONTRACT
+                ),
+                "migration_final_verification": "project_full",
             }
             if language == "cpp":
                 detector_specific["cpp_owner_resolution"] = (
@@ -490,31 +510,47 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
             }
         elif smell == "god_class":
             detector_specific = {
-                **detector_specific,
-                "target_definition_contract": (
-                    "unique-body-bearing-class-definition-v1"
+                "definition": "source_derived_multi_metric_profile",
+                "profile": nonjava_god_class_product_profile(),
+                "target_kind": (
+                    "source_module" if language == "c" else "class_definition"
                 ),
-                "forward_declarations": "excluded",
+                "target_definition_contract": (
+                    "caller-selected-complete-source-module-v1"
+                    if language == "c"
+                    else "unique-body-bearing-class-definition-v1"
+                ),
+                "forward_declarations": (
+                    "not_applicable" if language == "c" else "excluded"
+                ),
                 "target_definition_parseability": (
                     "selected-target-frozen-parser-recovery-no-additions-v1"
                 ),
             }
+            if language == "cpp":
+                detector_specific["cpp_owner_definition_closure"] = (
+                    "same-explicit-file-exact-qualified-owner-v1"
+                )
         profile_version = (
             CODE_CLONE_TARGET_GUARD_PROFILE_VERSION
             if smell == "code_clone_type1"
             else (
-                FEATURE_ENVY_TARGET_GUARD_PROFILE_VERSION
-                if smell == "feature_envy"
+                DATA_CLUMPS_TARGET_GUARD_PROFILE_VERSION
+                if smell == "data_clumps"
                 else (
-                    MYSTERIOUS_NAME_TARGET_GUARD_PROFILE_VERSION
-                    if smell == "mysterious_name"
+                    FEATURE_ENVY_TARGET_GUARD_PROFILE_VERSION
+                    if smell == "feature_envy"
                     else (
-                        GOD_CLASS_TARGET_GUARD_PROFILE_VERSION
-                        if smell == "god_class"
+                        MYSTERIOUS_NAME_TARGET_GUARD_PROFILE_VERSION
+                        if smell == "mysterious_name"
                         else (
-                            DEAD_CODE_TARGET_GUARD_PROFILE_VERSION
-                            if smell == "dead_code"
-                            else NONJAVA_TARGET_GUARD_PROFILE_VERSION
+                            GOD_CLASS_TARGET_GUARD_PROFILE_VERSION
+                            if smell == "god_class"
+                            else (
+                                DEAD_CODE_TARGET_GUARD_PROFILE_VERSION
+                                if smell == "dead_code"
+                                else NONJAVA_TARGET_GUARD_PROFILE_VERSION
+                            )
                         )
                     )
                 )
@@ -2497,29 +2533,62 @@ def _god_class(config: Any, evidence: str) -> dict[str, Any]:
         if selected is not None
         else []
     )
-    loc = count_meaningful_lines(text or "", config.language)
+    metric_text = text
+    metric_class_name = ""
+    if text is not None and str(config.language) == "cpp":
+        # The explicit target file is already caller-selected.  Read that one
+        # file so Owner::method definitions outside the class body contribute
+        # their real complexity; no project discovery or source scan occurs.
+        try:
+            metric_text = target.file_path.read_text(
+                encoding="utf-8",
+                errors="surrogateescape",
+            )
+            metric_class_name = str(
+                target.class_name
+                or (selected or {}).get("declared_name")
+                or ""
+            )
+        except OSError:
+            metric_text = None
+    metrics = (
+        nonjava_god_class_metrics(
+            metric_text,
+            str(config.language),
+            class_name=metric_class_name,
+        )
+        if metric_text is not None
+        else {}
+    )
+    metric_ready = text is not None and metric_text is not None
+    profile = nonjava_god_class_product_profile(metrics)
     error = (
         ""
-        if text is not None
+        if metric_ready
         else (
-            "target_class_not_found"
+            "target_source_unavailable"
+            if text is not None and metric_text is None
+            else "target_class_not_found"
             if not candidates
             else "target_class_definition_syntax_invalid"
             if len(candidates) == 1 and not definitions
             else "target_class_definition_ambiguous"
         )
     )
+    finding_present = metric_ready and profile["finding_present"] is True
     return {
-        "ok": text is not None,
+        "ok": metric_ready,
         "detector": "tree_sitter_generic",
-        "objectives": {"class_loc": float(loc)},
+        "objectives": {name: float(value) for name, value in metrics.items()},
+        "god_class_profile": profile,
+        "unsupported_metrics": list(profile["unsupported_metrics"]),
         "target_missing": text is None,
         "target_match_count": len(candidates),
         "target_parseable_match_count": len(definitions),
         "parser_recovery_required": bool(syntax_witnesses),
         "target_syntax_issue_witnesses": syntax_witnesses,
-        "finding_present": text is not None and loc >= 100,
-        "candidate_count": 1 if text is not None and loc >= 100 else 0,
+        "finding_present": finding_present,
+        "candidate_count": 1 if finding_present else 0,
         "finding_identity": _contract_identity(config) or _identity(
             config,
             target,

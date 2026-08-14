@@ -68,10 +68,11 @@ generic_smells: &generic_smells
     constraints:
     - Preserve behavior and keep the extraction focused on one responsibility cluster.
     verification:
-    - Reduce the labeled class or module metric and pass configured project tests.
+    - Make the frozen source-derived God Class profile false and pass configured project tests.
     guards:
     - type: god_class
-      min_relative_reduction: 0.05
+      # Continuation progress only; never a finding or PASS condition.
+      min_improved_relative_reduction: 0.05
     retry_hint_template: Move a measurable responsibility out of the labeled class or module.
   dead_code:
     instruction: Remove the exact labeled unused declaration while preserving behavior.

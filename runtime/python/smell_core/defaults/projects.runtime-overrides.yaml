@@ -194,6 +194,31 @@ projects:
         python3 /agent-src/scripts/run_aria2_project_tests.py \
           --project-root "${project_root}" \
           --build-dir build-refactoragent
+  - root: /opt/projects/cpp/protobuf-29.3
+    shell_timeout: 1800
+    build:
+      command: null
+      script: |
+        build_dir="/tmp/refactoragent-protobuf-29.3-build"
+        rm -rf "${build_dir}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -Dprotobuf_BUILD_TESTS=ON \
+          -Dprotobuf_BUILD_CONFORMANCE=OFF \
+          -Dprotobuf_BUILD_EXAMPLES=OFF \
+          -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+          -Dprotobuf_ABSL_PROVIDER=module \
+          -Dprotobuf_JSONCPP_PROVIDER=module \
+          -Dprotobuf_INSTALL=OFF \
+          -DABSL_RANDOM_RANDEN_COPTS_WARNING=OFF
+        cmake --build "${build_dir}" \
+          --target protoc lite-test upb-test --parallel 1
+    test:
+      command: null
+      script: |
+        ctest --test-dir "/tmp/refactoragent-protobuf-29.3-build" \
+          -R '^(lite-test|upb-test)$' \
+          --output-on-failure --parallel 1
   - root: /opt/projects/cpp/duckdb
     shell_timeout: 1500
     build:

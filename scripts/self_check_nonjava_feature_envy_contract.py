@@ -19,6 +19,7 @@ if str(RUNTIME_PYTHON) not in sys.path:
 
 from smell_core.guards import _run_generic_feature_envy_guard  # noqa: E402
 from smell_core.guards.context import GuardRunContext  # noqa: E402
+from smell_core.feature_envy import feature_envy_metric_budget  # noqa: E402
 from smell_core.location import parse_locations  # noqa: E402
 
 
@@ -119,6 +120,35 @@ static int total_price(Order *order) {
 }
 """
 
+PYTHON_DENOMINATOR_BEFORE = """\
+class Calculator:
+    def total_price(self, order):
+        subtotal = order.unit_price * order.quantity
+        tax = subtotal * order.tax_rate
+        shipping = order.shipping_fee
+        discount = order.discount
+        return subtotal + tax + shipping - discount
+"""
+PYTHON_DENOMINATOR_GAMED = """\
+class Calculator:
+    def total_price(self, order):
+        subtotal = order.unit_price * order.quantity
+        tax = subtotal * order.tax_rate
+        shipping = order.shipping_fee
+        discount = order.discount
+        unrelated = self.a + self.b + self.c + self.d + self.e
+        return subtotal + tax + shipping - discount + (unrelated * 0)
+"""
+PYTHON_WRONG_SELECTOR = """\
+class Calculator:
+    def total_price(self, customer, order):
+        first = customer.unit_price + customer.quantity
+        second = customer.tax_rate + customer.shipping_fee
+        selected = order.discount
+        padding = 1
+        return first + second + selected + padding
+"""
+
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
@@ -205,10 +235,12 @@ def _positive_case(
         assert baseline["success"] is True, baseline
         metrics = baseline["metrics"]
         profile = metrics["detector_profile"]
-        assert profile["version"].endswith("/feature_envy/v3"), profile
-        assert (
-            profile["definition"]
-            == "tree-sitter-explicit-target-dominant-receiver-root-v1"
+        assert profile["version"].endswith("/feature_envy/v5"), profile
+        assert profile["definition"] == (
+            "tree-sitter-explicit-target-access-and-ratio-predicate-v2"
+        ), profile
+        assert profile["ratio_denominator_contract"] == (
+            "baseline-capped-current-member-access-v1"
         ), profile
         assert (
             profile["metric"]
@@ -375,6 +407,111 @@ def _ordinary_guard_fail_closed() -> None:
         assert missing_target["success"] is False, missing_target
 
 
+def _exact_budget_and_denominator_contract() -> None:
+    access_boundary = feature_envy_metric_budget(
+        method_loc=8,
+        receiver_access=3,
+        total_member_access=3,
+        ratio_denominator_cap=3,
+    )
+    assert access_boundary["finding_present"] is False, access_boundary
+    assert access_boundary["receiver_access_passing_max"] == 3, access_boundary
+    assert access_boundary["receiver_access_required_reduction"] == 0, access_boundary
+    assert access_boundary["receiver_ratio"] == 1.0, access_boundary
+    assert access_boundary["required_receiver_access_reduction"] == 0, access_boundary
+
+    ratio_boundary = feature_envy_metric_budget(
+        method_loc=8,
+        receiver_access=4,
+        total_member_access=7,
+        ratio_denominator_cap=7,
+    )
+    assert ratio_boundary["finding_present"] is False, ratio_boundary
+    assert ratio_boundary["receiver_ratio"] == 0.571429, ratio_boundary
+    assert ratio_boundary["receiver_ratio_required_access_reduction"] == 0, ratio_boundary
+    assert ratio_boundary["required_receiver_access_reduction"] == 0, ratio_boundary
+
+    both_active = feature_envy_metric_budget(
+        method_loc=8,
+        receiver_access=4,
+        total_member_access=6,
+        ratio_denominator_cap=6,
+    )
+    assert both_active["finding_present"] is True, both_active
+    assert both_active["receiver_access_required_reduction"] == 1, both_active
+    # 4/6 -> 3/5 is exactly 0.6 and therefore still a finding; two access
+    # removals are required to cross the strict ratio boundary.
+    assert both_active["receiver_ratio_required_access_reduction"] == 2, both_active
+    assert both_active["required_receiver_access_reduction"] == 1, both_active
+    assert (
+        both_active["receiver_pass_when"]
+        == "receiver_access <= 3 OR receiver_ratio < 0.6"
+    ), both_active
+    assert (
+        both_active["finding_when"]
+        == "method_loc >= 5 AND receiver_access >= 4 AND receiver_ratio >= 0.6"
+    ), both_active
+
+    with tempfile.TemporaryDirectory(prefix="feature-envy-denominator-") as temp:
+        project = Path(temp)
+        path = _commit(project, "demo.py", PYTHON_DENOMINATOR_BEFORE)
+        baseline = _bridge(
+            project,
+            "capture-baseline",
+            language="python",
+            location="demo.py:method=total_price|line=2",
+            receiver="order",
+        )
+        assert baseline["success"] is True, baseline
+        baseline_metrics = baseline["metrics"]
+        # Alias folding preserves the receiver provenance of subtotal/tax, so
+        # this fixture has seven effective receiver accesses at baseline.
+        assert baseline_metrics["ratio_denominator_cap"] == 7, baseline_metrics
+        assert baseline_metrics["dominant_receiver_ratio"] == 1.0, baseline_metrics
+        assert baseline_metrics["feature_envy_budget"]["finding_present"] is True, baseline_metrics
+
+        path.write_text(PYTHON_DENOMINATOR_GAMED, encoding="utf-8")
+        verified = _bridge(
+            project,
+            "verify",
+            language="python",
+            location="demo.py:method=total_price|line=2",
+            receiver="order",
+        )
+        assert verified["success"] is False, verified
+        current = verified["checkpoint"]["current_metrics"]
+        assert current["total_member_access"] == 12, current
+        assert current["raw_dominant_receiver_ratio"] == 0.583333, current
+        assert current["ratio_denominator_cap"] == 7, current
+        assert current["ratio_denominator_growth_ignored"] == 5, current
+        assert current["dominant_receiver_ratio"] == 1.0, current
+        budget = current["feature_envy_budget"]
+        assert budget["receiver_access"] == 7, budget
+        assert budget["receiver_access_finding_min"] == 4, budget
+        assert budget["receiver_access_passing_max"] == 3, budget
+        assert budget["receiver_access_required_reduction"] == 4, budget
+        assert budget["receiver_ratio_finding_min"] == 0.6, budget
+        assert budget["receiver_ratio_required_access_reduction"] == 3, budget
+        assert budget["required_receiver_access_reduction"] == 3, budget
+        assert budget["finding_present"] is True, budget
+
+
+def _explicit_receiver_must_own_baseline_finding() -> None:
+    with tempfile.TemporaryDirectory(prefix="feature-envy-selector-") as temp:
+        project = Path(temp)
+        _commit(project, "demo.py", PYTHON_WRONG_SELECTOR)
+        baseline = _bridge(
+            project,
+            "capture-baseline",
+            language="python",
+            location="demo.py:method=total_price|line=2",
+            receiver="order",
+        )
+        assert baseline["success"] is False, baseline
+        rendered = json.dumps(baseline, sort_keys=True)
+        assert "BASELINE_FINDING_NOT_FOUND" in rendered, baseline
+
+
 def main() -> int:
     positives = {
         "python": _positive_case(
@@ -507,6 +644,8 @@ struct OtherCheckout {
         assert "missing_explicit_receiver_selector" in str(missing.get("error") or ""), missing
 
     _ordinary_guard_fail_closed()
+    _exact_budget_and_denominator_contract()
+    _explicit_receiver_must_own_baseline_finding()
     rendered = " ".join(
         f"{language}={before}->{after}/reanchor{reanchors}"
         for language, (before, after, reanchors) in positives.items()
@@ -514,7 +653,8 @@ struct OtherCheckout {
     print(
         "nonjava-feature-envy-contract PASS "
         f"{rendered} negatives={len(negatives)} "
-        "baseline_collision=1 current_collision=1 ordinary_fail_closed=2"
+        "baseline_collision=1 current_collision=1 ordinary_fail_closed=2 "
+        "exact_budget=3 denominator_gaming=1 selector_mismatch_rejected=1"
     )
     return 0
 

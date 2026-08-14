@@ -11,7 +11,7 @@ import math
 from typing import Any, Iterable, Mapping
 
 
-RESOLUTION_PLAN_VERSION = 3
+RESOLUTION_PLAN_VERSION = 4
 
 
 _PRIMARY_OBJECTIVES: dict[str, tuple[str, ...]] = {
@@ -85,6 +85,11 @@ def build_resolution_plan(
         current=current,
         objective_delta=objective_delta,
     )
+    metric_budget = _metric_budget(
+        smell,
+        current=current,
+        objectives=objectives,
+    )
     worklist, worklist_total = _worklist(smell, frozen=frozen, current=current)
     next_action = _next_action(smell, current=current, objectives=objectives, worklist=worklist)
     regressions = _semantic_regressions(delta)
@@ -118,6 +123,7 @@ def build_resolution_plan(
         ),
         "route_family": _ROUTE_FAMILIES.get(smell, "close-frozen-finding"),
         "objective_deficits": objectives,
+        "metric_budget": metric_budget,
         "worklist": worklist,
         # The prompt receives only a bounded priority batch, while this count
         # is computed from the complete target-Guard snapshot.  Large LPL/RB/DC
@@ -212,7 +218,10 @@ def _passing_max(
         return max(0.0, minimum - 1.0) if minimum is not None else None
     if smell == "feature_envy" and name == "envy_access_diff":
         return _number(profile.get("finding_min_exclusive"))
-    if smell in {"code_clone_type1", "refused_bequest", "switch_statements", "mysterious_name", "dead_code"}:
+    if smell == "code_clone_type1" and name == "clone_token_count":
+        minimum = _number(profile.get("finding_min_tokens"))
+        return max(0.0, minimum - 1.0) if minimum is not None else None
+    if smell in {"refused_bequest", "switch_statements", "mysterious_name", "dead_code"}:
         return 0.0
     minimum = _number(profile.get("finding_min"))
     if minimum is not None:
@@ -220,6 +229,126 @@ def _passing_max(
     # God Class is a multi-signal predicate. Each scalar target is deliberately
     # left profile-owned rather than reimplemented here.
     return None
+
+
+def _metric_budget(
+    smell: str,
+    *,
+    current: Mapping[str, Any],
+    objectives: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return prompt-safe scalar planning budgets, never dependency closure.
+
+    These values help size the first coherent edit. They are not an alternate
+    verdict: target identity, semantic contracts and project verification
+    remain authoritative.
+    """
+    if smell == "feature_envy":
+        return _feature_envy_metric_budget(current)
+    if smell == "god_class":
+        return _god_class_metric_budget(current)
+
+    profile = current.get("guard_profile") or current.get("detector_profile")
+    profile = profile if isinstance(profile, Mapping) else {}
+    display_override = {
+        "long_method": str(profile.get("metric") or "meaningful_line_count"),
+        "nested_complexity": str(profile.get("metric") or "max_nesting_depth"),
+    }.get(smell)
+    result: list[dict[str, Any]] = []
+    for item in objectives:
+        current_value = _number(item.get("current"))
+        passing_max = _number(item.get("passing_max"))
+        required = _number(item.get("remaining"))
+        if current_value is None or passing_max is None or required is None:
+            continue
+        metric = display_override or str(item.get("name") or "")
+        if not metric:
+            continue
+        result.append({
+            "metric": metric,
+            "current": _compact_number(current_value),
+            "passing_max": _compact_number(passing_max),
+            "required_reduction": _compact_number(required),
+            "unit": metric,
+        })
+    return result[:8]
+
+
+def _feature_envy_metric_budget(
+    current: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    access = _number(current.get("guard_receiver_access"))
+    access_max = _number(current.get("guard_receiver_access_passing_max"))
+    access_required = _number(
+        current.get("guard_receiver_access_required_reduction")
+    )
+    ratio = _number(current.get("guard_receiver_ratio"))
+    ratio_boundary = _number(current.get("guard_receiver_ratio_finding_min"))
+    ratio_required = _number(
+        current.get("guard_receiver_ratio_required_access_reduction")
+    )
+    result: list[dict[str, Any]] = []
+    if None not in (access, access_max, access_required):
+        result.append({
+            "metric": "receiver_access",
+            "current": _compact_number(access),
+            "passing_max": _compact_number(access_max),
+            "required_reduction": _compact_number(access_required),
+            "unit": "receiver_access",
+        })
+    if None not in (access, ratio, ratio_boundary, ratio_required):
+        ratio_route_passing_max = max(0.0, access - ratio_required)
+        result.append({
+            # Keep every row arithmetically executable: current, boundary and
+            # reduction use the same receiver-access unit.  The metric name
+            # retains the exact ratio route whose boundary produced this
+            # access budget.
+            "metric": (
+                "receiver_access_for_ratio_lt_"
+                f"{_compact_number(ratio_boundary)}"
+            ),
+            "current": _compact_number(access),
+            "passing_max": _compact_number(ratio_route_passing_max),
+            "required_reduction": _compact_number(ratio_required),
+            "unit": "receiver_access",
+        })
+    return result
+
+
+def _god_class_metric_budget(
+    current: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    profile = current.get("god_class_profile")
+    if not isinstance(profile, Mapping):
+        return []
+    result: list[dict[str, Any]] = []
+    mandatory = profile.get("mandatory")
+    if not isinstance(mandatory, list):
+        return []
+    for value in mandatory:
+        if not isinstance(value, Mapping) or value.get("matched") is not True:
+            continue
+        name = str(value.get("name") or "")
+        if name not in {"nom", "wmc"}:
+            continue
+        current_value = _number(value.get("value"))
+        boundary = _number(value.get("boundary"))
+        if current_value is None or boundary is None:
+            continue
+        result.append({
+            # The finding predicate requires every mandatory condition.  Each
+            # row below is therefore a complete scalar OR route by itself.
+            # Individual signal thresholds are deliberately omitted because
+            # crossing one may still leave the required signal count matched.
+            "metric": f"god_class_mandatory_{name}",
+            "current": _compact_number(current_value),
+            "passing_max": _compact_number(max(0.0, boundary - 1.0)),
+            "required_reduction": _compact_number(
+                max(0.0, current_value - boundary + 1.0)
+            ),
+            "unit": name,
+        })
+    return result
 
 
 def _worklist(

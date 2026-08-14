@@ -14,6 +14,10 @@ from .analysis import (
 )
 from .detector_utils import normalize_group, parse_group_from_evidence
 from .compatibility_contract import evaluate_target_local_compatibility
+from .data_clump_migration import (
+    authorize_data_clump_compatibility_changes,
+    evaluate_data_clump_declaration_migration,
+)
 from .location import LocationTarget
 from .target_patch_identity import (
     added_blocks_from_target_hunk_units,
@@ -113,6 +117,7 @@ def evaluate_data_clump_targets(
     scope_files: set[str] = set()
     seen_targets: set[tuple[str, int, str]] = set()
     resolved_identities: dict[tuple[str, int, int], int] = {}
+    deferred_identity_collisions: list[dict[str, Any]] = []
     frozen_targets = {
         int(item.get("target_index")): dict(item)
         for item in (
@@ -266,29 +271,35 @@ def evaluate_data_clump_targets(
                 "end_line": snippet.end_line,
                 "target_indexes": [previous_target_index, target_index],
             }
-            unresolved = [
-                {
-                    "target_index": index,
-                    "file": relative,
-                    "method": str(target.method or ""),
-                    "reason": "target_identity_collision",
+            # A parameter-object migration may consolidate several old
+            # declarations into one successor. Defer only a real, non-empty
+            # patch collision to the declaration-lineage gate below. Baseline
+            # and no-patch collisions remain hard failures.
+            if not changed_patch:
+                unresolved = [
+                    {
+                        "target_index": index,
+                        "file": relative,
+                        "method": str(target.method or ""),
+                        "reason": "target_identity_collision",
+                    }
+                    for index in collision["target_indexes"]
+                ]
+                return {
+                    "success": False,
+                    "group": normalized_group,
+                    "occurrence_count": len(occurrences),
+                    "occurrences": occurrences,
+                    "scope_files": sorted(scope_files),
+                    "scope_mode": "explicit_target_locations",
+                    "target_snapshots": target_snapshots,
+                    "unresolved_targets": unresolved,
+                    "target_identity_collision": True,
+                    "target_identity_collisions": [collision],
+                    "occurrence_contract": [],
+                    "error": "target_identity_collision",
                 }
-                for index in collision["target_indexes"]
-            ]
-            return {
-                "success": False,
-                "group": normalized_group,
-                "occurrence_count": len(occurrences),
-                "occurrences": occurrences,
-                "scope_files": sorted(scope_files),
-                "scope_mode": "explicit_target_locations",
-                "target_snapshots": target_snapshots,
-                "unresolved_targets": unresolved,
-                "target_identity_collision": True,
-                "target_identity_collisions": [collision],
-                "occurrence_contract": [],
-                "error": "target_identity_collision",
-            }
+            deferred_identity_collisions.append(collision)
         resolved_identities[resolved_identity] = target_index
         parameter_fingerprints = signature_parameter_fingerprints(
             snippet.signature_text,
@@ -347,6 +358,7 @@ def evaluate_data_clump_targets(
         "scope_mode": "explicit_target_locations",
         "target_snapshots": target_snapshots,
         "unresolved_targets": unresolved_targets,
+        "deferred_target_identity_collisions": deferred_identity_collisions,
         "occurrence_contract": occurrence_contract,
     }
 
@@ -408,7 +420,45 @@ def evaluate_data_clump_checkpoint_contract(
         changed_patch=changed_patch,
         language=language,
     )
-    continuity_ok = continuity_ok and target_identity.get("ok") is True
+    migration = evaluate_data_clump_declaration_migration(
+        baseline_records,
+        current_targets.values(),
+        changed_patch=changed_patch,
+        language=language,
+        group=(
+            str(baseline_records[0].get("group") or "")
+            if baseline_records
+            else ""
+        ),
+    )
+    migrated_indexes = {
+        int(value)
+        for value in list(migration.get("migrated_target_indexes") or [])
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    target_identity_failures = [
+        dict(item)
+        for item in list(target_identity.get("failures") or [])
+        if isinstance(item, Mapping)
+    ]
+    unauthorized_identity_failures = [
+        item
+        for item in target_identity_failures
+        if not _identity_failure_covered_by_migration(item, migrated_indexes)
+    ]
+    migration_authorized = bool(
+        migration.get("applicable") is True
+        and migration.get("ok") is True
+        and migration.get("old_group_entries_removed") is True
+        and migration.get("project_full_required") is True
+        and migration.get("closure_status") == "requires_project_full"
+        and not unauthorized_identity_failures
+        and not target_identity.get("error")
+    )
+    target_identity_ok = bool(
+        target_identity.get("ok") is True or migration_authorized
+    )
+    continuity_ok = continuity_ok and target_identity_ok
     continuity: dict[tuple[str, str, int], dict[str, Any]] = {}
     for occurrence in current_occurrences:
         if not isinstance(occurrence, Mapping):
@@ -510,6 +560,16 @@ def evaluate_data_clump_checkpoint_contract(
             str(item.get("method") or ""),
         ),
     )
+    added_old_group_entries = [
+        dict(item)
+        for item in continuity_occurrences
+        if item.get("match_mode") == "added_target_hunk_frozen_group"
+    ]
+    parallel_old_group_entries = [
+        dict(item)
+        for item in list(migration.get("parallel_old_group_entries") or [])
+        if isinstance(item, Mapping)
+    ]
     inline_error = (
         "baseline_body_window_contract_unavailable"
         if not inline_copy_contract_available
@@ -519,8 +579,13 @@ def evaluate_data_clump_checkpoint_contract(
         inline_copy_contract_available and not inline_error
     )
 
-    current_function_units = [
-        {
+    current_function_units_by_identity: dict[
+        tuple[str, int, int], dict[str, Any]
+    ] = {}
+    for item in current_targets.values():
+        if item.get("resolved") is not True:
+            continue
+        unit = {
             "file": str(item.get("file") or ""),
             "target_index": int(item.get("target_index") or 0),
             "method": str(item.get("method") or ""),
@@ -528,9 +593,15 @@ def evaluate_data_clump_checkpoint_contract(
             "end_line": int(item.get("end_line") or 0),
             "body_text": str(item.get("body_text") or ""),
         }
-        for item in current_targets.values()
-        if item.get("resolved") is True
-    ]
+        current_function_units_by_identity.setdefault(
+            (
+                str(unit["file"]),
+                int(unit["begin_line"]),
+                int(unit["end_line"]),
+            ),
+            unit,
+        )
+    current_function_units = list(current_function_units_by_identity.values())
     explicit_spans: dict[str, list[tuple[int, int]]] = {}
     for item in current_function_units:
         explicit_spans.setdefault(str(item["file"]), []).append((
@@ -608,6 +679,34 @@ def evaluate_data_clump_checkpoint_contract(
                     "reason": str(strongest["reason"]),
                 })
 
+    if migration_authorized and not added_old_group_entries:
+        migrated_predecessors = {
+            (
+                str(item.get("predecessor", {}).get("file") or ""),
+                str(item.get("predecessor", {}).get("declared_name") or ""),
+            )
+            for item in list(migration.get("lineage") or [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("predecessor"), Mapping)
+        }
+        # Moving a frozen body into its declared no-old-group successor is the
+        # intended parameter-object migration. Keep rejecting relocation for
+        # every predecessor not covered by the audited lineage.
+        expansions = [
+            item
+            for item in expansions
+            if not (
+                (
+                    str(item.get("source_file") or ""),
+                    str(item.get("source_method") or ""),
+                )
+                in migrated_predecessors
+                and item.get("reason") == "source_window_relocated"
+                and int(item.get("current_occurrences") or 0)
+                == int(item.get("baseline_occurrences") or 0)
+            )
+        ]
+
     result = {
         "continuity_ok": continuity_ok,
         "continuity_occurrence_count": len(continuity_occurrences),
@@ -615,16 +714,38 @@ def evaluate_data_clump_checkpoint_contract(
         "inline_copy_contract_available": inline_copy_contract_available,
         "inline_copy_analysis_ok": inline_copy_analysis_ok,
         "inline_copy_expansions": expansions,
-        "target_patch_identity_ok": target_identity.get("ok") is True,
+        "target_patch_identity_ok": target_identity_ok,
         "target_patch_identity_contract": str(
-            target_identity.get("contract") or ""
+            (
+                migration.get("contract")
+                if migration_authorized
+                else target_identity.get("contract")
+            )
+            or ""
         ),
-        "target_patch_identity_failures": list(
-            target_identity.get("failures") or []
+        "target_patch_identity_failures": (
+            target_identity_failures
+            if target_identity.get("ok") is True
+            else (
+                unauthorized_identity_failures
+                if migration_authorized
+                else [
+                    *unauthorized_identity_failures,
+                    *list(migration.get("failures") or []),
+                ]
+            )
         ),
         "constructor_signature_reanchors": list(
             target_identity.get("constructor_signature_reanchors") or []
         ),
+        "declaration_migration": migration,
+        "declaration_lineage": list(migration.get("lineage") or []),
+        "declaration_migration_mode": str(migration.get("mode") or ""),
+        "project_full_required": bool(
+            migration_authorized
+            and migration.get("project_full_required") is True
+        ),
+        "parallel_old_group_entries": parallel_old_group_entries,
     }
     if compatibility_patch is not None:
         compatibility = evaluate_target_local_compatibility(
@@ -633,10 +754,27 @@ def evaluate_data_clump_checkpoint_contract(
             current_targets=current_targets.values(),
             production_patch=compatibility_patch,
         )
-        result["compatibility_contract"] = compatibility
-        if compatibility.get("ok") is not True:
+        authorization = authorize_data_clump_compatibility_changes(
+            compatibility,
+            migration if migration_authorized else {},
+            production_patch=compatibility_patch,
+            group=(
+                str(baseline_records[0].get("group") or "")
+                if baseline_records
+                else ""
+            ),
+        )
+        result["compatibility_contract"] = {
+            **compatibility,
+            "ok": authorization.get("ok") is True,
+            "violations": list(authorization.get("violations") or []),
+            "authorized_migrations": list(
+                authorization.get("authorized") or []
+            ),
+        }
+        if authorization.get("ok") is not True:
             result["guard_violations"] = list(
-                compatibility.get("violations") or []
+                authorization.get("violations") or []
             )
     if target_identity.get("error"):
         result["target_patch_identity_error"] = str(target_identity["error"])
@@ -854,6 +992,22 @@ def _frozen_slots_retain_name_or_type(
         ):
             return False
     return True
+
+
+def _identity_failure_covered_by_migration(
+    failure: Mapping[str, Any],
+    migrated_indexes: set[int],
+) -> bool:
+    """Whether every target named by one strict failure has lineage."""
+    indexes = [
+        value
+        for value in (
+            failure.get("target_index"),
+            failure.get("other_target_index"),
+        )
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    return bool(indexes) and all(value in migrated_indexes for value in indexes)
 
 
 def _select_spread_windows(

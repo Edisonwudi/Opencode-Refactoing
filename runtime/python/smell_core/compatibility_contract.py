@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 
-TARGET_LOCAL_COMPATIBILITY_CONTRACT = "target-local-api-abi-continuity-v1"
+TARGET_LOCAL_COMPATIBILITY_CONTRACT = "target-local-api-abi-continuity-v2"
 _HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".hxx")
 _DECLARATION_TOKEN = re.compile(
     r"\*\*|->|::|\.\.\.|[A-Za-z_]\w*|0[xX][0-9A-Fa-f]+|"
@@ -203,6 +203,8 @@ def _changed_virtual_declarations(
     current_file = ""
     context_prefix: list[str] = []
     pending: list[str] = []
+    lexical_owner = ""
+    pending_lexical_owner = ""
 
     def flush() -> None:
         nonlocal pending
@@ -214,6 +216,8 @@ def _changed_virtual_declarations(
         if line.startswith("diff --git ") or line.startswith("@@ "):
             flush()
             context_prefix = []
+            lexical_owner = ""
+            pending_lexical_owner = ""
             continue
         if line.startswith("+++ "):
             flush()
@@ -224,37 +228,99 @@ def _changed_virtual_declarations(
                 else (rendered[2:] if rendered.startswith("b/") else rendered)
             )
             context_prefix = []
+            lexical_owner = ""
+            pending_lexical_owner = ""
             continue
         if not current_file or line.startswith("--- "):
             continue
         if line.startswith(" "):
             flush()
             stripped = line[1:].strip()
+            owner = _cpp_lexical_owner_open(stripped)
+            if owner:
+                lexical_owner = owner
+                pending_lexical_owner = ""
+            else:
+                declared_owner = _cpp_lexical_owner_declaration(stripped)
+                if declared_owner:
+                    pending_lexical_owner = declared_owner
+                elif pending_lexical_owner and "{" in stripped:
+                    lexical_owner = pending_lexical_owner
+                    pending_lexical_owner = ""
             if "virtual" in stripped:
-                context_prefix = [stripped]
+                context_prefix = [
+                    *([f"class {lexical_owner} {{"] if lexical_owner else []),
+                    stripped,
+                ]
             elif context_prefix and not _declaration_terminated(context_prefix):
                 context_prefix.append(stripped)
             else:
                 context_prefix = []
+            if stripped.startswith("}"):
+                lexical_owner = ""
+                pending_lexical_owner = ""
             continue
         if line.startswith(marker) and not line.startswith(marker * 3):
             stripped = line[1:].strip()
+            owner = _cpp_lexical_owner_open(stripped)
+            if owner:
+                lexical_owner = owner
+                pending_lexical_owner = ""
+            else:
+                declared_owner = _cpp_lexical_owner_declaration(stripped)
+                if declared_owner:
+                    pending_lexical_owner = declared_owner
+                elif pending_lexical_owner and "{" in stripped:
+                    lexical_owner = pending_lexical_owner
+                    pending_lexical_owner = ""
             if not pending:
                 pending = (
                     [*context_prefix, stripped]
                     if context_prefix and "virtual" not in stripped
-                    else [stripped]
+                    else [
+                        *(
+                            [f"class {lexical_owner} {{"]
+                            if lexical_owner
+                            and "virtual" in stripped
+                            and not owner
+                            else []
+                        ),
+                        stripped,
+                    ]
                 )
             else:
                 pending.append(stripped)
             if _declaration_terminated(pending):
                 flush()
+            if stripped.startswith("}"):
+                lexical_owner = ""
+                pending_lexical_owner = ""
             continue
         # The opposite side of the replacement does not invalidate the common
         # context prefix, but it does end this side's contiguous declaration.
         flush()
     flush()
     return result
+
+
+def _cpp_lexical_owner_open(line: str) -> str:
+    match = re.search(
+        r"\b(?:class|struct)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b[^;{}]*\{",
+        str(line or ""),
+    )
+    return match.group(1) if match else ""
+
+
+def _cpp_lexical_owner_declaration(line: str) -> str:
+    """Remember a class name whose opening brace is on a later diff line."""
+    text = str(line or "").strip()
+    if "{" in text or ";" in text:
+        return ""
+    match = re.match(
+        r"^(?:class|struct)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
+        text,
+    )
+    return match.group(1) if match else ""
 
 
 def _pure_virtual_declarations(lines: Iterable[str]) -> list[str]:

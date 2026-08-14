@@ -947,6 +947,46 @@ function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
 
+type MetricBudgetItem = {
+  metric: string
+  current: string
+  boundaryKey: "passing_max" | "passing_exclusive_max"
+  boundary: string
+  requiredReduction: string
+  unit: string
+}
+
+function shortPromptScalar(value: unknown, limit = 96): string | undefined {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : undefined
+  }
+  if (typeof value === "boolean") return String(value)
+  if (typeof value !== "string") return undefined
+  const compact = value.replace(/\s+/g, " ").trim()
+  if (!compact) return undefined
+  return compact.length <= limit ? compact : compact.slice(0, limit)
+}
+
+function checkpointMetricBudget(plan: Record<string, unknown> | null): MetricBudgetItem[] {
+  const output: MetricBudgetItem[] = []
+  for (const rawItem of arrayValue(plan?.metric_budget)) {
+    const item = recordValue(rawItem)
+    if (!item) continue
+    const metric = shortPromptScalar(item.metric)
+    const current = shortPromptScalar(item.current)
+    const unit = shortPromptScalar(item.unit, 48)
+    const requiredReduction = shortPromptScalar(item.required_reduction)
+    const boundaryKey = item.passing_max !== undefined
+      ? "passing_max"
+      : "passing_exclusive_max"
+    const boundary = shortPromptScalar(item[boundaryKey])
+    if (!metric || !current || !unit || !requiredReduction || !boundary) continue
+    output.push({ metric, current, boundaryKey, boundary, requiredReduction, unit })
+    if (output.length >= 12) break
+  }
+  return output
+}
+
 function compactTarget(payload: Record<string, unknown> | null): Record<string, unknown> | null {
   if (!payload) return null
   const source = recordValue(payload.resolvedSubject) || recordValue(payload.resolvedContext)
@@ -2037,6 +2077,7 @@ function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, u
     .map(([key, value]) => `${key}=${String(value)}`)
     .join(", ")
   const forbidden = asStringArray(plan?.forbidden).slice(0, 4)
+  const metricBudget = checkpointMetricBudget(plan)
   const lines = [
     "",
     "Target Guard resolution contract (source-derived; dataset evidence is audit-only):",
@@ -2047,6 +2088,17 @@ function checkpointTargetIdentityPrompt(smell: string, payload: Record<string, u
   if (forbidden.length) {
     lines.push("- Forbidden pseudo-fixes:")
     for (const item of forbidden) lines.push(`  - ${item}`)
+  }
+  if (metricBudget.length) {
+    lines.push("- Immutable numeric edit budget (bounded baseline planning input):")
+    for (const item of metricBudget) {
+      lines.push(
+        `  - metric=${item.metric}, current=${item.current}, ${item.boundaryKey}=${item.boundary}, required_reduction=${item.requiredReduction}, unit=${item.unit}`,
+      )
+    }
+    lines.push("- This budget is necessary planning information, not acceptance authority; final acceptance is still decided by frozen target identity, semantic closure, and the controller-owned configured build/test verification.")
+    lines.push("- During the first-edit stage, if the budget does not yet indicate that the projected edit crosses a source-derived passing route, continue with one small production edit and use the focused compile/test already provided by the language reference.")
+    lines.push("- Once the budget indicates the projected edit is likely to cross a source-derived passing route, call smell_verify once for final acceptance under the controller-owned verification mode.")
   }
   lines.push("- The frozen target Guard and build/test result are the acceptance authority; do not scan or rewrite unrelated sources.")
   lines.push("- Read mutable remaining counts, worklists, and next actions only from the latest smell_verify tool result.")
@@ -2074,8 +2126,10 @@ function commandControllerSystemContext(
     `- allowed_failure_groups: ${allowed}`,
     `- sample_deadline_seconds: ${policy.loop.sample_deadline_seconds}`,
     "",
-    "Call smell_verify as the acceptance gate. Its loop.decision field is authoritative.",
-    "When loop.decision is continue, read loop.instruction from that tool result and call smell_verify again.",
+    policy.checkpoint_required
+      ? `smell_verify is the final acceptance gate under verification_mode=${policy.verification_mode}; obey the bounded-budget timing below instead of using it as an intermediate metric probe.`
+      : "Call smell_verify as the acceptance gate. Its loop.decision field is authoritative.",
+    "When a final verification returns loop.decision=continue, read loop.instruction from that tool result before one narrow correction.",
     "When loop.decision is stop, stop and report loop.termination_reason.",
   ]
   lines.push(
