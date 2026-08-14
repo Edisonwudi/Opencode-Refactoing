@@ -97,11 +97,23 @@ def _run(
     cwd: Path,
     *,
     env: dict[str, str] | None = None,
-    timeout: int | None = None,
+    timeout: float | None = None,
     stdout: Any = subprocess.PIPE,
     stderr: Any = subprocess.PIPE,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    if timeout is None:
+        return subprocess.run(
+            args,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=stdout,
+            stderr=stderr,
+            check=False,
+        )
+    proc = subprocess.Popen(
         args,
         cwd=str(cwd),
         env=env,
@@ -110,9 +122,102 @@ def _run(
         errors="replace",
         stdout=stdout,
         stderr=stderr,
-        timeout=timeout,
-        check=False,
+        start_new_session=os.name == "posix",
     )
+    try:
+        captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(proc)
+        final_stdout, final_stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=final_stdout if final_stdout is not None else exc.stdout,
+            stderr=final_stderr if final_stderr is not None else exc.stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        args,
+        proc.returncode,
+        stdout=captured_stdout,
+        stderr=captured_stderr,
+    )
+
+
+def _process_tree_groups(root_pid: int) -> list[int]:
+    """Snapshot POSIX process groups owned by one runner child tree."""
+    if os.name != "posix":  # pragma: no cover - delivery/runtime is POSIX
+        return []
+    groups = {root_pid}
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        rows: dict[int, tuple[int, int]] = {}
+        children: dict[int, list[int]] = {}
+        for raw in listing.stdout.splitlines():
+            fields = raw.split()
+            if len(fields) != 3:
+                continue
+            pid, parent_pid, group_id = (int(value) for value in fields)
+            rows[pid] = (parent_pid, group_id)
+            children.setdefault(parent_pid, []).append(pid)
+        pending = [root_pid]
+        descendants: set[int] = set()
+        while pending:
+            parent_pid = pending.pop()
+            for child_pid in children.get(parent_pid, []):
+                if child_pid in descendants:
+                    continue
+                descendants.add(child_pid)
+                pending.append(child_pid)
+        groups.update(
+            rows[pid][1]
+            for pid in descendants
+            if pid in rows and rows[pid][1] > 0
+        )
+        if root_pid in rows and rows[root_pid][1] > 0:
+            groups.add(rows[root_pid][1])
+    except (OSError, ValueError):
+        pass
+    groups.discard(os.getpgrp())
+    return sorted(groups, key=lambda group_id: group_id == root_pid)
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Terminate the OpenCode/bridge tree, including nested build groups."""
+    if os.name != "posix":  # pragma: no cover - delivery/runtime is POSIX
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return
+    groups = _process_tree_groups(proc.pid)
+    for group_id in groups:
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    for group_id in groups:
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
 
 
 def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -831,6 +936,99 @@ def _native_failure_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]
     return diagnostics
 
 
+_TMUX_FAILURE_HEADER = re.compile(
+    r"\bFAIL ([A-Za-z0-9_.+/-]+): exit (-?[0-9]+)\b"
+)
+_TMUX_FAILURE_CASE_MARKER = "TMUX_FAIL_CASE "
+
+
+def _normalized_test_failure_fingerprint(exit_code: int, diagnostic: str) -> str:
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(diagnostic or ""))
+    text = re.sub(r"/(?:tmp|var/tmp)/[^\s'\"]+", "<tmp>", text)
+    text = re.sub(r"['\"],\s*['\"]", "\n", text)
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    notable = [
+        line
+        for line in lines
+        if line == "TIMEOUT"
+        or line.startswith("[FAIL]")
+        or re.search(r"(?:failed|error|unexpected|no such file)", line, re.IGNORECASE)
+    ]
+    selected = notable[:3] if notable else lines[:3]
+    if "TIMEOUT" in notable and "TIMEOUT" not in selected:
+        selected = ["TIMEOUT", *selected[:2]]
+    detail = " | ".join(selected)
+    return f"exit={exit_code}" + (f" | {detail}" if detail else "")
+
+
+def _failed_test_diagnostics(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract compact named test failures without retaining full test logs."""
+    marked: set[tuple[str, int, str]] = set()
+    legacy: set[tuple[str, int, str]] = set()
+    decoder = json.JSONDecoder()
+    for step_name, step in _failed_build_test_steps(payload):
+        if step_name not in {"test", "sample_test"}:
+            continue
+        text = _step_diagnostic_text(step)
+        marker_offset = 0
+        while True:
+            marker_offset = text.find(_TMUX_FAILURE_CASE_MARKER, marker_offset)
+            if marker_offset < 0:
+                break
+            payload_offset = marker_offset + len(_TMUX_FAILURE_CASE_MARKER)
+            try:
+                item, consumed = decoder.raw_decode(text[payload_offset:])
+            except json.JSONDecodeError:
+                marker_offset = payload_offset
+                continue
+            marker_offset = payload_offset + consumed
+            if not isinstance(item, dict):
+                continue
+            test_name = str(item.get("test") or "")
+            exit_code = item.get("exit_code")
+            fingerprint = str(item.get("diagnostic_fingerprint") or "")
+            if (
+                re.fullmatch(r"[A-Za-z0-9_.+/-]+", test_name)
+                and isinstance(exit_code, int)
+                and fingerprint
+            ):
+                marked.add((test_name, exit_code, fingerprint[:600]))
+        matches = list(_TMUX_FAILURE_HEADER.finditer(text))
+        for index, match in enumerate(matches):
+            block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            exit_code = int(match.group(2))
+            legacy.add(
+                (
+                    match.group(1),
+                    exit_code,
+                    _normalized_test_failure_fingerprint(
+                        exit_code, text[match.end() : block_end]
+                    )[:600],
+                )
+            )
+    selected = marked or legacy
+    by_case: dict[tuple[str, int], str] = {}
+    for test_name, exit_code, fingerprint in selected:
+        key = (test_name, exit_code)
+        if len(fingerprint) > len(by_case.get(key, "")):
+            by_case[key] = fingerprint
+    return [
+        {
+            "test": test_name,
+            "exit_code": exit_code,
+            "diagnostic_fingerprint": fingerprint,
+        }
+        for (test_name, exit_code), fingerprint in sorted(by_case.items())
+    ]
+
+
+def _failed_test_diagnostic_signature(payload: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        f'{item["test"]}|{item["exit_code"]}|{item["diagnostic_fingerprint"]}'
+        for item in _failed_test_diagnostics(payload)
+    )
+
+
 def _structured_failure_category(payload: dict[str, Any]) -> str:
     """Prefer structured build/test evidence over smell-only repair advice."""
     failed_steps = _failed_build_test_steps(payload)
@@ -964,6 +1162,7 @@ def _compact_verify_attempt(
 ) -> dict[str, Any]:
     status = _compute_status(0, verify_returncode, payload)
     failed_build_test_steps = [name for name, _ in _failed_build_test_steps(payload)]
+    failed_test_diagnostics = _failed_test_diagnostics(payload)
     return {
         "verify_source": verify_source,
         "verify_returncode": verify_returncode,
@@ -976,6 +1175,14 @@ def _compact_verify_attempt(
         "progress": bool(payload.get("progress")) or status == "PASS",
         "failure_category": _failure_category_from_verify_payload(payload),
         "failed_build_test_steps": failed_build_test_steps,
+        "failed_test_cases": sorted(
+            {item["test"] for item in failed_test_diagnostics}
+        ),
+        "failed_test_diagnostics": failed_test_diagnostics,
+        "failed_test_signature": list(
+            f'{item["test"]}|{item["exit_code"]}|{item["diagnostic_fingerprint"]}'
+            for item in failed_test_diagnostics
+        ),
         "diff_sha256": _verify_diff_sha256(payload),
         "native_diagnostics": _native_failure_diagnostics(payload),
     }
@@ -1030,16 +1237,45 @@ def _reconcile_final_verify_status(
         and final_diff_sha256
         and str(last_agent.get("diff_sha256") or "") == final_diff_sha256
     )
+    final_failed_test_signature = _failed_test_diagnostic_signature(verify_payload)
+    same_diff_test_failure_signatures: set[tuple[str, ...]] = set()
+    if (
+        raw_status == "TEST_FAILED"
+        and final_failed_test_signature
+        and _failure_category_from_verify_payload(verify_payload).startswith("TEST_")
+    ):
+        same_diff_test_failure_signatures.add(final_failed_test_signature)
+        for attempt in agent_attempts:
+            if not isinstance(attempt, dict):
+                continue
+            signature = tuple(
+                str(item) for item in (attempt.get("failed_test_signature") or [])
+            )
+            if (
+                attempt.get("verify_source") == "agent"
+                and attempt.get("reported_status") == "TEST_FAILED"
+                and str(attempt.get("failure_category") or "").startswith("TEST_")
+                and final_diff_sha256
+                and str(attempt.get("diff_sha256") or "") == final_diff_sha256
+                and signature
+            ):
+                same_diff_test_failure_signatures.add(signature)
+    same_diff_test_failure_drift = len(same_diff_test_failure_signatures) >= 2
     audit = {
         "raw_status": raw_status,
         "infra_category": infra_category,
         "last_agent_pass": last_agent_pass,
         "same_diff_as_last_agent_pass": same_diff,
         "last_agent_same_diff_test_failure": last_agent_same_diff_test_failure,
+        "same_diff_test_failure_drift": same_diff_test_failure_drift,
+        "same_diff_test_failure_signatures": [
+            list(signature) for signature in sorted(same_diff_test_failure_signatures)
+        ],
         "final_diff_sha256": final_diff_sha256,
         "last_agent_diff_sha256": agent_diff_sha256,
         "confirmation_required": bool(
-            (raw_status == "PASS" and last_agent_same_diff_test_failure)
+            same_diff_test_failure_drift
+            or (raw_status == "PASS" and last_agent_same_diff_test_failure)
             or (
                 raw_status in {"BUILD_FAILED", "TEST_FAILED", "VERIFY_FAILED"}
                 and infra_category
@@ -1047,6 +1283,8 @@ def _reconcile_final_verify_status(
             )
         ),
     }
+    if same_diff_test_failure_drift:
+        return "FLAKY_TEST_INCONCLUSIVE", audit
     if raw_status == "PASS" and last_agent_same_diff_test_failure:
         return "FLAKY_TEST_INCONCLUSIVE", audit
     if raw_status in {"BUILD_FAILED", "TEST_FAILED", "VERIFY_FAILED"} and infra_category and same_diff:
@@ -1054,13 +1292,126 @@ def _reconcile_final_verify_status(
     return raw_status, audit
 
 
-def _compute_status(opencode_returncode: int, verify_returncode: int, verify_payload: dict[str, Any]) -> str:
-    """Return the one authoritative status produced by the final bridge verify.
+def _normalize_reconciled_final_failure(
+    status: str,
+    verify_payload: dict[str, Any],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Render a runner reconciliation as one canonical non-passing decision."""
+    raw_pack = (
+        verify_payload.get("failure_pack")
+        if isinstance(verify_payload.get("failure_pack"), dict)
+        else {}
+    )
+    raw_artifacts = (
+        verify_payload.get("artifacts")
+        if isinstance(verify_payload.get("artifacts"), dict)
+        else {}
+    )
+    raw_artifact_paths = (
+        raw_pack.get("artifact_paths")
+        if isinstance(raw_pack.get("artifact_paths"), dict)
+        else {
+            key: value
+            for key, value in raw_artifacts.items()
+            if isinstance(value, str) and value
+        }
+    )
+    raw_repair_contract = (
+        raw_pack.get("repair_contract")
+        if isinstance(raw_pack.get("repair_contract"), dict)
+        else {}
+    )
+    failure_category = (
+        "FLAKY_TEST_INCONCLUSIVE"
+        if status == "FLAKY_TEST_INCONCLUSIVE"
+        else str(audit.get("infra_category") or "FINAL_VERIFY_INFRA_FAILED")
+    )
+    failure_pack = {
+        **raw_pack,
+        "failure_category": failure_category,
+        "failure_group": "",
+        "retryable": False,
+        "verify_status": status,
+        "artifact_paths": raw_artifact_paths,
+        "highlights": list(raw_pack.get("highlights") or []),
+        "next_action": "",
+        "recommendations": [],
+        "repair_contract": {
+            "repair_agent_may_edit": False,
+            "prefer_narrow_fix": False,
+            "must_rerun_smell_verify": False,
+            "tests_may_change": raw_repair_contract.get("tests_may_change") is True,
+        },
+    }
+    payload = {
+        **verify_payload,
+        "schema_version": "smell.verify.decision/v1",
+        "success": False,
+        "accepted": False,
+        "progress": False,
+        "status": status,
+        "resolution": "unresolved",
+        "continue_hint": "",
+        "failure_pack": failure_pack,
+        "termination_reason": status,
+        "reconciliation": {
+            "raw_status": str(
+                audit.get("raw_status") or verify_payload.get("status") or ""
+            ),
+            "raw_success": verify_payload.get("success") is True,
+            "raw_accepted": verify_payload.get("accepted") is True,
+            "raw_progress": verify_payload.get("progress") is True,
+            "raw_resolution": str(verify_payload.get("resolution") or ""),
+            "final_status": status,
+            "failure_category": failure_category,
+            "confirmation_required": audit.get("confirmation_required") is True,
+            "same_diff_as_last_agent_pass": audit.get(
+                "same_diff_as_last_agent_pass"
+            )
+            is True,
+            "last_agent_same_diff_test_failure": audit.get(
+                "last_agent_same_diff_test_failure"
+            )
+            is True,
+            "same_diff_test_failure_drift": audit.get(
+                "same_diff_test_failure_drift"
+            )
+            is True,
+        },
+    }
+    for key, default in (
+        ("smell_guard", None),
+        ("build_test_guard", None),
+        ("test_changes", None),
+        ("snapshot", None),
+        ("checkpoint", None),
+        ("artifacts", {}),
+        ("artifact_index", {}),
+    ):
+        payload.setdefault(key, default)
+    checkpoint = payload.get("checkpoint")
+    if isinstance(checkpoint, dict):
+        payload["checkpoint"] = {
+            **checkpoint,
+            "accepted": False,
+            "resolution": "unresolved",
+            "verify_status": status,
+        }
+    payload.pop("failure_fingerprint", None)
+    return payload
 
-    The model process return code remains execution metadata. In particular, a
-    model timeout must not create a second PASS status when the final verifier
-    can independently accept the worktree.
+
+def _compute_status(opencode_returncode: int, verify_returncode: int, verify_payload: dict[str, Any]) -> str:
+    """Return one authoritative terminal status for model and verification.
+
+    A nonzero model process is an abnormal sample termination and takes
+    precedence over the independent final verification. The latter remains
+    diagnostic evidence but cannot turn an abnormal execution into PASS.
     """
+    execution_failure = _opencode_failure_status(opencode_returncode)
+    if execution_failure:
+        return execution_failure
     verify_status = str(verify_payload.get("status") or "") if isinstance(verify_payload, dict) else ""
     if verify_status == "PASS":
         if (
@@ -1074,8 +1425,18 @@ def _compute_status(opencode_returncode: int, verify_returncode: int, verify_pay
     return verify_status or "VERIFY_FAILED"
 
 
-OPENCODE_SHUTDOWN_GRACE_SECONDS = 60
 OPENCODE_FATAL_PROVIDER_RETURN_CODE = 86
+SAMPLE_DEADLINE_EPOCH_MS_ENV = "SMELL_SAMPLE_DEADLINE_EPOCH_MS"
+
+
+def _opencode_failure_status(returncode: int) -> str:
+    if returncode == 0:
+        return ""
+    if returncode == 124:
+        return "OPENCODE_TIMEOUT"
+    if returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE:
+        return "PROVIDER_QUOTA_FAILED"
+    return "OPENCODE_FAILED"
 
 
 def _fatal_provider_error(log_text: str) -> str:
@@ -1094,8 +1455,13 @@ def _fatal_provider_error(log_text: str) -> str:
 
 
 def _opencode_timeout_seconds(sample_deadline: int) -> int:
-    """Derive the runner hard stop from the one public sample budget."""
-    return sample_deadline + OPENCODE_SHUTDOWN_GRACE_SECONDS
+    """Keep the runner hard stop equal to the one public sample budget."""
+    return sample_deadline
+
+
+def _deadline_epoch_ms(remaining_seconds: float) -> str:
+    """Translate the runner's monotonic remainder for owned child processes."""
+    return str(int((time.time() + max(0.0, remaining_seconds)) * 1000))
 
 
 def _is_accepted_status(status: object) -> bool:
@@ -1278,6 +1644,8 @@ def _persist_verify_payload(
 
 def _baseline_failure_status(returncode: int, payload: dict[str, Any]) -> str:
     """Return the precise setup status for a failed explicit c000 capture."""
+    if returncode == 124 or payload.get("status") == "OPENCODE_TIMEOUT":
+        return "OPENCODE_TIMEOUT"
     if (
         returncode == 0
         and payload.get("success") is True
@@ -1306,6 +1674,7 @@ def _run_capture_baseline(
     sample_dir: Path,
     args: argparse.Namespace,
     verification_mode: str,
+    deadline_monotonic: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Freeze the Java product finding before the model can edit the checkout."""
     cmd = [
@@ -1344,26 +1713,145 @@ def _run_capture_baseline(
 
     env = os.environ.copy()
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
-    proc = _run(cmd, ROOT, env=env, timeout=args.sample_deadline)
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        payload = {
-            "success": False,
-            "error": "BASELINE_OUTPUT_PARSE_FAILED",
-            "stdout": proc.stdout,
-        }
+    remaining = (
+        float(args.sample_deadline)
+        if deadline_monotonic is None
+        else deadline_monotonic - time.monotonic()
+    )
+    if remaining <= 0:
+        returncode = 124
+        stderr = ""
+        payload = _sample_deadline_payload(args.sample_deadline, stage="baseline")
+    else:
+        env[SAMPLE_DEADLINE_EPOCH_MS_ENV] = _deadline_epoch_ms(remaining)
+        try:
+            proc = _run(cmd, ROOT, env=env, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            returncode = 124
+            stderr = ""
+            payload = _sample_deadline_payload(args.sample_deadline, stage="baseline")
+        else:
+            returncode = proc.returncode
+            stderr = proc.stderr
+            try:
+                payload = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                payload = {
+                    "success": False,
+                    "error": "BASELINE_OUTPUT_PARSE_FAILED",
+                    "stdout": proc.stdout,
+                }
     artifact = {
-        "returncode": proc.returncode,
+        "returncode": returncode,
         "command": cmd,
         "payload": payload,
-        "stderr": proc.stderr,
+        "stderr": stderr,
     }
     (sample_dir / "baseline-capture.json").write_text(
         json.dumps(artifact, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
-    return proc.returncode, payload
+    return returncode, payload
+
+
+def _sample_deadline_payload(
+    sample_deadline: int,
+    *,
+    stage: str = "runner_final",
+) -> dict[str, Any]:
+    return {
+        "schema_version": "smell.verify.decision/v1",
+        "success": False,
+        "accepted": False,
+        "progress": False,
+        "status": "OPENCODE_TIMEOUT",
+        "resolution": "unresolved",
+        "project_full_executed": False,
+        "termination_reason": "SAMPLE_DEADLINE_REACHED",
+        "failure_pack": {
+            "verify_status": "OPENCODE_TIMEOUT",
+            "failure_category": "OPENCODE_TIMEOUT",
+            "failure_group": "",
+            "retryable": False,
+            "next_action": "",
+        },
+        "timeout": {
+            "scope": "sample",
+            "stage": stage,
+            "sample_deadline_seconds": sample_deadline,
+        },
+    }
+
+
+def _normalize_sample_timeout(
+    opencode_returncode: int,
+    verify_returncode: int,
+    verify_payload: dict[str, Any],
+    sample_deadline: int,
+) -> tuple[int, dict[str, Any]]:
+    """Prevent a timed-out model turn from becoming an accepted final PASS."""
+    if opencode_returncode != 124:
+        return verify_returncode, verify_payload
+    if (
+        verify_payload.get("status") == "OPENCODE_TIMEOUT"
+        and verify_payload.get("schema_version") == "smell.verify.decision/v1"
+    ):
+        return 124, verify_payload
+    payload = _sample_deadline_payload(sample_deadline, stage="model")
+    observed_status = str(verify_payload.get("status") or "")
+    if observed_status:
+        payload["timeout"]["final_verify_observation"] = {
+            "status": observed_status,
+            "returncode": verify_returncode,
+            "success": verify_payload.get("success") is True,
+            "accepted": verify_payload.get("accepted") is True,
+            "resolution": str(verify_payload.get("resolution") or ""),
+            "decision": verify_payload,
+        }
+        payload["project_full_executed"] = (
+            verify_payload.get("project_full_executed") is True
+        )
+    return 124, payload
+
+
+def _normalize_opencode_failure(
+    opencode_returncode: int,
+    verify_returncode: int,
+    verify_payload: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    status = _opencode_failure_status(opencode_returncode)
+    if not status or status == "OPENCODE_TIMEOUT":
+        return verify_returncode, verify_payload
+    payload = {
+        "schema_version": "smell.verify.decision/v1",
+        "success": False,
+        "accepted": False,
+        "progress": False,
+        "status": status,
+        "resolution": "unresolved",
+        "project_full_executed": verify_payload.get("project_full_executed") is True,
+        "termination_reason": status,
+        "failure_pack": {
+            "verify_status": status,
+            "failure_category": status,
+            "failure_group": "",
+            "retryable": False,
+            "next_action": "",
+        },
+        "execution_failure": {
+            "stage": "model",
+            "opencode_returncode": opencode_returncode,
+            "final_verify_observation": {
+                "status": str(verify_payload.get("status") or ""),
+                "returncode": verify_returncode,
+                "success": verify_payload.get("success") is True,
+                "accepted": verify_payload.get("accepted") is True,
+                "resolution": str(verify_payload.get("resolution") or ""),
+                "decision": verify_payload,
+            },
+        },
+    }
+    return verify_returncode, payload
 
 
 def _run_verify(
@@ -1373,6 +1861,7 @@ def _run_verify(
     verification_mode: str,
     attempt_suffix: str = "",
     baseline_seal: str = "",
+    deadline_monotonic: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     cmd = [
         sys.executable,
@@ -1413,7 +1902,22 @@ def _run_verify(
     env = os.environ.copy()
     env["SMELL_REQUIRE_BUILD_TEST"] = "1"
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
-    proc = _run(cmd, ROOT, env=env, timeout=args.sample_deadline)
+    remaining = (
+        float(args.sample_deadline)
+        if deadline_monotonic is None
+        else deadline_monotonic - time.monotonic()
+    )
+    if remaining <= 0:
+        payload = _sample_deadline_payload(args.sample_deadline)
+        _persist_verify_payload(sample_dir, payload, attempt_suffix)
+        return 124, payload
+    env[SAMPLE_DEADLINE_EPOCH_MS_ENV] = _deadline_epoch_ms(remaining)
+    try:
+        proc = _run(cmd, ROOT, env=env, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        payload = _sample_deadline_payload(args.sample_deadline)
+        _persist_verify_payload(sample_dir, payload, attempt_suffix)
+        return 124, payload
     payload: dict[str, Any]
     try:
         payload = json.loads(proc.stdout)
@@ -1461,6 +1965,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     tools_after_last_verify = 0
     last_payload: dict[str, Any] | None = None
     last_decision = ""
+    last_termination_reason = ""
     last_status = ""
     last_cap_recovery_used = False
     last_command_loop_state: dict[str, Any] | None = None
@@ -1512,6 +2017,9 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             meta_loop = metadata.get("loop")
             if isinstance(meta_loop, dict):
                 last_decision = str(meta_loop.get("decision") or "")
+                last_termination_reason = str(
+                    meta_loop.get("termination_reason") or ""
+                )
                 last_cap_recovery_used = meta_loop.get("cap_recovery_used") is True
             command_loop_state = metadata.get("command_loop_state")
             if isinstance(command_loop_state, dict):
@@ -1543,6 +2051,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     loop = last_payload.get("loop") if isinstance(last_payload, dict) else None
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
+        last_termination_reason = str(loop.get("termination_reason") or "")
         last_cap_recovery_used = loop.get("cap_recovery_used") is True
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
@@ -1563,6 +2072,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "verification_history_count": len(verification_history),
         "tools_after_last_verify": tools_after_last_verify,
         "last_loop_decision": last_decision,
+        "last_loop_termination_reason": last_termination_reason,
         "last_status": last_status,
         "last_guard_progress_required": last_guard_progress_required,
         "last_failure_category": _failure_category_from_verify_payload(last_payload or {}),
@@ -1645,8 +2155,11 @@ def _runner_closure_action(
         return "stop" if reminder_used else "verify_required"
     # Cheap Guard progress is a controller-owned editing phase, not a formal
     # verification failure. Resume the same OpenCode session without spending
-    # the plugin continuation budget; the sample deadline remains the bound.
+    # the plugin continuation budget, unless the command-owned no-progress or
+    # deadline decision has already stopped that editing phase.
     if trace.get("last_guard_progress_required") is True:
+        if trace.get("last_loop_decision") == "stop":
+            return "stop"
         return "guard_progress"
     # The plugin owns all semantic continuation policy across UI and batch.
     # This is only a transport safety bound. The extra transport is available
@@ -1836,6 +2349,10 @@ def _run_opencode(
     if args.projects:
         env["SMELL_PROJECTS"] = args.projects
     env["SMELL_REQUIRE_BUILD_TEST"] = "1"
+    turn_timeout_seconds = float(
+        hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
+    )
+    env[SAMPLE_DEADLINE_EPOCH_MS_ENV] = _deadline_epoch_ms(turn_timeout_seconds)
 
     # --format json: raw JSON events on stdout (for session-id parsing).
     # --print-logs: human-readable logs on stderr (written to run.log).
@@ -1853,10 +2370,10 @@ def _run_opencode(
         "loop_policy": parse_command_policy(command_arguments).loop.to_dict(),
         "time_budget": {
             "source": "sample-deadline",
+            "scope": "baseline-model-continuations-and-runner-final",
             "sample_deadline_seconds": args.sample_deadline,
-            "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline),
-            "final_verify_timeout_seconds": args.sample_deadline,
+            "final_verify_budget": "remaining-sample-budget",
             "final_verify_mode": "runner_final",
             "idle_watchdog_enabled": False,
         },
@@ -1904,9 +2421,7 @@ def _run_opencode(
 
         reader = threading.Thread(target=_drain_stdout, daemon=True)
         reader.start()
-        deadline = time.monotonic() + (
-            hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
-        )
+        deadline = time.monotonic() + turn_timeout_seconds
         timeout_code = 0
         log_scan_offset = 0
         log_scan_tail = ""
@@ -1921,8 +2436,7 @@ def _run_opencode(
             provider_failure = _fatal_provider_error(log_scan_tail + log_chunk)
             log_scan_tail = (log_scan_tail + log_chunk)[-256:]
             if provider_failure:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
+                _terminate_process_tree(proc)
                 timeout_code = OPENCODE_FATAL_PROVIDER_RETURN_CODE
                 provider_failure_path = _attempt_artifact_path(
                     sample_dir, "provider.failure.json", attempt_suffix
@@ -1942,8 +2456,7 @@ def _run_opencode(
                 )
                 break
             if time.monotonic() > deadline:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
+                _terminate_process_tree(proc)
                 timeout_code = 124
                 break
             time.sleep(1)
@@ -2201,6 +2714,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         json.dumps({**sample.raw, "execution_project_root": str(execution_sample.project_root)}, indent=2, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
+    sample_deadline_started_at_ms = int(time.time() * 1000)
+    sample_deadline_monotonic = time.monotonic() + _opencode_timeout_seconds(
+        args.sample_deadline
+    )
 
     baseline_capture: dict[str, Any] | None = None
     baseline_seal = ""
@@ -2210,11 +2727,79 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             sample_dir,
             args,
             verification_mode,
+            deadline_monotonic=sample_deadline_monotonic,
         )
         baseline_status = _baseline_failure_status(
             baseline_returncode,
             baseline_capture,
         )
+        if baseline_status == "OPENCODE_TIMEOUT":
+            timeout_payload = (
+                baseline_capture
+                if baseline_capture.get("schema_version") == "smell.verify.decision/v1"
+                else _sample_deadline_payload(args.sample_deadline, stage="baseline")
+            )
+            _persist_verify_payload(sample_dir, timeout_payload)
+            timeout_attempt = {
+                **_compact_verify_attempt(
+                    timeout_payload,
+                    verify_source="runner_deadline",
+                    verify_returncode=124,
+                ),
+                "attempt": 0,
+                "controller_attempt": 0,
+                "opencode_returncode": 124,
+                "status": "OPENCODE_TIMEOUT",
+                "reported_status": "OPENCODE_TIMEOUT",
+                "accepted": False,
+                "resolution": "unresolved",
+                "session_id": "",
+                "is_continuation": False,
+                "opencode_timed_out": True,
+                "opencode_failure_category": "OPENCODE_TIMEOUT",
+            }
+            row = {
+                "sample_id": sample.sample_id,
+                "smell": sample.smell,
+                "project_name": sample.project_name,
+                "project_root": str(sample.project_root),
+                "execution_project_root": str(execution_sample.project_root),
+                "location": execution_sample.location,
+                "verification_mode": verification_mode,
+                "allow_test_changes": bool(getattr(args, "allow_test_changes", False)),
+                "refactoring_backend": getattr(args, "refactoring_backend", "direct"),
+                "agent": agent,
+                "status": "OPENCODE_TIMEOUT",
+                "failure_category": "OPENCODE_TIMEOUT",
+                "resolution": "unresolved",
+                "accepted": False,
+                "progress": False,
+                "termination_reason": "SAMPLE_DEADLINE_REACHED",
+                "opencode_returncode": 124,
+                "opencode_timed_out": True,
+                "opencode_failure_category": "OPENCODE_TIMEOUT",
+                "verify_returncode": 124,
+                "duration_seconds": f"{time.time() - started:.1f}",
+                "sample_dir": str(sample_dir),
+                "note": "sample_deadline_reached_during_baseline_capture",
+            }
+            (sample_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        **row,
+                        "attempts": [timeout_attempt],
+                        "controller_attempts": [],
+                        "revision_audit": revision_audit,
+                        "dataset_audit": dataset_audit,
+                        "baseline_capture": baseline_capture,
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return row
         if baseline_status:
             baseline_error = str(
                 baseline_capture.get("error")
@@ -2325,7 +2910,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     # plugin promptAsync cannot reliably create another turn. Keep the policy in
     # one OpenCode session, but synchronously resume that session from the runner
     # when the completed event stream proves verification closure is missing.
-    model_deadline = time.monotonic() + _opencode_timeout_seconds(args.sample_deadline)
     controller_attempts: list[dict[str, Any]] = []
     agent_verification_history: list[dict[str, Any]] = []
     seen_agent_verification_ids: set[str] = set()
@@ -2335,14 +2919,16 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         execution_sample,
         args,
         verification_mode,
+        started_at_ms=sample_deadline_started_at_ms,
     )
     continuations_dispatched = 0
     reminders_dispatched = 0
     reminder_used = False
     attempt_index = 0
     opencode_returncode = 0
+    last_trace: dict[str, Any] = _verification_trace("")
     while True:
-        remaining = int(model_deadline - time.monotonic())
+        remaining = int(sample_deadline_monotonic - time.monotonic())
         if remaining <= 0:
             opencode_returncode = 124
             break
@@ -2367,6 +2953,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             trace = _verification_trace(events_path.read_text(encoding="utf-8"))
         except OSError:
             trace = _verification_trace("")
+        last_trace = trace
         trace_history = trace.get("verification_history")
         if isinstance(trace_history, list):
             for record in trace_history:
@@ -2421,8 +3008,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             continuations_dispatched += 1
             reminder_used = False
         else:
-            # guard_progress is an editing-phase transport resume. It neither
-            # mutates nor consumes CommandLoopState continuation counters.
+            # guard_progress is an editing-phase transport resume. The plugin
+            # tracks its no-progress fingerprint, but it does not consume the
+            # formal verification continuation counter.
             reminder_used = False
         continuation_prompt = _runner_continuation_prompt(
             action,
@@ -2454,7 +3042,36 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         args,
         verification_mode,
         baseline_seal=baseline_seal,
+        deadline_monotonic=sample_deadline_monotonic,
     )
+    if (
+        last_trace.get("last_guard_progress_required") is True
+        and last_trace.get("last_loop_termination_reason")
+    ):
+        verify_payload["termination_reason"] = str(
+            last_trace["last_loop_termination_reason"]
+        )
+        _persist_verify_payload(sample_dir, verify_payload)
+    if (
+        opencode_returncode == 0
+        and verify_returncode == 124
+        and verify_payload.get("status") == "OPENCODE_TIMEOUT"
+    ):
+        opencode_returncode = 124
+    original_verify_payload = verify_payload
+    verify_returncode, verify_payload = _normalize_sample_timeout(
+        opencode_returncode,
+        verify_returncode,
+        verify_payload,
+        args.sample_deadline,
+    )
+    verify_returncode, verify_payload = _normalize_opencode_failure(
+        opencode_returncode,
+        verify_returncode,
+        verify_payload,
+    )
+    if verify_payload is not original_verify_payload:
+        _persist_verify_payload(sample_dir, verify_payload)
     if getattr(args, "refactoring_backend", "direct") == "idea":
         _close_idea_project(execution_sample.project_root, sample_dir)
     final_verify_source = "runner_final"
@@ -2473,7 +3090,11 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         if getattr(args, "refactoring_backend", "direct") == "idea"
         else None
     )
-    if idea_protocol is not None and idea_protocol["success"] is not True:
+    if (
+        not opencode_failure_category
+        and idea_protocol is not None
+        and idea_protocol["success"] is not True
+    ):
         final_status = "IDEA_PROTOCOL_FAILED"
     final_verify_raw_status = final_status
     final_status, final_verify_audit = _reconcile_final_verify_status(
@@ -2481,16 +3102,23 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         verify_payload,
         agent_verification_history,
     )
-    resolution = str(verify_payload.get("resolution") or "")
+    raw_reconciled_verify_payload: dict[str, Any] | None = None
     if final_status in {"FINAL_VERIFY_INFRA_FAILED", "FLAKY_TEST_INCONCLUSIVE"}:
-        resolution = "unresolved"
+        raw_reconciled_verify_payload = verify_payload
+        verify_payload = _normalize_reconciled_final_failure(
+            final_status,
+            raw_reconciled_verify_payload,
+            final_verify_audit,
+        )
+        _persist_verify_payload(sample_dir, verify_payload)
+    resolution = str(verify_payload.get("resolution") or "")
     accepted = _is_accepted_status(final_status)
     progress = bool(verify_payload.get("progress")) or accepted
     loop_payload = verify_payload.get("loop")
     termination_reason = (
         str(loop_payload.get("termination_reason") or "")
         if isinstance(loop_payload, dict)
-        else ""
+        else str(verify_payload.get("termination_reason") or "")
     )
     last = {
         **_compact_verify_attempt(
@@ -2521,6 +3149,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "raw_status": final_verify_raw_status,
         "final_verify_audit": final_verify_audit,
     }
+    if raw_reconciled_verify_payload is not None:
+        last["raw_verify_payload"] = raw_reconciled_verify_payload
+        last["raw_reported_status"] = final_verify_raw_status
     attempts = _verification_attempt_history(agent_verification_history, last)
     note = (
         f"loop_policy={args.loop_mode}:{args.loop_max};"
@@ -2609,8 +3240,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-deadline",
         type=int,
         default=1800,
-        help="Single per-phase time budget for the command loop and the required final bridge verify; "
-        "the runner adds only a 60-second OpenCode shutdown grace.",
+        help="Single shared time budget for baseline capture, model turns, continuations, and final verification.",
     )
     parser.add_argument(
         "--verification-mode",
@@ -2690,10 +3320,10 @@ def main(argv: list[str] | None = None) -> int:
         ).loop.to_dict(),
         "time_budget": {
             "source": "sample-deadline",
+            "scope": "baseline-model-continuations-and-runner-final",
             "sample_deadline_seconds": args.sample_deadline,
-            "opencode_shutdown_grace_seconds": OPENCODE_SHUTDOWN_GRACE_SECONDS,
             "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
-            "final_verify_timeout_seconds": args.sample_deadline,
+            "final_verify_budget": "remaining-sample-budget",
             "final_verify_mode": "runner_final",
             "idle_watchdog_enabled": False,
         },

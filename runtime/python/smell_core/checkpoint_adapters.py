@@ -4,9 +4,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .analysis import (
     clone_normalized_tokens,
@@ -592,6 +593,159 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
         return profile
     profile["implementation"] = _java_guard_implementation_profile(smell)
     return profile
+
+
+def evaluate_changed_scope_long_parameter_regression(
+    *,
+    language: str,
+    detector_profile: Mapping[str, Any],
+    baseline_sources: Mapping[str, str],
+    current_sources: Mapping[str, str],
+) -> dict[str, Any]:
+    """Compare LPL findings in an already-frozen changed-production scope.
+
+    The caller owns file selection.  This adapter deliberately performs no
+    project discovery: it applies the existing Long Parameter List parser and
+    threshold to the baseline/current text for those files, then reports only
+    current findings not consumed by the same declaration slot or move lineage.
+    """
+
+    threshold = int(detector_profile.get("finding_min") or 0)
+    baseline_findings = _changed_scope_lpl_findings(
+        language=language,
+        threshold=threshold,
+        sources=baseline_sources,
+    )
+    current_findings = _changed_scope_lpl_findings(
+        language=language,
+        threshold=threshold,
+        sources=current_sources,
+    )
+    remaining_baseline, remaining_current = _consume_changed_scope_lpl_matches(
+        baseline_findings,
+        current_findings,
+        identity=_changed_scope_lpl_identity,
+    )
+    _, additions = _consume_changed_scope_lpl_matches(
+        remaining_baseline,
+        remaining_current,
+        identity=_changed_scope_lpl_lineage_identity,
+    )
+    violations = [
+        {
+            "code": "CROSS_SMELL_LONG_PARAMETER_LIST_INTRODUCED",
+            "file": item["file"],
+            "owner": item["owner"],
+            "name": item["name"],
+            "line": item["line"],
+            "parameter_count": item["parameter_count"],
+            "parameter_fingerprints": item["parameter_fingerprints"],
+            "finding_min": threshold,
+        }
+        for item in additions
+    ]
+    return {
+        "contract": "changed-production-long-parameter-list-regression/v1",
+        "detector_profile": dict(detector_profile),
+        "changed_files": sorted(current_sources),
+        "baseline_finding_count": len(baseline_findings),
+        "current_finding_count": len(current_findings),
+        "new_findings": additions,
+        "violations": violations,
+        "ok": not violations,
+    }
+
+
+def _changed_scope_lpl_findings(
+    *,
+    language: str,
+    threshold: int,
+    sources: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for relative_path in sorted(sources):
+        signatures = function_signatures_in_text(
+            sources[relative_path],
+            language,
+            file_path=Path(relative_path),
+        )
+        for signature in signatures:
+            parameter_count = count_parameters(signature.signature_text, language)
+            if parameter_count < threshold:
+                continue
+            findings.append(
+                {
+                    "file": relative_path,
+                    "owner": signature.owner_qualified_name,
+                    "name": signature.name,
+                    "line": signature.start_line,
+                    "parameter_count": parameter_count,
+                    "parameter_fingerprints": list(
+                        signature.parameter_fingerprints
+                    ),
+                }
+            )
+    return findings
+
+
+def _changed_scope_lpl_parameter_fingerprints(
+    finding: Mapping[str, Any],
+) -> tuple[str, ...]:
+    return tuple(
+        str(item) for item in list(finding.get("parameter_fingerprints") or [])
+    )
+
+
+def _changed_scope_lpl_identity(
+    finding: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    return (
+        str(finding.get("file") or ""),
+        str(finding.get("owner") or ""),
+        str(finding.get("name") or ""),
+    )
+
+
+def _changed_scope_lpl_parameter_types(
+    finding: Mapping[str, Any],
+) -> tuple[str, ...]:
+    parameter_types: list[str] = []
+    for fingerprint in _changed_scope_lpl_parameter_fingerprints(finding):
+        parameter_type, separator, _ = fingerprint.rpartition(":")
+        parameter_types.append(parameter_type if separator else fingerprint)
+    return tuple(parameter_types)
+
+
+def _changed_scope_lpl_lineage_identity(
+    finding: Mapping[str, Any],
+) -> tuple[str, ...]:
+    return _changed_scope_lpl_parameter_types(finding)
+
+
+def _consume_changed_scope_lpl_matches(
+    baseline: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    *,
+    identity: Callable[[Mapping[str, Any]], object],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    available = Counter(identity(item) for item in baseline)
+    matched = Counter()
+    remaining_current: list[dict[str, Any]] = []
+    for finding in current:
+        key = identity(finding)
+        if available[key] > 0:
+            available[key] -= 1
+            matched[key] += 1
+        else:
+            remaining_current.append(finding)
+    remaining_baseline: list[dict[str, Any]] = []
+    for finding in baseline:
+        key = identity(finding)
+        if matched[key] > 0:
+            matched[key] -= 1
+        else:
+            remaining_baseline.append(finding)
+    return remaining_baseline, remaining_current
 
 
 def _java_guard_implementation_profile(smell: str) -> dict[str, Any]:

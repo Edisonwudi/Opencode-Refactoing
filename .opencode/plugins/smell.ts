@@ -2709,6 +2709,60 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
   normalized.metadata.loop = toJsonSafe(loop)
 }
 
+function applyGuardProgressDecision(
+  normalized: { output: string; metadata: Record<string, unknown> },
+  state: CommandLoopState,
+) {
+  let payload: Record<string, unknown>
+  try {
+    payload = JSON.parse(normalized.output) as Record<string, unknown>
+  } catch {
+    return
+  }
+  const identity = Object.fromEntries(
+    Object.entries(state.policy.identity).sort(([left], [right]) => left.localeCompare(right)),
+  )
+  const fingerprint = "guard-progress:" + createHash("sha256")
+    .update(JSON.stringify({ identity, metric_budget: toJsonSafe(payload.metric_budget) }))
+    .digest("hex")
+  if (state.lastFailureFingerprint && state.lastFailureFingerprint === fingerprint) {
+    state.noProgressCount += 1
+  } else {
+    state.noProgressCount = 0
+  }
+  state.lastFailureFingerprint = fingerprint
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000))
+  let decision: "continue" | "stop" = "continue"
+  let terminationReason = ""
+  if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
+    decision = "stop"
+    terminationReason = "GUARD_PROGRESS_SAMPLE_DEADLINE"
+  } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
+    decision = "stop"
+    terminationReason = "GUARD_PROGRESS_NO_PROGRESS"
+  }
+  const loop = {
+    decision,
+    termination_reason: terminationReason,
+    continuation: state.continuationCount,
+    max_continuations: state.policy.loop.max_continuations,
+    cap_recovery_used: state.capRecoveryUsed,
+    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
+    no_progress_count: state.noProgressCount,
+    no_progress_limit: state.policy.loop.no_progress_limit,
+    elapsed_seconds: elapsedSeconds,
+    sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
+    failure_category: "GUARD_PROGRESS_REQUIRED",
+    failure_group: "smell",
+    instruction: decision === "continue" && typeof payload.next_action === "string"
+      ? payload.next_action
+      : "",
+  }
+  payload.loop = loop
+  normalized.output = safeJsonStringify(payload)
+  normalized.metadata.loop = toJsonSafe(loop)
+}
+
 export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const idleRuntime = createIdleContinueRuntime({ client, env: process.env })
   const refactoringBackend = String(process.env.SMELL_REFACTORING_BACKEND || "direct").trim().toLowerCase()
@@ -2832,9 +2886,17 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           if (!progressPassed) {
             const normalized = normalizeToolResult(name, progressResult)
             if (commandState) {
-              // This is a source-edit timing result, not a formal verification
-              // failure. Keep the controller state observable but do not call
-              // applyCommandLoopDecision or arm idle continuation.
+              const progressRequired = Boolean(
+                progressPayload?.schema_version === "smell.guard-progress/v1"
+                && progressPayload?.success === false
+                && progressPayload?.status === "GUARD_PROGRESS_REQUIRED"
+                && progressPayload?.applicable === true
+                && progressPayload?.checkpoint_required === true
+                && progressPayload?.source_guard_passed === false
+                && progressPayload?.ready_for_project_full === false
+                && progressPayload?.project_full_executed === false
+              )
+              if (progressRequired) applyGuardProgressDecision(normalized, commandState)
               normalized.metadata.command_loop_state = toJsonSafe(
                 commandLoopStateSnapshot(commandState),
               )

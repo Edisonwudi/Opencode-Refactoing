@@ -1,5 +1,16 @@
 schema_version: 1
 projects:
+  - root: /opt/projects/python/tornado
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        PYTHONPATH="." /opt/python-envs/tornado/bin/python -m pytest -q \
+          tornado/test/web_test.py tornado/test/iostream_test.py \
+          tornado/test/httpclient_test.py tornado/test/gen_test.py
+        /opt/python-envs/tornado/bin/python \
+          "/agent-src/scripts/verification_probes/tornado_http1_continue_ownership.py" \
+          "${project_root}"
   - root: /opt/projects/c/git
     shell_timeout: 1500
     build:
@@ -22,10 +33,15 @@ projects:
         cd "${project_root}"
         if [ -f Makefile ]; then make distclean; fi
         autoreconf -fvi -I m4
-        ./configure \
+        configure_log="$(mktemp)"
+        trap 'rm -f "${configure_log}"' EXIT
+        ./configure --enable-libdbi \
           --disable-docs --disable-python --disable-lua --disable-tcl \
-          --disable-ruby --disable-perl
+          --disable-ruby --disable-perl >"${configure_log}" 2>&1
+        cat "${configure_log}"
+        grep -Eq '^[[:space:]]*With libDBI: yes[[:space:]]*$' "${configure_log}"
         make -j"${SMELL_BUILD_JOBS:-1}"
+        test -s src/.libs/librrd_la-rrd_fetch_libdbi.o
     test:
       command: null
       script: |
@@ -61,6 +77,9 @@ projects:
       script: |
         cd "${project_root}"
         ./src/redis-server test all
+        python3 \
+          "/agent-src/scripts/verification_probes/redis_missing_geo_source_contract.py" \
+          "${project_root}"
   - root: /opt/projects/c/libssh2
     shell_timeout: 1500
     build:
@@ -123,6 +142,7 @@ projects:
         cd "${project_root}"
         python3 /agent-src/scripts/run_tmux_project_tests.py \
           --project-root "${project_root}" \
+          --timeout-per-test 180 \
           --exclude utf8-test.sh
   - root: /opt/projects/c/nginx
     shell_timeout: 1500

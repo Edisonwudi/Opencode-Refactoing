@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
 import shutil
 import subprocess
@@ -19,6 +21,10 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 from smell_core.config import load_project_overrides  # noqa: E402
 from smell_core.guards import _project_test_execution_evidence  # noqa: E402
 from run_nginx_project_tests import _select_tests  # noqa: E402
+from run_rrdtool_project_tests import (  # noqa: E402
+    _libdbi_build_contract,
+    _run_libdbi_attribute_probe,
+)
 
 
 ROOTS = {
@@ -31,6 +37,33 @@ ROOTS = {
     "libssh2": "/opt/projects/c/libssh2",
     "libuv": "/opt/projects/c/libuv",
 }
+
+LIBDBI_PROBE_FIXTURE = r"""
+static long rrd_fetch_dbi_long(dbi_result result, int idx) {
+  long value = DNAN;
+  unsigned int attr = dbi_result_get_field_attribs_idx(result, idx);
+  unsigned int type = dbi_result_get_field_type_idx(result, idx);
+  if (dbi_result_field_is_null_idx(result, idx)) { return DNAN; }
+  switch (type) {
+    case DBI_TYPE_INTEGER:
+      if        (attr & DBI_INTEGER_SIZE1) { value = dbi_result_get_char_idx(result, idx);
+      } else if (attr & DBI_INTEGER_SIZE2) { value = dbi_result_get_short_idx(result, idx);
+      } else if (attr & DBI_INTEGER_SIZE3) { value = dbi_result_get_int_idx(result, idx);
+      } else if (attr & DBI_INTEGER_SIZE4) { value = dbi_result_get_int_idx(result, idx);
+      } else if (attr & DBI_INTEGER_SIZE8) { value = dbi_result_get_longlong_idx(result, idx);
+      }
+      break;
+    case DBI_TYPE_DECIMAL:
+      if        (attr & DBI_DECIMAL_SIZE4) { value = floor(dbi_result_get_float_idx(result, idx));
+      } else if (attr & DBI_DECIMAL_SIZE8) { value = floor(dbi_result_get_double_idx(result, idx));
+      }
+      break;
+    default:
+      break;
+  }
+  return value;
+}
+""".strip()
 
 
 def _assert_no_weak_test(script: str) -> None:
@@ -105,7 +138,10 @@ def _assert_project_runners(temp: Path) -> None:
         encoding="utf-8",
     )
     for name in ("one.sh", "two.sh", "utf8-test.sh"):
-        (regress / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (regress / name).write_text(
+            "#!/bin/sh\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\"\nexit 0\n",
+            encoding="utf-8",
+        )
     completed = subprocess.run(
         [
             sys.executable,
@@ -130,6 +166,117 @@ def _assert_project_runners(temp: Path) -> None:
         "errors": "0",
         "skipped": "1",
     }, report_root.attrib
+    tmux_tmpdirs = {
+        (case.findtext("system-out") or "").strip()
+        for case in report_root.findall("testcase")
+        if case.attrib["name"] in {"one.sh", "two.sh"}
+    }
+    assert len(tmux_tmpdirs) == 2, tmux_tmpdirs
+    assert all(value.startswith("TMPDIR=") for value in tmux_tmpdirs), tmux_tmpdirs
+
+    timeout_tmux = temp / "tmux-timeout"
+    timeout_regress = timeout_tmux / "regress"
+    timeout_binary = timeout_tmux / "build-refactoragent" / "tmux"
+    timeout_regress.mkdir(parents=True)
+    timeout_binary.parent.mkdir(parents=True)
+    timeout_binary.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${2:-}\" = kill-server ] && [ -n \"${TMUX_CLEANUP_LOG:-}\" ]; then\n"
+        "  printf '%s\\n' \"${1:-}\" >> \"$TMUX_CLEANUP_LOG\"\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    timeout_binary.chmod(0o755)
+    (timeout_regress / "Makefile").write_text(
+        "TESTS!= echo *.sh\nall: ${TESTS}\n.SILENT:\n.SUFFIXES: .sh\n.sh:\n\tsh $*.sh\n",
+        encoding="utf-8",
+    )
+    (timeout_regress / "hang.sh").write_text(
+        "#!/bin/sh\nsleep 300 &\necho $! > child.pid\nwait\n",
+        encoding="utf-8",
+    )
+    (timeout_regress / "next.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cleanup_log = timeout_tmux / "cleanup.log"
+    timeout_env = {**os.environ, "TMUX_CLEANUP_LOG": str(cleanup_log)}
+    timed_out = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_tmux_project_tests.py"),
+            "--project-root",
+            str(timeout_tmux),
+            "--timeout-per-test",
+            "1",
+        ],
+        check=False,
+        env=timeout_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert timed_out.returncode == 1, timed_out.stdout
+    assert "FAIL hang.sh: exit 124" in timed_out.stdout, timed_out.stdout
+    assert "TMUX_FAIL_CASE " in timed_out.stdout, timed_out.stdout
+    assert '"test":"hang.sh"' in timed_out.stdout, timed_out.stdout
+    assert "TIMEOUT" in timed_out.stdout, timed_out.stdout
+    timeout_report = ET.parse(
+        timeout_tmux / ".smell-test-reports" / "TEST-tmux-regress.xml"
+    ).getroot()
+    assert timeout_report.attrib["tests"] == "2", timeout_report.attrib
+    assert timeout_report.attrib["failures"] == "1", timeout_report.attrib
+    child_pid = int((timeout_regress / "child.pid").read_text(encoding="utf-8"))
+    child_probe = subprocess.run(
+        ["kill", "-0", str(child_pid)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert child_probe.returncode != 0, f"timed-out tmux child survived: {child_pid}"
+    assert cleanup_log.read_text(encoding="utf-8").splitlines() == [
+        "-Ltest",
+        "-Ltest2",
+        "-Ltest",
+        "-Ltest2",
+    ]
+
+    (timeout_regress / "child.pid").unlink()
+    cleanup_log.unlink()
+    interrupted = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_tmux_project_tests.py"),
+            "--project-root",
+            str(timeout_tmux),
+            "--timeout-per-test",
+            "60",
+        ],
+        env=timeout_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    child_path = timeout_regress / "child.pid"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not child_path.is_file():
+        time.sleep(0.02)
+    assert child_path.is_file(), "external-deadline tmux child did not start"
+    interrupted_child_pid = int(child_path.read_text(encoding="utf-8"))
+    os.kill(interrupted.pid, signal.SIGTERM)
+    interrupted_output, _ = interrupted.communicate(timeout=5)
+    assert interrupted.returncode == 128 + signal.SIGTERM, interrupted_output
+    interrupted_child_probe = subprocess.run(
+        ["kill", "-0", str(interrupted_child_pid)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert interrupted_child_probe.returncode != 0, (
+        f"externally interrupted tmux child survived: {interrupted_child_pid}"
+    )
+    assert cleanup_log.read_text(encoding="utf-8").splitlines() == [
+        "-Ltest",
+        "-Ltest2",
+    ]
 
     git = temp / "git"
     git_tests = git / "t"
@@ -191,6 +338,61 @@ def _assert_project_runners(temp: Path) -> None:
         ),
         encoding="utf-8",
     )
+    rrd_src = rrd / "src"
+    rrd_objects = rrd_src / ".libs"
+    rrd_objects.mkdir(parents=True)
+    (rrd_src / "rrd_config.h").write_text("#define HAVE_LIBDBI 1\n", encoding="utf-8")
+    (rrd_src / "Makefile").write_text(
+        "am__append_1 = rrd_fetch_libdbi.c\n", encoding="utf-8"
+    )
+    (rrd_objects / "librrd_la-rrd_fetch_libdbi.o").write_bytes(b"compiled-object")
+    probe_include = rrd / "probe-include" / "dbi"
+    probe_include.mkdir(parents=True)
+    (probe_include / "dbi.h").write_text(
+        "typedef struct probe_dbi_result *dbi_result;\n"
+        "#define DBI_TYPE_INTEGER 1u\n"
+        "#define DBI_TYPE_DECIMAL 2u\n"
+        "#define DBI_TYPE_STRING 3u\n"
+        "#define DBI_TYPE_BINARY 4u\n"
+        "#define DBI_TYPE_DATETIME 5u\n"
+        "#define DBI_INTEGER_UNSIGNED 1u\n"
+        "#define DBI_INTEGER_SIZE1 2u\n"
+        "#define DBI_INTEGER_SIZE2 4u\n"
+        "#define DBI_INTEGER_SIZE3 8u\n"
+        "#define DBI_INTEGER_SIZE4 16u\n"
+        "#define DBI_INTEGER_SIZE8 32u\n"
+        "#define DBI_DECIMAL_UNSIGNED 1u\n"
+        "#define DBI_DECIMAL_SIZE4 2u\n"
+        "#define DBI_DECIMAL_SIZE8 4u\n",
+        encoding="utf-8",
+    )
+    (rrd_src / "rrd_fetch_libdbi.c").write_text(
+        LIBDBI_PROBE_FIXTURE + "\n", encoding="utf-8"
+    )
+    assert _libdbi_build_contract(rrd_build) == ""
+    assert _run_libdbi_attribute_probe(
+        rrd_build, include_dir=probe_include.parent
+    ).returncode == 0
+    (rrd_src / "rrd_fetch_libdbi.c").write_text(
+        LIBDBI_PROBE_FIXTURE.replace("attr & DBI_INTEGER", "attr == DBI_INTEGER") + "\n",
+        encoding="utf-8",
+    )
+    assert _run_libdbi_attribute_probe(
+        rrd_build, include_dir=probe_include.parent
+    ).returncode != 0
+    (rrd_src / "rrd_fetch_libdbi.c").write_text(
+        LIBDBI_PROBE_FIXTURE.replace("attr & DBI_DECIMAL", "attr == DBI_DECIMAL")
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _run_libdbi_attribute_probe(
+        rrd_build, include_dir=probe_include.parent
+    ).returncode != 0
+    (rrd_src / "rrd_fetch_libdbi.c").write_text(
+        LIBDBI_PROBE_FIXTURE + "\n", encoding="utf-8"
+    )
+    rrd_env = dict(os.environ)
+    rrd_env["CPATH"] = str(probe_include.parent)
     rrd_completed = subprocess.run(
         [
             sys.executable,
@@ -199,6 +401,7 @@ def _assert_project_runners(temp: Path) -> None:
             str(rrd),
         ],
         check=False,
+        env=rrd_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -207,7 +410,7 @@ def _assert_project_runners(temp: Path) -> None:
     rrd_report = ET.parse(
         rrd / ".smell-test-reports" / "TEST-rrdtool-make-check.xml"
     ).getroot()
-    assert rrd_report.attrib["tests"] == "4", rrd_report.attrib
+    assert rrd_report.attrib["tests"] == "6", rrd_report.attrib
     assert rrd_report.attrib["skipped"] == "1", rrd_report.attrib
     (rrd_tests / "Makefile").write_text(
         "TESTS = " + " ".join(rrd_test_names) + " newly-added-upstream-test\n"
@@ -222,6 +425,7 @@ def _assert_project_runners(temp: Path) -> None:
             str(rrd),
         ],
         check=False,
+        env=rrd_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -275,6 +479,16 @@ def _assert_project_runners(temp: Path) -> None:
 
 
 def main() -> int:
+    c_dependency_layer = (
+        ROOT / "docker" / "c-refactor-delivery" / "Dockerfile.project-test-dependencies"
+    )
+    dependency_text = c_dependency_layer.read_text(encoding="utf-8")
+    assert (
+        "opencode-smell-c-refactor-env:0.1.1-amd64-delivery-20260721"
+        in dependency_text
+    )
+    assert "libdbi-dev=0.9.0-6.1build1" in dependency_text
+
     with tempfile.TemporaryDirectory(prefix="c-project-tests-") as raw:
         temp = Path(raw)
         projects = temp / "projects.yaml"
@@ -311,6 +525,9 @@ def main() -> int:
         rrdtool = selected["rrdtool"]
         assert "autoreconf -fvi -I m4" in (rrdtool.build.script or "")
         assert "./configure" in (rrdtool.build.script or "")
+        assert "--enable-libdbi" in (rrdtool.build.script or "")
+        assert "With libDBI: yes" in (rrdtool.build.script or "")
+        assert "librrd_la-rrd_fetch_libdbi.o" in (rrdtool.build.script or "")
         assert "build-refactoragent" not in (rrdtool.build.script or "")
         assert "make check" not in (rrdtool.build.script or "")
         assert "run_rrdtool_project_tests.py" in (rrdtool.test.script or "")
@@ -333,6 +550,7 @@ def main() -> int:
         tmux = selected["tmux"]
         assert "run_tmux_project_tests.py" in (tmux.test.script or "")
         assert "--exclude utf8-test.sh" in (tmux.test.script or "")
+        assert "--timeout-per-test 180" in (tmux.test.script or "")
 
         nginx = selected["nginx"]
         assert "run_nginx_project_tests.py" in (nginx.test.script or "")

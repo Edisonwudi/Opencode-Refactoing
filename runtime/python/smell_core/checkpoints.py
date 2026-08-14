@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from .checkpoint_adapters import (
     authorize_dead_code_target_absence,
     capture_metric_snapshot,
     detector_profile_for,
+    evaluate_changed_scope_long_parameter_regression,
 )
 from .checkpoint_contract import CHECKPOINT_CONTRACT_VERSION, evaluate_checkpoint_contract
 from .config import interpolate_command_text
@@ -81,6 +83,11 @@ def _run_git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
 def _git_text(root: Path, args: list[str]) -> str:
     result = _run_git(root, args)
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_blob_text(root: Path, commit: str, relative_path: str) -> str:
+    result = _run_git(root, ["show", f"{commit}:{relative_path}"])
+    return result.stdout if result.returncode == 0 else ""
 
 
 def _task_key(smell: str, location: str) -> str:
@@ -942,6 +949,33 @@ def prepare_checkpoint(
             else None
         ),
     )
+    if not is_java and str(config.language) in {"python", "c", "cpp"}:
+        lpl_profile = detector_profile_for(
+            replace(config, smell="long_parameter_list")
+        )
+        baseline_sources = {
+            path: _git_blob_text(root, baseline_commit, path)
+            for path in production_sources
+        }
+        current_sources = {
+            path: (root / path).read_text(
+                encoding="utf-8", errors="surrogateescape"
+            )
+            for path in production_sources
+            if (root / path).is_file()
+        }
+        cross_smell = evaluate_changed_scope_long_parameter_regression(
+            language=str(config.language),
+            detector_profile=lpl_profile,
+            baseline_sources=baseline_sources,
+            current_sources=current_sources,
+        )
+        current["cross_smell_regression"] = cross_smell
+        if cross_smell["violations"]:
+            current["guard_violations"] = [
+                *list(current.get("guard_violations") or []),
+                *list(cross_smell["violations"]),
+            ]
     if not is_java and smell == "dead_code":
         # Dead Code may cross from a present frozen declaration to an absent
         # declaration only with byte-exact old-line evidence from that one

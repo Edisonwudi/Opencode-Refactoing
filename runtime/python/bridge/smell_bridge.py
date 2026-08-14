@@ -1750,6 +1750,22 @@ def _verify_status(
     return "VERIFY_FAILED"
 
 
+def _has_cross_smell_regression(smell_guard: dict[str, Any]) -> bool:
+    for result in list(smell_guard.get("results") or []):
+        if not isinstance(result, dict):
+            continue
+        details = result.get("details")
+        if not isinstance(details, dict):
+            continue
+        current = details.get("current_metrics")
+        if not isinstance(current, dict):
+            continue
+        contract = current.get("cross_smell_regression")
+        if isinstance(contract, dict) and contract.get("violations"):
+            return True
+    return False
+
+
 def _summarize_command_result(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if result is None:
         return None
@@ -3045,6 +3061,16 @@ def _classify_failure_pack(
     if payload is None:
         return "UNKNOWN_VERIFY_FAILURE", ["No verify artifact or inline verify payload was available."]
     status = str(payload.get("status") or "").strip()
+    smell_guard = payload.get("smell_guard") or {}
+    if (
+        status == "SMELL_GUARD_FAILED"
+        and isinstance(smell_guard, dict)
+        and _has_cross_smell_regression(smell_guard)
+    ):
+        return "CROSS_SMELL_REGRESSION", [
+            "The changed production declarations introduced a new Long Parameter List finding.",
+            "Reduce the new helper signature below the existing language threshold without weakening the target refactoring.",
+        ]
     if status == "BUILD_TEST_REQUIRED":
         return "BUILD_TEST_REQUIRED", [
             "Build/test verification is required for this batch run; rerun smell_verify without skipBuildTest.",

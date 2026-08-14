@@ -14,9 +14,11 @@ import io
 import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +30,7 @@ from smell_core.loop_policy import (  # noqa: E402
     parse_command_policy,
     parse_command_task_identity,
 )
+from smell_core.guards import _effective_command_timeout  # noqa: E402
 
 failures: list[str] = []
 
@@ -71,17 +74,21 @@ check("pass_missing_accepted_fails_closed", R._compute_status(0, 0, {"status": "
 check("pass_false_success_fails_closed", R._compute_status(0, 0, {"status": "PASS", "success": False, "accepted": True, "resolution": "resolved"}), "VERIFY_FAILED")
 check("verify_fail_rc", R._compute_status(0, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
 check("verify_fail_nostatus", R._compute_status(0, 1, {"status": ""}), "VERIFY_FAILED")
-check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
-check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "PASS")
-check("opencode_timeout_verify_pass", R._compute_status(124, 0, make_payload("PASS")), "PASS")
-check("opencode_timeout_verify_fail", R._compute_status(124, 1, make_payload("SMELL_GUARD_FAILED")), "SMELL_GUARD_FAILED")
+check("both_fail", R._compute_status(1, 1, make_payload("SMELL_GUARD_FAILED", "SMELL_GUARD_FAILED")), "OPENCODE_FAILED")
+check("opencode_fail_verify_pass", R._compute_status(1, 0, make_payload("PASS")), "OPENCODE_FAILED")
+check(
+    "opencode_timeout_verify_pass_fails_closed",
+    R._compute_status(124, 0, make_payload("PASS")),
+    "OPENCODE_TIMEOUT",
+)
+check("opencode_timeout_verify_fail", R._compute_status(124, 1, make_payload("SMELL_GUARD_FAILED")), "OPENCODE_TIMEOUT")
 check("improved_not_accepted", R._compute_status(0, 1, make_payload("IMPROVED")), "IMPROVED")
-check("timeout_preserves_improved", R._compute_status(124, 1, make_payload("IMPROVED")), "IMPROVED")
+check("timeout_overrides_improved", R._compute_status(124, 1, make_payload("IMPROVED")), "OPENCODE_TIMEOUT")
 check("improved_status_not_accepted", R._is_accepted_status("IMPROVED"), False)
 check(
-    "provider_quota_is_metadata_when_final_verify_passes",
+    "provider_quota_cannot_be_overridden_by_final_pass",
     R._compute_status(R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, 0, make_payload("PASS")),
-    "PASS",
+    "PROVIDER_QUOTA_FAILED",
 )
 
 print("== fatal provider error ==")
@@ -217,10 +224,26 @@ with tempfile.TemporaryDirectory() as tmp:
         failures.append("mysterious_name_selector_required: invalid row was accepted")
 
 print("== single time budget ==")
-check("opencode_timeout_derived", R._opencode_timeout_seconds(1800), 1860)
+check("opencode_timeout_is_exact_policy_budget", R._opencode_timeout_seconds(1800), 1800)
+check_true(
+    "opencode_timeout_terminates_nested_process_groups",
+    "_terminate_process_tree(proc)" in inspect.getsource(R._run_opencode),
+)
+check_true(
+    "runner_final_timeout_terminates_nested_process_groups",
+    "_terminate_process_tree(proc)" in inspect.getsource(R._run),
+)
 check("pass_is_accepted", R._is_accepted_status("PASS"), True)
 check("removed_timeout_pass_is_not_accepted", R._is_accepted_status("PASS_AFTER_OPENCODE_TIMEOUT"), False)
 check("opencode_failure_not_accepted", R._is_accepted_status("OPENCODE_FAILED"), False)
+check(
+    "nested_build_honors_expired_sample_deadline",
+    _effective_command_timeout(
+        600,
+        {R.SAMPLE_DEADLINE_EPOCH_MS_ENV: str(int((time.time() - 1) * 1000))},
+    ),
+    0.0,
+)
 parser = R.build_parser()
 parsed = parser.parse_args(["--dataset", "/tmp/input.csv", "--sample-deadline", "2400"])
 check("sample_deadline_public_entry", parsed.sample_deadline, 2400)
@@ -232,6 +255,77 @@ check(
     parser.parse_args(["--dataset", "/tmp/input.csv", "--refactoring-backend", "idea"]).refactoring_backend,
     "idea",
 )
+
+with tempfile.TemporaryDirectory() as tmp:
+    timeout_root = Path(tmp)
+    wrapper = timeout_root / "nested-timeout.py"
+    child_pid_path = timeout_root / "child.pid"
+    child_ready_path = timeout_root / "child.ready"
+    child_term_path = timeout_root / "child.terminated"
+    child_source = """
+import os
+import signal
+import time
+from pathlib import Path
+
+ready = Path(os.environ["SELF_CHECK_CHILD_READY"])
+terminated = Path(os.environ["SELF_CHECK_CHILD_TERMINATED"])
+
+def stop(_signum, _frame):
+    terminated.write_text("terminated", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+ready.write_text("ready", encoding="utf-8")
+while True:
+    time.sleep(1)
+"""
+    wrapper.write_text(
+        """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen(
+    [sys.executable, "-c", os.environ["SELF_CHECK_CHILD_SOURCE"]],
+    env=os.environ.copy(),
+    start_new_session=True,
+)
+Path(os.environ["SELF_CHECK_CHILD_PID"]).write_text(str(child.pid), encoding="utf-8")
+while not Path(os.environ["SELF_CHECK_CHILD_READY"]).is_file():
+    time.sleep(0.01)
+child.wait()
+""",
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o755)
+    timeout_env = {
+        **os.environ,
+        "SELF_CHECK_CHILD_SOURCE": child_source,
+        "SELF_CHECK_CHILD_PID": str(child_pid_path),
+        "SELF_CHECK_CHILD_READY": str(child_ready_path),
+        "SELF_CHECK_CHILD_TERMINATED": str(child_term_path),
+    }
+    try:
+        try:
+            R._run([str(wrapper)], timeout_root, env=timeout_env, timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            failures.append("nested_process_group_timeout: command did not time out")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not child_term_path.is_file():
+            time.sleep(0.02)
+        check_true("nested_process_group_received_structured_termination", child_term_path.is_file())
+    finally:
+        if child_pid_path.is_file():
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 check(
     "test_changes_explicit_opt_in",
     parser.parse_args(["--dataset", "/tmp/input.csv", "--allow-test-changes"]).allow_test_changes,
@@ -479,6 +573,30 @@ check(
         max_continuations=0,
     ),
     "guard_progress",
+)
+guard_progress_stopped = dict(guard_progress_payload)
+guard_progress_stopped["loop"] = {
+    "decision": "stop",
+    "termination_reason": "GUARD_PROGRESS_NO_PROGRESS",
+}
+guard_progress_stopped_trace = R._verification_trace(verify_event(
+    guard_progress_stopped,
+    metadata={"loop": guard_progress_stopped["loop"]},
+))
+check(
+    "guard_progress_no_progress_reason_is_audited",
+    guard_progress_stopped_trace["last_loop_termination_reason"],
+    "GUARD_PROGRESS_NO_PROGRESS",
+)
+check(
+    "guard_progress_no_progress_stops_same_session",
+    R._runner_closure_action(
+        guard_progress_stopped_trace,
+        reminder_used=False,
+        continuations_dispatched=0,
+        max_continuations=2,
+    ),
+    "stop",
 )
 continue_trace = R._verification_trace(verify_event({"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}}))
 check("trace_verify_calls", continue_trace["smell_verify_calls"], 1)
@@ -755,6 +873,72 @@ with tempfile.TemporaryDirectory() as tmp:
         )
     finally:
         R._run = original_run
+
+    baseline_spawn = {"started": False}
+
+    def forbidden_baseline_run(*_args, **_kwargs):
+        baseline_spawn["started"] = True
+        raise AssertionError("baseline capture must not start after the sample deadline")
+
+    expired_baseline_dir = Path(tmp) / "expired-baseline"
+    expired_baseline_dir.mkdir()
+    R._run = forbidden_baseline_run
+    try:
+        baseline_timeout_rc, baseline_timeout_payload = R._run_capture_baseline(
+            sample,
+            expired_baseline_dir,
+            argparse.Namespace(projects="", sample_deadline=1, allow_test_changes=True),
+            "project_full",
+            deadline_monotonic=time.monotonic() - 1,
+        )
+    finally:
+        R._run = original_run
+    check("expired_baseline_returncode", baseline_timeout_rc, 124)
+    check("expired_baseline_status", baseline_timeout_payload["status"], "OPENCODE_TIMEOUT")
+    check(
+        "expired_baseline_schema",
+        baseline_timeout_payload["schema_version"],
+        "smell.verify.decision/v1",
+    )
+    check("expired_baseline_child_not_spawned", baseline_spawn["started"], False)
+    baseline_timeout_artifact = json.loads(
+        (expired_baseline_dir / "baseline-capture.json").read_text(encoding="utf-8")
+    )
+    check("expired_baseline_artifact_returncode", baseline_timeout_artifact["returncode"], 124)
+    check(
+        "expired_baseline_artifact_status",
+        baseline_timeout_artifact["payload"]["status"],
+        "OPENCODE_TIMEOUT",
+    )
+
+    final_spawn = {"started": False}
+
+    def forbidden_final_run(*_args, **_kwargs):
+        final_spawn["started"] = True
+        raise AssertionError("final verification must not start after the sample deadline")
+
+    R._run = forbidden_final_run
+    try:
+        timeout_rc, timeout_payload = R._run_verify(
+            sample,
+            Path(tmp),
+            argparse.Namespace(projects="", sample_deadline=1, allow_test_changes=True),
+            "project_full",
+            baseline_seal="controller-seal",
+            deadline_monotonic=time.monotonic() - 1,
+        )
+    finally:
+        R._run = original_run
+    check("expired_final_verify_returncode", timeout_rc, 124)
+    check("expired_final_verify_status", timeout_payload["status"], "OPENCODE_TIMEOUT")
+    check(
+        "expired_final_verify_schema",
+        timeout_payload["schema_version"],
+        "smell.verify.decision/v1",
+    )
+    check("expired_final_verify_category", timeout_payload["failure_pack"]["failure_category"], "OPENCODE_TIMEOUT")
+    check("expired_final_verify_project_full_not_started", timeout_payload["project_full_executed"], False)
+    check("expired_final_verify_child_not_spawned", final_spawn["started"], False)
     final_cmd = captured["cmd"]
     final_env = captured["env"]
     check("final_verify_excludes_smell_evidence", "--smell-evidence" in final_cmd, False)
@@ -765,6 +949,7 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     check_true("final_verify_keeps_target_context", "--target-context-json" in final_cmd)
     check_true("final_verify_uses_controller_seal", "--baseline-seal" in final_cmd and "controller-seal" in final_cmd)
+    check("final_verify_remains_standard_decision", "--guard-progress-only" in final_cmd, False)
     check("dataset_runner_freezes_tests", final_env.get("SMELL_ALLOW_TEST_CHANGES"), "0")
     check("final_verify_requires_build_test", final_env.get("SMELL_REQUIRE_BUILD_TEST"), "1")
 
@@ -797,6 +982,68 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         R._run = original_run
 
+print("== baseline deadline terminal artifacts ==")
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    run_dir = root / "run"
+    run_dir.mkdir()
+    timeout_sample = R.Sample(
+        sample_id="baseline-timeout",
+        language="java",
+        smell="data_clumps",
+        project_name="p",
+        project_root=root,
+        location="src/Foo.java:method=target",
+        evidence="",
+        raw={},
+        verification_mode="project_full",
+    )
+    timeout_args = argparse.Namespace(
+        project_revisions="unused.json",
+        worktree=False,
+        agent="",
+        verification_mode="project_full",
+        allow_test_changes=True,
+        refactoring_backend="direct",
+        sample_deadline=0,
+        projects="",
+    )
+    originals = {
+        "load_revisions": R.load_revisions,
+        "resolve_revision": R.resolve_revision,
+        "assert_commit_present": R.assert_commit_present,
+        "audit_test_commit": R.audit_test_commit,
+        "verify_test_oracle": R.verify_test_oracle,
+    }
+    R.load_revisions = lambda _path: {}
+    R.resolve_revision = lambda _project, _revisions, _path: argparse.Namespace(
+        project_commit="frozen-commit"
+    )
+    R.assert_commit_present = lambda _root, _commit: None
+    R.audit_test_commit = lambda *_args, **_kwargs: {}
+    R.verify_test_oracle = lambda *_args, **_kwargs: {}
+    try:
+        timeout_row = R._run_sample(timeout_sample, run_dir, timeout_args)
+    finally:
+        for name, value in originals.items():
+            setattr(R, name, value)
+    timeout_result = json.loads(
+        (Path(timeout_row["sample_dir"]) / "result.json").read_text(encoding="utf-8")
+    )
+    timeout_verify = json.loads(
+        (Path(timeout_row["sample_dir"]) / "verify.json").read_text(encoding="utf-8")
+    )
+    results_path = run_dir / "results.csv"
+    R._append_result(results_path, timeout_row)
+    with results_path.open(encoding="utf-8", newline="") as handle:
+        timeout_csv = next(R.csv.DictReader(handle))
+    check("baseline_timeout_row_status", timeout_row["status"], "OPENCODE_TIMEOUT")
+    check("baseline_timeout_result_status", timeout_result["status"], "OPENCODE_TIMEOUT")
+    check("baseline_timeout_verify_status", timeout_verify["status"], "OPENCODE_TIMEOUT")
+    check("baseline_timeout_csv_status", timeout_csv["status"], "OPENCODE_TIMEOUT")
+    check("baseline_timeout_result_accepted", timeout_result["accepted"], False)
+    check("baseline_timeout_verify_schema", timeout_verify["schema_version"], "smell.verify.decision/v1")
+
 check(
     "baseline_not_found_status_is_exact",
     R._baseline_failure_status(1, {"success": False, "error": "BASELINE_FINDING_NOT_FOUND"}),
@@ -811,6 +1058,11 @@ check(
     "baseline_success_has_no_failure_status",
     R._baseline_failure_status(0, {"success": True, "status": "BASELINE_CAPTURED"}),
     "",
+)
+check(
+    "baseline_deadline_status_is_exact",
+    R._baseline_failure_status(124, {"success": False, "status": "OPENCODE_TIMEOUT"}),
+    "OPENCODE_TIMEOUT",
 )
 
 run_sample_source = inspect.getsource(R._run_sample)
@@ -836,6 +1088,63 @@ check_true(
 check_true(
     "guard_progress_does_not_consume_continuation_counter",
     'elif action == "continue":\n            continuations_dispatched += 1' in run_sample_source,
+)
+check_true(
+    "one_absolute_deadline_precedes_baseline",
+    run_sample_source.index("sample_deadline_monotonic =")
+    < run_sample_source.index("_run_capture_baseline("),
+)
+check(
+    "one_absolute_deadline_covers_baseline_and_final",
+    run_sample_source.count("deadline_monotonic=sample_deadline_monotonic"),
+    2,
+)
+check_true(
+    "timeout_pass_is_normalized_before_persistence",
+    "_normalize_sample_timeout(" in run_sample_source,
+)
+normalized_timeout_rc, normalized_timeout_payload = R._normalize_sample_timeout(
+    124,
+    0,
+    make_payload("PASS"),
+    1800,
+)
+check("normalized_timeout_returncode", normalized_timeout_rc, 124)
+check("normalized_timeout_status", normalized_timeout_payload["status"], "OPENCODE_TIMEOUT")
+check(
+    "normalized_timeout_observes_rejected_pass",
+    normalized_timeout_payload["timeout"]["final_verify_observation"]["status"],
+    "PASS",
+)
+for failure_name, failure_rc, expected_status in (
+    ("provider_quota", R.OPENCODE_FATAL_PROVIDER_RETURN_CODE, "PROVIDER_QUOTA_FAILED"),
+    ("ordinary_nonzero", 7, "OPENCODE_FAILED"),
+):
+    normalized_failure_rc, normalized_failure_payload = R._normalize_opencode_failure(
+        failure_rc,
+        0,
+        make_payload("PASS", project_full_executed=True),
+    )
+    check(f"normalized_{failure_name}_verify_returncode", normalized_failure_rc, 0)
+    check(f"normalized_{failure_name}_status", normalized_failure_payload["status"], expected_status)
+    check(
+        f"normalized_{failure_name}_schema",
+        normalized_failure_payload["schema_version"],
+        "smell.verify.decision/v1",
+    )
+    check(
+        f"normalized_{failure_name}_observes_rejected_pass",
+        normalized_failure_payload["execution_failure"]["final_verify_observation"]["status"],
+        "PASS",
+    )
+runner_help = R.build_parser().format_help()
+check_true(
+    "sample_deadline_help_has_no_per_phase_or_shutdown_grace",
+    "per-phase" not in runner_help and "60-second" not in runner_help,
+)
+check_true(
+    "command_metadata_has_no_shutdown_grace_budget",
+    "opencode_shutdown_grace_seconds" not in inspect.getsource(R._run_opencode),
 )
 sanitized_service = R._sanitize_idea_service_payload({
     "status": "ok",
@@ -1140,6 +1449,19 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
     check("zero_verify_first_process_session", first_session, "ses_zero_verify")
     first_manifest = json.loads(
         (artifacts / "message-manifest.json").read_text(encoding="utf-8")
+    )
+    first_command = json.loads(
+        (artifacts / "command.json").read_text(encoding="utf-8")
+    )
+    check(
+        "command_audits_shared_sample_deadline_scope",
+        first_command["time_budget"]["scope"],
+        "baseline-model-continuations-and-runner-final",
+    )
+    check(
+        "command_audits_remaining_final_budget",
+        first_command["time_budget"]["final_verify_budget"],
+        "remaining-sample-budget",
     )
     check("initial_message_provenance", first_manifest["provenance"], "user_command")
     check(

@@ -135,6 +135,34 @@ with tempfile.TemporaryDirectory() as tmp:
         True,
     )
     check("flaky_requires_confirmation", flaky_audit["confirmation_required"], True)
+    normalized_flaky = R._normalize_reconciled_final_failure(
+        flaky_status,
+        passing,
+        flaky_audit,
+    )
+    check(
+        "flaky_normalized_verify_schema",
+        normalized_flaky["schema_version"],
+        "smell.verify.decision/v1",
+    )
+    check("flaky_normalized_verify_status", normalized_flaky["status"], flaky_status)
+    check("flaky_normalized_verify_success", normalized_flaky["success"], False)
+    check("flaky_normalized_verify_accepted", normalized_flaky["accepted"], False)
+    check("flaky_normalized_verify_progress", normalized_flaky["progress"], False)
+    check("flaky_normalized_verify_resolution", normalized_flaky["resolution"], "unresolved")
+    check(
+        "flaky_normalized_failure_category",
+        normalized_flaky["failure_pack"]["failure_category"],
+        "FLAKY_TEST_INCONCLUSIVE",
+    )
+    check(
+        "flaky_normalized_preserves_raw_status_for_diagnostics",
+        normalized_flaky["reconciliation"]["raw_status"],
+        "PASS",
+    )
+    R._persist_verify_payload(temp, normalized_flaky, ".flaky")
+    persisted_flaky = json.loads((temp / "verify.json.flaky").read_text(encoding="utf-8"))
+    check("flaky_persisted_verify_status", persisted_flaky["status"], flaky_status)
     confirmed_status, _ = R._reconcile_final_verify_status(
         "PASS", passing, history
     )
@@ -170,6 +198,29 @@ with tempfile.TemporaryDirectory() as tmp:
     check("infra_result_not_accepted", R._is_accepted_status(infra_status), False)
     check("structured_timeout_category", infra_audit["infra_category"], "BUILD_TIMEOUT")
     check("infra_requires_confirmation", infra_audit["confirmation_required"], True)
+    normalized_infra = R._normalize_reconciled_final_failure(
+        infra_status,
+        timeout_failure,
+        infra_audit,
+    )
+    check("infra_normalized_verify_status", normalized_infra["status"], infra_status)
+    check("infra_normalized_verify_success", normalized_infra["success"], False)
+    check("infra_normalized_verify_accepted", normalized_infra["accepted"], False)
+    check("infra_normalized_verify_progress", normalized_infra["progress"], False)
+    check("infra_normalized_verify_resolution", normalized_infra["resolution"], "unresolved")
+    check(
+        "infra_normalized_failure_category",
+        normalized_infra["failure_pack"]["failure_category"],
+        "BUILD_TIMEOUT",
+    )
+    check(
+        "infra_normalized_preserves_raw_status_for_diagnostics",
+        normalized_infra["reconciliation"]["raw_status"],
+        "BUILD_FAILED",
+    )
+    R._persist_verify_payload(temp, normalized_infra, ".infra")
+    persisted_infra = json.loads((temp / "verify.json.infra").read_text(encoding="utf-8"))
+    check("infra_persisted_verify_status", persisted_infra["status"], infra_status)
 
     changed_timeout = payload(
         "BUILD_FAILED",
@@ -224,6 +275,181 @@ with tempfile.TemporaryDirectory() as tmp:
         "timeout_word_without_timeout_state_is_test_failure",
         R._failure_category_from_verify_payload(ordinary_timeout_name),
         "TEST_BEHAVIOR_REGRESSION",
+    )
+
+    tmux_first_failure = payload(
+        "TEST_FAILED",
+        same_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary=(
+                "tmux project tests failed\n"
+                "FAIL conf-syntax.sh: exit 1\n"
+                "server exited unexpectedly\n"
+                "FAIL input-keys.sh: exit 1\n"
+                "[FAIL] C-h -> ^H (Got: )"
+            ),
+        ),
+    )
+    tmux_drifted_failure = payload(
+        "TEST_FAILED",
+        same_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary=(
+                "tmux project tests failed\n"
+                "FAIL input-keys.sh: exit 1\n"
+                "[FAIL] F3 -> ^[OR (Got: )\n"
+                "FAIL tty-keys.sh: exit 124"
+            ),
+        ),
+    )
+    tmux_first_attempt = R._compact_verify_attempt(
+        tmux_first_failure,
+        verify_source="agent",
+        verify_returncode=1,
+    )
+    check(
+        "tmux_failed_cases_are_structured",
+        tmux_first_attempt["failed_test_cases"],
+        ["conf-syntax.sh", "input-keys.sh"],
+    )
+    check(
+        "tmux_failed_case_diagnostics_are_structured",
+        [item["test"] for item in tmux_first_attempt["failed_test_diagnostics"]],
+        ["conf-syntax.sh", "input-keys.sh"],
+    )
+    tmux_marked_failure = payload(
+        "TEST_FAILED",
+        same_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary=str(
+                [
+                    "FAIL input-keys.sh: exit 1",
+                    "[FAIL] volatile raw detail",
+                    (
+                        'TMUX_FAIL_CASE {"diagnostic_fingerprint":'
+                        '"exit=1 | [FAIL] normalized detail","exit_code":1,'
+                        '"test":"input-keys.sh"}'
+                    ),
+                ]
+            ),
+        ),
+    )
+    tmux_marked_attempt = R._compact_verify_attempt(
+        tmux_marked_failure,
+        verify_source="agent",
+        verify_returncode=1,
+    )
+    check(
+        "tmux_marker_precedes_truncated_raw_tail",
+        tmux_marked_attempt["failed_test_diagnostics"],
+        [
+            {
+                "test": "input-keys.sh",
+                "exit_code": 1,
+                "diagnostic_fingerprint": "exit=1 | [FAIL] normalized detail",
+            }
+        ],
+    )
+    drifted_status, drifted_audit = R._reconcile_final_verify_status(
+        "TEST_FAILED", tmux_drifted_failure, [tmux_first_attempt]
+    )
+    check(
+        "same_diff_tmux_failure_set_drift_is_inconclusive",
+        drifted_status,
+        "FLAKY_TEST_INCONCLUSIVE",
+    )
+    check(
+        "same_diff_tmux_failure_set_drift_is_audited",
+        drifted_audit["same_diff_test_failure_drift"],
+        True,
+    )
+    check(
+        "drifted_tmux_failure_requires_confirmation",
+        drifted_audit["confirmation_required"],
+        True,
+    )
+    stable_status, stable_audit = R._reconcile_final_verify_status(
+        "TEST_FAILED", tmux_first_failure, [tmux_first_attempt]
+    )
+    check(
+        "stable_tmux_failure_remains_behavior_regression",
+        stable_status,
+        "TEST_FAILED",
+    )
+    check(
+        "stable_tmux_failure_has_no_drift",
+        stable_audit["same_diff_test_failure_drift"],
+        False,
+    )
+    input_keys_first = payload(
+        "TEST_FAILED",
+        same_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary=(
+                "FAIL input-keys.sh: exit 1\n"
+                "[FAIL] C-h -> ^H (Got: )"
+            ),
+        ),
+    )
+    input_keys_second = payload(
+        "TEST_FAILED",
+        same_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary=(
+                "FAIL input-keys.sh: exit 1\n"
+                "[FAIL] F3 -> ^[OR (Got: )"
+            ),
+        ),
+    )
+    input_keys_first_attempt = R._compact_verify_attempt(
+        input_keys_first,
+        verify_source="agent",
+        verify_returncode=1,
+    )
+    input_keys_drift_status, input_keys_drift_audit = R._reconcile_final_verify_status(
+        "TEST_FAILED", input_keys_second, [input_keys_first_attempt]
+    )
+    check(
+        "same_case_different_tmux_diagnostic_is_inconclusive",
+        input_keys_drift_status,
+        "FLAKY_TEST_INCONCLUSIVE",
+    )
+    check(
+        "same_case_different_tmux_diagnostic_is_audited",
+        len(input_keys_drift_audit["same_diff_test_failure_signatures"]),
+        2,
+    )
+    changed_tmux_failure = payload(
+        "TEST_FAILED",
+        different_diff,
+        test=step(
+            status="fail",
+            returncode=1,
+            summary="FAIL tty-keys.sh: exit 124",
+        ),
+    )
+    changed_tmux_status, changed_tmux_audit = R._reconcile_final_verify_status(
+        "TEST_FAILED", changed_tmux_failure, [tmux_first_attempt]
+    )
+    check(
+        "different_diff_tmux_failure_remains_behavior_regression",
+        changed_tmux_status,
+        "TEST_FAILED",
+    )
+    check(
+        "different_diff_tmux_failure_has_no_drift",
+        changed_tmux_audit["same_diff_test_failure_drift"],
+        False,
     )
 
     missing_test_evidence = payload(

@@ -2781,6 +2781,12 @@ elif guard_progress_only:
     budget = dict(case.get("budget", {}))
     if ready:
         budget["required_reduction"] = 0
+    elif case.get("progress_each_call"):
+        reduction = max(0, count - 1)
+        if isinstance(budget.get("current"), (int, float)):
+            budget["current"] = budget["current"] - reduction
+        if isinstance(budget.get("required_reduction"), (int, float)):
+            budget["required_reduction"] = max(1, budget["required_reduction"] - reduction)
     payload = {
         "schema_version": "smell.guard-progress/v1",
         "success": ready,
@@ -3273,6 +3279,7 @@ print(json.dumps(payload))
         project_root: replayRoot,
         checkpoint_required: true,
         early_calls: 2,
+        progress_each_call: true,
       })
       const plugin = await pluginModule.SmellPlugin({ worktree: replayRoot })
       const sessionID = `guard-progress-${replay.name}`
@@ -3297,7 +3304,7 @@ print(json.dumps(payload))
         const earlyPayload = parseJson(`guard_progress_${replay.name}_${call}`, early.output)
         assertEqual(`guard_progress_${replay.name}_${call}_status`, earlyPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
         assertEqual(`guard_progress_${replay.name}_${call}_full`, earlyPayload.project_full_executed, false, "project_full_executed")
-        assertEqual(`guard_progress_${replay.name}_${call}_loop_absent`, earlyPayload.loop, undefined, "loop")
+        assertEqual(`guard_progress_${replay.name}_${call}_loop`, earlyPayload.loop?.decision, "continue", "loop.decision")
         assertEqual(
           `guard_progress_${replay.name}_${call}_continuation`,
           early.metadata?.command_loop_state?.continuation_count,
@@ -3312,9 +3319,9 @@ print(json.dumps(payload))
         )
         assertEqual(
           `guard_progress_${replay.name}_${call}_fingerprint`,
-          early.metadata?.command_loop_state?.last_failure_fingerprint,
-          "",
-          "last_failure_fingerprint",
+          Boolean(early.metadata?.command_loop_state?.last_failure_fingerprint),
+          true,
+          "last_failure_fingerprint present",
         )
         assertEqual(
           `guard_progress_${replay.name}_${call}_cap`,
@@ -3330,12 +3337,7 @@ print(json.dumps(payload))
         )
         earlyStates.push(JSON.stringify(early.metadata?.command_loop_state))
       }
-      assertEqual(
-        `guard_progress_${replay.name}_state_unchanged`,
-        earlyStates[1],
-        earlyStates[0],
-        "command_loop_state",
-      )
+      assertEqual(`guard_progress_${replay.name}_state_tracks_progress`, earlyStates[1] === earlyStates[0], false, "state differs")
       const beforeCross = (await readFile(logFile, "utf8"))
         .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
       assertEqual(
@@ -3360,6 +3362,65 @@ print(json.dumps(payload))
       assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
       results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })
     }
+
+    const noProgressRoot = path.join(tempRoot, "guard-progress-no-progress")
+    await mkdir(noProgressRoot, { recursive: true })
+    await writeFile(stateFile, "0", "utf8")
+    await writeFile(logFile, "", "utf8")
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "no-progress",
+      project_root: noProgressRoot,
+      language: "c",
+      smell: "nested_complexity",
+      location: "sample185.c:method=target|line=1",
+      checkpoint_required: true,
+      early_calls: 99,
+      budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
+    })
+    const noProgressPlugin = await pluginModule.SmellPlugin({ worktree: noProgressRoot })
+    const noProgressSession = "guard-progress-no-progress"
+    await noProgressPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: noProgressSession,
+        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    const noProgressToolArgs = {
+      projectRoot: noProgressRoot,
+      smell: "nested_complexity",
+      location: "sample185.c:method=target|line=1",
+      verificationMode: "project_full",
+    }
+    const noProgressContext = {
+      sessionID: noProgressSession,
+      agent: "smell-refactor-agent",
+      directory: noProgressRoot,
+    }
+    const firstNoProgress = await noProgressPlugin.tool.smell_verify.execute(noProgressToolArgs, noProgressContext)
+    const firstNoProgressPayload = parseJson("guard_progress_no_progress_first", firstNoProgress.output)
+    assertEqual("guard_progress_no_progress_first_decision", firstNoProgressPayload.loop?.decision, "continue", "loop.decision")
+    assertEqual("guard_progress_no_progress_first_count", firstNoProgress.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
+    process.env.SMELL_COMMAND_LOOP_STATE_JSON = JSON.stringify(firstNoProgress.metadata?.command_loop_state)
+    process.env.SMELL_PROJECT_ROOT = noProgressRoot
+    process.env.SMELL_LANGUAGE = "c"
+    process.env.SMELL_SMELL = "nested_complexity"
+    process.env.SMELL_LOCATION = "sample185.c:method=target|line=1"
+    process.env.SMELL_VERIFICATION_MODE = "project_full"
+    process.env.SMELL_BASELINE_SEAL = "controller-seal"
+    const resumedNoProgressPlugin = await pluginModule.SmellPlugin({ worktree: noProgressRoot })
+    const secondNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(noProgressToolArgs, noProgressContext)
+    const secondNoProgressPayload = parseJson("guard_progress_no_progress_second", secondNoProgress.output)
+    assertEqual("guard_progress_no_progress_second_status", secondNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
+    assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "GUARD_PROGRESS_NO_PROGRESS", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
+    assertEqual("guard_progress_no_progress_continuation_unchanged", secondNoProgress.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
+    const noProgressCommands = (await readFile(logFile, "utf8"))
+      .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")
+    assertEqual("guard_progress_no_progress_full_count", noProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
 
     const malformedRoot = path.join(tempRoot, "malformed-progress")
     await mkdir(malformedRoot, { recursive: true })

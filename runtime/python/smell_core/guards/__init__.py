@@ -51,6 +51,9 @@ from ..java_test_evidence import (
 from .context import GuardRunContext
 
 
+SAMPLE_DEADLINE_EPOCH_MS_ENV = "SMELL_SAMPLE_DEADLINE_EPOCH_MS"
+
+
 SUMMARY_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
@@ -2020,13 +2023,18 @@ def _run_command_config(
             "summary_text": f"No configured {label} command.",
             "output": "",
         }
+    command_env = {**os.environ, **env}
+    effective_timeout = _effective_command_timeout(
+        max(1, int(timeout_seconds)) if timeout_seconds else None,
+        command_env,
+    )
     try:
         proc = _run_captured_command(
             command,
             cwd=str(cwd),
-            env={**os.environ, **env},
+            env=command_env,
             shell=shell,
-            timeout=max(1, int(timeout_seconds)) if timeout_seconds else None,
+            timeout=effective_timeout,
         )
     except subprocess.TimeoutExpired as exc:
         captured = exc.stdout or ""
@@ -2035,7 +2043,8 @@ def _run_command_config(
             if isinstance(captured, bytes)
             else str(captured)
         )
-        message = f"{label.capitalize()} timed out after {int(timeout_seconds)} seconds."
+        elapsed_limit = effective_timeout if effective_timeout is not None else timeout_seconds
+        message = f"{label.capitalize()} timed out after {float(elapsed_limit):.1f} seconds."
         command_summary = _summarize_command_output(output, label=label, returncode=124)
         return {
             "label": label,
@@ -2073,13 +2082,26 @@ def _run_command_config(
     }
 
 
+def _effective_command_timeout(
+    configured_timeout: Optional[float],
+    env: Dict[str, str],
+) -> Optional[float]:
+    raw_deadline = str(env.get(SAMPLE_DEADLINE_EPOCH_MS_ENV, "")).strip()
+    if not raw_deadline.isdigit():
+        return configured_timeout
+    remaining = (int(raw_deadline) / 1000.0) - time.time()
+    if configured_timeout is None:
+        return max(0.0, remaining)
+    return max(0.0, min(float(configured_timeout), remaining))
+
+
 def _run_captured_command(
     command: object,
     *,
     cwd: str,
     env: Dict[str, str],
     shell: bool,
-    timeout: Optional[int],
+    timeout: Optional[float],
 ) -> subprocess.CompletedProcess[str]:
     """Run one build/test command and terminate its whole process group on timeout."""
     proc = subprocess.Popen(
