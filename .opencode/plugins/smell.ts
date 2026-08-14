@@ -2723,8 +2723,20 @@ function applyGuardProgressDecision(
   const identity = Object.fromEntries(
     Object.entries(state.policy.identity).sort(([left], [right]) => left.localeCompare(right)),
   )
+  const focused = recordValue(payload.focused_preflight)
+  const focusedExecution = recordValue(focused?.execution)
   const fingerprint = "guard-progress:" + createHash("sha256")
-    .update(JSON.stringify({ identity, metric_budget: toJsonSafe(payload.metric_budget) }))
+    .update(JSON.stringify({
+      identity,
+      metric_budget: toJsonSafe(payload.metric_budget),
+      focused_preflight: focused
+        ? {
+            status: focused.status,
+            returncode: focusedExecution?.returncode,
+            summary_text: focusedExecution?.summary_text,
+          }
+        : null,
+    }))
     .digest("hex")
   if (state.lastFailureFingerprint && state.lastFailureFingerprint === fingerprint) {
     state.noProgressCount += 1

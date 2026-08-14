@@ -2855,6 +2855,12 @@ elif guard_progress_only:
         payload["project_full_executed"] = True
 elif focused_preflight_only:
     focused_status = case.get("focused_status", "NOT_APPLICABLE")
+    focused_generation = int(Path(os.environ["SMELL_PREFLIGHT_STATE"]).read_text(encoding="utf-8") or "0")
+    focused_summary = (
+        f"compile error stage {focused_generation}"
+        if case.get("focused_progress_each_call")
+        else "compile error in changed target"
+    )
     payload = {
         "schema_version": 1,
         "type": "focused_preflight",
@@ -2869,7 +2875,7 @@ elif focused_preflight_only:
         "execution": {
             "success": focused_status == "READY",
             "returncode": 17 if focused_status == "FAILED" else 0,
-            "summary_text": "compile error in changed target" if focused_status == "FAILED" else "",
+            "summary_text": focused_summary if focused_status == "FAILED" else "",
         } if focused_status != "NOT_APPLICABLE" else None,
     }
 elif command == "verify":
@@ -3473,6 +3479,74 @@ print(json.dumps(payload))
       }
       results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })
     }
+
+    const focusedProgressRoot = path.join(tempRoot, "focused-diagnostic-progress")
+    await mkdir(focusedProgressRoot, { recursive: true })
+    await writeFile(stateFile, "0", "utf8")
+    await writeFile(logFile, "", "utf8")
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "focused-diagnostic-progress",
+      project_root: focusedProgressRoot,
+      language: "cpp",
+      smell: "code_clone_type1",
+      location: "sample.cc:method=target|line=1",
+      checkpoint_required: true,
+      early_calls: 99,
+      focused_status: "FAILED",
+      focused_progress_each_call: true,
+      budget: { metric: "clone_token_count", current: 9, passing_max: 24, required_reduction: 0, unit: "clone_token_count" },
+    })
+    const focusedProgressPlugin = await pluginModule.SmellPlugin({ worktree: focusedProgressRoot })
+    const focusedProgressSession = "focused-diagnostic-progress"
+    await focusedProgressPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: focusedProgressSession,
+        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${focusedProgressRoot}; Language: cpp; Smell type: code_clone_type1; Target location: sample.cc:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    const focusedProgressArgs = {
+      projectRoot: focusedProgressRoot,
+      smell: "code_clone_type1",
+      location: "sample.cc:method=target|line=1",
+      verificationMode: "project_full",
+    }
+    const focusedProgressContext = {
+      sessionID: focusedProgressSession,
+      agent: "smell-refactor-agent",
+      directory: focusedProgressRoot,
+    }
+    const focusedProgressFirst = await focusedProgressPlugin.tool.smell_verify.execute(
+      focusedProgressArgs,
+      focusedProgressContext,
+    )
+    const focusedProgressSecond = await focusedProgressPlugin.tool.smell_verify.execute(
+      focusedProgressArgs,
+      focusedProgressContext,
+    )
+    const focusedProgressFirstPayload = parseJson(
+      "focused_diagnostic_progress_first",
+      focusedProgressFirst.output,
+    )
+    const focusedProgressSecondPayload = parseJson(
+      "focused_diagnostic_progress_second",
+      focusedProgressSecond.output,
+    )
+    assertEqual("focused_diagnostic_progress_first_count", focusedProgressFirst.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
+    assertEqual("focused_diagnostic_progress_second_count", focusedProgressSecond.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
+    assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "continue", "loop.decision")
+    assertCond(
+      "focused_diagnostic_progress_changed",
+      focusedProgressFirstPayload.focused_preflight?.execution?.summary_text
+        !== focusedProgressSecondPayload.focused_preflight?.execution?.summary_text,
+      "changed focused diagnostics did not reach the progress result",
+    )
+    const focusedProgressCommands = (await readFile(logFile, "utf8"))
+      .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    assertEqual("focused_diagnostic_progress_focused_count", focusedProgressCommands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
+    assertEqual("focused_diagnostic_progress_full_count", focusedProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
+    await focusedProgressPlugin.dispose?.()
 
     const noProgressRoot = path.join(tempRoot, "guard-progress-no-progress")
     await mkdir(noProgressRoot, { recursive: true })
