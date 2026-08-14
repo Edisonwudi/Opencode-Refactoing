@@ -20,6 +20,8 @@ from smell_core.guards import _project_test_execution_evidence  # noqa: E402
 
 
 def _assert_duckdb_contract(script: str, test_script: str) -> None:
+    assert 'build_dir="${project_root}/build-refactoragent"' in script
+    assert "refactoragent-protobuf-29.3-build" not in script
     assert "-DBUILD_UNITTESTS=ON" in script
     assert "-DENABLE_UNITTEST_CPP_TESTS=OFF" in script
     assert "-DCMAKE_BUILD_TYPE=Debug" in script
@@ -87,20 +89,47 @@ def _assert_aria2_contract(script: str, test_script: str) -> None:
     assert "--version" not in test_script
 
 
-def _assert_protobuf_contract(script: str, test_script: str) -> None:
-    external_build_dir = "/tmp/refactoragent-protobuf-29.3-build"
-    assert f'build_dir="{external_build_dir}"' in script
+def _assert_protobuf_contract(
+    focused_script: str, script: str, test_script: str
+) -> None:
+    isolated_build_dir = "${TMPDIR:-/tmp}/refactoragent-protobuf-29.3-build"
+    assert f'build_dir="{isolated_build_dir}"' in focused_script
+    assert f'build_dir="{isolated_build_dir}"' in script
     assert 'cmake -S "${project_root}" -B "${build_dir}"' in script
+    assert "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache" in script
     assert "-Dprotobuf_BUILD_TESTS=ON" in script
     assert "-Dprotobuf_BUILD_CONFORMANCE=OFF" in script
     assert "--target protoc lite-test upb-test --parallel 1" in script
+    assert "--target protoc lite-test upb-test --parallel 1" in focused_script
+    assert "ctest" not in focused_script
+    assert "rm -rf" not in script
     assert "$(nproc)" not in script
     assert "SMELL_BUILD_JOBS" not in script
-    assert "${project_root}/build-refactoragent" not in script
-    assert f'ctest --test-dir "{external_build_dir}"' in test_script
+    assert "/tmp/refactoragent-protobuf-29.3-" not in script
+    assert 'ctest --test-dir "${build_dir}"' in test_script
     assert "-R '^(lite-test|upb-test)$'" in test_script
     assert "--output-on-failure --parallel 1" in test_script
-    assert "${project_root}/build-refactoragent" not in test_script
+    assert "/tmp/refactoragent-protobuf-29.3-" not in test_script
+
+
+def _assert_yaml_cpp_contract(
+    focused_script: str, script: str, test_script: str
+) -> None:
+    assert 'build_dir="${project_root}/build-refactoragent"' in focused_script
+    assert 'build_dir="${project_root}/build-refactoragent"' in script
+    assert "refactoragent-protobuf-29.3-build" not in focused_script
+    assert "refactoragent-protobuf-29.3-build" not in script
+    assert "-DYAML_CPP_BUILD_TESTS=ON" in focused_script
+    assert "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache" in focused_script
+    assert "--target yaml-cpp" in focused_script
+    assert "yaml-cpp-tests" not in focused_script
+    assert "ctest" not in focused_script
+    assert "--target yaml-cpp yaml-cpp-tests" in script
+    assert "rm -rf" not in script
+    assert "ctest" in test_script
+    assert "--no-tests=error" in test_script
+    assert "--output-junit" in test_script
+    assert "TEST-yaml-cpp-ctest.xml" in test_script
 
 
 def _assert_aria2_runner(temp: Path) -> None:
@@ -204,6 +233,13 @@ def _assert_fresh_junit_evidence(project: Path) -> None:
 
 
 def main() -> int:
+    cpp_dependency_layer = (
+        ROOT / "docker" / "cpp-refactor-delivery" / "Dockerfile.project-test-dependencies"
+    )
+    dependency_text = cpp_dependency_layer.read_text(encoding="utf-8")
+    assert "ccache=4.9.1-1" in dependency_text
+    assert "libcppunit-dev=1.15.1-4build1" in dependency_text
+
     with tempfile.TemporaryDirectory(prefix="cpp-project-tests-") as raw_temp:
         temp = Path(raw_temp)
         projects = temp / "projects.yaml"
@@ -244,11 +280,17 @@ def main() -> int:
             "    build:\n"
             "      command: old-protobuf-build\n"
             "    test:\n"
-            "      command: protoc --version\n",
+            "      command: protoc --version\n"
+            "  - root: /opt/projects/cpp/yaml-cpp\n"
+            "    language: cpp\n"
+            "    build:\n"
+            "      command: old-yaml-build\n"
+            "    test:\n"
+            "      command: yaml-cpp --version\n",
             encoding="utf-8",
         )
         overrides = load_project_overrides(str(projects))
-        assert len(overrides) == 7
+        assert len(overrides) == 8
         duckdb = next(item for item in overrides if item.root.name == "duckdb")
         rocksdb = next(item for item in overrides if item.root.name == "rocksdb")
         other = next(item for item in overrides if item.root.name == "other")
@@ -257,6 +299,9 @@ def main() -> int:
         aria2 = next(item for item in overrides if item.root.name == "aria2")
         protobuf = next(
             item for item in overrides if item.root.name == "protobuf-29.3"
+        )
+        yaml_cpp = next(
+            item for item in overrides if item.root.name == "yaml-cpp"
         )
 
         assert duckdb.build.command is None
@@ -289,7 +334,16 @@ def main() -> int:
         assert protobuf.test.command is None
         assert protobuf.shell_timeout == 1800
         _assert_protobuf_contract(
+            protobuf.focused_preflight.script or "",
             protobuf.build.script or "", protobuf.test.script or ""
+        )
+        assert yaml_cpp.build.command is None
+        assert yaml_cpp.test.command is None
+        assert yaml_cpp.shell_timeout == 1500
+        _assert_yaml_cpp_contract(
+            yaml_cpp.focused_preflight.script or "",
+            yaml_cpp.build.script or "",
+            yaml_cpp.test.script or "",
         )
         _assert_aria2_runner(temp)
         _assert_fresh_junit_evidence(temp / "junit-fixture")
@@ -297,7 +351,8 @@ def main() -> int:
     print(
         "non-Java C++ project-test self-check: PASS "
         "cmake=8-native-ctest aria2=make-check "
-        "protobuf=external-build-single-job duckdb=upstream-smoke "
+        "protobuf=external-build-single-job yaml-cpp=focused-library-then-ctest "
+        "duckdb=upstream-smoke "
         "rocksdb=db_basic_test openttd=94-unit-ctest evidence=native-junit"
     )
     return 0

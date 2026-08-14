@@ -126,6 +126,7 @@ class ProjectOverride:
     cwd: Optional[str] = None
     shell_timeout: Optional[int] = None
     roots: ProjectRootsConfig = field(default_factory=ProjectRootsConfig)
+    focused_preflight: CommandConfig = field(default_factory=CommandConfig)
     build: CommandConfig = field(default_factory=CommandConfig)
     test: CommandConfig = field(default_factory=CommandConfig)
     smells: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -148,6 +149,9 @@ class ProjectOverride:
             cwd=_clean_optional_string(data.get("cwd")),
             shell_timeout=shell_timeout,
             roots=ProjectRootsConfig.from_dict(data.get("roots")),
+            focused_preflight=CommandConfig.from_dict(
+                data.get("focused_preflight")
+            ),
             build=CommandConfig.from_dict(data.get("build")),
             test=CommandConfig.from_dict(data.get("test")),
             smells=smells,
@@ -176,6 +180,7 @@ class ResolvedRunConfig:
     env: Dict[str, str]
     cwd: Path
     profile: SmellProfile
+    focused_preflight: CommandConfig = field(default_factory=CommandConfig)
     project_override: Optional[ProjectOverride] = None
     idea_refactor_cli: Optional[str] = None
     idea_refactor_ready: bool = False
@@ -221,6 +226,7 @@ class ResolvedRunConfig:
             "env": dict(self.env),
             "cwd": str(self.cwd),
             "profile": asdict(self.profile),
+            "focused_preflight": self.focused_preflight.to_dict(),
             "project_override_root": str(self.project_override.root) if self.project_override else None,
             "idea_refactor_cli": self.idea_refactor_cli,
             "idea_refactor_ready": self.idea_refactor_ready,
@@ -393,7 +399,17 @@ def resolve_run_config(
     merged_profile = profile.merged_with(smell_override)
     build = _merge_command_config(language_config.build, override.build if override else None)
     project_test = _merge_command_config(language_config.test, override.test if override else None)
+    focused_preflight = (
+        copy.deepcopy(override.focused_preflight)
+        if override
+        else CommandConfig()
+    )
     if override and override.root.resolve() != project_root_path:
+        focused_preflight = _rebase_command_config(
+            focused_preflight,
+            override.root.resolve(),
+            project_root_path,
+        )
         build = _rebase_command_config(build, override.root.resolve(), project_root_path)
         project_test = _rebase_command_config(project_test, override.root.resolve(), project_root_path)
     normalized_verification_mode = _resolve_verification_mode(
@@ -453,6 +469,7 @@ def resolve_run_config(
         env=resolved_env,
         cwd=cwd,
         profile=merged_profile,
+        focused_preflight=focused_preflight,
         project_override=override,
         verification_mode=normalized_verification_mode,
         build_source="projects.yaml",

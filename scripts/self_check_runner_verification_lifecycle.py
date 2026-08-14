@@ -222,6 +222,31 @@ with tempfile.TemporaryDirectory() as tmp:
     persisted_infra = json.loads((temp / "verify.json.infra").read_text(encoding="utf-8"))
     check("infra_persisted_verify_status", persisted_infra["status"], infra_status)
 
+    idea_protocol = {
+        "success": False,
+        "status": "IDEA_PROTOCOL_FAILED",
+        "violations": ["IDEA_PREVIEW_REQUIRED"],
+    }
+    normalized_idea = R._normalize_reconciled_final_failure(
+        "IDEA_PROTOCOL_FAILED",
+        passing,
+        {"raw_status": "IDEA_PROTOCOL_FAILED", "idea_protocol": idea_protocol},
+    )
+    check("idea_normalized_verify_status", normalized_idea["status"], "IDEA_PROTOCOL_FAILED")
+    check("idea_normalized_verify_success", normalized_idea["success"], False)
+    check("idea_normalized_verify_accepted", normalized_idea["accepted"], False)
+    check("idea_normalized_verify_progress", normalized_idea["progress"], False)
+    check("idea_normalized_verify_resolution", normalized_idea["resolution"], "unresolved")
+    check(
+        "idea_normalized_failure_category",
+        normalized_idea["failure_pack"]["failure_category"],
+        "IDEA_PROTOCOL_FAILED",
+    )
+    check("idea_protocol_evidence_preserved", normalized_idea["idea_protocol"], idea_protocol)
+    R._persist_verify_payload(temp, normalized_idea, ".idea")
+    persisted_idea = json.loads((temp / "verify.json.idea").read_text(encoding="utf-8"))
+    check("idea_persisted_verify_status", persisted_idea["status"], "IDEA_PROTOCOL_FAILED")
+
     changed_timeout = payload(
         "BUILD_FAILED",
         different_diff,

@@ -122,6 +122,11 @@ settings 完全一致，再用运行时从 `/agent-src` 装配的同一脚本以
 dependency-audit 和模型任务。发布验收必须做到每个唯一 execution plan 使用
 全新容器或独立只读缓存，禁止跨 plan 依赖前一容器写入的 Maven/Gradle 缓存。
 
+C/C++ 并发 worker 可共享且只能共享 ccache 对象：外部控制器按精确镜像 tag、
+语言和项目创建稳定 named volume，挂到 `/var/cache/refactoragent/ccache`，并设置
+`CCACHE_DIR` 与 `CCACHE_UMASK=000`。build 目录、测试输出、JUnit、`verify.json` 与 PASS 结论不得挂入
+该 volume；Python worker 不启用此缓存。
+
 ### 一键依赖闭包审计
 
 元数据检查只能证明离线仓库格式正确，不能证明当前 dataset、固定项目提交

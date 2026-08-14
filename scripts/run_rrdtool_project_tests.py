@@ -176,8 +176,7 @@ def _run_libdbi_attribute_probe(
         probe_source.write_text(
             _libdbi_probe_translation_unit(function), encoding="utf-8"
         )
-        compiler = os.environ.get("CC", "cc")
-        command = [compiler, "-std=c11"]
+        command = [*shlex.split(os.environ.get("CC", "cc")), "-std=c11"]
         if include_dir is not None:
             command.extend(["-I", str(include_dir)])
         command.extend([str(probe_source), "-lm", "-o", str(probe_binary)])
@@ -235,16 +234,39 @@ def _declared_tests(build: Path) -> tuple[str, ...]:
     return tests
 
 
+def _libdbi_probe_errors(build: Path) -> tuple[str, str]:
+    build_error = _libdbi_build_contract(build)
+    probe = _run_libdbi_attribute_probe(build)
+    probe_error = ""
+    if probe.returncode != 0:
+        probe_error = (
+            (probe.stdout or "") + (probe.stderr or "")
+        ).strip() or f"libDBI attribute probe exited {probe.returncode}"
+    return build_error, probe_error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", required=True)
     parser.add_argument("--build-dir", default=".")
+    parser.add_argument("--focused-libdbi-probe", action="store_true")
     args = parser.parse_args()
 
     root = Path(args.project_root).expanduser().resolve()
     build = (root / args.build_dir).resolve()
     if not (build / "Makefile").is_file():
         raise SystemExit("RRDtool configured build directory is missing")
+    if args.focused_libdbi_probe:
+        build_error, probe_error = _libdbi_probe_errors(build)
+        if build_error:
+            print(f"FAIL: libdbi-object-built: {build_error}")
+        if probe_error:
+            print(f"FAIL: libdbi-unsigned-size-attributes: {probe_error}")
+        if build_error or probe_error:
+            return 1
+        print("rrdtool focused libDBI probe: PASS")
+        return 0
+
     tests = _declared_tests(build)
     report = root / ".smell-test-reports" / "TEST-rrdtool-make-check.xml"
     report.unlink(missing_ok=True)
@@ -261,13 +283,7 @@ def main() -> int:
     duration = time.monotonic() - started
     print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
 
-    libdbi_build_error = _libdbi_build_contract(build)
-    libdbi_probe = _run_libdbi_attribute_probe(build)
-    libdbi_probe_error = ""
-    if libdbi_probe.returncode != 0:
-        libdbi_probe_error = (
-            (libdbi_probe.stdout or "") + (libdbi_probe.stderr or "")
-        ).strip() or f"libDBI attribute probe exited {libdbi_probe.returncode}"
+    libdbi_build_error, libdbi_probe_error = _libdbi_probe_errors(build)
     if libdbi_build_error:
         print(f"FAIL: libdbi-object-built: {libdbi_build_error}")
     if libdbi_probe_error:

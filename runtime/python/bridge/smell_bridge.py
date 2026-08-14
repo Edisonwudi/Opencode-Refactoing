@@ -44,6 +44,7 @@ from smell_core.guards import (  # noqa: E402
     dead_code_checkpoint_absence_allowed,
     god_class_relative_reduction,
     run_build_test_guard,
+    run_focused_preflight,
     run_smell_guards,
     validate_java_strict_verification_contract,
 )
@@ -681,11 +682,15 @@ def cmd_capture_baseline(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
-    """Evaluate the frozen non-Java source Guard without build/test or snapshots."""
+    """Evaluate the frozen source Guard without build/test or snapshots."""
     resolved = _resolve(args)
     language = str(resolved.language or "").strip().lower()
+    location = str(getattr(args, "location", "") or "").strip().lower()
+    java_source = bool(
+        language == "java" or re.search(r"\.java(?::|\b)", location)
+    )
     applicable = bool(
-        language in {"python", "c", "cpp"}
+        (java_source or language in {"python", "c", "cpp"})
         and resolved.smell in CHECKPOINT_SMELLS
         and resolved.locations
     )
@@ -1034,6 +1039,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
                 resolved,
                 require_test_execution=require_test_execution,
             )
+            if resolved.verification_mode == "project_full":
+                build_test_result["project_full_executed"] = True
     behavior_valid = build_test_result is None or bool(build_test_result.get("success"))
     success = not failed_smell and (
         build_test_result is None or bool(build_test_result.get("success"))
@@ -1083,6 +1090,10 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
         "continue_hint": continue_hint,
         "smell_guard": smell_guard,
         "build_test_guard": build_test_result,
+        "project_full_executed": bool(
+            isinstance(build_test_result, dict)
+            and build_test_result.get("project_full_executed") is True
+        ),
         "test_changes": test_changes or None,
         "snapshot": snapshot,
     }
@@ -1410,6 +1421,7 @@ def _rebase_build_test_config(
             fresh_root,
         ),
         build=command_config(resolved.build),
+        focused_preflight=command_config(resolved.focused_preflight),
         test=command_config(resolved.test),
         sample_test=command_config(resolved.sample_test),
         env=rebased_env,
@@ -1520,6 +1532,7 @@ def _run_project_full_in_fresh_worktree(
 
     failure: Optional[dict[str, Any]] = None
     build_test_result: Optional[dict[str, Any]] = None
+    focused_preflight_result: Optional[dict[str, Any]] = None
     cleanup_success: Optional[bool] = None
     try:
         with tempfile.TemporaryDirectory(prefix="smell-project-full-") as raw:
@@ -1595,21 +1608,57 @@ def _run_project_full_in_fresh_worktree(
                             )
                         else:
                             try:
-                                build_test_result = run_build_test_guard(
-                                    isolated,
-                                    require_test_execution=require_test_execution,
+                                focused_preflight_result = run_focused_preflight(
+                                    isolated
                                 )
                             except Exception:
                                 failure = _final_verify_infra_failure_result(
                                     resolved,
-                                    stage="run_build_test_guard",
+                                    stage="run_focused_preflight",
                                     message=(
-                                        "The isolated build/test Guard raised "
+                                        "The isolated focused preflight raised "
                                         "an exception."
                                     ),
                                     base_commit=resolved_base_text,
                                     snapshot_change_count=change_count,
                                 )
+                            else:
+                                if focused_preflight_result.get("success") is False:
+                                    execution = focused_preflight_result.get("execution")
+                                    build_test_result = {
+                                        "type": "build_test",
+                                        "success": False,
+                                        "reason": "FOCUSED_PREFLIGHT_FAILED",
+                                        "message": focused_preflight_result.get("message"),
+                                        "focused_preflight": focused_preflight_result,
+                                        "project_full_executed": False,
+                                        "details": {
+                                            "build": execution,
+                                            "test": None,
+                                            "sample_test": None,
+                                        },
+                                    }
+                                else:
+                                    try:
+                                        build_test_result = run_build_test_guard(
+                                            isolated,
+                                            require_test_execution=require_test_execution,
+                                        )
+                                        build_test_result["focused_preflight"] = (
+                                            focused_preflight_result
+                                        )
+                                        build_test_result["project_full_executed"] = True
+                                    except Exception:
+                                        failure = _final_verify_infra_failure_result(
+                                            resolved,
+                                            stage="run_build_test_guard",
+                                            message=(
+                                                "The isolated build/test Guard raised "
+                                                "an exception."
+                                            ),
+                                            base_commit=resolved_base_text,
+                                            snapshot_change_count=change_count,
+                                        )
                 finally:
                     removed = _run_git(
                         ["worktree", "remove", "--force", str(fresh_root)],
@@ -1658,6 +1707,7 @@ def _run_project_full_in_fresh_worktree(
 
     sample_command = str(resolved.sample_test_command or "").strip()
     build_test_result.update({
+        "focused_preflight": focused_preflight_result,
         "verification_mode": resolved.verification_mode,
         "build_source": resolved.build_source,
         "test_source": resolved.test_source,
@@ -1750,22 +1800,6 @@ def _verify_status(
     return "VERIFY_FAILED"
 
 
-def _has_cross_smell_regression(smell_guard: dict[str, Any]) -> bool:
-    for result in list(smell_guard.get("results") or []):
-        if not isinstance(result, dict):
-            continue
-        details = result.get("details")
-        if not isinstance(details, dict):
-            continue
-        current = details.get("current_metrics")
-        if not isinstance(current, dict):
-            continue
-        contract = current.get("cross_smell_regression")
-        if isinstance(contract, dict) and contract.get("violations"):
-            return True
-    return False
-
-
 def _summarize_command_result(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if result is None:
         return None
@@ -1797,6 +1831,7 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
     details = result.get("details") or {}
     final_artifact_audit = result.get("final_diff_generated_artifact_audit")
     isolation = result.get("verification_isolation")
+    focused_preflight = result.get("focused_preflight")
     return {
         "type": result.get("type"),
         "success": bool(result.get("success")),
@@ -1808,6 +1843,23 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
         "sample_test_source": result.get("sample_test_source", ""),
         "test_location": _bounded_text(result.get("test_location", "")),
         "test_command_hash": result.get("test_command_hash", ""),
+        "project_full_executed": result.get("project_full_executed") is True,
+        "focused_preflight": {
+            "schema_version": focused_preflight.get("schema_version"),
+            "success": focused_preflight.get("success") is True,
+            "status": _bounded_text(focused_preflight.get("status"), limit=128),
+            "acceptance": False,
+            "project_full_executed": False,
+            "cache_scope": _bounded_text(
+                focused_preflight.get("cache_scope"),
+                limit=128,
+            ),
+            "execution": _summarize_command_result(
+                focused_preflight.get("execution")
+            ),
+        }
+        if isinstance(focused_preflight, dict)
+        else None,
         "test_changes": _compact_test_changes(result.get("test_changes")),
         "final_diff_generated_artifact_audit": {
             "success": bool(final_artifact_audit.get("success")),
@@ -1897,6 +1949,7 @@ def _legacy_verify_payload(
         "status": full_payload.get("status"),
         "resolution": full_payload.get("resolution"),
         "continue_hint": full_payload.get("continue_hint", ""),
+        "project_full_executed": full_payload.get("project_full_executed") is True,
         "smell_guard": full_payload.get("smell_guard"),
         "build_test_guard": _summarize_build_test_guard(full_payload.get("build_test_guard")),
         "test_changes": full_payload.get("test_changes"),
@@ -1923,6 +1976,7 @@ def _verify_decision_payload(
         "status": _bounded_text(full_payload.get("status"), limit=128),
         "resolution": _bounded_text(full_payload.get("resolution"), limit=128),
         "continue_hint": _bounded_text(full_payload.get("continue_hint")),
+        "project_full_executed": full_payload.get("project_full_executed") is True,
         "smell_guard": _compact_smell_guard(full_payload.get("smell_guard")),
         "build_test_guard": _summarize_build_test_guard(full_payload.get("build_test_guard")),
         "test_changes": _compact_test_changes(full_payload.get("test_changes")),
@@ -3061,16 +3115,6 @@ def _classify_failure_pack(
     if payload is None:
         return "UNKNOWN_VERIFY_FAILURE", ["No verify artifact or inline verify payload was available."]
     status = str(payload.get("status") or "").strip()
-    smell_guard = payload.get("smell_guard") or {}
-    if (
-        status == "SMELL_GUARD_FAILED"
-        and isinstance(smell_guard, dict)
-        and _has_cross_smell_regression(smell_guard)
-    ):
-        return "CROSS_SMELL_REGRESSION", [
-            "The changed production declarations introduced a new Long Parameter List finding.",
-            "Reduce the new helper signature below the existing language threshold without weakening the target refactoring.",
-        ]
     if status == "BUILD_TEST_REQUIRED":
         return "BUILD_TEST_REQUIRED", [
             "Build/test verification is required for this batch run; rerun smell_verify without skipBuildTest.",

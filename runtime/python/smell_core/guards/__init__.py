@@ -600,6 +600,56 @@ def run_build_test_guard(
     }
 
 
+def run_focused_preflight(config: ResolvedRunConfig) -> Dict[str, object]:
+    """Run a declared bounded preflight without accepting the sample.
+
+    The command runs in the caller's project root, so a fresh project-full
+    worktree can reuse its compiler outputs for the immediately following full
+    build. Any focused test or behavior probe is a gate only: its evidence and
+    result are never reused for final acceptance.
+    """
+    command = config.focused_preflight
+    common: Dict[str, object] = {
+        "schema_version": 1,
+        "type": "focused_preflight",
+        "acceptance": False,
+        "project_full_executed": False,
+        "cache_scope": "compiler_outputs_only",
+        "test_result_reused": False,
+        "pass_reused": False,
+    }
+    if not command.command and not command.script:
+        return {
+            **common,
+            "success": True,
+            "status": "NOT_APPLICABLE",
+            "message": "No focused preflight is declared for this project.",
+            "execution": None,
+        }
+    execution = _run_command_config(
+        command,
+        cwd=config.cwd,
+        env=config.env,
+        label="focused_preflight",
+        project_root=config.project_root,
+        source="projects.yaml",
+        timeout_seconds=config.defaults.shell_timeout,
+    )
+    ready = bool(execution["success"])
+    return {
+        **common,
+        "success": ready,
+        "status": "READY" if ready else "FAILED",
+        "message": (
+            "Focused preflight is ready; final project verification "
+            "has not run."
+            if ready
+            else f"Focused preflight failed. {execution['summary_text']}"
+        ),
+        "execution": execution,
+    }
+
+
 def _verification_metadata(config: ResolvedRunConfig) -> Dict[str, object]:
     return {
         "verification_mode": config.verification_mode,

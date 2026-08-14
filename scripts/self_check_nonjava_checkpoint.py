@@ -60,9 +60,19 @@ def main() -> int:
         unchanged = run(project, "verify", *common, "--skip-build-test")
         assert unchanged["success"] is False, unchanged
         assert unchanged["checkpoint"]["delta"]["has_production_diff"] is False, unchanged
-        target.write_text(source(2), encoding="utf-8")
+        target.write_text(
+            source(2)
+            + "\ndef unrelated_helper(a, b, c, d, e, f, g):\n"
+            + "    return a + b + c + d + e + f + g\n",
+            encoding="utf-8",
+        )
         reduced = run(project, "verify", *common, "--skip-build-test")
         assert reduced["success"] is True, reduced
+        assert reduced["status"] == "PASS", reduced
+        assert (
+            "cross_smell_regression"
+            not in reduced["checkpoint"]["current_metrics"]
+        ), reduced
         assert reduced["checkpoint"]["baseline_project_commit"] == baseline_commit, reduced
         assert reduced["snapshot"]["base_commit"] == baseline_commit, reduced
         delta = reduced["checkpoint"]["delta"]

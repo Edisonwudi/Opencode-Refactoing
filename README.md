@@ -131,10 +131,12 @@ runs/<run-name>/samples/<sample>/
 ```
 
 `results.csv` 会独立记录 `status`、`resolution`、`accepted`、`progress`
-和 `termination_reason`，`note` 另记录 `final_verify_source`。无论 OpenCode
-是否超时或已在循环中调用过验证，runner 都只执行一次独立的最终
-`runner_final` 验收；该结果是终态唯一权威。OpenCode 超时和 Provider 错误仅作为
-执行元数据记录，不触发第二套验收。每样本容器内 Maven `install` 产生的临时
+和 `termination_reason`，`note` 另记录 `final_verify_source`。runner 只做一次
+最终验收选择：若最后一次 agent `project_full` PASS 的候选 diff、fresh-worktree
+隔离、build/test、Guard、测试未修改证据和 artifact 均与当前候选一致，runner
+复用该次完整验证并写入独立 receipt；否则执行一次新的 `runner_final` 完整验证。
+两条路径都只产生一个权威终态。OpenCode 超时和 Provider 错误仅作为
+执行元数据记录，不能被已通过的验证覆盖。每样本容器内 Maven `install` 产生的临时
 本地仓库元数据不会覆盖 smell/build/test 的最终状态。
 
 `smell_verify` 和数据集 runner 默认只传递固定投影的
@@ -309,10 +311,15 @@ docker run --rm \
   或严格的 pytest、Python `unittest`、CTest、Curl `TESTDONE` 与 Redis native-test
   终态可作为证据；后两者必须与对应真实 runner invocation 同时出现。`--version`、`-v`、
   帮助输出、文件存在性和 collection-only 均不能把返回码 0 变成测试 PASS。
+- 正式验证按三段执行：source Guard 先判断目标异味是否越线；配置了重项目预检时，
+  再在同一 fresh worktree 做增量编译，并仅对已声明的项目运行固定目标测试或行为探针；最后才执行一次
+  `project_full`。前两段只提供修复反馈，`acceptance=false`，不能缓存或复用 PASS、
+  测试结果和 JUnit。C/C++ replay matrix 只通过按镜像、语言、项目隔离的 named volume
+  共享 ccache 对象；build 目录、测试输出与验收结论始终按样本隔离。
 - 最终交付快照在 build/test 前以 c000 冻结 commit 为基线采集完整 Git diff/status，
   包含已提交、已暂存、未暂存、未跟踪生产源码及构建元数据；候选自行 commit 不能
   隐藏改动。禁止的测试源码改动会先于构建测试 fail-closed。
-- runner 在 `result.json.attempts` 中保留每次 agent 验证与最终独立验证。同一 diff
+- runner 在 `result.json.attempts` 中保留每次 agent 验证与最终验收选择。同一 diff
   若最后一次 agent 测试失败而 final 单次转绿，标记 `FLAKY_TEST_INCONCLUSIVE`；
   若 agent 已通过而 final 仅因超时/OOM 翻红，标记 `FINAL_VERIFY_INFRA_FAILED`。
   两者都不自动计为接受，也不会伪装成确定的代码回归。
@@ -464,7 +471,9 @@ Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_ful
 `--loop-no-progress-limit=1..5`、`--loop-on=smell,compile,test`、
 `--sample-deadline=60..7200`。参数非法直接报 `INVALID_LOOP_POLICY`。
 
-两种验证模式都会执行严格 build/test；`sample_optimized` 在 build 后只执行数据行
+Java 与非 Java 都会在正式 build/test 前先执行 source-only Guard；未越线时只返回
+数值缺口，不启动完整项目验证。两种正式验证模式都会执行严格 build/test；
+`sample_optimized` 在 build 后只执行数据行
 中已物化的聚焦测试命令。`project_full` 是固定的两段测试合同：先执行
 `projects.yaml` 的项目级测试，再执行数据行的 `sample_test_command`，并要求每个
 声明测试类都有新鲜、非零的 JUnit 执行证据。build、项目测试和样本测试三段任一
@@ -507,6 +516,12 @@ python3 scripts/run_smell_dataset.py \
   `SMELL_ARTIFACT_ROOT` 唯一设置为该目录后再降权启动 worker；目录不可写时
   会在调用模型前以退出码 73 失败。不要另行挂载未对齐的 `/runs` artifact
   目录。
+- C/C++ worker 若要跨样本复用编译对象，还必须按“精确镜像 tag / 语言 / 项目”
+  挂载一个稳定 named volume 到 `/var/cache/refactoragent/ccache`，并设置
+  `CCACHE_DIR` 为该目录、`CCACHE_UMASK=000`。只允许共享这个目录；不得共享 build 目录、测试报告或
+  验收结果。Python worker 不挂该 volume。受版本控制的 non-Java replay launcher
+  会自动生成此挂载；自定义 300 条控制器必须采用同一合同，否则缓存只存在于单个
+  `--rm` 容器内，跨样本命中率为零。
 - 更多 runner 参数（`--limit`、`--offset`、`--projects`、
   `--project-revisions`、dry-run 等）见 `python3 scripts/run_smell_dataset.py --help`。
 

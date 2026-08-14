@@ -46,6 +46,10 @@ from smell_core.project_revision import (  # noqa: E402
     verify_checkout,
     verify_test_oracle,
 )
+from bridge.smell_bridge import (  # noqa: E402
+    _snapshot_project as _capture_candidate_snapshot,
+    _summarize_command_result as _summarize_receipt_command_result,
+)
 
 
 OPENCODE_BATCH_API_KEY_ENV = "SMELL_OPENCODE_API_KEY"
@@ -73,6 +77,7 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
 }
 
 FINAL_VERIFICATION_MODES = {"sample_optimized", "project_full"}
+RUNNER_FINAL_RECEIPT_SCHEMA = "smell.runner-final-receipt/v1"
 
 @dataclass(frozen=True)
 class Sample:
@@ -1192,7 +1197,7 @@ def _verification_attempt_history(
     agent_attempts: list[dict[str, Any]],
     final_attempt: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Preserve every parsed agent verify before the independent final verify."""
+    """Preserve every parsed agent verify before the runner-owned final decision."""
     return [*agent_attempts, final_attempt]
 
 
@@ -1297,7 +1302,7 @@ def _normalize_reconciled_final_failure(
     verify_payload: dict[str, Any],
     audit: dict[str, Any],
 ) -> dict[str, Any]:
-    """Render a runner reconciliation as one canonical non-passing decision."""
+    """Render a runner-owned terminal override as one canonical failure."""
     raw_pack = (
         verify_payload.get("failure_pack")
         if isinstance(verify_payload.get("failure_pack"), dict)
@@ -1322,11 +1327,14 @@ def _normalize_reconciled_final_failure(
         if isinstance(raw_pack.get("repair_contract"), dict)
         else {}
     )
-    failure_category = (
-        "FLAKY_TEST_INCONCLUSIVE"
-        if status == "FLAKY_TEST_INCONCLUSIVE"
-        else str(audit.get("infra_category") or "FINAL_VERIFY_INFRA_FAILED")
-    )
+    if status == "FLAKY_TEST_INCONCLUSIVE":
+        failure_category = "FLAKY_TEST_INCONCLUSIVE"
+    elif status == "IDEA_PROTOCOL_FAILED":
+        failure_category = "IDEA_PROTOCOL_FAILED"
+    else:
+        failure_category = str(
+            audit.get("infra_category") or "FINAL_VERIFY_INFRA_FAILED"
+        )
     failure_pack = {
         **raw_pack,
         "failure_category": failure_category,
@@ -1399,6 +1407,10 @@ def _normalize_reconciled_final_failure(
             "verify_status": status,
         }
     payload.pop("failure_fingerprint", None)
+    if status == "IDEA_PROTOCOL_FAILED" and isinstance(
+        audit.get("idea_protocol"), dict
+    ):
+        payload["idea_protocol"] = audit["idea_protocol"]
     return payload
 
 
@@ -1927,6 +1939,474 @@ def _run_verify(
     return proc.returncode, payload
 
 
+def _runner_final_receipt_audit(
+    reason: str,
+    *,
+    reused: bool = False,
+    agent_diff_sha256: str = "",
+) -> dict[str, Any]:
+    return {
+        "schema_version": RUNNER_FINAL_RECEIPT_SCHEMA,
+        "reused": reused,
+        "reason": reason,
+        "source": "agent_smell_verify",
+        "required_verification_mode": "project_full",
+        "agent_diff_sha256": agent_diff_sha256,
+    }
+
+
+def _persist_runner_final_receipt_audit(
+    sample_dir: Path,
+    receipt_audit: dict[str, Any],
+) -> None:
+    (sample_dir / "runner-final-receipt.json").write_text(
+        json.dumps(receipt_audit, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _receipt_artifacts_complete(
+    payload: dict[str, Any],
+    sample_dir: Path,
+) -> bool:
+    artifacts = payload.get("artifacts")
+    artifact_index = payload.get("artifact_index")
+    if not isinstance(artifacts, dict) or not isinstance(artifact_index, dict):
+        return False
+    required = {
+        "guard_evidence",
+        "build_test_guard",
+        "build_result",
+        "test_result",
+        "build_log",
+        "test_log",
+        "snapshot",
+        "diff",
+        "diff_stat",
+    }
+    details = _build_test_details(payload)
+    if isinstance(details.get("sample_test"), dict):
+        required.update({"sample_test_result", "sample_test_log"})
+    artifact_root = (sample_dir / "agent-artifacts").resolve()
+    nonempty = required - {"build_log", "test_log", "sample_test_log"}
+    for name in required:
+        raw_path = artifacts.get(name)
+        indexed = artifact_index.get(name)
+        if not isinstance(raw_path, str) or not isinstance(indexed, dict):
+            return False
+        path = Path(raw_path)
+        try:
+            path.resolve().relative_to(artifact_root)
+        except (OSError, ValueError):
+            return False
+        if str(indexed.get("path") or "") != raw_path:
+            return False
+        indexed_bytes = indexed.get("bytes")
+        try:
+            actual_bytes = path.stat().st_size
+        except OSError:
+            return False
+        if not isinstance(indexed_bytes, int) or actual_bytes != indexed_bytes:
+            return False
+        if name in nonempty and indexed_bytes <= 0:
+            return False
+    return True
+
+
+def _receipt_command_stage_complete(stage: Any) -> bool:
+    return bool(
+        isinstance(stage, dict)
+        and stage.get("success") is True
+        and stage.get("status") == "ok"
+        and stage.get("returncode") == 0
+        and (str(stage.get("command") or "").strip() or str(stage.get("script") or "").strip())
+    )
+
+
+def _receipt_command_stages_match(
+    summary: Any,
+    full_stage: Any,
+    artifact_stage: Any,
+) -> bool:
+    return bool(
+        _receipt_command_stage_complete(summary)
+        and _receipt_command_stage_complete(full_stage)
+        and _receipt_command_stage_complete(artifact_stage)
+        and _summarize_receipt_command_result(full_stage) == summary
+        and _summarize_receipt_command_result(artifact_stage) == summary
+    )
+
+
+def _read_receipt_json(payload: dict[str, Any], name: str) -> dict[str, Any] | None:
+    artifacts = payload.get("artifacts")
+    raw_path = artifacts.get(name) if isinstance(artifacts, dict) else None
+    if not isinstance(raw_path, str):
+        return None
+    try:
+        value = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _receipt_build_test_complete(payload: dict[str, Any], sample: Sample) -> bool:
+    guard = payload.get("build_test_guard")
+    if not isinstance(guard, dict) or guard.get("success") is not True:
+        return False
+    if (
+        guard.get("verification_mode") != "project_full"
+        or guard.get("project_full_executed") is not True
+    ):
+        return False
+    focused_preflight = guard.get("focused_preflight")
+    if not (
+        isinstance(focused_preflight, dict)
+        and focused_preflight.get("success") is True
+        and focused_preflight.get("status") in {"READY", "NOT_APPLICABLE"}
+        and focused_preflight.get("acceptance") is False
+        and focused_preflight.get("project_full_executed") is False
+    ):
+        return False
+    isolation = guard.get("verification_isolation")
+    snapshot = payload.get("snapshot")
+    if not (
+        isinstance(isolation, dict)
+        and isinstance(snapshot, dict)
+        and isolation.get("contract_version") == "project-full-fresh-worktree/v1"
+        and isolation.get("mode") == "detached_git_worktree"
+        and isolation.get("success") is True
+        and isolation.get("stage") == "completed"
+        and isolation.get("cleanup_success") is True
+        and isolation.get("base_commit") == snapshot.get("base_commit")
+    ):
+        return False
+    full_guard = _read_receipt_json(payload, "build_test_guard")
+    if not (
+        isinstance(full_guard, dict)
+        and full_guard.get("success") is True
+        and full_guard.get("verification_mode") == "project_full"
+        and full_guard.get("project_full_executed") is True
+    ):
+        return False
+    full_isolation = full_guard.get("verification_isolation")
+    if not (
+        isinstance(full_isolation, dict)
+        and full_isolation.get("contract_version")
+        == isolation.get("contract_version")
+        and full_isolation.get("mode") == isolation.get("mode")
+        and full_isolation.get("success") is True
+        and full_isolation.get("stage") == isolation.get("stage")
+        and full_isolation.get("base_commit") == isolation.get("base_commit")
+        and full_isolation.get("cleanup_success") is True
+    ):
+        return False
+    full_focused = full_guard.get("focused_preflight")
+    if not (
+        isinstance(full_focused, dict)
+        and full_focused.get("success") is True
+        and full_focused.get("status") in {"READY", "NOT_APPLICABLE"}
+        and full_focused.get("status") == focused_preflight.get("status")
+        and full_focused.get("acceptance") is False
+        and full_focused.get("project_full_executed") is False
+    ):
+        return False
+    details = _build_test_details(payload)
+    full_details = full_guard.get("details")
+    if not isinstance(full_details, dict):
+        return False
+    full_build = _read_receipt_json(payload, "build_result")
+    full_test = _read_receipt_json(payload, "test_result")
+    if not (
+        _receipt_command_stages_match(
+            details.get("build"), full_details.get("build"), full_build
+        )
+        and _receipt_command_stages_match(
+            details.get("test"), full_details.get("test"), full_test
+        )
+        and isinstance(full_details["test"].get("execution_evidence"), dict)
+        and full_details["test"]["execution_evidence"].get("success") is True
+        and isinstance(full_test.get("execution_evidence"), dict)
+        and full_test["execution_evidence"].get("success") is True
+    ):
+        return False
+    sample_test = details.get("sample_test")
+    full_sample_test_stage = full_details.get("sample_test")
+    if bool(isinstance(sample_test, dict)) != bool(
+        isinstance(full_sample_test_stage, dict)
+    ):
+        return False
+    if sample.test_command.strip() and not isinstance(sample_test, dict):
+        return False
+    if isinstance(sample_test, dict):
+        full_sample_test = _read_receipt_json(payload, "sample_test_result")
+        if not (
+            _receipt_command_stages_match(
+                sample_test, full_sample_test_stage, full_sample_test
+            )
+            and isinstance(
+                full_sample_test_stage.get("execution_evidence"), dict
+            )
+            and full_sample_test_stage["execution_evidence"].get("success") is True
+            and isinstance(full_sample_test.get("execution_evidence"), dict)
+            and full_sample_test["execution_evidence"].get("success") is True
+        ):
+            return False
+    return True
+
+
+def _receipt_guard_evidence_complete(payload: dict[str, Any]) -> bool:
+    evidence = _read_receipt_json(payload, "guard_evidence")
+    checkpoint = payload.get("checkpoint")
+    evidence_checkpoint = evidence.get("checkpoint") if isinstance(evidence, dict) else None
+    return bool(
+        isinstance(evidence, dict)
+        and evidence.get("success") is True
+        and evidence.get("accepted") is True
+        and evidence.get("status") == "PASS"
+        and evidence.get("resolution") == "resolved"
+        and isinstance(checkpoint, dict)
+        and isinstance(evidence_checkpoint, dict)
+        and evidence_checkpoint.get("accepted") == checkpoint.get("accepted")
+        and evidence_checkpoint.get("resolution") == checkpoint.get("resolution")
+        and evidence_checkpoint.get("verify_status") == checkpoint.get("verify_status")
+        and evidence_checkpoint.get("build_test_success")
+        == checkpoint.get("build_test_success")
+        and evidence.get("smell_guard") == payload.get("smell_guard")
+        and evidence.get("test_changes") == payload.get("test_changes")
+    )
+
+
+def _receipt_tests_unchanged(payload: dict[str, Any]) -> bool:
+    test_changes = payload.get("test_changes")
+    if not (
+        isinstance(test_changes, dict)
+        and test_changes.get("success") is True
+        and test_changes.get("status") == "TEST_SOURCE_UNCHANGED"
+    ):
+        return False
+    count_keys = (
+        "added_count",
+        "changed_count",
+        "deleted_count",
+        "verification_config_added_count",
+        "verification_config_changed_count",
+        "verification_config_deleted_count",
+        "test_strength_violations_count",
+    )
+    return all(test_changes.get(key) in (None, 0) for key in count_keys)
+
+
+def _receipt_matches_current_candidate(
+    sample: Sample,
+    payload: dict[str, Any],
+) -> bool:
+    snapshot_summary = payload.get("snapshot")
+    snapshot = _read_receipt_json(payload, "snapshot")
+    diff_path = _verify_diff_path(payload)
+    if not (
+        isinstance(snapshot_summary, dict)
+        and isinstance(snapshot, dict)
+        and diff_path is not None
+        and snapshot_summary.get("scope") == "full_worktree_pre_verification"
+        and snapshot.get("scope") == "full_worktree_pre_verification"
+    ):
+        return False
+    try:
+        if Path(str(snapshot.get("project_root") or "")).resolve() != sample.project_root.resolve():
+            return False
+    except OSError:
+        return False
+    base_commit = str(snapshot.get("base_commit") or "").strip()
+    change_audit = snapshot.get("change_audit")
+    summary_change_audit = snapshot_summary.get("change_audit")
+    saved_diff = snapshot.get("diff")
+    if not (
+        base_commit
+        and snapshot_summary.get("base_commit") == base_commit
+        and isinstance(change_audit, dict)
+        and change_audit.get("success") is True
+        and isinstance(change_audit.get("change_count"), int)
+        and change_audit["change_count"] > 0
+        and isinstance(summary_change_audit, dict)
+        and summary_change_audit.get("success") is True
+        and summary_change_audit.get("change_count") == change_audit["change_count"]
+        and isinstance(saved_diff, dict)
+        and saved_diff.get("returncode") == 0
+        and isinstance(saved_diff.get("stdout"), str)
+        and bool(saved_diff["stdout"])
+    ):
+        return False
+    category_counts = change_audit.get("category_counts")
+    if not isinstance(category_counts, dict) or int(category_counts.get("test") or 0):
+        return False
+    try:
+        artifact_diff = diff_path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return False
+    if saved_diff["stdout"] != artifact_diff:
+        return False
+    declared_test_paths = [
+        item.strip()
+        for item in str(sample.test_location or "").split(";")
+        if item.strip()
+    ]
+    try:
+        current = _capture_candidate_snapshot(
+            sample.project_root,
+            declared_test_paths=declared_test_paths,
+            base_commit=base_commit,
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    current_audit = current.get("change_audit")
+    current_diff = current.get("diff")
+    current_categories = (
+        current_audit.get("category_counts") if isinstance(current_audit, dict) else None
+    )
+    return bool(
+        isinstance(current_audit, dict)
+        and current_audit.get("success") is True
+        and isinstance(current_categories, dict)
+        and int(current_categories.get("test") or 0) == 0
+        and isinstance(current_diff, dict)
+        and current_diff.get("returncode") == 0
+        and current_diff.get("stdout") == artifact_diff
+    )
+
+
+def _agent_project_full_receipt(
+    sample: Sample,
+    sample_dir: Path,
+    verification_mode: str,
+    opencode_returncode: int,
+    last_trace: dict[str, Any],
+    agent_verification_history: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    def reject(reason: str, digest: str = "") -> tuple[None, dict[str, Any]]:
+        return None, _runner_final_receipt_audit(reason, agent_diff_sha256=digest)
+
+    if verification_mode != "project_full":
+        return reject("NOT_PROJECT_FULL")
+    if opencode_returncode != 0:
+        return reject("OPENCODE_NONZERO")
+    if int(last_trace.get("tools_after_last_verify") or 0) != 0:
+        return reject("TOOLS_AFTER_LAST_VERIFY")
+    if int(last_trace.get("tool_attempts_after_last_verify") or 0) != 0:
+        return reject("TOOL_ATTEMPT_AFTER_LAST_VERIFY")
+    if (
+        last_trace.get("last_output_parsed") is not True
+        or last_trace.get("last_loop_decision") != "stop"
+    ):
+        return reject("AGENT_VERIFY_NOT_TERMINAL")
+    payload = last_trace.get("last_payload")
+    last_attempt = agent_verification_history[-1] if agent_verification_history else None
+    if not isinstance(payload, dict) or not isinstance(last_attempt, dict):
+        return reject("AGENT_VERIFY_MISSING")
+    digest = str(last_attempt.get("diff_sha256") or "")
+    if not (
+        payload.get("schema_version") == "smell.verify.decision/v1"
+        and payload.get("project_full_executed") is True
+        and _accepted_verify_pass(payload, int(last_attempt.get("verify_returncode") or 0))
+        and last_attempt.get("verify_source") == "agent"
+        and last_attempt.get("verify_returncode") == 0
+        and last_attempt.get("status") == "PASS"
+        and last_attempt.get("accepted") is True
+        and not str(last_attempt.get("failure_category") or "")
+        and not list(last_attempt.get("failed_build_test_steps") or [])
+        and payload.get("failure_pack") in (None, {})
+        and digest
+        and digest == _verify_diff_sha256(payload)
+    ):
+        return reject("AGENT_FORMAL_PASS_REQUIRED", digest)
+    smell_guard = payload.get("smell_guard")
+    checkpoint = payload.get("checkpoint")
+    if not (
+        isinstance(smell_guard, dict)
+        and smell_guard.get("success") is True
+        and int(smell_guard.get("failure_count") or 0) == 0
+        and isinstance(checkpoint, dict)
+        and checkpoint.get("accepted") is True
+        and checkpoint.get("resolution") == "resolved"
+        and checkpoint.get("verify_status") == "PASS"
+        and checkpoint.get("build_test_success") is True
+    ):
+        return reject("FORMAL_GUARD_EVIDENCE_INCOMPLETE", digest)
+    if not _receipt_tests_unchanged(payload):
+        return reject("TEST_SOURCE_CHANGED", digest)
+    if not _receipt_artifacts_complete(payload, sample_dir):
+        return reject("EVIDENCE_INCOMPLETE", digest)
+    if not (
+        _receipt_build_test_complete(payload, sample)
+        and _receipt_guard_evidence_complete(payload)
+    ):
+        return reject("FRESH_ISOLATION_INCOMPLETE", digest)
+    if any(
+        str(attempt.get("diff_sha256") or "") == digest
+        and (
+            attempt.get("status") != "PASS"
+            or attempt.get("accepted") is not True
+            or attempt.get("success") is not True
+        )
+        for attempt in agent_verification_history[:-1]
+        if isinstance(attempt, dict)
+    ):
+        return reject("SAME_DIFF_CONTRADICTION", digest)
+    if not _receipt_matches_current_candidate(sample, payload):
+        return reject("CURRENT_DIFF_MISMATCH", digest)
+    return payload, _runner_final_receipt_audit(
+        "REUSED",
+        reused=True,
+        agent_diff_sha256=digest,
+    )
+
+
+def _runner_final_verify(
+    sample: Sample,
+    sample_dir: Path,
+    args: argparse.Namespace,
+    verification_mode: str,
+    *,
+    baseline_seal: str,
+    deadline_monotonic: float | None,
+    opencode_returncode: int,
+    last_trace: dict[str, Any],
+    agent_verification_history: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        receipt_payload = None
+        receipt_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
+    else:
+        receipt_payload, receipt_audit = _agent_project_full_receipt(
+            sample,
+            sample_dir,
+            verification_mode,
+            opencode_returncode,
+            last_trace,
+            agent_verification_history,
+        )
+        if (
+            receipt_payload is not None
+            and deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            receipt_payload = None
+            receipt_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
+    if receipt_payload is not None:
+        _persist_verify_payload(sample_dir, receipt_payload)
+        _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
+        return 0, receipt_payload, receipt_audit
+    verify_returncode, verify_payload = _run_verify(
+        sample,
+        sample_dir,
+        args,
+        verification_mode,
+        baseline_seal=baseline_seal,
+        deadline_monotonic=deadline_monotonic,
+    )
+    _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
+    return verify_returncode, verify_payload, receipt_audit
+
+
 def _parse_session_id_from_json_events(events_text: str) -> str:
     """Extract the session id from a --format json stdout event stream.
 
@@ -1963,6 +2443,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     calls = 0
     verification_history: list[dict[str, Any]] = []
     tools_after_last_verify = 0
+    tool_attempts_after_last_verify = 0
     last_payload: dict[str, Any] | None = None
     last_decision = ""
     last_termination_reason = ""
@@ -1996,6 +2477,16 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
                 direct_idea_cli_calls += 1
         if tool_name in {"edit", "write", "patch", "apply_patch"}:
             direct_edit_calls += 1
+        if calls and tool_name != "smell_verify":
+            tool_attempts_after_last_verify += 1
+        if calls and tool_name == "smell_verify":
+            # A newer verification attempt supersedes the older receipt even
+            # when the tool itself errors or is cancelled before producing a
+            # decision. Only a later completed, parsed call may become final.
+            last_payload = None
+            last_decision = ""
+            last_termination_reason = ""
+            last_status = ""
         if state.get("status") != "completed":
             continue
         if tool_name:
@@ -2006,6 +2497,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             continue
         calls += 1
         tools_after_last_verify = 0
+        tool_attempts_after_last_verify = 0
         # A malformed newer verify must not leave an older payload reusable.
         last_payload = None
         metadata = state.get("metadata")
@@ -2071,6 +2563,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "verification_history": verification_history,
         "verification_history_count": len(verification_history),
         "tools_after_last_verify": tools_after_last_verify,
+        "tool_attempts_after_last_verify": tool_attempts_after_last_verify,
         "last_loop_decision": last_decision,
         "last_loop_termination_reason": last_termination_reason,
         "last_status": last_status,
@@ -2341,8 +2834,9 @@ def _run_opencode(
         env["SMELL_BASELINE_SEAL"] = baseline_seal
     else:
         env.pop("SMELL_BASELINE_SEAL", None)
-    # Agent-triggered verifies are loop feedback. The runner performs a fresh
-    # final bridge verify after the model process exits.
+    # Agent-triggered verifies are loop feedback. After the model exits, the
+    # runner either validates one exact project_full receipt as its final
+    # decision or performs the existing fresh bridge verify.
     agent_artifact_root = sample_dir / "agent-artifacts"
     agent_artifact_root.mkdir(parents=True, exist_ok=True)
     env["SMELL_ARTIFACT_ROOT"] = str(agent_artifact_root)
@@ -3036,13 +3530,16 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         )
         attempt_index += 1
 
-    verify_returncode, verify_payload = _run_verify(
+    verify_returncode, verify_payload, runner_final_receipt = _runner_final_verify(
         execution_sample,
         sample_dir,
         args,
         verification_mode,
         baseline_seal=baseline_seal,
         deadline_monotonic=sample_deadline_monotonic,
+        opencode_returncode=opencode_returncode,
+        last_trace=last_trace,
+        agent_verification_history=agent_verification_history,
     )
     if (
         last_trace.get("last_guard_progress_required") is True
@@ -3075,6 +3572,11 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     if getattr(args, "refactoring_backend", "direct") == "idea":
         _close_idea_project(execution_sample.project_root, sample_dir)
     final_verify_source = "runner_final"
+    final_verify_execution = (
+        "agent_project_full_receipt"
+        if runner_final_receipt.get("reused") is True
+        else "fresh_runner_verify"
+    )
     opencode_failure_category = (
         "PROVIDER_QUOTA_FAILED"
         if opencode_returncode == OPENCODE_FATAL_PROVIDER_RETURN_CODE
@@ -3102,8 +3604,14 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         verify_payload,
         agent_verification_history,
     )
+    if final_status == "IDEA_PROTOCOL_FAILED" and isinstance(idea_protocol, dict):
+        final_verify_audit["idea_protocol"] = idea_protocol
     raw_reconciled_verify_payload: dict[str, Any] | None = None
-    if final_status in {"FINAL_VERIFY_INFRA_FAILED", "FLAKY_TEST_INCONCLUSIVE"}:
+    if final_status in {
+        "FINAL_VERIFY_INFRA_FAILED",
+        "FLAKY_TEST_INCONCLUSIVE",
+        "IDEA_PROTOCOL_FAILED",
+    }:
         raw_reconciled_verify_payload = verify_payload
         verify_payload = _normalize_reconciled_final_failure(
             final_status,
@@ -3148,6 +3656,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "opencode_failure_category": opencode_failure_category,
         "raw_status": final_verify_raw_status,
         "final_verify_audit": final_verify_audit,
+        "runner_final_receipt": runner_final_receipt,
     }
     if raw_reconciled_verify_payload is not None:
         last["raw_verify_payload"] = raw_reconciled_verify_payload
@@ -3159,6 +3668,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         f"verify_reminders={reminders_dispatched};"
         f"opencode_timed_out={str(opencode_returncode == 124).lower()};"
         f"final_verify_source={final_verify_source};"
+        f"final_verify_execution={final_verify_execution};"
         f"final_verify_raw_status={final_verify_raw_status};"
         f"final_verify_infra_category={final_verify_audit.get('infra_category') or ''};"
         f"agent_verifications={len(agent_verification_history)}"
@@ -3187,6 +3697,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "verify_returncode": last["verify_returncode"],
         "final_verify_raw_status": final_verify_raw_status,
         "final_verify_infra_category": final_verify_audit.get("infra_category") or "",
+        "final_verify_execution": final_verify_execution,
+        "runner_final_receipt_reused": runner_final_receipt.get("reused") is True,
+        "runner_final_receipt_reason": str(runner_final_receipt.get("reason") or ""),
         "same_diff_as_last_agent_pass": final_verify_audit.get(
             "same_diff_as_last_agent_pass"
         )
@@ -3205,6 +3718,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "controller_attempts": controller_attempts,
         "agent_verification_count": len(agent_verification_history),
         "final_verify_audit": final_verify_audit,
+        "runner_final_receipt": runner_final_receipt,
         "revision_audit": revision_audit,
         "dataset_audit": dataset_audit,
         "baseline_capture": baseline_capture,

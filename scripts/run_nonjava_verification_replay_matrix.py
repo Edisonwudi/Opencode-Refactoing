@@ -16,6 +16,84 @@ from typing import Any
 
 
 LANGUAGES = {"python", "c", "cpp"}
+CCACHE_LANGUAGES = {"c", "cpp"}
+CCACHE_MOUNT_TARGET = "/var/cache/refactoragent/ccache"
+CCACHE_VOLUME_PREFIX = "smell-ccache"
+
+
+def _docker_volume_component(value: str) -> str:
+    component = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    if not component:
+        raise ValueError("Docker cache volume component is empty")
+    return component
+
+
+def _ccache_volume_name(
+    image: str,
+    language: str,
+    canonical_project_root: str,
+) -> str:
+    if language not in CCACHE_LANGUAGES:
+        raise ValueError(f"Unsupported ccache language: {language}")
+    project = PurePosixPath(canonical_project_root).name
+    if not project:
+        raise ValueError("Canonical project root has no project name")
+    return "-".join(
+        (
+            CCACHE_VOLUME_PREFIX,
+            _docker_volume_component(image),
+            language,
+            _docker_volume_component(project),
+        )
+    )
+
+
+def _docker_runtime_args(
+    *,
+    image: str,
+    language: str,
+    canonical_project_root: str,
+    cpuset: str,
+    memory: str,
+) -> list[str]:
+    runtime_args = [
+        "--network", "none",
+        "--cpuset-cpus", cpuset,
+        "--memory", memory,
+    ]
+    if language not in CCACHE_LANGUAGES:
+        return runtime_args
+    volume = _ccache_volume_name(image, language, canonical_project_root)
+    return [
+        *runtime_args,
+        "--mount",
+        f"type=volume,source={volume},target={CCACHE_MOUNT_TARGET}",
+        "-e", f"CCACHE_DIR={CCACHE_MOUNT_TARGET}",
+        "-e", "CCACHE_UMASK=000",
+    ]
+
+
+def _compiler_cache_manifest(
+    image: str,
+    jobs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "scope": "ccache_objects_only",
+        "mount_target": CCACHE_MOUNT_TARGET,
+        "test_results_shared": False,
+        "acceptance_shared": False,
+        "volumes": sorted(
+            {
+                _ccache_volume_name(
+                    image,
+                    str(job["language"]),
+                    str(job["canonical_project_root"]),
+                )
+                for job in jobs
+                if str(job["language"]) in CCACHE_LANGUAGES
+            }
+        ),
+    }
 
 
 def _utc_now() -> str:
@@ -120,6 +198,7 @@ def main() -> int:
             "allow_test_changes": False,
             "model_invoked": False,
             "replay_script_sha256": _sha256(replay_script),
+            "compiler_cache": _compiler_cache_manifest(args.image, jobs),
         }
     )
     _write_json(output_root / "manifest.json", frozen_manifest)
@@ -196,9 +275,13 @@ exec python3 /agent-src/scripts/replay_nonjava_verification_diff.py \\
             command = [
                 "docker", "run", "--rm", "--pull", "never",
                 "--name", container_name,
-                "--network", "none",
-                "--cpuset-cpus", args.cpuset,
-                "--memory", args.memory,
+                *_docker_runtime_args(
+                    image=args.image,
+                    language=str(job["language"]),
+                    canonical_project_root=str(job["canonical_project_root"]),
+                    cpuset=args.cpuset,
+                    memory=args.memory,
+                ),
                 "-e", "PYTHONDONTWRITEBYTECODE=1",
                 "-e", "SMELL_BUILD_JOBS=1",
                 "-e", f"JOB_ID={job_id}",

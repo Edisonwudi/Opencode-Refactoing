@@ -412,6 +412,25 @@ def _assert_project_runners(temp: Path) -> None:
     ).getroot()
     assert rrd_report.attrib["tests"] == "6", rrd_report.attrib
     assert rrd_report.attrib["skipped"] == "1", rrd_report.attrib
+    rrd_report_path = rrd / ".smell-test-reports" / "TEST-rrdtool-make-check.xml"
+    rrd_report_path.unlink()
+    rrd_focused = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_rrdtool_project_tests.py"),
+            "--project-root",
+            str(rrd),
+            "--focused-libdbi-probe",
+        ],
+        check=False,
+        env=rrd_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert rrd_focused.returncode == 0, rrd_focused.stdout
+    assert "rrdtool focused libDBI probe: PASS" in rrd_focused.stdout
+    assert not rrd_report_path.exists(), rrd_report_path
     (rrd_tests / "Makefile").write_text(
         "TESTS = " + " ".join(rrd_test_names) + " newly-added-upstream-test\n"
         "all:\n\t@:\n",
@@ -488,6 +507,7 @@ def main() -> int:
         in dependency_text
     )
     assert "libdbi-dev=0.9.0-6.1build1" in dependency_text
+    assert "ccache=4.9.1-1" in dependency_text
 
     with tempfile.TemporaryDirectory(prefix="c-project-tests-") as raw:
         temp = Path(raw)
@@ -523,6 +543,9 @@ def main() -> int:
         assert "run_git_project_tests.py" in (git.test.script or "")
 
         rrdtool = selected["rrdtool"]
+        assert "--focused-libdbi-probe" in (
+            rrdtool.focused_preflight.script or ""
+        )
         assert "autoreconf -fvi -I m4" in (rrdtool.build.script or "")
         assert "./configure" in (rrdtool.build.script or "")
         assert "--enable-libdbi" in (rrdtool.build.script or "")
@@ -548,6 +571,9 @@ def main() -> int:
         assert "run_libuv_project_tests.py" in (libuv.test.script or "")
 
         tmux = selected["tmux"]
+        assert "run_tmux_project_tests.py" not in (
+            tmux.focused_preflight.script or ""
+        )
         assert "run_tmux_project_tests.py" in (tmux.test.script or "")
         assert "--exclude utf8-test.sh" in (tmux.test.script or "")
         assert "--timeout-per-test 180" in (tmux.test.script or "")

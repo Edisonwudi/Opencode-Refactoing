@@ -112,6 +112,17 @@ grep -Fq 'benchmark_artifact_root="$benchmark_results_root/artifacts"' "$deliver
 grep -Fq 'Cannot create benchmark artifact directory: $benchmark_artifact_root' "$delivery_entrypoint"
 grep -Fq 'Cannot assign benchmark results to $RUN_AS_USER: $benchmark_results_root' "$delivery_entrypoint"
 grep -Fq 'runuser -u "$RUN_AS_USER" -- test -w "$benchmark_artifact_root"' "$delivery_entrypoint"
+grep -Fq 'prepare_compiler_cache_for_run_user()' "$delivery_entrypoint"
+grep -Fq 'CCACHE_DIR must use /var/cache/refactoragent/ccache' "$delivery_entrypoint"
+grep -Fq 'chown "$RUN_AS_USER:$RUN_AS_USER" "$cache_dir"' "$delivery_entrypoint"
+if grep -Fq 'chown -R "$RUN_AS_USER:$RUN_AS_USER" "$cache_dir"' "$delivery_entrypoint"; then
+  echo "Compiler cache initialization must not recursively chown persistent entries" >&2
+  exit 1
+fi
+grep -Fq 'runuser -u "$RUN_AS_USER" -- test -w "$cache_dir"' "$delivery_entrypoint"
+grep -Fq 'export CCACHE_UMASK=000' "$delivery_entrypoint"
+test "$(grep -Fc 'prepare_compiler_cache_for_run_user' "$delivery_entrypoint")" -ge 3
+grep -Fq 'benchmark_worker_env+=("CCACHE_DIR=$benchmark_ccache_dir")' "$delivery_entrypoint"
 grep -Fq '/tmp/idea-cache /tmp/idea-state /tmp/idea-runtime' "$delivery_entrypoint"
-grep -Fq 'env SMELL_ARTIFACT_ROOT="$benchmark_artifact_root"' "$delivery_entrypoint"
+grep -Fq 'env "${benchmark_worker_env[@]}"' "$delivery_entrypoint"
 echo "Mounted source contract self-check passed"

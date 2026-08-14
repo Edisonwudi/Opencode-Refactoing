@@ -17,6 +17,7 @@ function parseArgs(argv) {
   const options = {
     requireDataset: false,
     ideaProtocolOnly: false,
+    guardProgressOnly: false,
     dataset: process.env.SELF_CHECK_DATASET || "/opt/dataset/java/delivery_schema/mysterious_name.csv",
     sampleId: process.env.SELF_CHECK_SAMPLE_ID || "8",
     model: process.env.SELF_CHECK_MODEL || "zai/glm-4.7",
@@ -27,6 +28,8 @@ function parseArgs(argv) {
       options.requireDataset = true
     } else if (arg === "--idea-protocol-only") {
       options.ideaProtocolOnly = true
+    } else if (arg === "--guard-progress-only") {
+      options.guardProgressOnly = true
     } else if (arg === "--dataset-smoke-dataset") {
       options.dataset = argv[++index] || ""
     } else if (arg === "--dataset-smoke-sample-id") {
@@ -1999,6 +2002,33 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     false,
     "identity",
   )
+  assertCond(
+    "java_checkpoint_uses_cheap_guard_progress_gate",
+    typeof hooks.usesCheapGuardProgressGate === "function"
+      && hooks.usesCheapGuardProgressGate(
+        { language: "java" },
+        {
+          policy: {
+            checkpoint_required: true,
+            identity: { language: "java" },
+          },
+        },
+      ),
+    "Java checkpoint did not enter the source-only Guard progress gate",
+  )
+  assertCond(
+    "java_location_uses_cheap_guard_progress_gate",
+    hooks.usesCheapGuardProgressGate(
+      { language: "", location: "Foo.java:1" },
+      {
+        policy: {
+          checkpoint_required: true,
+          identity: { language: "", location: "Foo.java:1" },
+        },
+      },
+    ),
+    "Java checkpoint location did not enter the source-only Guard progress gate",
+  )
   const state = {
     policy: {
       task: "task",
@@ -2545,13 +2575,30 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
       }
       const unchangedResult = await smellVerify.execute(verifyArgs, verifyContext)
       const unchangedPayload = parseJson("checkpoint_unchanged_tool_result", unchangedResult.output)
-      assertEqual("checkpoint_unchanged_status", unchangedPayload.status, "SMELL_GUARD_FAILED", "status")
-      assertEqual("checkpoint_unchanged_loop", unchangedPayload.loop?.decision, "continue", "loop.decision")
+      assertEqual("checkpoint_unchanged_status", unchangedPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
       assertEqual(
-        "checkpoint_unchanged_reason",
-        unchangedPayload.smell_guard?.results?.[0]?.details?.reason,
-        "EDIT_REQUIRED",
-        "checkpoint reason",
+        "checkpoint_unchanged_source_guard",
+        unchangedPayload.source_guard_passed,
+        false,
+        "source_guard_passed",
+      )
+      assertEqual(
+        "checkpoint_unchanged_ready_for_full",
+        unchangedPayload.ready_for_project_full,
+        false,
+        "ready_for_project_full",
+      )
+      assertEqual(
+        "checkpoint_unchanged_project_full",
+        unchangedPayload.project_full_executed,
+        false,
+        "project_full_executed",
+      )
+      assertEqual("checkpoint_unchanged_loop", unchangedPayload.loop?.decision, "continue", "loop.decision")
+      assertCond(
+        "checkpoint_unchanged_scalar_guidance",
+        Array.isArray(unchangedPayload.metric_budget) || typeof unchangedPayload.next_action === "string",
+        "cheap Guard response must retain bounded scalar guidance",
       )
       const afterFailureSystemOutput = { system: [] }
       await systemHook(
@@ -2737,7 +2784,7 @@ logged_command = "guard-progress" if guard_progress_only else command
 case = json.loads(os.environ.get("SMELL_PREFLIGHT_CASE", "{}"))
 log_path = Path(os.environ["SMELL_PREFLIGHT_LOG"])
 with log_path.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"case": case.get("name"), "command": logged_command}) + "\\n")
+    handle.write(json.dumps({"case": case.get("name"), "command": logged_command, "argv": sys.argv[2:]}) + "\\n")
 
 if command == "resolve-command":
     payload = {
@@ -2830,6 +2877,19 @@ print(json.dumps(payload))
     const compiledFile = await compilePluginForSelfCheck(tempRoot)
     const pluginModule = await import(
       `${pathToFileURL(compiledFile).href}?guard_progress=${Date.now()}`
+    )
+    const cheapGateHook = pluginModule.SmellPlugin?.__selfTest?.usesCheapGuardProgressGate
+    const checkpointState = { policy: { checkpoint_required: true } }
+    assertCond(
+      "guard_progress_java_language_dispatch",
+      typeof cheapGateHook === "function"
+        && cheapGateHook({ language: "java", location: "Foo.java:1" }, checkpointState),
+      "Java language did not enter the source-only Guard progress gate",
+    )
+    assertCond(
+      "guard_progress_java_location_dispatch",
+      cheapGateHook({ language: "", location: "Foo.java:1" }, checkpointState),
+      "Java location did not enter the source-only Guard progress gate",
     )
     process.env.SMELL_BUILD_JOBS = "1"
     const buildGateResults = []
@@ -3267,6 +3327,13 @@ print(json.dumps(payload))
         location: "sample185.c:method=target|line=1",
         budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
       },
+      {
+        name: "java-long-method",
+        language: "java",
+        smell: "long_method",
+        location: "Sample.java:1",
+        budget: { metric: "ast_ncss", current: 91, passing_max: 80, required_reduction: 11, unit: "ast_ncss" },
+      },
     ]
     const results = []
     for (const replay of replayCases) {
@@ -3360,6 +3427,15 @@ print(json.dumps(payload))
         .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
       assertEqual(`guard_progress_${replay.name}_preflight_count`, commands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
       assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
+      if (replay.language === "java") {
+        for (const command of commands.filter((item) => item.command === "guard-progress")) {
+          const argv = command.argv || []
+          assertEqual(`guard_progress_${replay.name}_seal`, argv[argv.indexOf("--baseline-seal") + 1], "controller-seal", "baseline seal")
+          assertEqual(`guard_progress_${replay.name}_language`, argv[argv.indexOf("--language") + 1], "java", "language")
+          assertEqual(`guard_progress_${replay.name}_smell`, argv[argv.indexOf("--smell") + 1], replay.smell, "smell")
+          assertEqual(`guard_progress_${replay.name}_location`, argv[argv.indexOf("--location") + 1], replay.location, "location")
+        }
+      }
       results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })
     }
 
@@ -3466,7 +3542,6 @@ print(json.dumps(payload))
     assertEqual("guard_progress_malformed_full_count", malformedCommands.filter((item) => item.command === "verify").length, 0, "verify count")
 
     for (const bypass of [
-      { name: "java", language: "java", smell: "long_method", location: "Sample.java:1", checkpoint_required: true },
       { name: "noncheckpoint", language: "python", smell: "unsupported_smell", location: "sample.py:1", checkpoint_required: false },
     ]) {
       const bypassRoot = path.join(tempRoot, `bypass-${bypass.name}`)
@@ -3518,7 +3593,7 @@ print(json.dumps(payload))
         unownedBypass: true,
       },
       malformedPreflightFailsClosed: true,
-      javaBypass: true,
+      javaCheckpointGate: true,
       noncheckpointBypass: true,
     }
   } finally {
@@ -3532,6 +3607,13 @@ print(json.dumps(payload))
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
+  if (options.guardProgressOnly) {
+    console.log(JSON.stringify({
+      success: true,
+      guardProgressGate: await runGuardProgressGateSelfCheck(),
+    }, null, 2))
+    return
+  }
   if (options.ideaProtocolOnly) {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "idea-proposal-self-check-"))
     try {

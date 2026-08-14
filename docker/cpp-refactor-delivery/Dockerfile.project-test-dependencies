@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+       ccache=4.9.1-1 \
        libcppunit-1.15-0=1.15.1-4build1 \
        libcppunit-dev=1.15.1-4build1 \
     && rm -rf /var/lib/apt/lists/*

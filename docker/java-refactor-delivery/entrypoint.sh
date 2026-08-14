@@ -77,6 +77,34 @@ prepare_opencode_auth_json_for_run_user() {
   export OPENCODE_AUTH_JSON="$source"
 }
 
+prepare_compiler_cache_for_run_user() {
+  local cache_dir="${CCACHE_DIR:-}"
+  [[ -n "$cache_dir" ]] || return 0
+  if [[ "$cache_dir" != "/var/cache/refactoragent/ccache" ]]; then
+    echo "CCACHE_DIR must use /var/cache/refactoragent/ccache" >&2
+    exit 64
+  fi
+  if [[ "$(id -u)" == "0" && "$RUN_AS_USER" != "root" ]]; then
+    if ! mkdir -p "$cache_dir"; then
+      echo "Compiler cache directory cannot be created: $cache_dir" >&2
+      exit 73
+    fi
+    if ! runuser -u "$RUN_AS_USER" -- test -w "$cache_dir" \
+      && ! chown "$RUN_AS_USER:$RUN_AS_USER" "$cache_dir"; then
+      echo "Compiler cache directory ownership cannot be initialized: $cache_dir" >&2
+      exit 73
+    fi
+    if ! runuser -u "$RUN_AS_USER" -- test -w "$cache_dir"; then
+      echo "Compiler cache directory is not writable by $RUN_AS_USER: $cache_dir" >&2
+      exit 73
+    fi
+  elif ! mkdir -p "$cache_dir" || [[ ! -w "$cache_dir" ]]; then
+    echo "Compiler cache directory is not writable: $cache_dir" >&2
+    exit 73
+  fi
+  export CCACHE_UMASK=000
+}
+
 if [[ "${1:-}" == "bash" || "${1:-}" == "sh" ]]; then
   exec "$@"
 fi
@@ -160,6 +188,7 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
   [[ -n "$benchmark_results_root" ]] || { echo "benchmark-worker requires --results-root" >&2; exit 64; }
   [[ -s "$benchmark_secret_source" ]] || { echo "Benchmark secret file is missing or empty" >&2; exit 66; }
   benchmark_artifact_root="$benchmark_results_root/artifacts"
+  benchmark_ccache_dir="${CCACHE_DIR:-}"
 
   benchmark_secret_target="/dev/shm/minimax-api-key.$$.secret"
   install -m 400 -o "$RUN_AS_USER" -g "$RUN_AS_USER" \
@@ -186,8 +215,15 @@ if [[ "${1:-}" == "benchmark-worker" ]]; then
     exit 73
   fi
 
+  benchmark_worker_env=("SMELL_ARTIFACT_ROOT=$benchmark_artifact_root")
+  if [[ -n "$benchmark_ccache_dir" ]]; then
+    prepare_compiler_cache_for_run_user
+    benchmark_worker_env+=("CCACHE_DIR=$benchmark_ccache_dir")
+    benchmark_worker_env+=("CCACHE_UMASK=$CCACHE_UMASK")
+  fi
+
   exec runuser -u "$RUN_AS_USER" -- \
-    env SMELL_ARTIFACT_ROOT="$benchmark_artifact_root" \
+    env "${benchmark_worker_env[@]}" \
     python3 "$benchmark_runner" "${benchmark_args[@]}"
 fi
 
@@ -204,6 +240,7 @@ elif [[ ! -w "$RUNS_ROOT" ]]; then
   exit 73
 fi
 
+prepare_compiler_cache_for_run_user
 prepare_opencode_auth_json_for_run_user
 
 if [[ $# -gt 0 ]]; then

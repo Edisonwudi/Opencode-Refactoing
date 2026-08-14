@@ -27,19 +27,47 @@ projects:
           --project-root "${project_root}"
   - root: /opt/projects/c/rrdtool
     shell_timeout: 1500
+    focused_preflight:
+      command: null
+      script: |
+        cd "${project_root}"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        export CC="ccache gcc"
+        export CXX="ccache g++"
+        if [ ! -f Makefile ]; then
+          autoreconf -fvi -I m4
+          configure_log="$(mktemp)"
+          trap 'rm -f "${configure_log}"' EXIT
+          ./configure --enable-libdbi \
+            --disable-docs --disable-python --disable-lua --disable-tcl \
+            --disable-ruby --disable-perl >"${configure_log}" 2>&1
+          cat "${configure_log}"
+          grep -Eq '^[[:space:]]*With libDBI: yes[[:space:]]*$' "${configure_log}"
+        fi
+        make -j"${SMELL_BUILD_JOBS:-1}"
+        test -s src/.libs/librrd_la-rrd_fetch_libdbi.o
+        python3 /agent-src/scripts/run_rrdtool_project_tests.py \
+          --project-root "${project_root}" \
+          --focused-libdbi-probe
     build:
       command: null
       script: |
         cd "${project_root}"
-        if [ -f Makefile ]; then make distclean; fi
-        autoreconf -fvi -I m4
-        configure_log="$(mktemp)"
-        trap 'rm -f "${configure_log}"' EXIT
-        ./configure --enable-libdbi \
-          --disable-docs --disable-python --disable-lua --disable-tcl \
-          --disable-ruby --disable-perl >"${configure_log}" 2>&1
-        cat "${configure_log}"
-        grep -Eq '^[[:space:]]*With libDBI: yes[[:space:]]*$' "${configure_log}"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        export CC="ccache gcc"
+        export CXX="ccache g++"
+        if [ ! -f Makefile ]; then
+          autoreconf -fvi -I m4
+          configure_log="$(mktemp)"
+          trap 'rm -f "${configure_log}"' EXIT
+          ./configure --enable-libdbi \
+            --disable-docs --disable-python --disable-lua --disable-tcl \
+            --disable-ruby --disable-perl >"${configure_log}" 2>&1
+          cat "${configure_log}"
+          grep -Eq '^[[:space:]]*With libDBI: yes[[:space:]]*$' "${configure_log}"
+        fi
         make -j"${SMELL_BUILD_JOBS:-1}"
         test -s src/.libs/librrd_la-rrd_fetch_libdbi.o
     test:
@@ -125,17 +153,44 @@ projects:
           --build-dir build-refactoragent
   - root: /opt/projects/c/tmux
     shell_timeout: 1500
+    # input-keys.sh is environment-sensitive on the pinned image, and no one
+    # regression maps safely to every tmux target. Keep this phase compile-only.
+    focused_preflight:
+      command: null
+      script: |
+        cd "${project_root}"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        export CC="ccache gcc"
+        export CXX="ccache g++"
+        build_dir="${project_root}/build-refactoragent"
+        if [ ! -f "${project_root}/configure" ]; then
+          ./autogen.sh
+        fi
+        if [ ! -f "${build_dir}/Makefile" ]; then
+          mkdir -p "${build_dir}"
+          cd "${build_dir}"
+          "${project_root}/configure" --enable-debug
+        fi
+        make -C "${build_dir}" -j"${SMELL_BUILD_JOBS:-1}"
     build:
       command: null
       script: |
         cd "${project_root}"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        export CC="ccache gcc"
+        export CXX="ccache g++"
         build_dir="${project_root}/build-refactoragent"
-        rm -rf "${build_dir}"
-        mkdir -p "${build_dir}"
-        ./autogen.sh
-        cd "${build_dir}"
-        "${project_root}/configure" --enable-debug
-        make -j"${SMELL_BUILD_JOBS:-1}"
+        if [ ! -f "${project_root}/configure" ]; then
+          ./autogen.sh
+        fi
+        if [ ! -f "${build_dir}/Makefile" ]; then
+          mkdir -p "${build_dir}"
+          cd "${build_dir}"
+          "${project_root}/configure" --enable-debug
+        fi
+        make -C "${build_dir}" -j"${SMELL_BUILD_JOBS:-1}"
     test:
       command: null
       script: |
@@ -216,13 +271,40 @@ projects:
           --build-dir build-refactoragent
   - root: /opt/projects/cpp/protobuf-29.3
     shell_timeout: 1800
+    # No safe test is narrower than the pinned lite/upb pair. This phase only
+    # compiles their targets; the following project_full CTest remains final.
+    focused_preflight:
+      command: null
+      script: |
+        project_root="${project_root}"
+        build_dir="${TMPDIR:-/tmp}/refactoragent-protobuf-29.3-build"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -Dprotobuf_BUILD_TESTS=ON \
+          -Dprotobuf_BUILD_CONFORMANCE=OFF \
+          -Dprotobuf_BUILD_EXAMPLES=OFF \
+          -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+          -Dprotobuf_ABSL_PROVIDER=module \
+          -Dprotobuf_JSONCPP_PROVIDER=module \
+          -Dprotobuf_INSTALL=OFF \
+          -DABSL_RANDOM_RANDEN_COPTS_WARNING=OFF
+        cmake --build "${build_dir}" \
+          --target protoc lite-test upb-test --parallel 1
     build:
       command: null
       script: |
-        build_dir="/tmp/refactoragent-protobuf-29.3-build"
-        rm -rf "${build_dir}"
+        project_root="${project_root}"
+        build_dir="${TMPDIR:-/tmp}/refactoragent-protobuf-29.3-build"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
         cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -Dprotobuf_BUILD_TESTS=ON \
           -Dprotobuf_BUILD_CONFORMANCE=OFF \
           -Dprotobuf_BUILD_EXAMPLES=OFF \
@@ -236,9 +318,55 @@ projects:
     test:
       command: null
       script: |
-        ctest --test-dir "/tmp/refactoragent-protobuf-29.3-build" \
+        project_root="${project_root}"
+        build_dir="${TMPDIR:-/tmp}/refactoragent-protobuf-29.3-build"
+        ctest --test-dir "${build_dir}" \
           -R '^(lite-test|upb-test)$' \
           --output-on-failure --parallel 1
+  - root: /opt/projects/cpp/yaml-cpp
+    shell_timeout: 1500
+    focused_preflight:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DYAML_CPP_BUILD_TESTS=ON \
+          -DYAML_CPP_BUILD_TOOLS=OFF \
+          -DYAML_BUILD_SHARED_LIBS=OFF
+        cmake --build "${build_dir}" --target yaml-cpp \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+    build:
+      command: null
+      script: |
+        cd "${project_root}"
+        build_dir="${project_root}/build-refactoragent"
+        export CCACHE_DIR="${CCACHE_DIR:-/tmp/refactoragent-ccache}"
+        export CCACHE_BASEDIR="${project_root}"
+        cmake -S "${project_root}" -B "${build_dir}" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DYAML_CPP_BUILD_TESTS=ON \
+          -DYAML_CPP_BUILD_TOOLS=OFF \
+          -DYAML_BUILD_SHARED_LIBS=OFF
+        cmake --build "${build_dir}" --target yaml-cpp yaml-cpp-tests \
+          --parallel "${SMELL_BUILD_JOBS:-1}"
+    test:
+      command: null
+      script: |
+        cd "${project_root}"
+        report_dir="${project_root}/.smell-test-reports"
+        report="${report_dir}/TEST-yaml-cpp-ctest.xml"
+        mkdir -p "${report_dir}"
+        rm -f "${report}"
+        ctest --test-dir "${project_root}/build-refactoragent" \
+          --output-on-failure --no-tests=error --output-junit "${report}"
   - root: /opt/projects/cpp/duckdb
     shell_timeout: 1500
     build:

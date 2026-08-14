@@ -651,7 +651,11 @@ check(
 )
 check("trace_keeps_last_payload", pass_trace["last_payload"]["status"], "PASS")
 check("trace_no_tools_after_final_verify", pass_trace["tools_after_last_verify"], 0)
-check("agent_verify_is_not_reused", hasattr(R, "_reusable_verify_payload"), False)
+check(
+    "agent_project_full_receipt_path_exists",
+    hasattr(R, "_agent_project_full_receipt"),
+    True,
+)
 post_verify_tool = json.dumps({
     "type": "tool_use",
     "part": {
@@ -665,6 +669,54 @@ edited_after_verify = R._verification_trace(
     + post_verify_tool
 )
 check("trace_counts_tools_after_verify", edited_after_verify["tools_after_last_verify"], 1)
+check(
+    "trace_counts_tool_attempts_after_verify",
+    edited_after_verify["tool_attempts_after_last_verify"],
+    1,
+)
+failed_post_verify_tool = json.dumps({
+    "type": "tool_use",
+    "part": {
+        "tool": "edit",
+        "state": {"status": "error", "output": "partially changed"},
+    },
+})
+failed_edit_after_verify = R._verification_trace(
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}})
+    + "\n"
+    + failed_post_verify_tool
+)
+check(
+    "trace_does_not_count_failed_tool_as_completed",
+    failed_edit_after_verify["tools_after_last_verify"],
+    0,
+)
+check(
+    "trace_counts_failed_tool_attempt_after_verify",
+    failed_edit_after_verify["tool_attempts_after_last_verify"],
+    1,
+)
+failed_verify_after_pass = R._verification_trace(
+    verify_event({"success": True, "status": "PASS", "loop": {"decision": "stop"}})
+    + "\n"
+    + json.dumps({
+        "type": "tool_use",
+        "part": {
+            "tool": "smell_verify",
+            "state": {"status": "error", "output": "bridge unavailable"},
+        },
+    })
+)
+check(
+    "new_failed_verify_invalidates_older_pass_receipt",
+    failed_verify_after_pass["last_output_parsed"],
+    False,
+)
+check(
+    "new_failed_verify_clears_older_stop_decision",
+    failed_verify_after_pass["last_loop_decision"],
+    "",
+)
 idea_protocol_events = "\n".join([
     json.dumps({"type": "tool_use", "part": {"tool": "idea_refactor_preview", "state": {"status": "completed", "output": "{}"}}}),
     json.dumps({"type": "tool_use", "part": {"tool": "idea_refactor_apply", "state": {"status": "completed", "output": "{}"}}}),
@@ -1066,8 +1118,11 @@ check(
 )
 
 run_sample_source = inspect.getsource(R._run_sample)
-check("run_sample_has_one_final_verify_call", run_sample_source.count("_run_verify("), 1)
-check("run_sample_has_no_verify_reuse", "reusable_verify" in run_sample_source, False)
+check(
+    "run_sample_has_one_final_verify_selection_call",
+    run_sample_source.count("_runner_final_verify("),
+    1,
+)
 check_true(
     "baseline_capture_precedes_model",
     run_sample_source.index("_run_capture_baseline(") < run_sample_source.index("_run_opencode("),
@@ -1083,7 +1138,8 @@ check_true(
 )
 check_true(
     "idea_close_follows_final_verify",
-    run_sample_source.index("_run_verify(") < run_sample_source.index("_close_idea_project("),
+    run_sample_source.index("_runner_final_verify(")
+    < run_sample_source.index("_close_idea_project("),
 )
 check_true(
     "guard_progress_does_not_consume_continuation_counter",

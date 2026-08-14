@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial checks for the non-Java cheap Guard progress gate."""
+"""Adversarial checks for the source-only cheap Guard progress gate."""
 from __future__ import annotations
 
 import json
@@ -21,6 +21,8 @@ def _run_case(
     smell: str,
     budget: dict[str, object],
     source_guard_passed: bool,
+    baseline_seal: str = "",
+    location: str = "sample:1",
 ) -> dict[str, object]:
     resolved = SimpleNamespace(
         language=language,
@@ -61,13 +63,17 @@ def _run_case(
     original_checkpoint = smell_bridge._checkpoint_context
     original_guards = smell_bridge.run_smell_guards
     original_build = smell_bridge.run_build_test_guard
+    original_snapshot = smell_bridge._snapshot_project
     project_full_calls: list[bool] = []
+    snapshot_calls: list[bool] = []
     checkpoint_persist_modes: list[bool] = []
+    checkpoint_seals: list[str] = []
     try:
         smell_bridge._resolve = lambda _args: resolved
 
-        def _checkpoint(*_args, **kwargs):
+        def _checkpoint(_resolved, _evidence, seal="", **kwargs):
             checkpoint_persist_modes.append(bool(kwargs.get("persist", True)))
+            checkpoint_seals.append(str(seal))
             return SimpleNamespace(), checkpoint
 
         smell_bridge._checkpoint_context = _checkpoint
@@ -78,18 +84,25 @@ def _run_case(
             raise AssertionError("cheap Guard progress must not run project_full")
 
         smell_bridge.run_build_test_guard = _unexpected_project_full
+        smell_bridge._snapshot_project = lambda *_args, **_kwargs: (
+            snapshot_calls.append(True)
+        )
         payload = smell_bridge.cmd_guard_progress(SimpleNamespace(
             smell_evidence="",
-            baseline_seal="",
+            baseline_seal=baseline_seal,
+            location=location,
         ))
     finally:
         smell_bridge._resolve = original_resolve
         smell_bridge._checkpoint_context = original_checkpoint
         smell_bridge.run_smell_guards = original_guards
         smell_bridge.run_build_test_guard = original_build
+        smell_bridge._snapshot_project = original_snapshot
 
     assert project_full_calls == [], project_full_calls
+    assert snapshot_calls == [], snapshot_calls
     assert checkpoint_persist_modes == [False], checkpoint_persist_modes
+    assert checkpoint_seals == [baseline_seal], checkpoint_seals
     assert payload["project_full_executed"] is False, payload
     assert payload["ready_for_project_full"] is source_guard_passed, payload
     assert payload["status"] == (
@@ -168,6 +181,53 @@ def main() -> None:
         )
         assert crossed["source_guard_passed"] is True, (replay, crossed)
 
+    java_early = _run_case(
+        language="java",
+        smell="long_method",
+        budget={
+            "metric": "ast_ncss",
+            "current": 91,
+            "passing_max": 80,
+            "required_reduction": 11,
+            "unit": "ast_ncss",
+        },
+        source_guard_passed=False,
+        baseline_seal="controller-seal",
+    )
+    assert java_early["applicable"] is True, java_early
+    assert java_early["ready_for_project_full"] is False, java_early
+
+    java_crossed = _run_case(
+        language="java",
+        smell="long_method",
+        budget={
+            "metric": "ast_ncss",
+            "current": 80,
+            "passing_max": 80,
+            "required_reduction": 0,
+            "unit": "ast_ncss",
+        },
+        source_guard_passed=True,
+        baseline_seal="controller-seal",
+    )
+    assert java_crossed["ready_for_project_full"] is True, java_crossed
+
+    java_location_only = _run_case(
+        language="",
+        smell="long_method",
+        budget={
+            "metric": "ast_ncss",
+            "current": 91,
+            "passing_max": 80,
+            "required_reduction": 11,
+            "unit": "ast_ncss",
+        },
+        source_guard_passed=False,
+        baseline_seal="controller-seal",
+        location="src/Sample.java:1",
+    )
+    assert java_location_only["applicable"] is True, java_location_only
+
     no_budget = _run_case(
         language="python",
         smell="long_method",
@@ -182,7 +242,6 @@ def main() -> None:
     checkpoint_calls: list[str] = []
     try:
         for language, smell, location in (
-            ("java", "long_method", "Sample.java:1"),
             ("python", "unsupported_smell", "sample.py:1"),
         ):
             smell_bridge._resolve = lambda _args, language=language, smell=smell: (
@@ -209,7 +268,8 @@ def main() -> None:
 
     print(
         "guard progress preflight self-check passed: replay 55/57/185 early "
-        "calls avoid project_full; scalar budget only; Java/noncheckpoint bypass"
+        "calls avoid project_full; scalar budget only; Java uses controller-sealed "
+        "source gate; noncheckpoint bypass"
     )
 
 

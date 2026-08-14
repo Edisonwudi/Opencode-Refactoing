@@ -296,12 +296,12 @@ function isJavaSourceIdentity(input: { language?: unknown; location?: unknown })
 }
 
 function usesCheapGuardProgressGate(
-  input: { language?: unknown },
+  input: { language?: unknown; location?: unknown },
   state: CommandLoopState | undefined,
 ): boolean {
   const language = String(input.language || "").trim().toLowerCase()
   return state?.policy.checkpoint_required === true
-    && ["python", "c", "cpp"].includes(language)
+    && (isJavaSourceIdentity(input) || ["python", "c", "cpp"].includes(language))
 }
 
 const MAX_STDOUT_STDERR_LEN = 4000
@@ -3318,6 +3318,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   restoreCommandLoopState,
   failureFingerprint,
   isJavaCheckpointIdentity,
+  usesCheapGuardProgressGate,
   applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,
   // Idle continuation pure helpers + constants (no production control surface):

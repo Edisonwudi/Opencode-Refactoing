@@ -66,8 +66,12 @@ def _config(root: Path) -> ResolvedRunConfig:
             run_build=True,
             run_tests=True,
         ),
+        focused_preflight=CommandConfig(
+            command=": > .focused-preflight-ready"
+        ),
         build=CommandConfig(
             command=(
+                "test -f .focused-preflight-ready && "
                 "test -f src/untracked_api.h && "
                 "grep -q 'candidate build metadata' Makefile && "
                 "grep -q 'candidate test source' tests/declared_test.c && "
@@ -178,6 +182,12 @@ def main() -> None:
 
         assert first["status"] == "PASS", first
         assert second["status"] == "PASS", second
+        assert first["project_full_executed"] is True, first
+        assert second["project_full_executed"] is True, second
+        assert first["build_test_guard"]["focused_preflight"]["status"] == "READY", first
+        assert second["build_test_guard"]["focused_preflight"]["status"] == "READY", second
+        assert first["build_test_guard"]["project_full_executed"] is True, first
+        assert second["build_test_guard"]["project_full_executed"] is True, second
         assert before == after_first == after_second, (
             before,
             after_first,
@@ -236,6 +246,38 @@ def main() -> None:
         assert "src/untracked_api.h" in snapshot["diff"]["stdout"], snapshot
         assert "tests/declared_test.c" in snapshot["diff"]["stdout"], snapshot
         assert "Makefile" in snapshot["diff"]["stdout"], snapshot
+
+        original_run_build_test_guard = smell_bridge.run_build_test_guard
+        full_calls_after_failed_preflight: list[bool] = []
+
+        def _unexpected_full_after_failed_preflight(*_args, **_kwargs):
+            full_calls_after_failed_preflight.append(True)
+            raise AssertionError("failed focused preflight must stop before project_full")
+
+        try:
+            smell_bridge.run_build_test_guard = _unexpected_full_after_failed_preflight
+            failed_preflight_result = smell_bridge._run_project_full_in_fresh_worktree(
+                replace(
+                    config,
+                    focused_preflight=CommandConfig(command="exit 9"),
+                ),
+                snapshot,
+            )
+        finally:
+            smell_bridge.run_build_test_guard = original_run_build_test_guard
+        assert full_calls_after_failed_preflight == [], full_calls_after_failed_preflight
+        assert failed_preflight_result["reason"] == "FOCUSED_PREFLIGHT_FAILED", (
+            failed_preflight_result
+        )
+        assert failed_preflight_result["project_full_executed"] is False, (
+            failed_preflight_result
+        )
+        assert failed_preflight_result["focused_preflight"]["status"] == "FAILED", (
+            failed_preflight_result
+        )
+        assert failed_preflight_result["verification_isolation"]["cleanup_success"] is True, (
+            failed_preflight_result
+        )
 
         unresolved = dict(snapshot)
         unresolved["base_commit"] = "missing-frozen-base"
