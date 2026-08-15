@@ -148,11 +148,10 @@ def _run(
     )
 
 
-def _process_tree_groups(root_pid: int) -> list[int]:
-    """Snapshot POSIX process groups owned by one runner child tree."""
+def _process_tree_snapshot(root_pid: int) -> tuple[dict[int, tuple[int, int]], set[int]]:
+    """Return one POSIX process-table snapshot and descendants of root_pid."""
     if os.name != "posix":  # pragma: no cover - delivery/runtime is POSIX
-        return []
-    groups = {root_pid}
+        return {}, set()
     try:
         listing = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,pgid="],
@@ -181,17 +180,32 @@ def _process_tree_groups(root_pid: int) -> list[int]:
                     continue
                 descendants.add(child_pid)
                 pending.append(child_pid)
-        groups.update(
-            rows[pid][1]
-            for pid in descendants
-            if pid in rows and rows[pid][1] > 0
-        )
-        if root_pid in rows and rows[root_pid][1] > 0:
-            groups.add(rows[root_pid][1])
     except (OSError, ValueError):
-        pass
+        return {}, set()
+    return rows, descendants
+
+
+def _process_tree_groups(root_pid: int) -> list[int]:
+    """Snapshot POSIX process groups owned by one runner child tree."""
+    if os.name != "posix":  # pragma: no cover - delivery/runtime is POSIX
+        return []
+    rows, descendants = _process_tree_snapshot(root_pid)
+    groups = {root_pid}
+    groups.update(
+        rows[pid][1]
+        for pid in descendants
+        if pid in rows and rows[pid][1] > 0
+    )
+    if root_pid in rows and rows[root_pid][1] > 0:
+        groups.add(rows[root_pid][1])
     groups.discard(os.getpgrp())
     return sorted(groups, key=lambda group_id: group_id == root_pid)
+
+
+def _process_tree_has_descendants(root_pid: int) -> bool:
+    """Whether OpenCode currently owns an active tool child process."""
+    _, descendants = _process_tree_snapshot(root_pid)
+    return bool(descendants)
 
 
 def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -1770,6 +1784,7 @@ def _sample_deadline_payload(
     sample_deadline: int,
     *,
     stage: str = "runner_final",
+    termination_reason: str = "SAMPLE_DEADLINE_REACHED",
 ) -> dict[str, Any]:
     return {
         "schema_version": "smell.verify.decision/v1",
@@ -1779,7 +1794,7 @@ def _sample_deadline_payload(
         "status": "OPENCODE_TIMEOUT",
         "resolution": "unresolved",
         "project_full_executed": False,
-        "termination_reason": "SAMPLE_DEADLINE_REACHED",
+        "termination_reason": termination_reason,
         "failure_pack": {
             "verify_status": "OPENCODE_TIMEOUT",
             "failure_category": "OPENCODE_TIMEOUT",
@@ -1788,7 +1803,11 @@ def _sample_deadline_payload(
             "next_action": "",
         },
         "timeout": {
-            "scope": "sample",
+            "scope": (
+                "model-event-inactivity"
+                if termination_reason == "MODEL_EVENT_INACTIVITY_TIMEOUT"
+                else "sample"
+            ),
             "stage": stage,
             "sample_deadline_seconds": sample_deadline,
         },
@@ -1800,6 +1819,8 @@ def _normalize_sample_timeout(
     verify_returncode: int,
     verify_payload: dict[str, Any],
     sample_deadline: int,
+    *,
+    termination_reason: str = "SAMPLE_DEADLINE_REACHED",
 ) -> tuple[int, dict[str, Any]]:
     """Prevent a timed-out model turn from becoming an accepted final PASS."""
     if opencode_returncode != 124:
@@ -1809,7 +1830,11 @@ def _normalize_sample_timeout(
         and verify_payload.get("schema_version") == "smell.verify.decision/v1"
     ):
         return 124, verify_payload
-    payload = _sample_deadline_payload(sample_deadline, stage="model")
+    payload = _sample_deadline_payload(
+        sample_deadline,
+        stage="model",
+        termination_reason=termination_reason,
+    )
     observed_status = str(verify_payload.get("status") or "")
     if observed_status:
         payload["timeout"]["final_verify_observation"] = {
@@ -2770,7 +2795,7 @@ def _run_opencode(
     attempt_suffix: str = "",
     hard_timeout_seconds: int | None = None,
     baseline_seal: str = "",
-) -> tuple[int, str]:
+) -> tuple[int, str, str]:
     """Run one initial or same-session OpenCode turn."""
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
     task = _task_prompt(sample, args, verification_mode)
@@ -2867,6 +2892,9 @@ def _run_opencode(
     turn_timeout_seconds = float(
         hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline)
     )
+    model_event_inactivity_timeout = float(
+        getattr(args, "model_event_inactivity_timeout", 300)
+    )
     env[SAMPLE_DEADLINE_EPOCH_MS_ENV] = _deadline_epoch_ms(turn_timeout_seconds)
 
     # --format json: raw JSON events on stdout (for session-id parsing).
@@ -2890,7 +2918,9 @@ def _run_opencode(
             "opencode_hard_timeout_seconds": hard_timeout_seconds or _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_budget": "remaining-sample-budget",
             "final_verify_mode": "runner_final",
-            "idle_watchdog_enabled": False,
+            "idle_watchdog_enabled": True,
+            "model_event_inactivity_timeout_seconds": model_event_inactivity_timeout,
+            "idle_watchdog_suspends_for_child_processes": True,
         },
     }
     command_path = _attempt_artifact_path(sample_dir, "command.json", attempt_suffix)
@@ -2922,11 +2952,13 @@ def _run_opencode(
         # Read stdout (JSON events) incrementally, write to events file, and
         # detect session id.
         detected_sid = ""
+        last_event_at = time.monotonic()
 
         def _drain_stdout():
-            nonlocal detected_sid
+            nonlocal detected_sid, last_event_at
             assert proc.stdout is not None
             for line in proc.stdout:
+                last_event_at = time.monotonic()
                 events_file.write(line)
                 events_file.flush()
                 if not detected_sid:
@@ -2938,6 +2970,7 @@ def _run_opencode(
         reader.start()
         deadline = time.monotonic() + turn_timeout_seconds
         timeout_code = 0
+        termination_reason = ""
         log_scan_offset = 0
         log_scan_tail = ""
         while proc.poll() is None:
@@ -2970,10 +3003,42 @@ def _run_opencode(
                     encoding="utf-8",
                 )
                 break
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 _terminate_process_tree(proc)
                 timeout_code = 124
+                termination_reason = "SAMPLE_DEADLINE_REACHED"
                 break
+            if now - last_event_at > model_event_inactivity_timeout:
+                if _process_tree_has_descendants(proc.pid):
+                    # A bridge/build/test tool can be quiet for minutes. Give
+                    # the model a fresh inactivity window after that child
+                    # work completes instead of charging tool time as silence.
+                    last_event_at = now
+                else:
+                    _terminate_process_tree(proc)
+                    timeout_code = 124
+                    termination_reason = "MODEL_EVENT_INACTIVITY_TIMEOUT"
+                    termination_path = _attempt_artifact_path(
+                        sample_dir, "opencode-termination.json", attempt_suffix
+                    )
+                    termination_path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "status": "OPENCODE_TIMEOUT",
+                                "termination_reason": termination_reason,
+                                "model_event_inactivity_timeout_seconds": (
+                                    model_event_inactivity_timeout
+                                ),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    break
             time.sleep(1)
         reader.join(timeout=5)
         rc = timeout_code if timeout_code else int(proc.returncode or 0)
@@ -3022,7 +3087,7 @@ def _run_opencode(
             + "\n",
             encoding="utf-8",
         )
-        return rc, detected_sid or session_id
+        return rc, detected_sid or session_id, termination_reason
 
 
 def _append_result(results_path: Path, row: dict[str, Any]) -> None:
@@ -3441,6 +3506,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     reminder_used = False
     attempt_index = 0
     opencode_returncode = 0
+    opencode_termination_reason = ""
     last_trace: dict[str, Any] = _verification_trace("")
     while True:
         remaining = int(sample_deadline_monotonic - time.monotonic())
@@ -3448,7 +3514,11 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             opencode_returncode = 124
             break
         attempt_suffix = "" if attempt_index == 0 else f".continue-{attempt_index}"
-        opencode_returncode, detected_session_id = _run_opencode(
+        (
+            opencode_returncode,
+            detected_session_id,
+            attempt_termination_reason,
+        ) = _run_opencode(
             execution_sample,
             sample_dir,
             args,
@@ -3461,6 +3531,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             hard_timeout_seconds=remaining,
             baseline_seal=baseline_seal,
         )
+        if attempt_termination_reason:
+            opencode_termination_reason = attempt_termination_reason
         if detected_session_id:
             session_id = detected_session_id
         events_path = _attempt_artifact_path(sample_dir, "run.events.jsonl", attempt_suffix)
@@ -3499,6 +3571,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "attempt": attempt_index,
                 "suffix": attempt_suffix,
                 "opencode_returncode": opencode_returncode,
+                "termination_reason": attempt_termination_reason,
                 "session_id": session_id,
                 **trace_summary,
             }
@@ -3582,6 +3655,9 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         verify_returncode,
         verify_payload,
         args.sample_deadline,
+        termination_reason=(
+            opencode_termination_reason or "SAMPLE_DEADLINE_REACHED"
+        ),
     )
     verify_returncode, verify_payload = _normalize_opencode_failure(
         opencode_returncode,
@@ -3778,6 +3854,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Single shared time budget for baseline capture, model turns, continuations, and final verification.",
     )
     parser.add_argument(
+        "--model-event-inactivity-timeout",
+        type=int,
+        default=300,
+        help=(
+            "Terminate an OpenCode model turn after this many seconds without a new "
+            "JSON event; active bridge/build/test child processes suspend the watchdog."
+        ),
+    )
+    parser.add_argument(
         "--verification-mode",
         choices=sorted(FINAL_VERIFICATION_MODES),
         default="project_full",
@@ -3827,6 +3912,8 @@ def main(argv: list[str] | None = None) -> int:
         args.verification_mode = "project_full"
     if args.refactoring_backend == "idea" and args.agent == "smell-refactor-agent":
         parser.error("--refactoring-backend=idea requires the Java refactor agent")
+    if args.model_event_inactivity_timeout <= 0:
+        parser.error("--model-event-inactivity-timeout must be positive")
     # Validate the runner flags through the same parser used by the OpenCode
     # command hook, so batch and direct command invocations cannot drift.
     parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
@@ -3860,7 +3947,11 @@ def main(argv: list[str] | None = None) -> int:
             "opencode_hard_timeout_seconds": _opencode_timeout_seconds(args.sample_deadline),
             "final_verify_budget": "remaining-sample-budget",
             "final_verify_mode": "runner_final",
-            "idle_watchdog_enabled": False,
+            "idle_watchdog_enabled": True,
+            "model_event_inactivity_timeout_seconds": (
+                args.model_event_inactivity_timeout
+            ),
+            "idle_watchdog_suspends_for_child_processes": True,
         },
         "dry_run": args.dry_run,
     }

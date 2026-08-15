@@ -247,6 +247,11 @@ check(
 parser = R.build_parser()
 parsed = parser.parse_args(["--dataset", "/tmp/input.csv", "--sample-deadline", "2400"])
 check("sample_deadline_public_entry", parsed.sample_deadline, 2400)
+check(
+    "model_event_inactivity_timeout_default",
+    getattr(parsed, "model_event_inactivity_timeout", None),
+    300,
+)
 check("project_full_is_default", parsed.verification_mode, "project_full")
 check("test_changes_default_forbidden", parsed.allow_test_changes, False)
 check("direct_backend_is_default", parsed.refactoring_backend, "direct")
@@ -1118,6 +1123,103 @@ with tempfile.TemporaryDirectory() as tmp:
     check("baseline_timeout_result_accepted", timeout_result["accepted"], False)
     check("baseline_timeout_verify_schema", timeout_verify["schema_version"], "smell.verify.decision/v1")
 
+print("== inactivity timeout terminal artifacts ==")
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    run_dir = root / "run"
+    run_dir.mkdir()
+    inactivity_sample = R.Sample(
+        sample_id="inactivity-timeout",
+        language="python",
+        smell="long_method",
+        project_name="p",
+        project_root=root,
+        location="src/a.py:method=target|line=1",
+        evidence="",
+        raw={},
+        verification_mode="project_full",
+    )
+    inactivity_args = argparse.Namespace(
+        project_revisions="unused.json",
+        worktree=False,
+        agent="",
+        verification_mode="project_full",
+        allow_test_changes=False,
+        refactoring_backend="direct",
+        sample_deadline=60,
+        model_event_inactivity_timeout=1,
+        projects="",
+        loop_mode="verify-failure",
+        loop_max=2,
+        loop_no_progress_limit=1,
+        loop_on="smell,compile,test",
+        loop_instruction="repair narrowly",
+    )
+    originals = {
+        "load_revisions": R.load_revisions,
+        "resolve_revision": R.resolve_revision,
+        "assert_commit_present": R.assert_commit_present,
+        "audit_test_commit": R.audit_test_commit,
+        "verify_test_oracle": R.verify_test_oracle,
+        "_bootstrap_opencode": R._bootstrap_opencode,
+        "_run_opencode": R._run_opencode,
+        "_runner_final_verify": R._runner_final_verify,
+    }
+    R.load_revisions = lambda _path: {}
+    R.resolve_revision = lambda _project, _revisions, _path: argparse.Namespace(
+        project_commit="frozen-commit"
+    )
+    R.assert_commit_present = lambda _root, _commit: None
+    R.audit_test_commit = lambda *_args, **_kwargs: {}
+    R.verify_test_oracle = lambda *_args, **_kwargs: {}
+    R._bootstrap_opencode = lambda *_args, **_kwargs: None
+    R._run_opencode = lambda *_args, **_kwargs: (
+        124,
+        "ses_inactivity",
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+    R._runner_final_verify = lambda *_args, **_kwargs: (
+        0,
+        {
+            "schema_version": "smell.verify.decision/v1",
+            **make_payload("PASS", project_full_executed=True),
+        },
+        {"schema_version": R.RUNNER_FINAL_RECEIPT_SCHEMA, "reused": False},
+    )
+    try:
+        inactivity_row = R._run_sample(inactivity_sample, run_dir, inactivity_args)
+    finally:
+        for name, value in originals.items():
+            setattr(R, name, value)
+    inactivity_result = json.loads(
+        (Path(inactivity_row["sample_dir"]) / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    inactivity_verify = json.loads(
+        (Path(inactivity_row["sample_dir"]) / "verify.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    inactivity_results_path = run_dir / "results.csv"
+    R._append_result(inactivity_results_path, inactivity_row)
+    with inactivity_results_path.open(encoding="utf-8", newline="") as handle:
+        inactivity_csv = next(R.csv.DictReader(handle))
+    check("inactivity_timeout_row_status", inactivity_row["status"], "OPENCODE_TIMEOUT")
+    check("inactivity_timeout_result_status", inactivity_result["status"], "OPENCODE_TIMEOUT")
+    check("inactivity_timeout_verify_status", inactivity_verify["status"], "OPENCODE_TIMEOUT")
+    check("inactivity_timeout_csv_status", inactivity_csv["status"], "OPENCODE_TIMEOUT")
+    check(
+        "inactivity_timeout_reason_persisted",
+        inactivity_verify["termination_reason"],
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+    check(
+        "inactivity_timeout_scope_persisted",
+        inactivity_verify["timeout"]["scope"],
+        "model-event-inactivity",
+    )
+
 check(
     "baseline_not_found_status_is_exact",
     R._baseline_failure_status(1, {"success": False, "error": "BASELINE_FINDING_NOT_FOUND"}),
@@ -1514,7 +1616,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         "project_full",
         started_at_ms=123456,
     )
-    first_rc, first_session = R._run_opencode(
+    first_rc, first_session, first_termination_reason = R._run_opencode(
         handoff_sample,
         artifacts,
         handoff_args,
@@ -1525,6 +1627,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
     )
     check("zero_verify_first_process_rc", first_rc, 0)
     check("zero_verify_first_process_session", first_session, "ses_zero_verify")
+    check("zero_verify_first_process_not_terminated", first_termination_reason, "")
     first_manifest = json.loads(
         (artifacts / "message-manifest.json").read_text(encoding="utf-8")
     )
@@ -1541,6 +1644,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         first_command["time_budget"]["final_verify_budget"],
         "remaining-sample-budget",
     )
+    check("command_audits_event_watchdog", first_command["time_budget"]["idle_watchdog_enabled"], True)
     check("initial_message_provenance", first_manifest["provenance"], "user_command")
     check(
         "initial_user_parts_not_mutated",
@@ -1552,7 +1656,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         (artifacts / "raw-user-input.txt").is_file()
         and bool(first_manifest["raw_user_input"]["sha256"]),
     )
-    second_rc, second_session = R._run_opencode(
+    second_rc, second_session, second_termination_reason = R._run_opencode(
         handoff_sample,
         artifacts,
         handoff_args,
@@ -1568,6 +1672,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
     )
     check("zero_verify_second_process_receives_state", second_rc, 0)
     check("zero_verify_second_process_session", second_session, "ses_zero_verify")
+    check("zero_verify_second_process_not_terminated", second_termination_reason, "")
     second_manifest = json.loads(
         (artifacts / "message-manifest.json.continue-1").read_text(encoding="utf-8")
     )
@@ -1581,6 +1686,132 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
             )
         )["excluded_mutable_fields"],
     )
+
+print("== model event inactivity watchdog ==")
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    project = temp / "project"
+    project.mkdir()
+    base_args = argparse.Namespace(
+        **{
+            **vars(handoff_args),
+            "refactoring_backend": "direct",
+            "model_event_inactivity_timeout": 1,
+        }
+    )
+
+    silent = temp / "fake-opencode-silent"
+    silent.write_text(
+        """#!/usr/bin/env python3
+import json
+import time
+
+print(json.dumps({"type": "message", "sessionID": "ses_silent"}), flush=True)
+time.sleep(3)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(silent, 0o755)
+    silent_artifacts = temp / "silent-artifacts"
+    silent_artifacts.mkdir()
+    silent_rc, _, silent_reason = R._run_opencode(
+        Sample(
+            sample_id="silent",
+            language="python",
+            smell="long_method",
+            project_name="p",
+            project_root=project,
+            location="a.py:method=f|line=1",
+            evidence="",
+            raw={},
+        ),
+        silent_artifacts,
+        argparse.Namespace(**{**vars(base_args), "opencode_bin": str(silent)}),
+        "smell-refactor-agent",
+        "project_full",
+        hard_timeout_seconds=5,
+    )
+    check("silent_model_is_terminated_early", silent_rc, 124)
+    check("silent_model_termination_reason", silent_reason, "MODEL_EVENT_INACTIVITY_TIMEOUT")
+    silent_termination = json.loads(
+        (silent_artifacts / "opencode-termination.json").read_text(encoding="utf-8")
+    )
+    check(
+        "silent_model_termination_artifact",
+        silent_termination["termination_reason"],
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+
+    periodic = temp / "fake-opencode-periodic"
+    periodic.write_text(
+        """#!/usr/bin/env python3
+import json
+import time
+
+for index in range(6):
+    print(json.dumps({"type": "message", "sessionID": "ses_periodic", "index": index}), flush=True)
+    time.sleep(0.35)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(periodic, 0o755)
+    periodic_artifacts = temp / "periodic-artifacts"
+    periodic_artifacts.mkdir()
+    periodic_rc, _, periodic_reason = R._run_opencode(
+        Sample(
+            sample_id="periodic",
+            language="python",
+            smell="long_method",
+            project_name="p",
+            project_root=project,
+            location="a.py:method=f|line=1",
+            evidence="",
+            raw={},
+        ),
+        periodic_artifacts,
+        argparse.Namespace(**{**vars(base_args), "opencode_bin": str(periodic)}),
+        "smell-refactor-agent",
+        "project_full",
+        hard_timeout_seconds=5,
+    )
+    check("periodic_model_events_keep_turn_alive", periodic_rc, 0)
+    check("periodic_model_is_not_terminated", periodic_reason, "")
+
+    active_tool = temp / "fake-opencode-active-tool"
+    active_tool.write_text(
+        """#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+child.wait()
+print(json.dumps({"type": "message", "sessionID": "ses_active_tool"}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    os.chmod(active_tool, 0o755)
+    tool_artifacts = temp / "tool-artifacts"
+    tool_artifacts.mkdir()
+    tool_rc, _, tool_reason = R._run_opencode(
+        Sample(
+            sample_id="active-tool",
+            language="python",
+            smell="long_method",
+            project_name="p",
+            project_root=project,
+            location="a.py:method=f|line=1",
+            evidence="",
+            raw={},
+        ),
+        tool_artifacts,
+        argparse.Namespace(**{**vars(base_args), "opencode_bin": str(active_tool)}),
+        "smell-refactor-agent",
+        "project_full",
+        hard_timeout_seconds=5,
+    )
+    check("active_tool_process_suspends_inactivity_watchdog", tool_rc, 0)
+    check("active_tool_process_is_not_terminated", tool_reason, "")
 
 allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
 allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")

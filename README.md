@@ -436,6 +436,11 @@ checkpoint 只保留作诊断证据，`restorable=false`。
 
 - 唯一时间预算：`--sample-deadline`（默认 1800s，范围 60–7200)，没有
   step 数上限。
+- 模型事件静默看门狗：`--model-event-inactivity-timeout`（默认 300s）。
+  OpenCode 在该窗口内没有产生新的 JSON 事件且没有正在运行的工具子进程
+  （包括 bridge/build/test）时，runner 会终止该进程树，并以
+  `OPENCODE_TIMEOUT`、`termination_reason=MODEL_EVENT_INACTIVITY_TIMEOUT`
+  fail closed；工具执行时间不计入模型静默时间。
 - 续跑预算：`--loop-max`（默认 3，范围 0–5）、
   `--loop-no-progress-limit`（默认 2)、`--loop-mode=verify-failure`。
 - 预算内 checkpoint 失败会把"基线/当前/差值/真实剩余总数/优先 worklist/唯一下一步动作"
