@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import shlex
 import time
@@ -8,11 +9,13 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 from .config import VERIFICATION_COMMAND_SOURCES
+from .verification_receipt import validate_formal_verification_receipt
 
 
 LOOP_MODES = {"off", "verify-failure"}
 FAILURE_GROUPS = {"smell", "compile", "test"}
-COMMAND_LOOP_STATE_VERSION = 4
+COMMAND_LOOP_STATE_VERSION = 6
+INITIAL_VERIFY_INSTRUCTION = "Call smell_verify now using the frozen command identity."
 CHECKPOINT_SMELLS = frozenset({
     "long_method",
     "nested_complexity",
@@ -64,6 +67,7 @@ class LoopPolicy:
 class ResolvedCommandPolicy:
     task: str
     verification_mode: str
+    refactoring_backend: str
     allow_test_changes: bool
     loop: LoopPolicy
 
@@ -71,6 +75,7 @@ class ResolvedCommandPolicy:
         return {
             "task": self.task,
             "verification_mode": self.verification_mode,
+            "refactoring_backend": self.refactoring_backend,
             "allow_test_changes": self.allow_test_changes,
             "loop": self.loop.to_dict(),
         }
@@ -290,6 +295,7 @@ def initial_command_loop_state(
     policy = {
         "task": "Continue the current smell refactoring task.",
         "verification_mode": command_payload["verification_mode"],
+        "refactoring_backend": command_payload["refactoring_backend"],
         "allow_test_changes": command_payload["allow_test_changes"],
         "checkpoint_required": command_payload["checkpoint_required"],
         "identity": dict(command_payload["identity"]),
@@ -298,16 +304,387 @@ def initial_command_loop_state(
     return {
         "schema_version": COMMAND_LOOP_STATE_VERSION,
         "policy": policy,
+        "target_identity_context": "",
         "started_at": (
             int(started_at_ms)
             if started_at_ms is not None
             else int(time.time() * 1000)
         ),
+        "control": {
+            "generation": 0,
+            "decision": "verify_required",
+            "instruction": INITIAL_VERIFY_INSTRUCTION,
+            "termination_reason": "",
+        },
         "continuation_count": 0,
         "cap_recovery_used": False,
         "no_progress_count": 0,
         "last_failure_fingerprint": "",
+        "best_metric_deficit": None,
+        "best_structural_failure_count": None,
+        "last_blocker_codes": [],
+        "seen_structural_states": [],
+        "formal_candidate_state": {
+            "candidate_identity": None,
+            "outcome": "",
+            "diagnostic_signature": "",
+            "confirmation_required": False,
+        },
+        "idea_protocol_state": {
+            "active_proposal": None,
+            "proposal_blocker": None,
+            "mutation_generation": 0,
+            "verified_generation": 0,
+            "mutation_route": "",
+            "mutation_proposal_id": "",
+            "revertible_apply_generation": None,
+        },
+        "terminal_receipt": None,
     }
+
+
+def _state_record(value: Any) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _state_integer(value: Any, *, minimum: int = 0) -> bool:
+    return bool(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= minimum
+    )
+
+
+def _state_finite_number(value: Any, *, minimum: float = 0.0) -> bool:
+    return bool(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= minimum
+    )
+
+
+def _valid_transfer_policy(value: Any) -> Mapping[str, Any] | None:
+    policy = _state_record(value)
+    loop = _state_record(policy.get("loop")) if policy else None
+    identity = _state_record(policy.get("identity")) if policy else None
+    if policy is None or loop is None or identity is None:
+        return None
+    verification_mode = policy.get("verification_mode")
+    backend = policy.get("refactoring_backend", "direct")
+    if (
+        not isinstance(policy.get("task"), str)
+        or not str(policy.get("task")).strip()
+        or verification_mode
+        not in {"local", "auto", "sample_optimized", "project_full"}
+        or backend not in {"direct", "idea"}
+        or not isinstance(policy.get("allow_test_changes"), bool)
+        or not isinstance(policy.get("checkpoint_required"), bool)
+        or (
+            policy.get("allow_test_changes") is True
+            and verification_mode != "project_full"
+        )
+    ):
+        return None
+    identity_fields = tuple(CommandTaskIdentity.__dataclass_fields__)
+    if any(not isinstance(identity.get(field), str) for field in identity_fields):
+        return None
+    if any(not str(identity.get(field)).strip() for field in ("project_root", "smell", "location")):
+        return None
+    if identity.get("verification_mode") != verification_mode:
+        return None
+    build_command = str(identity.get("build_command") or "").strip()
+    project_test_command = str(identity.get("project_test_command") or "").strip()
+    verification_cwd = str(identity.get("verification_cwd") or "").strip()
+    verification_source = str(identity.get("verification_command_source") or "").strip()
+    sample_test_command = str(identity.get("sample_test_command") or "").strip()
+    sample_test_source = str(identity.get("sample_test_source") or "").strip()
+    if (
+        bool(build_command) != bool(project_test_command)
+        or (verification_cwd and not build_command)
+        or (verification_source and not build_command)
+        or (sample_test_source and not sample_test_command)
+        or verification_source not in VERIFICATION_COMMAND_SOURCES | {""}
+        or sample_test_source not in VERIFICATION_COMMAND_SOURCES | {""}
+        or (backend == "idea" and str(identity.get("language")).lower() != "java")
+    ):
+        return None
+    groups = loop.get("allowed_failure_groups")
+    if (
+        loop.get("mode") not in LOOP_MODES
+        or not _state_integer(loop.get("max_continuations"))
+        or int(loop.get("max_continuations")) > 5
+        or not _state_integer(loop.get("no_progress_limit"), minimum=1)
+        or int(loop.get("no_progress_limit")) > 5
+        or not isinstance(groups, list)
+        or any(not isinstance(item, str) or item not in FAILURE_GROUPS for item in groups)
+        or len(set(groups)) != len(groups)
+        or (
+            loop.get("mode") != "off"
+            and int(loop.get("max_continuations")) > 0
+            and not groups
+        )
+        or not isinstance(loop.get("instruction"), str)
+        or not str(loop.get("instruction")).strip()
+        or not _state_finite_number(loop.get("sample_deadline_seconds"), minimum=60)
+        or float(loop.get("sample_deadline_seconds")) > 7200
+    ):
+        return None
+    return policy
+
+
+def _valid_idea_protocol_state(value: Any) -> Mapping[str, Any] | None:
+    state = _state_record(value)
+    if state is None:
+        return None
+    active = state.get("active_proposal")
+    blocker = state.get("proposal_blocker")
+    active_record = None if active is None else _state_record(active)
+    blocker_record = None if blocker is None else _state_record(blocker)
+    if active is not None and (
+        active_record is None
+        or not isinstance(active_record.get("proposal_id"), str)
+        or not str(active_record.get("proposal_id")).strip()
+        or not isinstance(active_record.get("operation"), str)
+        or active_record.get("status")
+        not in {"ready", "needs_input", "needs_decision", "retryable_failed"}
+    ):
+        return None
+    if blocker is not None and (
+        blocker_record is None
+        or blocker_record.get("status") != "unsupported_target"
+        or not isinstance(blocker_record.get("proposal_id"), str)
+        or not isinstance(blocker_record.get("operation"), str)
+        or not str(blocker_record.get("operation")).strip()
+        or not isinstance(blocker_record.get("diagnostic_codes"), list)
+        or len(blocker_record.get("diagnostic_codes", [])) > 8
+        or any(
+            not isinstance(item, str) or not item
+            for item in blocker_record.get("diagnostic_codes", [])
+        )
+    ):
+        return None
+    mutation_generation = state.get("mutation_generation")
+    verified_generation = state.get("verified_generation")
+    revertible_generation = state.get("revertible_apply_generation")
+    route = state.get("mutation_route")
+    proposal_id = state.get("mutation_proposal_id")
+    if (
+        active_record is not None and blocker_record is not None
+        or not _state_integer(mutation_generation)
+        or not _state_integer(verified_generation)
+        or int(verified_generation) > int(mutation_generation)
+        or route not in {"", "native_apply", "authorized_edit", "apply_outcome_unknown"}
+        or not isinstance(proposal_id, str)
+        or (
+            int(mutation_generation) == 0
+            and (
+                int(verified_generation) != 0
+                or route
+                or proposal_id
+                or revertible_generation is not None
+            )
+        )
+        or (int(mutation_generation) > 0 and not route)
+        or (
+            revertible_generation is not None
+            and (
+                not _state_integer(revertible_generation, minimum=1)
+                or int(revertible_generation) != int(mutation_generation)
+                or route != "native_apply"
+                or int(verified_generation) >= int(mutation_generation)
+            )
+        )
+    ):
+        return None
+    return state
+
+
+def validate_transferable_command_loop_state(
+    value: Any,
+) -> Mapping[str, Any] | None:
+    """Validate the complete v6 cross-process state without smell decisions."""
+
+    state = _state_record(value)
+    policy = _valid_transfer_policy(state.get("policy")) if state else None
+    if state is None or state.get("schema_version") != COMMAND_LOOP_STATE_VERSION or policy is None:
+        return None
+    loop_policy = _state_record(policy.get("loop"))
+    control = _state_record(state.get("control"))
+    formal = _state_record(state.get("formal_candidate_state"))
+    if loop_policy is None or control is None or formal is None:
+        return None
+    generation = control.get("generation")
+    decision = control.get("decision")
+    instruction = control.get("instruction")
+    termination_reason = control.get("termination_reason")
+    if (
+        not _state_finite_number(state.get("started_at"))
+        or not isinstance(state.get("target_identity_context"), str)
+        or len(str(state.get("target_identity_context"))) > 32768
+        or not _state_integer(generation)
+        or decision not in {"verify_required", "continue", "stop"}
+        or not isinstance(instruction, str)
+        or not isinstance(termination_reason, str)
+        or (
+            decision == "verify_required"
+            and (
+                generation != 0
+                or instruction != INITIAL_VERIFY_INSTRUCTION
+                or termination_reason
+            )
+        )
+        or (decision == "continue" and (not instruction or termination_reason))
+        or (decision == "stop" and (instruction or not termination_reason))
+        or not _state_integer(state.get("continuation_count"))
+        or int(state.get("continuation_count"))
+        > int(loop_policy.get("max_continuations"))
+        or not isinstance(state.get("cap_recovery_used"), bool)
+        or not _state_integer(state.get("no_progress_count"))
+        or not isinstance(state.get("last_failure_fingerprint"), str)
+    ):
+        return None
+    for name, integer_only in (
+        ("best_metric_deficit", False),
+        ("best_structural_failure_count", True),
+    ):
+        item = state.get(name)
+        if item is not None and not (
+            _state_integer(item) if integer_only else _state_finite_number(item)
+        ):
+            return None
+    blockers = state.get("last_blocker_codes")
+    seen = state.get("seen_structural_states")
+    if (
+        not isinstance(blockers, list)
+        or not isinstance(seen, list)
+        or len(blockers) > 32
+        or len(seen) > 32
+        or any(not isinstance(item, str) or not item for item in blockers)
+        or any(not isinstance(item, str) or not item for item in seen)
+        or len(set(seen)) != len(seen)
+    ):
+        return None
+    candidate_value = formal.get("candidate_identity")
+    candidate = None if candidate_value is None else _state_record(candidate_value)
+    outcome = formal.get("outcome")
+    signature = formal.get("diagnostic_signature")
+    confirmation = formal.get("confirmation_required")
+    if (
+        (candidate_value is not None and candidate is None)
+        or outcome not in {"", "pass", "test_failed", "failed"}
+        or not isinstance(signature, str)
+        or len(signature) > 128
+        or not isinstance(confirmation, bool)
+    ):
+        return None
+    if candidate is None:
+        if outcome != "" or signature != "" or confirmation is not False:
+            return None
+    else:
+        java_identity = str(
+            (_state_record(policy.get("identity")) or {}).get("language") or ""
+        ).lower() == "java"
+        for name, nonempty in (
+            ("baseline_revision", True),
+            ("baseline_tree", False),
+            ("production_diff", True),
+            ("test_tree", java_identity),
+            ("verification_config_tree", java_identity),
+        ):
+            item = candidate.get(name)
+            if (
+                not isinstance(item, str)
+                or len(item) > 128
+                or (nonempty and not item)
+            ):
+                return None
+        if outcome == "" or not signature:
+            return None
+    idea_state = state.get("idea_protocol_state")
+    validated_idea_state = _valid_idea_protocol_state(idea_state)
+    if validated_idea_state is None:
+        return None
+
+    terminal_value = state.get("terminal_receipt")
+    terminal = None if terminal_value is None else _state_record(terminal_value)
+    if terminal_value is not None and terminal is None:
+        return None
+    if terminal is None:
+        return state if decision != "stop" else None
+    terminal_loop = _state_record(terminal.get("loop"))
+    if (
+        terminal.get("stage") not in {"cheap_guard", "formal_verify", "protocol"}
+        or not isinstance(terminal.get("status"), str)
+        or not isinstance(terminal.get("success"), bool)
+        or not isinstance(terminal.get("accepted"), bool)
+        or not isinstance(terminal.get("resolution"), str)
+        or not isinstance(terminal.get("terminationReason"), str)
+        or not isinstance(terminal.get("failureCategory"), str)
+        or not isinstance(terminal.get("failureGroup"), str)
+        or "formalVerificationReceipt" not in terminal
+        or "ideaProtocolReceipt" not in terminal
+        or terminal_loop is None
+        or terminal_loop.get("decision") != "stop"
+        or terminal_loop.get("generation") != generation
+        or terminal_loop.get("termination_reason") != termination_reason
+        or terminal.get("terminationReason") != termination_reason
+        or decision != "stop"
+        or (terminal.get("accepted") is True and terminal.get("success") is not True)
+    ):
+        return None
+    formal_receipt_value = terminal.get("formalVerificationReceipt")
+    if terminal.get("stage") == "formal_verify":
+        formal_receipt = (
+            None
+            if formal_receipt_value is None
+            else validate_formal_verification_receipt(formal_receipt_value)
+        )
+        if formal_receipt_value is not None and formal_receipt is None:
+            return None
+        if terminal.get("accepted") is True and formal_receipt is None:
+            return None
+        if formal_receipt is not None and any(
+            formal_receipt.get(key) != terminal.get(key)
+            for key in ("status", "success", "accepted", "resolution")
+        ):
+            return None
+    elif formal_receipt_value is not None:
+        return None
+    idea_receipt_value = terminal.get("ideaProtocolReceipt")
+    idea_receipt = (
+        None if idea_receipt_value is None else _state_record(idea_receipt_value)
+    )
+    idea_formal = (
+        terminal.get("stage") == "formal_verify"
+        and policy.get("refactoring_backend") == "idea"
+    )
+    if idea_formal:
+        if idea_receipt is None:
+            return None
+        mutation_generation = int(validated_idea_state.get("mutation_generation"))
+        verified_generation = int(validated_idea_state.get("verified_generation"))
+        blocker = _state_record(validated_idea_state.get("proposal_blocker"))
+        expected_blocker_status = str(blocker.get("status") or "") if blocker else ""
+        expected_blocker_codes = list(blocker.get("diagnostic_codes") or []) if blocker else []
+        complete = mutation_generation > 0 and mutation_generation == verified_generation
+        if (
+            idea_receipt.get("schema_version") != "smell.idea-protocol-receipt/v1"
+            or idea_receipt.get("mutation_generation") != mutation_generation
+            or idea_receipt.get("verified_generation") != verified_generation
+            or idea_receipt.get("mutation_route")
+            != validated_idea_state.get("mutation_route")
+            or idea_receipt.get("proposal_id")
+            != validated_idea_state.get("mutation_proposal_id")
+            or idea_receipt.get("blocker_status") != expected_blocker_status
+            or idea_receipt.get("blocker_codes") != expected_blocker_codes
+            or idea_receipt.get("complete") is not complete
+            or (terminal.get("accepted") is True and complete is not True)
+        ):
+            return None
+    elif idea_receipt_value is not None:
+        return None
+    return state
 
 
 def resolve_command_payload(
@@ -326,6 +703,11 @@ def resolve_command_payload(
     )
     payload = policy.to_dict()
     payload["identity"] = identity.to_dict()
+    if policy.refactoring_backend == "idea" and identity.language.lower() != "java":
+        raise ValueError(
+            "IDEA_BACKEND_REQUIRES_JAVA: --refactoring-backend=idea requires "
+            "an explicit Java command identity"
+        )
     payload["checkpoint_required"] = identity.smell in CHECKPOINT_SMELLS
     payload["command_loop_state"] = initial_command_loop_state(
         payload,
@@ -373,6 +755,11 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
         default="project_full",
     )
     parser.add_argument(
+        "--refactoring-backend",
+        choices=("direct", "idea"),
+        default="direct",
+    )
+    parser.add_argument(
         "--allow-test-changes",
         action="store_true",
         help="controller-owned opt-in; frozen into c000 before the repair starts",
@@ -406,6 +793,7 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
     return ResolvedCommandPolicy(
         task=task,
         verification_mode=parsed.verification_mode,
+        refactoring_backend=parsed.refactoring_backend,
         allow_test_changes=bool(parsed.allow_test_changes),
         loop=LoopPolicy(
             mode=mode,

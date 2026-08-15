@@ -2,6 +2,7 @@
 """Adversarial checks for isolated project_full verification worktrees."""
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import sys
@@ -305,12 +306,37 @@ def main() -> None:
             smell_bridge._checkpoint_context = original_checkpoint_context
             smell_bridge.run_build_test_guard = original_run_build_test_guard
         assert focused_command_result["status"] == "READY", focused_command_result
+        assert focused_command_result["schema_version"] == (
+            "smell.focused-preflight.decision/v1"
+        ), focused_command_result
         assert focused_command_result["project_full_executed"] is False, (
             focused_command_result
         )
         assert focused_command_result["verification_isolation"]["success"] is True, (
             focused_command_result
         )
+        focused_command_json = json.dumps(focused_command_result)
+        assert '"output"' not in focused_command_json, focused_command_result
+        assert len(focused_command_json.encode("utf-8")) < (
+            smell_bridge.DECISION_MAX_BYTES
+        ), focused_command_result
+        huge_focused_decision = smell_bridge._focused_preflight_decision_payload({
+            "type": "focused_preflight",
+            "success": False,
+            "status": "FAILED",
+            "message": "focused failure",
+            "execution": {
+                "success": False,
+                "returncode": 17,
+                "summary_text": "compiler failed",
+                "output": "X" * (smell_bridge.DECISION_MAX_BYTES * 2),
+            },
+        })
+        huge_focused_json = json.dumps(huge_focused_decision)
+        assert '"output"' not in huge_focused_json, huge_focused_decision
+        assert len(huge_focused_json.encode("utf-8")) < (
+            smell_bridge.DECISION_MAX_BYTES
+        ), huge_focused_decision
         assert _status(root) == before, (_status(root), before)
 
         original_run_build_test_guard = smell_bridge.run_build_test_guard

@@ -96,7 +96,7 @@ Treat `status` and `nextAction` as a state machine:
 | `needs_selection` | target is valid but a concrete selection is required | start a fresh preview with one returned selection |
 | `needs_input` | required operation input is missing | preview again with the same `proposalId` and requested arguments |
 | `needs_decision` | IDEA requires a structured choice | follow `nextAction` using the same `proposalId` |
-| `unsupported_target` | operation is unavailable on this target | relocate according to target admission |
+| `unsupported_target` | operation is explicitly unavailable on this admitted target | use the command-authorized `idea_edit` route, or report the blocker |
 | `retryable_failed` | IDEA asks for a corrected retry | correct only the reported condition |
 | `stale` | source changed after preview | create a fresh preview; do not reuse the proposal |
 | `applied` | IDEA committed the refactor | inspect paths, then verify |
@@ -182,10 +182,10 @@ files.
 
 ## Service Check
 
-The runner owns IDEA service startup and readiness. If preview reports that the
-service is unavailable, report the wrapper diagnostic as a concrete
-infrastructure blocker. Do not call the underlying CLI through bash and do not
-repeatedly open IDEA from the agent session.
+The shared `java-refactor-run --refactoring-backend=idea` command owns IDEA
+service startup and readiness before the model turn. If that precheck fails,
+the command is already terminal. Do not call the underlying CLI through bash
+and do not open IDEA from the agent session.
 
 ## Revert Last Apply
 
@@ -202,12 +202,13 @@ reusable.
 ## Fallback Rule
 
 Direct OpenCode `edit`/`write` is not an IDEA-backend fallback. For a planned
-native step, `idea_edit` is allowed only after a concrete proposal blocker:
-unsupported native operation after target admission, no legal selection,
-unrecoverable stale proposal, or non-decision failure. It never substitutes for
-the required preview/apply lifecycle in a proposal-contract run.
-
-Before using `idea_edit`, record a short `deviation_reason` with that blocker.
+native step, `idea_edit` is allowed only after preview returns the explicit
+`unsupported_target` status for the admitted target. `needs_selection`, stale,
+transport, input, decision, and generic failure states do not authorize it.
+The two legal mutation routes are therefore `preview -> apply` and
+`preview(unsupported_target) -> idea_edit`; both must then call `smell_verify`.
+The command persists the blocker and binds the resulting mutation to formal
+verification.
 
 ## Common Operation Notes
 

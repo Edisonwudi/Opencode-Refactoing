@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -208,6 +211,207 @@ def main() -> int:
         test_changes={},
         exact_dead_code_deletion=False,
     ) is False
+
+    receipt_artifacts = {
+        "guard_evidence": "/tmp/artifacts/guard-evidence.json",
+        "build_result": "/tmp/artifacts/build.full.json",
+        "test_result": "/tmp/artifacts/test.full.json",
+        "diff": "/tmp/artifacts/diff.patch",
+    }
+    pass_decision = smell_bridge._verify_decision_payload(
+        {
+            "success": True,
+            "accepted": True,
+            "progress": True,
+            "status": "PASS",
+            "resolution": "resolved",
+            "project_full_executed": True,
+            "smell_guard": {
+                "success": True,
+                "failure_count": 0,
+                "results": [],
+            },
+            "build_test_guard": {
+                "success": True,
+                "project_full_executed": True,
+                "details": {
+                    "build": {"success": True, "status": "passed"},
+                    "test": {"success": True, "status": "passed"},
+                    "sample_test": None,
+                },
+                "verification_isolation": {
+                    "contract_version": "project-full-fresh-worktree/v1",
+                    "mode": "detached_git_worktree",
+                    "success": True,
+                    "stage": "completed",
+                    "base_commit": "base-revision",
+                    "snapshot_change_count": 2,
+                    "cleanup_success": True,
+                },
+            },
+            "checkpoint": {
+                "baseline_project_commit": "base-revision",
+                "baseline_tree_hash": "base-tree",
+                "production_diff_hash": "existing-production-diff-id",
+                "test_changes": {
+                    "current_tree_sha256": "existing-test-tree-id",
+                    "current_verification_config_tree_sha256": "existing-verification-config-tree-id",
+                },
+            },
+        },
+        receipt_artifacts,
+    )
+    pass_receipt = pass_decision["formal_verification_receipt"]
+    assert pass_receipt["schema_version"] == (
+        "smell.formal-verification-receipt/v1"
+    ), pass_receipt
+    assert pass_receipt["terminal_stage"] == "formal_verify", pass_receipt
+    assert pass_receipt["candidate_identity"] == {
+        "baseline_revision": "base-revision",
+        "baseline_tree": "base-tree",
+        "production_diff": "existing-production-diff-id",
+        "test_tree": "existing-test-tree-id",
+        "verification_config_tree": "existing-verification-config-tree-id",
+    }, pass_receipt
+    assert pass_receipt["outcome"] == "pass", pass_receipt
+    assert pass_receipt["diagnostic_signature"] == "PASS", pass_receipt
+    assert pass_receipt["guard"]["success"] is True, pass_receipt
+    assert pass_receipt["build_test"]["test_status"] == "passed", pass_receipt
+    assert pass_receipt["fresh_isolation"]["cleanup_success"] is True, (
+        pass_receipt
+    )
+    assert pass_receipt["artifact_refs"] == receipt_artifacts, pass_receipt
+
+    failed_decision = smell_bridge._verify_decision_payload(
+        {
+            "success": False,
+            "accepted": False,
+            "progress": False,
+            "status": "TEST_FAILED",
+            "resolution": "unresolved",
+            "project_full_executed": True,
+            "smell_guard": {
+                "success": True,
+                "failure_count": 0,
+                "results": [],
+            },
+            "build_test_guard": {
+                "success": False,
+                "project_full_executed": True,
+                "details": {
+                    "build": {"success": True, "status": "passed"},
+                    "test": {"success": False, "status": "failed"},
+                    "sample_test": None,
+                },
+            },
+            "checkpoint": {
+                "baseline_project_commit": "base-revision",
+                "production_diff_hash": "existing-production-diff-id",
+                "test_changes": {
+                    "current_tree_sha256": "existing-test-tree-id",
+                    "current_verification_config_tree_sha256": "existing-verification-config-tree-id",
+                },
+                "delta": {"reason": "NO_STRUCTURAL_PROGRESS"},
+            },
+            "failure_pack": {
+                "failure_category": "TEST_BEHAVIOR_REGRESSION",
+                "failure_group": "test",
+                "retryable": True,
+                "verify_status": "TEST_FAILED",
+                "next_action": "run one fresh confirmation",
+            },
+        },
+        receipt_artifacts,
+    )
+    failed_receipt = failed_decision["formal_verification_receipt"]
+    assert failed_receipt["outcome"] == "test_failed", failed_receipt
+    assert failed_receipt["diagnostic_signature"] == (
+        failed_decision["failure_fingerprint"]
+    ), failed_decision
+    changed_test_tree_payload = smell_bridge._verify_decision_payload(
+        {
+            "success": True,
+            "accepted": True,
+            "progress": True,
+            "status": "PASS",
+            "resolution": "resolved",
+            "smell_guard": {"success": True, "failure_count": 0, "results": []},
+            "build_test_guard": {"success": True, "details": {}},
+            "checkpoint": {
+                "baseline_project_commit": "base-revision",
+                "baseline_tree_hash": "base-tree",
+                "production_diff_hash": "existing-production-diff-id",
+                "test_changes": {
+                    "current_tree_sha256": "changed-test-tree-id",
+                    "current_verification_config_tree_sha256": "existing-verification-config-tree-id",
+                },
+            },
+        },
+        receipt_artifacts,
+    )
+    assert (
+        changed_test_tree_payload["formal_verification_receipt"]["candidate_identity"]
+        != pass_receipt["candidate_identity"]
+    ), changed_test_tree_payload
+    assert len(json.dumps(pass_decision).encode("utf-8")) < (
+        smell_bridge.DECISION_MAX_BYTES
+    )
+
+    # Every Git command nested under snapshot capture must consume the same
+    # absolute sample deadline.  A blocked Git command may not outlive the
+    # manual/plugin verification budget.
+    original_run_git = smell_bridge._run_git
+    observed_deadlines: list[float | None] = []
+
+    def timed_out_git(
+        args: list[str],
+        cwd: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, object]:
+        observed_deadlines.append(deadline_monotonic)
+        raise subprocess.TimeoutExpired(["git", *args], timeout=0.01)
+
+    smell_bridge._run_git = timed_out_git
+    snapshot_deadline = time.monotonic() + 0.1
+    try:
+        try:
+            smell_bridge._snapshot_project(
+                Path("/tmp/project"),
+                deadline_monotonic=snapshot_deadline,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("snapshot Git timeout must fail closed")
+    finally:
+        smell_bridge._run_git = original_run_git
+    assert observed_deadlines == [snapshot_deadline], observed_deadlines
+
+    original_subprocess_run = smell_bridge.subprocess.run
+    observed_timeouts: list[float | None] = []
+
+    def blocked_git_process(*args, **kwargs):
+        observed_timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(args[0], timeout=kwargs.get("timeout"))
+
+    smell_bridge.subprocess.run = blocked_git_process
+    try:
+        explicit_deadline = time.monotonic() + 0.1
+        try:
+            smell_bridge._run_git(
+                ["status", "--short"],
+                Path("/tmp/project"),
+                deadline_monotonic=explicit_deadline,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("bounded Git timeout must propagate")
+    finally:
+        smell_bridge.subprocess.run = original_subprocess_run
+    assert len(observed_timeouts) == 1, observed_timeouts
+    assert observed_timeouts[0] is not None and 0 < observed_timeouts[0] <= 0.1
 
     print(
         "bridge-surface self-check: PASS commands=3 legacy_context_commands=0 "

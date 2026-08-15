@@ -48,10 +48,10 @@ Workflow:
    plan from the frozen target Guard contract and the actual source.
 4. Execute the plan using only the selected backend:
    - `idea`: use `idea_refactor_preview`, reuse its `proposalId` and returned
-     `nextRequest`, then use `idea_refactor_apply`. Do not call the underlying
-     IDEA CLI through bash and do not use OpenCode edit/write tools. A narrow
-     `idea_edit` is permitted only after a concrete proposal blocker and never
-     substitutes for the required preview/apply lifecycle.
+     `nextRequest`, then use `idea_refactor_apply` when status is `ready`. Do
+     not call the underlying IDEA CLI through bash and do not use OpenCode
+     edit/write tools. Only an explicit `unsupported_target` preview status
+     authorizes the alternative `idea_edit` route; no other failure does.
    - `direct`: use OpenCode read/search/edit tools.
    Never rewrite Java files with shell text commands.
 5. Call `smell_verify` as the acceptance gate.
@@ -83,7 +83,8 @@ Acceptance:
 - The final status comes from `smell_verify`, not visual plausibility.
 - The final report includes the planned route summary, verification status, and
   any blocker.
-- In the `idea` backend, a valid run contains real tool calls in this order:
-  `idea_refactor_preview`, `idea_refactor_apply`, then `smell_verify`. Merely
-  mentioning those names or invoking `idea-refactor` through bash is invalid.
+- In the `idea` backend, a valid run contains `idea_refactor_preview`, then
+  either its matching `idea_refactor_apply` or blocker-authorized `idea_edit`,
+  then `smell_verify`. The terminal IDEA receipt must bind the mutation to that
+  verification. Merely mentioning tool names is not evidence.
 - Outputs are modified project code and process logs/artifacts only.

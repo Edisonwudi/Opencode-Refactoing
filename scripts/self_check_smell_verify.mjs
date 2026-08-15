@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process"
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -18,6 +18,7 @@ function parseArgs(argv) {
     requireDataset: false,
     ideaProtocolOnly: false,
     guardProgressOnly: false,
+    manualStateOnly: false,
     dataset: process.env.SELF_CHECK_DATASET || "/opt/dataset/java/delivery_schema/mysterious_name.csv",
     sampleId: process.env.SELF_CHECK_SAMPLE_ID || "8",
     model: process.env.SELF_CHECK_MODEL || "zai/glm-4.7",
@@ -30,6 +31,8 @@ function parseArgs(argv) {
       options.ideaProtocolOnly = true
     } else if (arg === "--guard-progress-only") {
       options.guardProgressOnly = true
+    } else if (arg === "--manual-state-only") {
+      options.manualStateOnly = true
     } else if (arg === "--dataset-smoke-dataset") {
       options.dataset = argv[++index] || ""
     } else if (arg === "--dataset-smoke-sample-id") {
@@ -123,6 +126,7 @@ function cleanSmellIdentityEnv(env) {
     "SMELL_SAMPLE_TEST_SOURCE",
     "SMELL_COMMAND_LOOP_STATE_JSON",
     "SMELL_BASELINE_SEAL",
+    "SMELL_SESSION_STATE_ROOT",
   ]) {
     delete cleaned[key]
   }
@@ -902,30 +906,30 @@ async function runIdeaBackendSurfaceSelfCheck(pluginModule) {
     if (typeof beforeHook !== "function") {
       throw new SelfCheckError("idea_backend_tool_hook", "IDEA backend did not register tool.execute.before.", {})
     }
-    let editBlocked = false
+    let unownedIdeaRejected = false
     try {
       await beforeHook(
-        { tool: "edit", sessionID: "idea-session" },
-        { args: { filePath: "/tmp/idea-backend-self-check/src/Foo.java" } },
+        { tool: "idea_refactor_preview", sessionID: "idea-session" },
+        { args: { operation: "rename:method", target: { fqcn: "example.Foo", memberName: "oldName" } } },
       )
     } catch (error) {
-      editBlocked = String(error).includes("IDEA_BACKEND_DIRECT_EDIT_FORBIDDEN")
+      unownedIdeaRejected = String(error).includes("IDEA_COMMAND_POLICY_REQUIRED")
     }
-    let cliBlocked = false
-    try {
-      await beforeHook(
-        { tool: "bash", sessionID: "idea-session" },
-        { args: { command: "/usr/local/bin/idea-refactor locate --project-root /tmp/p" } },
-      )
-    } catch (error) {
-      cliBlocked = String(error).includes("IDEA_BACKEND_DIRECT_CLI_FORBIDDEN")
-    }
-    if (!editBlocked || !cliBlocked) {
-      throw new SelfCheckError("idea_backend_bypass_guard", "IDEA backend did not reject a direct edit or direct CLI call.", {
-        editBlocked,
-        cliBlocked,
+    if (!unownedIdeaRejected) {
+      throw new SelfCheckError("idea_backend_policy_authority", "Process environment enabled an unowned IDEA tool call.", {
+        unownedIdeaRejected,
       })
     }
+    // Process-wide backend variables are not command authority. Ordinary tools
+    // remain untouched until a command freezes refactoring_backend=idea.
+    await beforeHook(
+      { tool: "edit", sessionID: "idea-session" },
+      { args: { filePath: "/tmp/idea-backend-self-check/src/Foo.java" } },
+    )
+    await beforeHook(
+      { tool: "bash", sessionID: "idea-session" },
+      { args: { command: "/usr/local/bin/idea-refactor locate --project-root /tmp/p" } },
+    )
     await beforeHook(
       { tool: "read", sessionID: "idea-session" },
       { args: { filePath: "/tmp/idea-backend-self-check/src/Foo.java" } },
@@ -936,20 +940,285 @@ async function runIdeaBackendSurfaceSelfCheck(pluginModule) {
     process.env.SMELL_ENABLE_IDEA_TOOLS = "1"
     const directPlugin = await pluginModule.SmellPlugin({ worktree: "/tmp/direct-backend-self-check" })
     const directToolKeys = Object.keys(directPlugin?.tool || {}).sort()
-    if (directToolKeys.some((name) => name.startsWith("idea_"))) {
-      throw new SelfCheckError("direct_backend_tool_surface", "Direct backend exposed IDEA tools from the enable flag alone.", {
+    if (!directToolKeys.some((name) => name === "idea_refactor_preview")) {
+      throw new SelfCheckError("static_idea_tool_surface", "Static plugin surface omitted IDEA tools before command policy resolution.", {
         toolKeys: directToolKeys,
       })
     }
     await directPlugin?.dispose?.()
     return {
       ideaToolKeys: toolKeys.filter((name) => name.startsWith("idea_")),
-      directBackendIdeaTools: [],
-      directEditBlocked: editBlocked,
-      directCliBlocked: cliBlocked,
+      directBackendIdeaTools: directToolKeys.filter((name) => name.startsWith("idea_")),
+      environmentIsNotAuthority: unownedIdeaRejected,
     }
   } finally {
     restoreEnv()
+  }
+}
+
+async function runIdeaManualCommandProtocolSelfCheck() {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "idea-command-protocol-self-check-"))
+  const envBefore = { ...process.env }
+  try {
+    const projectRoot = path.join(tempRoot, "project")
+    const stateRoot = path.join(tempRoot, "state")
+    const fakeBridge = path.join(tempRoot, "bridge.py")
+    const fakeCli = path.join(tempRoot, "idea-refactor")
+    const cliLog = path.join(tempRoot, "idea-cli.jsonl")
+    await mkdir(path.join(projectRoot, "src"), { recursive: true })
+    await writeFile(path.join(projectRoot, "src", "Foo.java"), "class Foo {}\n", "utf8")
+    await writeFile(cliLog, "", "utf8")
+    await writeFile(fakeBridge, `
+import json
+import os
+import sys
+
+command = sys.argv[1]
+project_root = os.environ["IDEA_SELF_CHECK_PROJECT_ROOT"]
+identity = {
+    "project_root": project_root,
+    "project_override_root": "",
+    "language": "java",
+    "smell": "mysterious_name",
+    "location": "src/Foo.java:1",
+    "target_context_json": "",
+    "verification_mode": "project_full",
+    "sample_test_location": "",
+    "sample_test_command": "",
+    "build_command": "",
+    "project_test_command": "",
+    "verification_cwd": "",
+    "verification_command_source": "",
+    "sample_test_source": "",
+}
+if command == "resolve-command":
+    payload = {
+        "task": "Continue the current Java refactoring task.",
+        "verification_mode": "project_full",
+        "refactoring_backend": "idea",
+        "allow_test_changes": False,
+        "checkpoint_required": False,
+        "identity": identity,
+        "loop": {
+            "mode": "verify-failure",
+            "max_continuations": 2,
+            "no_progress_limit": 1,
+            "allowed_failure_groups": ["smell", "compile", "test"],
+            "instruction": "repair narrowly",
+            "sample_deadline_seconds": 60,
+        },
+    }
+elif command == "verify":
+    payload = {
+        "success": True,
+        "accepted": True,
+        "progress": True,
+        "project_full_executed": True,
+        "status": "PASS",
+        "resolution": "resolved",
+        "formal_verification_receipt": {
+            "schema_version": "smell.formal-verification-receipt/v1",
+            "terminal_stage": "formal_verify",
+            "status": "PASS",
+            "success": True,
+            "accepted": True,
+            "resolution": "resolved",
+            "candidate_identity": {
+                "baseline_revision": "idea-baseline",
+                "baseline_tree": "idea-tree",
+                "production_diff": "idea-production-diff",
+                "test_tree": "idea-test-tree",
+                "verification_config_tree": "idea-config-tree",
+            },
+            "outcome": "pass",
+            "diagnostic_signature": "PASS",
+            "guard": {"success": True, "failure_count": 0},
+            "build_test": {"success": True, "project_full_executed": True, "test_status": "passed"},
+            "fresh_isolation": None,
+            "artifact_refs": {},
+        },
+    }
+else:
+    payload = {"success": False, "status": "UNEXPECTED_COMMAND"}
+print(json.dumps(payload))
+`, "utf8")
+    await writeFile(fakeCli, `#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+with Path(os.environ["IDEA_SELF_CHECK_CLI_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+action = args[0] if args else ""
+if action == "ensure-service":
+    if os.environ.get("IDEA_SELF_CHECK_PRECHECK_FAIL") == "1":
+        print(json.dumps({"status": "failed", "diagnostics": [{"code": "SERVICE_NOT_READY"}]}))
+        raise SystemExit(1)
+    payload = {"status": "ok"}
+elif action == "locate":
+    payload = {
+        "status": "ok",
+        "draftId": "draft-1",
+        "availableOperations": [{"operation": "rename:method"}],
+    }
+elif action == "prepare":
+    payload = {"status": "ok", "operation": "rename:method"}
+elif action == "apply":
+    payload = {"status": "ok", "applied": True, "operation": "rename:method", "result": {"changedFilePaths": ["src/Foo.java"]}}
+elif action == "edit":
+    payload = {"status": "ok"}
+elif action == "rollback":
+    payload = {"status": "ok"}
+else:
+    payload = {"status": "failed", "diagnostics": [{"code": "UNEXPECTED_ACTION"}]}
+print(json.dumps(payload))
+`, "utf8")
+    await chmod(fakeCli, 0o755)
+    Object.assign(process.env, cleanSmellIdentityEnv(process.env), {
+      SMELL_BRIDGE_FILE: fakeBridge,
+      SMELL_IDEA_REFACTOR_CLI: fakeCli,
+      SMELL_SESSION_STATE_ROOT: stateRoot,
+      IDEA_SELF_CHECK_PROJECT_ROOT: projectRoot,
+      IDEA_SELF_CHECK_CLI_LOG: cliLog,
+    })
+    delete process.env.SMELL_BATCH_RUN
+    const compiledFile = await compilePluginForSelfCheck(tempRoot)
+    const pluginModule = await import(`${pathToFileURL(compiledFile).href}?idea_command=${Date.now()}`)
+    const hooks = pluginModule.SmellPlugin.__selfTest
+    const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot })
+    const sessionID = "idea-manual-command"
+    await plugin["command.execute.before"](
+      {
+        command: "java-refactor-run",
+        sessionID,
+        arguments: `--refactoring-backend=idea -- Project root: ${projectRoot}; Language: java; Smell type: mysterious_name; Target location: src/Foo.java:1`,
+      },
+      { parts: [] },
+    )
+    const cliCallsAfterPrecheck = (await readFile(cliLog, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse)
+    assertEqual("idea_manual_precheck_action", cliCallsAfterPrecheck[0]?.[0], "ensure-service", "action")
+    assertCond("idea_manual_precheck_opens_project", cliCallsAfterPrecheck[0]?.includes("--open"), JSON.stringify(cliCallsAfterPrecheck[0]))
+    assertCond("idea_manual_precheck_has_shared_timeout", Number(cliCallsAfterPrecheck[0]?.[cliCallsAfterPrecheck[0].indexOf("--timeout") + 1]) > 0, JSON.stringify(cliCallsAfterPrecheck[0]))
+
+    const beforeHook = plugin["tool.execute.before"]
+    for (const [name, toolName, args, code] of [
+      ["direct_edit", "edit", { filePath: path.join(projectRoot, "src", "Foo.java") }, "IDEA_BACKEND_DIRECT_EDIT_FORBIDDEN"],
+      ["shell", "bash", { command: "pwd" }, "IDEA_BACKEND_SHELL_FORBIDDEN"],
+      ["root_retarget", "idea_refactor_preview", { projectRoot: path.join(tempRoot, "other"), operation: "rename:method", target: { fqcn: "Foo" } }, "IDEA_PROJECT_ROOT_MISMATCH"],
+      ["apply_before_preview", "idea_refactor_apply", { proposalId: "draft-1" }, "IDEA_APPLY_REQUIRES_READY_PROPOSAL"],
+    ]) {
+      let message = ""
+      try {
+        await beforeHook({ tool: toolName, sessionID }, { args })
+      } catch (error) {
+        message = String(error?.message || error)
+      }
+      assertCond(`idea_manual_${name}_blocked`, message.includes(code), message)
+    }
+
+    const preview = await plugin.tool.idea_refactor_preview.execute(
+      { operation: "rename:method", target: { fqcn: "Foo", memberName: "oldName", parameterTypes: [] } },
+      { sessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    assertEqual("idea_manual_preview_ready", JSON.parse(preview.output).status, "ready", "status")
+    let wrongProposal = ""
+    try {
+      await plugin.tool.idea_refactor_apply.execute(
+        { proposalId: "draft-2" },
+        { sessionID, agent: "java-refactor-agent", directory: projectRoot },
+      )
+    } catch (error) {
+      wrongProposal = String(error?.message || error)
+    }
+    assertCond("idea_manual_proposal_id_frozen", wrongProposal.includes("IDEA_PROPOSAL_ID_MISMATCH"), wrongProposal)
+    const apply = await plugin.tool.idea_refactor_apply.execute(
+      { proposalId: "draft-1" },
+      { sessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    assertEqual("idea_manual_apply_succeeds", JSON.parse(apply.output).status, "applied", "status")
+    const verified = await plugin.tool.smell_verify.execute(
+      { projectRoot, language: "java", smell: "mysterious_name", location: "src/Foo.java:1", verificationMode: "project_full" },
+      { sessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    const verifiedPayload = JSON.parse(verified.output)
+    assertEqual("idea_manual_verify_pass", verifiedPayload.status, "PASS", "status")
+    assertEqual("idea_manual_receipt_complete", verifiedPayload.idea_protocol_receipt?.complete, true, "complete")
+    assertEqual("idea_manual_receipt_route", verifiedPayload.idea_protocol_receipt?.mutation_route, "native_apply", "route")
+    const envelope = JSON.parse(await readFile(hooks.commandSessionStateFile(sessionID), "utf8"))
+    assertEqual("idea_manual_backend_persisted", envelope.command_loop_state.policy.refactoring_backend, "idea", "backend")
+    assertEqual("idea_manual_state_verified", envelope.command_loop_state.idea_protocol_state.verified_generation, 1, "verified_generation")
+    assertEqual("idea_manual_terminal_receipt_complete", envelope.command_loop_state.terminal_receipt.ideaProtocolReceipt.complete, true, "complete")
+    const mismatchedReceiptState = JSON.parse(JSON.stringify(envelope.command_loop_state))
+    mismatchedReceiptState.terminal_receipt.ideaProtocolReceipt.verified_generation = 0
+    assertEqual(
+      "idea_manual_terminal_receipt_must_match_state",
+      hooks.restoreCommandLoopState(JSON.stringify(mismatchedReceiptState)),
+      undefined,
+      "restored state",
+    )
+
+    const editSessionID = "idea-authorized-edit-command"
+    await plugin["command.execute.before"](
+      {
+        command: "java-refactor-run",
+        sessionID: editSessionID,
+        arguments: `--refactoring-backend=idea -- Project root: ${projectRoot}; Language: java; Smell type: mysterious_name; Target location: src/Foo.java:1`,
+      },
+      { parts: [] },
+    )
+    const unsupported = await plugin.tool.idea_refactor_preview.execute(
+      { operation: "move:method", target: { fqcn: "Foo", memberName: "oldName", parameterTypes: [] } },
+      { sessionID: editSessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    assertEqual("idea_manual_edit_requires_real_blocker", JSON.parse(unsupported.output).status, "unsupported_target", "status")
+    const edited = await plugin.tool.idea_edit.execute(
+      { file: "src/Foo.java", oldString: "class Foo {}", newString: "class Foo { }" },
+      { sessionID: editSessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    assertEqual("idea_manual_authorized_edit_succeeds", JSON.parse(edited.output).success, true, "success")
+    const editVerified = await plugin.tool.smell_verify.execute(
+      { projectRoot, language: "java", smell: "mysterious_name", location: "src/Foo.java:1", verificationMode: "project_full" },
+      { sessionID: editSessionID, agent: "java-refactor-agent", directory: projectRoot },
+    )
+    const editVerifiedPayload = JSON.parse(editVerified.output)
+    assertEqual("idea_manual_authorized_edit_receipt", editVerifiedPayload.idea_protocol_receipt?.mutation_route, "authorized_edit", "route")
+    assertEqual("idea_manual_authorized_edit_blocker_receipt", editVerifiedPayload.idea_protocol_receipt?.blocker_status, "unsupported_target", "blocker_status")
+
+    process.env.IDEA_SELF_CHECK_PRECHECK_FAIL = "1"
+    let precheckFailure = ""
+    try {
+      await plugin["command.execute.before"](
+        {
+          command: "java-refactor-run",
+          sessionID: "idea-precheck-failure",
+          arguments: `--refactoring-backend=idea -- Project root: ${projectRoot}; Language: java; Smell type: mysterious_name; Target location: src/Foo.java:1`,
+        },
+        { parts: [] },
+      )
+    } catch (error) {
+      precheckFailure = String(error?.message || error)
+    }
+    assertCond("idea_manual_precheck_failure_terminal", precheckFailure.includes("IDEA_PRECHECK_FAILED"), precheckFailure)
+    const failedEnvelope = JSON.parse(await readFile(hooks.commandSessionStateFile("idea-precheck-failure"), "utf8"))
+    assertEqual("idea_manual_precheck_failure_stage", failedEnvelope.command_loop_state.terminal_receipt.stage, "protocol", "stage")
+    assertEqual("idea_manual_precheck_failure_status", failedEnvelope.command_loop_state.terminal_receipt.status, "IDEA_PRECHECK_FAILED", "status")
+    await plugin.dispose?.()
+    return {
+      precheckBeforeModel: true,
+      frozenBackendAndRoot: true,
+      proposalIdBound: true,
+      unsupportedTargetAuthorizesEdit: true,
+      verifiedReceipt: true,
+      precheckFailureTerminal: true,
+    }
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envBefore)) delete process.env[key]
+    }
+    Object.assign(process.env, envBefore)
+    await rm(tempRoot, { recursive: true, force: true })
   }
 }
 
@@ -1164,7 +1433,22 @@ async function runPluginIdeaResultSelfCheck(hooks, maxLen) {
 }
 
 async function runPluginIdeaProposalSelfCheck(hooks) {
-  for (const name of ["runIdeaPreviewProtocol", "renderIdeaApplyProtocolResult", "ideaDecisionsShape"]) {
+  for (const name of [
+    "runIdeaPreviewProtocol",
+    "renderIdeaApplyProtocolResult",
+    "ideaDecisionsShape",
+    "newIdeaProtocolState",
+    "recordIdeaPreviewOutcome",
+    "assertIdeaApplyAllowed",
+    "recordIdeaApplyOutcome",
+    "assertIdeaEditAllowed",
+    "recordIdeaEditOutcome",
+    "assertIdeaVerifyAllowed",
+    "recordIdeaVerifyOutcome",
+    "assertIdeaRevertAllowed",
+    "recordIdeaRevertOutcome",
+    "ideaProtocolReceipt",
+  ]) {
     if (typeof hooks[name] !== "function") {
       throw new SelfCheckError("plugin_self_test_hooks", `Plugin __selfTest is missing ${name}.`, {
         keys: Object.keys(hooks).sort(),
@@ -1184,6 +1468,197 @@ async function runPluginIdeaProposalSelfCheck(hooks) {
       invalidAccepted: invalidDecisionShape.success,
     })
   }
+  const expectProtocolError = (name, expectedCode, action) => {
+    let message = ""
+    try {
+      action()
+    } catch (error) {
+      message = String(error?.message || error)
+    }
+    if (!message.includes(expectedCode)) {
+      throw new SelfCheckError("plugin_idea_command_protocol", `${name} did not fail with ${expectedCode}.`, {
+        message,
+      })
+    }
+  }
+
+  const applyBeforePreview = hooks.newIdeaProtocolState()
+  expectProtocolError(
+    "apply_before_preview",
+    "IDEA_APPLY_REQUIRES_READY_PROPOSAL",
+    () => hooks.assertIdeaApplyAllowed(applyBeforePreview, "draft-1"),
+  )
+
+  const proposalState = hooks.newIdeaProtocolState()
+  hooks.recordIdeaPreviewOutcome(
+    proposalState,
+    { operation: "rename:method", proposalId: "" },
+    {
+      protocol: "idea-proposal-v1",
+      status: "ready",
+      proposalId: "draft-1",
+      operation: "rename:method",
+      diagnostics: [],
+    },
+  )
+  expectProtocolError(
+    "apply_proposal_mismatch",
+    "IDEA_PROPOSAL_ID_MISMATCH",
+    () => hooks.assertIdeaApplyAllowed(proposalState, "draft-2"),
+  )
+  hooks.assertIdeaApplyAllowed(proposalState, "draft-1")
+  hooks.recordIdeaApplyOutcome(proposalState, "draft-1", {
+    protocol: "idea-proposal-v1",
+    status: "applied",
+    proposalId: "draft-1",
+    operation: "rename:method",
+    diagnostics: [],
+  })
+  hooks.assertIdeaVerifyAllowed(proposalState, { controlGeneration: 1, confirmationRequired: false })
+  hooks.recordIdeaVerifyOutcome(proposalState)
+  expectProtocolError(
+    "repeat_verify_without_mutation",
+    "IDEA_VERIFY_REQUIRES_NEW_MUTATION",
+    () => hooks.assertIdeaVerifyAllowed(proposalState, { controlGeneration: 1, confirmationRequired: false }),
+  )
+  hooks.assertIdeaVerifyAllowed(proposalState, { controlGeneration: 1, confirmationRequired: true })
+  const nativeReceipt = hooks.ideaProtocolReceipt(proposalState)
+  if (
+    nativeReceipt?.schema_version !== "smell.idea-protocol-receipt/v1"
+    || nativeReceipt.mutation_route !== "native_apply"
+    || nativeReceipt.mutation_generation !== 1
+    || nativeReceipt.verified_generation !== 1
+    || nativeReceipt.proposal_id !== "draft-1"
+  ) {
+    throw new SelfCheckError("plugin_idea_command_protocol", "Native apply receipt was not bound to its verification.", {
+      nativeReceipt,
+    })
+  }
+
+  const failedApplyState = hooks.newIdeaProtocolState()
+  hooks.recordIdeaPreviewOutcome(
+    failedApplyState,
+    { operation: "rename:method", proposalId: "" },
+    { protocol: "idea-proposal-v1", status: "ready", proposalId: "draft-failed", operation: "rename:method", diagnostics: [] },
+  )
+  hooks.recordIdeaApplyOutcome(failedApplyState, "draft-failed", {
+    protocol: "idea-proposal-v1",
+    status: "failed",
+    proposalId: "draft-failed",
+    operation: "rename:method",
+    diagnostics: [{ code: "REFACTORING_FAILED" }],
+  })
+  expectProtocolError(
+    "failed_apply_does_not_authorize_verify",
+    "IDEA_VERIFY_REQUIRES_MUTATION",
+    () => hooks.assertIdeaVerifyAllowed(failedApplyState, { controlGeneration: 1, confirmationRequired: false }),
+  )
+  expectProtocolError(
+    "failed_apply_does_not_authorize_edit",
+    "IDEA_EDIT_REQUIRES_UNSUPPORTED_TARGET",
+    () => hooks.assertIdeaEditAllowed(failedApplyState),
+  )
+
+  const blockerState = hooks.newIdeaProtocolState()
+  expectProtocolError(
+    "edit_without_blocker",
+    "IDEA_EDIT_REQUIRES_UNSUPPORTED_TARGET",
+    () => hooks.assertIdeaEditAllowed(blockerState),
+  )
+  hooks.recordIdeaPreviewOutcome(
+    blockerState,
+    { operation: "move:method", proposalId: "" },
+    {
+      protocol: "idea-proposal-v1",
+      status: "unsupported_target",
+      proposalId: "draft-blocked",
+      operation: "move:method",
+      diagnostics: [{ code: "OPERATION_UNAVAILABLE" }],
+    },
+  )
+  hooks.assertIdeaEditAllowed(blockerState)
+  hooks.recordIdeaEditOutcome(blockerState, { success: true, status: "ok" })
+  hooks.assertIdeaVerifyAllowed(blockerState, { controlGeneration: 1, confirmationRequired: false })
+  hooks.recordIdeaVerifyOutcome(blockerState)
+  const fallbackReceipt = hooks.ideaProtocolReceipt(blockerState)
+  if (
+    fallbackReceipt?.mutation_route !== "authorized_edit"
+    || fallbackReceipt.blocker_status !== "unsupported_target"
+    || fallbackReceipt.mutation_generation !== 1
+  ) {
+    throw new SelfCheckError("plugin_idea_command_protocol", "Authorized edit receipt lost its proposal blocker.", {
+      fallbackReceipt,
+    })
+  }
+
+  const infraFailureState = hooks.newIdeaProtocolState()
+  hooks.recordIdeaPreviewOutcome(
+    infraFailureState,
+    { operation: "rename:method", proposalId: "" },
+    {
+      protocol: "idea-proposal-v1",
+      status: "failed",
+      proposalId: "",
+      operation: "rename:method",
+      diagnostics: [{ code: "IDEA_CLI_OUTPUT_PARSE_FAILED" }],
+    },
+  )
+  expectProtocolError(
+    "infrastructure_failure_is_not_edit_authority",
+    "IDEA_EDIT_REQUIRES_UNSUPPORTED_TARGET",
+    () => hooks.assertIdeaEditAllowed(infraFailureState),
+  )
+
+  const uncertainState = hooks.newIdeaProtocolState()
+  hooks.recordIdeaPreviewOutcome(
+    uncertainState,
+    { operation: "rename:method", proposalId: "" },
+    { protocol: "idea-proposal-v1", status: "ready", proposalId: "draft-unknown", operation: "rename:method", diagnostics: [] },
+  )
+  hooks.recordIdeaApplyOutcome(uncertainState, "draft-unknown", {
+    protocol: "idea-proposal-v1",
+    status: "outcome_unknown",
+    proposalId: "draft-unknown",
+    operation: "rename:method",
+    diagnostics: [{ code: "SERVICE_REQUEST_TIMEOUT" }],
+  })
+  expectProtocolError(
+    "unknown_apply_must_not_repeat",
+    "IDEA_APPLY_REQUIRES_READY_PROPOSAL",
+    () => hooks.assertIdeaApplyAllowed(uncertainState, "draft-unknown"),
+  )
+  hooks.assertIdeaVerifyAllowed(uncertainState, { controlGeneration: 1, confirmationRequired: false })
+
+  const revertState = hooks.newIdeaProtocolState()
+  expectProtocolError(
+    "revert_without_apply",
+    "IDEA_REVERT_REQUIRES_COMMAND_APPLY",
+    () => hooks.assertIdeaRevertAllowed(revertState),
+  )
+  hooks.recordIdeaPreviewOutcome(
+    revertState,
+    { operation: "rename:method", proposalId: "" },
+    { protocol: "idea-proposal-v1", status: "ready", proposalId: "draft-revert", operation: "rename:method", diagnostics: [] },
+  )
+  hooks.recordIdeaApplyOutcome(revertState, "draft-revert", {
+    protocol: "idea-proposal-v1",
+    status: "applied",
+    proposalId: "draft-revert",
+    operation: "rename:method",
+    diagnostics: [],
+  })
+  hooks.assertIdeaRevertAllowed(revertState)
+  hooks.recordIdeaRevertOutcome(revertState, { success: true, status: "ok" })
+  expectProtocolError(
+    "revert_only_once",
+    "IDEA_REVERT_REQUIRES_COMMAND_APPLY",
+    () => hooks.assertIdeaRevertAllowed(revertState),
+  )
+  expectProtocolError(
+    "reverted_candidate_cannot_verify",
+    "IDEA_VERIFY_REQUIRES_MUTATION",
+    () => hooks.assertIdeaVerifyAllowed(revertState, { controlGeneration: 1, confirmationRequired: false }),
+  )
   let invalidTargetRunnerCalls = 0
   const invalidContinuationPayload = JSON.parse((await hooks.runIdeaPreviewProtocol({
     worktree: "/p",
@@ -1838,10 +2313,24 @@ async function runIdleContinueSelfCheck(pluginModule) {
   ]) {
     assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
   }
+  const confirmationInstruction = "Do not edit the candidate; call smell_verify again for one fresh confirmation."
+  const confirmationMessage = hooks.buildContinuationMessage({
+    continuation: 2,
+    maxContinuations: 2,
+    instruction: confirmationInstruction,
+  })
+  assertCond(
+    "continuation_instruction_is_only_action_authority",
+    confirmationMessage.includes(confirmationInstruction)
+      && !confirmationMessage.includes("After one narrow corrective edit")
+      && confirmationMessage.indexOf(confirmationInstruction) === confirmationMessage.lastIndexOf(confirmationInstruction),
+    confirmationMessage,
+  )
 
-  function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED", nextAction = "" } = {}) {
+  function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED", nextAction = "", generation } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status, { next_action: nextAction }))
     payload.loop = {
+      generation,
       decision,
       continuation,
       max_continuations: max,
@@ -1850,13 +2339,22 @@ async function runIdleContinueSelfCheck(pluginModule) {
     return JSON.stringify(payload)
   }
 
+  const runtimeGenerations = new WeakMap()
   function record(rt, options = {}) {
+    const sessionID = options.sessionID || "s1"
+    let generations = runtimeGenerations.get(rt)
+    if (!generations) {
+      generations = new Map()
+      runtimeGenerations.set(rt, generations)
+    }
+    const generation = options.generation ?? ((generations.get(sessionID) || 0) + 1)
+    generations.set(sessionID, generation)
     return rt.recordFromBridgeOutput({
-      sessionID: options.sessionID || "s1",
+      sessionID,
       agent: options.agent || "any-refactor-agent",
       directory: options.directory || IDLE_DIR,
       taskKey: options.taskKey || IDLE_TASK,
-      output: options.output || outputWithLoop(options),
+      output: options.output || outputWithLoop({ ...options, generation }),
     })
   }
 
@@ -1969,7 +2467,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
     assertCond(
       "unified_latest_tool_result_is_single_source",
       !calls[0].body.parts[0].text.includes(required)
-        && calls[0].body.parts[0].text.includes("latest smell_verify tool result"),
+        && calls[0].body.parts[0].text.includes("repair from the latest evidence"),
       "continuation prompt duplicated mutable next-action evidence",
     )
   }
@@ -2049,6 +2547,13 @@ async function runIdleContinueSelfCheck(pluginModule) {
 function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
   assertCond("command_decision_hook", typeof hooks?.applyCommandLoopDecision === "function", "missing applyCommandLoopDecision")
+  assertCond("guard_progress_decision_hook", typeof hooks?.applyGuardProgressDecision === "function", "missing applyGuardProgressDecision")
+  assertCond("guard_progress_observation_hook", typeof hooks?.guardProgressObservation === "function", "missing guardProgressObservation")
+  assertCond(
+    "formal_candidate_consistency_hook",
+    typeof hooks?.applyFormalVerificationConsistency === "function",
+    "missing applyFormalVerificationConsistency",
+  )
   assertCond("command_state_snapshot_hook", typeof hooks?.commandLoopStateSnapshot === "function", "missing commandLoopStateSnapshot")
   assertCond("command_state_restore_hook", typeof hooks?.restoreCommandLoopState === "function", "missing restoreCommandLoopState")
   assertEqual(
@@ -2100,6 +2605,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     policy: {
       task: "task",
       verification_mode: "project_full",
+      refactoring_backend: "direct",
       allow_test_changes: false,
       checkpoint_required: true,
       identity: {
@@ -2127,13 +2633,61 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
         sample_deadline_seconds: 1800,
       },
     },
+    targetIdentityContext: "",
     startedAt: Date.now(),
+    control: {
+      generation: 0,
+      decision: "verify_required",
+      instruction: "Call smell_verify now using the frozen command identity.",
+      terminationReason: "",
+    },
     continuationCount: 0,
     capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
+    bestMetricDeficit: null,
+    bestStructuralFailureCount: null,
+    lastBlockerCodes: [],
+    seenStructuralStates: [],
+    formalCandidateState: {
+      candidateIdentity: null,
+      outcome: "",
+      diagnosticSignature: "",
+      confirmationRequired: false,
+    },
+    ideaProtocolState: hooks.newIdeaProtocolState(),
+    terminalReceipt: null,
   }
   const serializedState = hooks.commandLoopStateSnapshot(state)
+  assertEqual("command_state_schema_v6", serializedState.schema_version, 6, "schema_version")
+  assertEqual(
+    "command_state_v6_formal_candidate_initial",
+    serializedState.formal_candidate_state.confirmation_required,
+    false,
+    "formal_candidate_state.confirmation_required",
+  )
+  assertEqual(
+    "command_state_v5_rejected_without_fallback",
+    hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, schema_version: 5 })),
+    undefined,
+    "restored state",
+  )
+  const missingV6Field = { ...serializedState }
+  delete missingV6Field.control
+  assertEqual(
+    "command_state_v6_missing_field_rejected",
+    hooks.restoreCommandLoopState(JSON.stringify(missingV6Field)),
+    undefined,
+    "restored state",
+  )
+  const missingFormalCandidateState = { ...serializedState }
+  delete missingFormalCandidateState.formal_candidate_state
+  assertEqual(
+    "command_state_v6_missing_formal_candidate_rejected",
+    hooks.restoreCommandLoopState(JSON.stringify(missingFormalCandidateState)),
+    undefined,
+    "restored state",
+  )
   assertCond(
     "command_state_valid_snapshot_restores",
     Boolean(hooks.restoreCommandLoopState(JSON.stringify(serializedState))),
@@ -2150,6 +2704,444 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, last_failure_fingerprint: 7 })),
     undefined,
     "last_failure_fingerprint",
+  )
+  const candidateIdentity = (
+    productionDiff = "candidate-diff-a",
+    testTree = "test-tree-a",
+    verificationConfigTree = "verification-config-tree-a",
+  ) => ({
+    baseline_revision: "baseline-revision",
+    baseline_tree: "baseline-tree",
+    production_diff: productionDiff,
+    test_tree: testTree,
+    verification_config_tree: verificationConfigTree,
+  })
+  const formalReceipt = ({
+    status,
+    success,
+    accepted,
+    resolution,
+    outcome,
+    diagnosticSignature,
+    productionDiff = "candidate-diff-a",
+    testTree = "test-tree-a",
+    verificationConfigTree = "verification-config-tree-a",
+  }) => ({
+    schema_version: "smell.formal-verification-receipt/v1",
+    terminal_stage: "formal_verify",
+    status,
+    success,
+    accepted,
+    resolution,
+    candidate_identity: candidateIdentity(productionDiff, testTree, verificationConfigTree),
+    outcome,
+    diagnostic_signature: diagnosticSignature,
+    guard: {
+      success: true,
+      failure_count: 0,
+      artifact_ref: "/tmp/artifacts/guard-evidence.json",
+    },
+    build_test: {
+      success,
+      reason: success ? "" : "TEST_FAILED",
+      project_full_executed: true,
+      build_status: "passed",
+      test_status: success ? "passed" : "failed",
+      sample_test_status: "",
+    },
+    fresh_isolation: {
+      contract_version: "project-full-fresh-worktree/v1",
+      mode: "detached_git_worktree",
+      success: true,
+      stage: "completed",
+      cleanup_success: true,
+    },
+    artifact_refs: {
+      guard_evidence: "/tmp/artifacts/guard-evidence.json",
+      test_result: "/tmp/artifacts/test.full.json",
+    },
+  })
+  const formalFailure = (diagnosticSignature, productionDiff = "candidate-diff-a") => ({
+    success: false,
+    accepted: false,
+    progress: false,
+    status: "TEST_FAILED",
+    resolution: "unresolved",
+    failure_fingerprint: diagnosticSignature,
+    failure_pack: {
+      failure_category: "TEST_BEHAVIOR_REGRESSION",
+      failure_group: "test",
+      retryable: true,
+      verify_status: "TEST_FAILED",
+      next_action: "repair the behavior regression",
+    },
+    checkpoint: { delta: { has_production_diff: true } },
+    formal_verification_receipt: formalReceipt({
+      status: "TEST_FAILED",
+      success: false,
+      accepted: false,
+      resolution: "unresolved",
+      outcome: "test_failed",
+      diagnosticSignature,
+      productionDiff,
+    }),
+  })
+  const formalPass = (
+    productionDiff = "candidate-diff-a",
+    testTree = "test-tree-a",
+    verificationConfigTree = "verification-config-tree-a",
+  ) => ({
+    success: true,
+    accepted: true,
+    progress: true,
+    project_full_executed: true,
+    status: "PASS",
+    resolution: "resolved",
+    formal_verification_receipt: formalReceipt({
+      status: "PASS",
+      success: true,
+      accepted: true,
+      resolution: "resolved",
+      outcome: "pass",
+      diagnosticSignature: "PASS",
+      productionDiff,
+      testTree,
+      verificationConfigTree,
+    }),
+  })
+  const newFormalState = () => ({
+    ...state,
+    policy: {
+      ...state.policy,
+      loop: {
+        ...state.policy.loop,
+        max_continuations: 2,
+        no_progress_limit: 3,
+        allowed_failure_groups: ["smell", "compile", "test"],
+      },
+    },
+    startedAt: Date.now(),
+    control: { ...state.control },
+    continuationCount: 0,
+    capRecoveryUsed: false,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+    formalCandidateState: {
+      candidateIdentity: null,
+      outcome: "",
+      diagnosticSignature: "",
+      confirmationRequired: false,
+    },
+    terminalReceipt: null,
+  })
+
+  const flakyState = newFormalState()
+  const failedFormal = { output: JSON.stringify(formalFailure("test-diagnostic-a")), metadata: {} }
+  hooks.applyCommandLoopDecision(failedFormal, flakyState)
+  assertEqual("formal_first_test_failure_continues", JSON.parse(failedFormal.output).loop.decision, "continue", "decision")
+  const restoredBeforeContradiction = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(flakyState)),
+  )
+  assertCond("formal_candidate_state_survives_restart", Boolean(restoredBeforeContradiction), "state did not restore")
+  const contradictoryPass = { output: JSON.stringify(formalPass()), metadata: {} }
+  hooks.applyCommandLoopDecision(contradictoryPass, restoredBeforeContradiction)
+  const contradictoryPayload = JSON.parse(contradictoryPass.output)
+  assertEqual("formal_same_candidate_pass_is_flaky", contradictoryPayload.status, "FLAKY_TEST_INCONCLUSIVE", "status")
+  assertEqual("formal_same_candidate_pass_not_accepted", contradictoryPayload.accepted, false, "accepted")
+  assertEqual("formal_same_candidate_requires_confirmation", contradictoryPayload.loop.decision, "continue", "decision")
+  assertEqual(
+    "formal_confirmation_instruction_forbids_edit",
+    contradictoryPayload.loop.instruction,
+    "Do not edit the candidate; call smell_verify again for one fresh confirmation.",
+    "instruction",
+  )
+  assertEqual("formal_same_candidate_not_terminal", restoredBeforeContradiction.terminalReceipt, null, "terminalReceipt")
+  assertEqual(
+    "formal_confirmation_state_latched",
+    restoredBeforeContradiction.formalCandidateState.confirmationRequired,
+    true,
+    "confirmationRequired",
+  )
+  const exhaustedConfirmationState = newFormalState()
+  exhaustedConfirmationState.continuationCount = 2
+  exhaustedConfirmationState.formalCandidateState = {
+    candidateIdentity: {
+      baselineRevision: "baseline-revision",
+      baselineTree: "baseline-tree",
+      productionDiff: "candidate-diff-a",
+      testTree: "test-tree-a",
+      verificationConfigTree: "verification-config-tree-a",
+    },
+    outcome: "test_failed",
+    diagnosticSignature: "test-diagnostic-a",
+    confirmationRequired: false,
+  }
+  const exhaustedPass = { output: JSON.stringify(formalPass()), metadata: {} }
+  hooks.applyCommandLoopDecision(exhaustedPass, exhaustedConfirmationState)
+  const exhaustedPayload = JSON.parse(exhaustedPass.output)
+  assertEqual("formal_confirmation_exhausted_status", exhaustedPayload.status, "FLAKY_TEST_INCONCLUSIVE", "status")
+  assertEqual("formal_confirmation_exhausted_stops", exhaustedPayload.loop.decision, "stop", "decision")
+  assertEqual("formal_confirmation_exhausted_not_accepted", exhaustedPayload.accepted, false, "accepted")
+  const restoredForConfirmation = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(restoredBeforeContradiction)),
+  )
+  const confirmedPass = { output: JSON.stringify(formalPass()), metadata: {} }
+  hooks.applyCommandLoopDecision(confirmedPass, restoredForConfirmation)
+  const confirmedPayload = JSON.parse(confirmedPass.output)
+  assertEqual("formal_fresh_confirmation_passes", confirmedPayload.status, "PASS", "status")
+  assertEqual("formal_fresh_confirmation_terminal", confirmedPayload.loop.termination_reason, "PASS", "termination")
+  assertEqual("formal_fresh_confirmation_accepted", confirmedPayload.accepted, true, "accepted")
+  assertEqual(
+    "formal_terminal_receipt_keeps_evidence",
+    restoredForConfirmation.terminalReceipt.formalVerificationReceipt.artifact_refs.test_result,
+    "/tmp/artifacts/test.full.json",
+    "artifact ref",
+  )
+  const restoredTerminal = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(restoredForConfirmation)),
+  )
+  assertEqual(
+    "formal_terminal_receipt_survives_restart",
+    restoredTerminal.terminalReceipt.formalVerificationReceipt.fresh_isolation.cleanup_success,
+    true,
+    "cleanup_success",
+  )
+
+  const diagnosticState = newFormalState()
+  hooks.applyCommandLoopDecision(
+    { output: JSON.stringify(formalFailure("test-diagnostic-a")), metadata: {} },
+    diagnosticState,
+  )
+  const changedDiagnostic = {
+    output: JSON.stringify(formalFailure("test-diagnostic-b")),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(changedDiagnostic, diagnosticState)
+  assertEqual(
+    "formal_same_candidate_diagnostic_conflict",
+    JSON.parse(changedDiagnostic.output).status,
+    "FLAKY_TEST_INCONCLUSIVE",
+    "status",
+  )
+
+  const changedCandidateState = newFormalState()
+  hooks.applyCommandLoopDecision(
+    { output: JSON.stringify(formalFailure("test-diagnostic-a")), metadata: {} },
+    changedCandidateState,
+  )
+  const changedCandidatePass = {
+    output: JSON.stringify(formalPass("candidate-diff-b")),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(changedCandidatePass, changedCandidateState)
+  assertEqual(
+    "formal_changed_candidate_passes_without_false_flaky",
+    JSON.parse(changedCandidatePass.output).status,
+    "PASS",
+    "status",
+  )
+
+  const changedTestTreeState = newFormalState()
+  hooks.applyCommandLoopDecision(
+    { output: JSON.stringify(formalFailure("test-diagnostic-a")), metadata: {} },
+    changedTestTreeState,
+  )
+  const changedTestTreePass = {
+    output: JSON.stringify(formalPass("candidate-diff-a", "test-tree-b")),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(changedTestTreePass, changedTestTreeState)
+  assertEqual(
+    "formal_changed_test_tree_is_a_different_candidate",
+    JSON.parse(changedTestTreePass.output).status,
+    "PASS",
+    "status",
+  )
+
+  const missingReceiptState = newFormalState()
+  const missingReceiptPass = {
+    output: JSON.stringify({ success: true, accepted: true, status: "PASS", resolution: "resolved" }),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(missingReceiptPass, missingReceiptState)
+  assertEqual(
+    "formal_checkpoint_pass_without_receipt_fails_closed",
+    JSON.parse(missingReceiptPass.output).status,
+    "FORMAL_VERIFICATION_RECEIPT_INVALID",
+    "status",
+  )
+  const incompleteIdentityState = newFormalState()
+  const incompleteIdentityPass = formalPass()
+  delete incompleteIdentityPass.formal_verification_receipt.candidate_identity.test_tree
+  const incompleteIdentityResult = {
+    output: JSON.stringify(incompleteIdentityPass),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(incompleteIdentityResult, incompleteIdentityState)
+  assertEqual(
+    "formal_checkpoint_receipt_missing_test_identity_fails_closed",
+    JSON.parse(incompleteIdentityResult.output).status,
+    "FORMAL_VERIFICATION_RECEIPT_INVALID",
+    "status",
+  )
+  const emptyJavaIdentityState = newFormalState()
+  const emptyJavaIdentityResult = {
+    output: JSON.stringify(formalPass("candidate-diff-java", "", "")),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(emptyJavaIdentityResult, emptyJavaIdentityState)
+  assertEqual(
+    "formal_java_receipt_empty_test_identity_fails_closed",
+    JSON.parse(emptyJavaIdentityResult.output).status,
+    "FORMAL_VERIFICATION_RECEIPT_INVALID",
+    "status",
+  )
+  const nonJavaIdentityState = {
+    ...newFormalState(),
+    policy: {
+      ...state.policy,
+      identity: {
+        ...state.policy.identity,
+        language: "python",
+        location: "sample.py:1",
+      },
+    },
+  }
+  const emptyNonJavaIdentityResult = {
+    output: JSON.stringify(formalPass("candidate-diff-python", "", "")),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(emptyNonJavaIdentityResult, nonJavaIdentityState)
+  assertEqual(
+    "formal_nonjava_receipt_allows_empty_java_trees",
+    JSON.parse(emptyNonJavaIdentityResult.output).status,
+    "PASS",
+    "status",
+  )
+  assertCond(
+    "formal_nonjava_empty_tree_state_restores",
+    Boolean(hooks.restoreCommandLoopState(JSON.stringify(hooks.commandLoopStateSnapshot(nonJavaIdentityState)))),
+    "non-Java formal state with empty Java-only trees did not restore",
+  )
+  const incompleteProjectFullState = newFormalState()
+  const incompleteProjectFullPass = formalPass()
+  incompleteProjectFullPass.formal_verification_receipt.build_test.project_full_executed = false
+  const incompleteProjectFullResult = {
+    output: JSON.stringify(incompleteProjectFullPass),
+    metadata: {},
+  }
+  hooks.applyCommandLoopDecision(incompleteProjectFullResult, incompleteProjectFullState)
+  assertEqual(
+    "formal_project_full_pass_requires_executed_receipt",
+    JSON.parse(incompleteProjectFullResult.output).status,
+    "FORMAL_VERIFICATION_RECEIPT_INVALID",
+    "status",
+  )
+  const guardState = {
+    ...state,
+    continuationCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+    bestMetricDeficit: null,
+    bestStructuralFailureCount: null,
+    lastBlockerCodes: [],
+    seenStructuralStates: [],
+    control: { ...state.control },
+    terminalReceipt: null,
+  }
+  const guardRequired = {
+    output: JSON.stringify({
+      schema_version: "smell.guard-progress/v1",
+      success: false,
+      status: "GUARD_PROGRESS_REQUIRED",
+      metric_budget: [{ required_reduction: 3 }],
+      source_guard_feedback: {
+        progress_observation: { metric_deficit: 3, structural_failure_count: 1 },
+      },
+      next_action: "repair the structural contract",
+    }),
+    metadata: {},
+  }
+  hooks.applyGuardProgressDecision(guardRequired, guardState)
+  const guardPayload = JSON.parse(guardRequired.output)
+  assertEqual("guard_progress_consumes_shared_budget", guardPayload.loop.continuation, 1, "continuation")
+  assertEqual("guard_progress_arms_manual_continue", guardPayload.loop.decision, "continue", "decision")
+  const guardRepeated = { output: guardRequired.output.replace('"loop":', '"prior_loop":'), metadata: {} }
+  hooks.applyGuardProgressDecision(guardRepeated, guardState)
+  const repeatedPayload = JSON.parse(guardRepeated.output)
+  assertEqual("guard_progress_no_progress_terminal", repeatedPayload.loop.decision, "stop", "decision")
+  assertEqual("guard_progress_terminal_latched", Boolean(guardState.terminalReceipt), true, "terminalReceipt")
+  const phaseState = {
+    ...state,
+    policy: {
+      ...state.policy,
+      loop: {
+        ...state.policy.loop,
+        max_continuations: 5,
+        no_progress_limit: 5,
+      },
+    },
+    control: { ...state.control },
+    continuationCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+    bestMetricDeficit: null,
+    bestStructuralFailureCount: null,
+    lastBlockerCodes: [],
+    seenStructuralStates: [],
+    terminalReceipt: null,
+  }
+  const observePhase = (metric, structural, blockerCodes) => {
+    const result = {
+      output: JSON.stringify({
+        schema_version: "smell.guard-progress/v1",
+        success: false,
+        status: "GUARD_PROGRESS_REQUIRED",
+        source_guard_feedback: {
+          next_action: "repair the current blocker",
+          progress_observation: {
+            metric_deficit: metric,
+            structural_failure_count: structural,
+            blocker_codes: blockerCodes,
+          },
+        },
+      }),
+      metadata: {},
+    }
+    hooks.applyGuardProgressDecision(result, phaseState)
+    return JSON.parse(result.output).progress_observation.strictly_improved
+  }
+  assertEqual("guard_phase_initial_structural", observePhase(5, 2, ["A"]), true, "progress")
+  assertEqual("guard_phase_equal_new_blocker_once", observePhase(4, 2, ["B"]), true, "progress")
+  assertEqual("guard_phase_cycle_not_progress", observePhase(3, 2, ["A"]), false, "progress")
+  assertEqual("guard_phase_structural_clear_wins_metric_rise", observePhase(9, 0, []), true, "progress")
+  assertEqual("guard_phase_new_structure_never_progress", observePhase(1, 1, ["C"]), false, "progress")
+  assertEqual("guard_phase_scalar_decline_after_clear", observePhase(8, 0, []), true, "progress")
+  const restoredPhaseState = hooks.restoreCommandLoopState(
+    JSON.stringify(hooks.commandLoopStateSnapshot(phaseState)),
+  )
+  assertCond("guard_phase_state_restores", Boolean(restoredPhaseState), "phase state did not restore")
+  assertCond(
+    "guard_phase_seen_states_persist",
+    restoredPhaseState.seenStructuralStates.includes("2:A")
+      && restoredPhaseState.seenStructuralStates.includes("2:B")
+      && restoredPhaseState.seenStructuralStates.includes("1:C"),
+    "seen structural states did not persist",
+  )
+  const fallbackObservation = hooks.guardProgressObservation({
+    guard_failure_count: 2,
+    source_guard_feedback: {
+      metric_budget: [{ required_reduction: 4 }, { required_reduction: 3 }],
+      blocker: { kind: "declaration_identity" },
+    },
+  })
+  assertEqual("guard_progress_current_feedback_metric_fallback", fallbackObservation.metricDeficit, 7, "metricDeficit")
+  assertEqual("guard_progress_current_feedback_structural_fallback", fallbackObservation.structuralFailureCount, 2, "structuralFailureCount")
+  assertEqual(
+    "guard_progress_blocker_structural_fallback",
+    hooks.guardProgressObservation({ source_guard_feedback: { blocker: { kind: "declaration_identity" } } }).structuralFailureCount,
+    1,
+    "structuralFailureCount",
   )
   const failure = {
     success: false,
@@ -2271,7 +3263,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && featureTargetIdentityPrompt.includes("required_reduction=5")
       && featureTargetIdentityPrompt.includes("unit=foreign accesses")
       && featureTargetIdentityPrompt.includes("necessary planning information, not acceptance authority")
-      && featureTargetIdentityPrompt.includes("configured isolated focused preflight")
+      && featureTargetIdentityPrompt.includes("performs only the source check")
       && featureTargetIdentityPrompt.includes("cannot accept the sample or execute project_full")
       && featureTargetIdentityPrompt.includes("Do not manually run a heavy project build in the candidate source tree")
       && featureTargetIdentityPrompt.includes("same smell_verify call advances to final acceptance")
@@ -2346,12 +3338,14 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   // resolved (with the bridge continue_hint), and only identical best-partial
   // objectives across verifies count as no-progress.
   const improvedState = {
-    policy: state.policy,
+    ...state,
     startedAt: Date.now(),
+    control: { ...state.control },
     continuationCount: 0,
     capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
+    terminalReceipt: null,
   }
   const improved = {
     success: false,
@@ -2383,7 +3377,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   )
   assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
 
-  const resolved = { success: true, accepted: true, status: "PASS", resolution: "resolved" }
+  const resolved = formalPass()
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
   hooks.applyCommandLoopDecision(resolvedResult, improvedState)
   const resolvedPayload = JSON.parse(resolvedResult.output)
@@ -2416,12 +3410,15 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     },
   }
   const capState = {
+    ...state,
     policy: capPolicy,
     startedAt: Date.now(),
+    control: { ...state.control },
     continuationCount: 2,
     capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
+    terminalReceipt: null,
   }
   const progressingAtCap = {
     ...failure,
@@ -2504,6 +3501,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
     Object.assign(process.env, cleanSmellIdentityEnv(process.env), {
       SMELL_ARTIFACT_ROOT: artifactRoot,
       SMELL_PROJECTS: path.join(fixtureRoot, "projects.yaml"),
+      SMELL_SESSION_STATE_ROOT: path.join(tempRoot, "session-state"),
     })
     try {
       const plugin = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
@@ -2580,7 +3578,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         controllerContexts[0].includes("Immutable numeric edit budget")
           && controllerContexts[0].includes("required_reduction=")
           && controllerContexts[0].includes("necessary planning information, not acceptance authority")
-          && controllerContexts[0].includes("configured isolated focused preflight")
+          && controllerContexts[0].includes("performs only the source check")
           && controllerContexts[0].includes("cannot accept the sample or execute project_full")
           && controllerContexts[0].includes("Do not manually run a heavy project build in the candidate source tree")
           && controllerContexts[0].includes("same smell_verify call advances to final acceptance")
@@ -2716,6 +3714,20 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         "utf8",
       )
       const repairedResult = await smellVerify.execute(verifyArgs, verifyContext)
+      const repairedPayload = parseJson("command_policy_pass_payload", repairedResult.output)
+      assertEqual("command_policy_pass_project_full_top", repairedPayload.project_full_executed, true, "project_full_executed")
+      assertEqual(
+        "command_policy_pass_project_full_build_guard",
+        repairedPayload.build_test_guard?.project_full_executed,
+        true,
+        "build_test_guard.project_full_executed",
+      )
+      assertEqual(
+        "command_policy_pass_project_full_receipt",
+        repairedPayload.formal_verification_receipt?.build_test?.project_full_executed,
+        true,
+        "formal_verification_receipt.build_test.project_full_executed",
+      )
       const successPath = normalizeToolResult(repairedResult)
       assertEqual("command_policy_pass_decision", successPath.loop?.decision, "stop", "loop.decision")
       assertEqual("command_policy_pass_reason", successPath.loop?.termination_reason, "PASS", "termination_reason")
@@ -2915,6 +3927,7 @@ if command == "resolve-command":
     payload = {
         "task": "Continue the current smell refactoring task.",
         "verification_mode": verification_mode,
+        "refactoring_backend": "direct",
         "allow_test_changes": False,
         "checkpoint_required": bool(case.get("checkpoint_required")),
         "identity": {
@@ -2975,6 +3988,13 @@ elif guard_progress_only:
         "project_full_executed": False,
         "metric_budget": [budget],
         "next_action": "continue one narrow production edit" if not ready else "",
+        "source_guard_feedback": {
+            "next_action": "repair the exact source Guard contract" if not ready else "",
+            "progress_observation": {
+                "metric_deficit": budget.get("required_reduction", 0),
+                "structural_failure_count": 0 if ready else int(case.get("structural_failure_count", 0)),
+            },
+        },
     }
     if case.get("malformed_progress"):
         payload["project_full_executed"] = True
@@ -3008,6 +4028,7 @@ elif command == "verify":
         "success": True,
         "accepted": True,
         "progress": True,
+        "project_full_executed": True,
         "status": "PASS",
         "resolution": "resolved",
         "continue_hint": "",
@@ -3015,11 +4036,34 @@ elif command == "verify":
         "build_test_guard": {"success": True},
         "snapshot": None,
         "artifacts": {},
+        "formal_verification_receipt": {
+            "schema_version": "smell.formal-verification-receipt/v1",
+            "terminal_stage": "formal_verify",
+            "status": "PASS",
+            "success": True,
+            "accepted": True,
+            "resolution": "resolved",
+            "candidate_identity": {
+                "baseline_revision": "controller-seal",
+                "baseline_tree": "",
+                "production_diff": "candidate-diff",
+                "test_tree": "test-tree",
+                "verification_config_tree": "verification-config-tree",
+            },
+            "outcome": "pass",
+            "diagnostic_signature": "PASS",
+            "guard": {"success": True, "failure_count": 0},
+            "build_test": {"success": True, "project_full_executed": True, "test_status": "passed"},
+            "fresh_isolation": None,
+            "artifact_refs": {},
+        },
     }
 else:
     payload = {"success": False, "status": "UNEXPECTED_COMMAND", "command": command}
 
 print(json.dumps(payload))
+if guard_progress_only and case.get("guard_progress_exit_code"):
+    raise SystemExit(int(case["guard_progress_exit_code"]))
 `
   await writeFile(fakeBridge, fakeSource, "utf8")
   await writeFile(stateFile, "0", "utf8")
@@ -3028,6 +4072,8 @@ print(json.dumps(payload))
   process.env.SMELL_BRIDGE_FILE = fakeBridge
   process.env.SMELL_PREFLIGHT_STATE = stateFile
   process.env.SMELL_PREFLIGHT_LOG = logFile
+  process.env.SMELL_SESSION_STATE_ROOT = path.join(tempRoot, "session-state")
+  delete process.env.SMELL_BATCH_RUN
   try {
     const compiledFile = await compilePluginForSelfCheck(tempRoot)
     const pluginModule = await import(
@@ -3767,7 +4813,8 @@ print(json.dumps(payload))
         progress_each_call: true,
         ...controllerVerification,
       })
-      const plugin = await pluginModule.SmellPlugin({ worktree: replayRoot })
+      const { client: replayClient, calls: replayPromptCalls } = makeFakeClient()
+      const plugin = await pluginModule.SmellPlugin({ worktree: replayRoot, client: replayClient })
       const sessionID = `guard-progress-${replay.name}`
       await plugin["command.execute.before"](
         {
@@ -3796,20 +4843,13 @@ print(json.dumps(payload))
         const earlyPayload = parseJson(`guard_progress_${replay.name}_${call}`, early.output)
         assertEqual(`guard_progress_${replay.name}_${call}_status`, earlyPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
         assertEqual(`guard_progress_${replay.name}_${call}_full`, earlyPayload.project_full_executed, false, "project_full_executed")
-        assertEqual(`guard_progress_${replay.name}_${call}_focused_status`, earlyPayload.focused_preflight?.status, replay.focused_status || "NOT_APPLICABLE", "focused_preflight.status")
-        assertEqual(`guard_progress_${replay.name}_${call}_focused_full`, earlyPayload.focused_preflight?.project_full_executed, false, "focused_preflight.project_full_executed")
-        if (replay.focused_status === "FAILED") {
-          assertCond(
-            `guard_progress_${replay.name}_${call}_focused_diagnostic`,
-            String(earlyPayload.next_action || "").includes("compile error in changed target"),
-            "focused failure did not replace the next action with its diagnostic",
-          )
-        }
+        assertEqual(`guard_progress_${replay.name}_${call}_focused_absent`, earlyPayload.focused_preflight, undefined, "focused_preflight")
+        assertEqual(`guard_progress_${replay.name}_${call}_source_feedback`, earlyPayload.loop?.instruction, "repair the exact source Guard contract", "loop.instruction")
         assertEqual(`guard_progress_${replay.name}_${call}_loop`, earlyPayload.loop?.decision, "continue", "loop.decision")
         assertEqual(
           `guard_progress_${replay.name}_${call}_continuation`,
           early.metadata?.command_loop_state?.continuation_count,
-          0,
+          call + 1,
           "continuation_count",
         )
         assertEqual(
@@ -3831,10 +4871,20 @@ print(json.dumps(payload))
           "cap_recovery_used",
         )
         assertEqual(
-          `guard_progress_${replay.name}_${call}_auto_absent`,
-          early.metadata?.auto_continuation,
-          undefined,
-          "auto_continuation",
+          `guard_progress_${replay.name}_${call}_auto_enabled`,
+          early.metadata?.auto_continuation?.enabled,
+          true,
+          "auto_continuation.enabled",
+        )
+        await plugin.event({
+          event: { type: "session.idle", properties: { sessionID } },
+        })
+        await flush()
+        assertEqual(
+          `guard_progress_${replay.name}_${call}_manual_prompt`,
+          replayPromptCalls.length,
+          call + 1,
+          "prompt count",
         )
         earlyStates.push(JSON.stringify(early.metadata?.command_loop_state))
       }
@@ -3854,13 +4904,13 @@ print(json.dumps(payload))
       assertEqual(
         `guard_progress_${replay.name}_crossed_continuation`,
         crossed.metadata?.command_loop_state?.continuation_count,
-        0,
+        2,
         "continuation_count",
       )
       const commands = (await readFile(logFile, "utf8"))
         .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
       assertEqual(`guard_progress_${replay.name}_preflight_count`, commands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
-      assertEqual(`guard_progress_${replay.name}_focused_count`, commands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
+      assertEqual(`guard_progress_${replay.name}_focused_count`, commands.filter((item) => item.command === "focused-preflight").length, 0, "focused-preflight count")
       assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
       if (replay.language === "java") {
         for (const command of commands.filter((item) => item.command !== "resolve-command")) {
@@ -3908,7 +4958,7 @@ print(json.dumps(payload))
           )
         }
       }
-      results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })
+      results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 2 })
     }
 
     const focusedProgressRoot = path.join(tempRoot, "focused-diagnostic-progress")
@@ -3965,17 +5015,13 @@ print(json.dumps(payload))
       focusedProgressSecond.output,
     )
     assertEqual("focused_diagnostic_progress_first_count", focusedProgressFirst.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
-    assertEqual("focused_diagnostic_progress_second_count", focusedProgressSecond.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
-    assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "continue", "loop.decision")
-    assertCond(
-      "focused_diagnostic_progress_changed",
-      focusedProgressFirstPayload.focused_preflight?.execution?.summary_text
-        !== focusedProgressSecondPayload.focused_preflight?.execution?.summary_text,
-      "changed focused diagnostics did not reach the progress result",
-    )
+    assertEqual("focused_diagnostic_progress_second_count", focusedProgressSecond.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
+    assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("focused_diagnostic_progress_not_exposed_first", focusedProgressFirstPayload.focused_preflight, undefined, "focused_preflight")
+    assertEqual("focused_diagnostic_progress_not_exposed_second", focusedProgressSecondPayload.focused_preflight, undefined, "focused_preflight")
     const focusedProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
-    assertEqual("focused_diagnostic_progress_focused_count", focusedProgressCommands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
+    assertEqual("focused_diagnostic_progress_focused_count", focusedProgressCommands.filter((item) => item.command === "focused-preflight").length, 0, "focused-preflight count")
     assertEqual("focused_diagnostic_progress_full_count", focusedProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
     await focusedProgressPlugin.dispose?.()
 
@@ -4032,9 +5078,9 @@ print(json.dumps(payload))
     const secondNoProgressPayload = parseJson("guard_progress_no_progress_second", secondNoProgress.output)
     assertEqual("guard_progress_no_progress_second_status", secondNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
     assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "GUARD_PROGRESS_NO_PROGRESS", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "NO_PROGRESS", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
-    assertEqual("guard_progress_no_progress_continuation_unchanged", secondNoProgress.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
+    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.continuation_count, 1, "continuation_count")
     const latchedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
       noProgressToolArgs,
       noProgressContext,
@@ -4043,15 +5089,91 @@ print(json.dumps(payload))
       "guard_progress_no_progress_latched",
       latchedNoProgress.output,
     )
+    assertEqual("guard_progress_no_progress_latched_schema", latchedNoProgressPayload.schema_version, "smell.loop-terminal/v1", "schema_version")
     assertEqual("guard_progress_no_progress_latched_status", latchedNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
     assertEqual("guard_progress_no_progress_latched_decision", latchedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "GUARD_PROGRESS_NO_PROGRESS", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "NO_PROGRESS", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
     assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")
-    assertEqual("guard_progress_no_progress_focused_count", noProgressCommands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
+    assertEqual("guard_progress_no_progress_focused_count", noProgressCommands.filter((item) => item.command === "focused-preflight").length, 0, "focused-preflight count")
     assertEqual("guard_progress_no_progress_full_count", noProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
+
+    for (const mutationTool of [
+      "edit",
+      "write",
+      "patch",
+      "apply_patch",
+      "bash",
+      "task",
+      "idea_refactor_apply",
+      "idea_edit",
+      "idea_refactor_revert_last_apply",
+    ]) {
+      let terminalMessage = ""
+      try {
+        await resumedNoProgressPlugin["tool.execute.before"](
+          { tool: mutationTool, sessionID: noProgressSession },
+          { args: { command: "true" } },
+        )
+      } catch (error) {
+        terminalMessage = String(error?.message || error)
+      }
+      assertCond(
+        `guard_progress_terminal_blocks_${mutationTool}`,
+        terminalMessage.includes("SMELL_LOOP_TERMINAL"),
+        `terminal command allowed ${mutationTool}`,
+      )
+    }
+    for (const readOnlyTool of ["read", "grep", "glob", "list"]) {
+      await resumedNoProgressPlugin["tool.execute.before"](
+        { tool: readOnlyTool, sessionID: noProgressSession },
+        { args: {} },
+      )
+    }
+    let directIdeaPreviewMessage = ""
+    try {
+      await resumedNoProgressPlugin["tool.execute.before"](
+        { tool: "idea_refactor_preview", sessionID: noProgressSession },
+        { args: {} },
+      )
+    } catch (error) {
+      directIdeaPreviewMessage = String(error?.message || error)
+    }
+    assertCond(
+      "guard_progress_direct_backend_rejects_static_idea_preview",
+      directIdeaPreviewMessage.includes("IDEA_BACKEND_NOT_ENABLED"),
+      directIdeaPreviewMessage,
+    )
+
+    process.env.SMELL_COMMAND_LOOP_STATE_JSON = JSON.stringify(
+      secondNoProgress.metadata?.command_loop_state,
+    )
+    const restartedTerminalPlugin = await pluginModule.SmellPlugin({ worktree: noProgressRoot })
+    const restartedTerminal = await restartedTerminalPlugin.tool.smell_verify.execute(
+      noProgressToolArgs,
+      noProgressContext,
+    )
+    assertEqual(
+      "guard_progress_terminal_survives_restart",
+      parseJson("guard_progress_terminal_restart", restartedTerminal.output).schema_version,
+      "smell.loop-terminal/v1",
+      "schema_version",
+    )
+    await restartedTerminalPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: noProgressSession,
+        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    await restartedTerminalPlugin["tool.execute.before"](
+      { tool: "edit", sessionID: noProgressSession },
+      { args: {} },
+    )
+    await restartedTerminalPlugin.dispose?.()
 
     const malformedRoot = path.join(tempRoot, "malformed-progress")
     await mkdir(malformedRoot, { recursive: true })
@@ -4088,13 +5210,59 @@ print(json.dumps(payload))
       { sessionID: malformedSession, agent: "smell-refactor-agent", directory: malformedRoot },
     )
     const malformedPayload = parseJson("guard_progress_malformed", malformed.output)
-    assertEqual("guard_progress_malformed_status", malformedPayload.status, "BRIDGE_CONTRACT_INVALID", "status")
-    assertEqual("guard_progress_malformed_loop_absent", malformedPayload.loop, undefined, "loop")
+    assertEqual("guard_progress_malformed_status", malformedPayload.status, "GUARD_PROGRESS_PROTOCOL_INVALID", "status")
+    assertEqual("guard_progress_malformed_loop_terminal", malformedPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("guard_progress_malformed_terminal_stage", malformed.metadata?.command_loop_state?.terminal_receipt?.stage, "protocol", "terminal stage")
+    assertEqual("guard_progress_malformed_control", malformed.metadata?.command_loop_state?.control?.decision, "stop", "control decision")
     assertEqual("guard_progress_malformed_continuation", malformed.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
     const malformedCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
     assertEqual("guard_progress_malformed_preflight_count", malformedCommands.filter((item) => item.command === "guard-progress").length, 1, "guard-progress count")
     assertEqual("guard_progress_malformed_full_count", malformedCommands.filter((item) => item.command === "verify").length, 0, "verify count")
+
+    const nonzeroProgressRoot = path.join(tempRoot, "nonzero-progress")
+    await mkdir(nonzeroProgressRoot, { recursive: true })
+    await writeFile(stateFile, "0", "utf8")
+    await writeFile(logFile, "", "utf8")
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "nonzero-progress",
+      project_root: nonzeroProgressRoot,
+      language: "python",
+      smell: "long_method",
+      location: "nonzero.py:method=target|line=1",
+      checkpoint_required: true,
+      early_calls: 2,
+      guard_progress_exit_code: 9,
+      budget: { metric: "meaningful_line_count", current: 90, passing_max: 80, required_reduction: 10, unit: "meaningful_line_count" },
+    })
+    const nonzeroProgressPlugin = await pluginModule.SmellPlugin({ worktree: nonzeroProgressRoot })
+    const nonzeroProgressSession = "guard-progress-nonzero"
+    await nonzeroProgressPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: nonzeroProgressSession,
+        arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${nonzeroProgressRoot}; Language: python; Smell type: long_method; Target location: nonzero.py:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    const nonzeroProgress = await nonzeroProgressPlugin.tool.smell_verify.execute(
+      {
+        projectRoot: nonzeroProgressRoot,
+        smell: "long_method",
+        location: "nonzero.py:method=target|line=1",
+        verificationMode: "project_full",
+      },
+      { sessionID: nonzeroProgressSession, agent: "smell-refactor-agent", directory: nonzeroProgressRoot },
+    )
+    const nonzeroProgressPayload = parseJson("guard_progress_nonzero", nonzeroProgress.output)
+    assertEqual(
+      "guard_progress_nonzero_cannot_authorize_continue",
+      nonzeroProgressPayload.status,
+      "GUARD_PROGRESS_PROTOCOL_INVALID",
+      "status",
+    )
+    assertEqual("guard_progress_nonzero_is_terminal", nonzeroProgressPayload.loop?.decision, "stop", "loop.decision")
+    await nonzeroProgressPlugin.dispose?.()
 
     for (const bypass of [
       { name: "noncheckpoint", language: "python", smell: "unsupported_smell", location: "sample.py:1", checkpoint_required: false },
@@ -4149,6 +5317,7 @@ print(json.dumps(payload))
         unownedBypass: true,
       },
       malformedPreflightFailsClosed: true,
+      nonzeroProgressFailsClosed: true,
       javaCheckpointGate: true,
       noncheckpointBypass: true,
     }
@@ -4161,8 +5330,641 @@ print(json.dumps(payload))
   }
 }
 
+async function runManualStateDeadlineSelfCheck() {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "smell-manual-state-self-check-"))
+  const envBefore = { ...process.env }
+  const realNow = Date.now
+  try {
+    const projectRoot = path.join(tempRoot, "project")
+    const stateRoot = path.join(tempRoot, "controller-state")
+    const logFile = path.join(tempRoot, "bridge-log.jsonl")
+    const fakeBridge = path.join(tempRoot, "manual_bridge.py")
+    await mkdir(projectRoot, { recursive: true })
+    await writeFile(logFile, "", "utf8")
+    await writeFile(fakeBridge, `
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+command = sys.argv[1]
+state_root = Path(os.environ["SMELL_SESSION_STATE_ROOT"])
+state_files = sorted((state_root / "sessions").glob("*.json")) if (state_root / "sessions").exists() else []
+state_payload = json.loads(state_files[0].read_text(encoding="utf-8")) if len(state_files) == 1 else None
+with Path(os.environ["SMELL_MANUAL_LOG"]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "command": command,
+        "deadline": os.environ.get("SMELL_SAMPLE_DEADLINE_EPOCH_MS", ""),
+        "state_file_count": len(state_files),
+        "state": state_payload,
+        "at_ms": int(time.time() * 1000),
+    }) + "\\n")
+
+if command == "resolve-command" and os.environ.get("SMELL_MANUAL_RESOLVE_DELAY_MS"):
+    time.sleep(int(os.environ["SMELL_MANUAL_RESOLVE_DELAY_MS"]) / 1000)
+if command == "resolve-command" and os.environ.get("SMELL_MANUAL_RESOLVE_FAIL") == "1":
+    print(json.dumps({"success": False, "status": "RESOLVE_FAILED"}))
+    raise SystemExit(17)
+
+project_root = os.environ["SMELL_MANUAL_PROJECT_ROOT"]
+identity = {
+    "project_root": project_root,
+    "project_override_root": "",
+    "language": "python",
+    "smell": "long_method",
+    "location": "sample.py:method=target|line=1",
+    "target_context_json": "",
+    "verification_mode": "project_full",
+    "sample_test_location": "",
+    "sample_test_command": "",
+    "build_command": "",
+    "project_test_command": "",
+    "verification_cwd": "",
+    "verification_command_source": "",
+    "sample_test_source": "",
+}
+if command == "resolve-command":
+    payload = {
+        "task": "Continue the current smell refactoring task.",
+        "verification_mode": "project_full",
+        "refactoring_backend": "direct",
+        "allow_test_changes": False,
+        "checkpoint_required": True,
+        "identity": identity,
+        "loop": {
+            "mode": "verify-failure",
+            "max_continuations": 2,
+            "no_progress_limit": 1,
+            "allowed_failure_groups": ["smell", "compile", "test"],
+            "instruction": "repair narrowly",
+            "sample_deadline_seconds": 60,
+        },
+    }
+elif command == "capture-baseline":
+    payload = {
+        "success": True,
+        "status": "BASELINE_CAPTURED",
+        "baseline_seal": "manual-seal",
+        "metrics": {"entity_identity": {"method": "target"}},
+        "resolution_plan": {"route_family": "close-frozen-finding", "metric_budget": []},
+    }
+elif command == "verify" and "--guard-progress-only" in sys.argv:
+    payload = {
+        "schema_version": "smell.guard-progress/v1",
+        "success": True,
+        "status": "GUARD_PROGRESS_PASSED",
+        "applicable": True,
+        "checkpoint_required": True,
+        "source_guard_passed": True,
+        "ready_for_project_full": True,
+        "project_full_executed": False,
+    }
+elif command == "verify":
+    payload = {
+        "success": True,
+        "accepted": True,
+        "progress": True,
+        "project_full_executed": True,
+        "status": "PASS",
+        "resolution": "resolved",
+        "smell_guard": {"success": True, "failure_count": 0, "results": []},
+        "build_test_guard": {"success": True, "project_full_executed": True},
+        "artifacts": {},
+        "formal_verification_receipt": {
+            "schema_version": "smell.formal-verification-receipt/v1",
+            "terminal_stage": "formal_verify",
+            "status": "PASS",
+            "success": True,
+            "accepted": True,
+            "resolution": "resolved",
+            "candidate_identity": {
+                "baseline_revision": "manual-seal",
+                "baseline_tree": "",
+                "production_diff": "manual-production-diff",
+                "test_tree": "manual-test-tree",
+                "verification_config_tree": "manual-verification-config-tree",
+            },
+            "outcome": "pass",
+            "diagnostic_signature": "PASS",
+            "guard": {"success": True, "failure_count": 0},
+            "build_test": {"success": True, "project_full_executed": True, "test_status": "passed"},
+            "fresh_isolation": None,
+            "artifact_refs": {},
+        },
+    }
+elif command == "sleep":
+    time.sleep(30)
+    payload = {"success": True, "status": "PASS"}
+else:
+    payload = {"success": False, "status": "UNEXPECTED_COMMAND", "command": command}
+print(json.dumps(payload))
+`, "utf8")
+
+    Object.assign(process.env, cleanSmellIdentityEnv(process.env), {
+      SMELL_BRIDGE_FILE: fakeBridge,
+      SMELL_SESSION_STATE_ROOT: stateRoot,
+      SMELL_MANUAL_LOG: logFile,
+      SMELL_MANUAL_PROJECT_ROOT: projectRoot,
+    })
+    delete process.env.SMELL_BATCH_RUN
+    const compiledFile = await compilePluginForSelfCheck(tempRoot)
+    const pluginModule = await import(`${pathToFileURL(compiledFile).href}?manual_state=${Date.now()}`)
+    const hooks = pluginModule.SmellPlugin?.__selfTest
+    assertCond("manual_state_persistence_surface", typeof hooks?.commandSessionStateFile === "function", "missing state path helper")
+    assertCond("manual_deadline_process_surface", typeof hooks?.runBridge === "function", "missing deadline-aware bridge helper")
+
+    const abortCalls = []
+    const promptCalls = []
+    const client = {
+      session: {
+        promptAsync(options) {
+          promptCalls.push(options)
+          return Promise.resolve({ data: undefined, error: undefined })
+        },
+        abort(options) {
+          abortCalls.push(options)
+          return Promise.resolve({ data: true, error: undefined })
+        },
+      },
+    }
+    const commandArguments = `--verification-mode=project_full --loop-max=2 -- Project root: ${projectRoot}; Language: python; Smell type: long_method; Target location: sample.py:method=target|line=1`
+    const sessionID = "manual-cross-process"
+    const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await plugin["command.execute.before"](
+      { command: "smell-refactor-run", sessionID, arguments: commandArguments },
+      { parts: [] },
+    )
+    const stateFile = hooks.commandSessionStateFile(sessionID)
+    assertCond("manual_state_outside_candidate", !stateFile.startsWith(`${projectRoot}${path.sep}`), stateFile)
+    const stateMode = (await stat(stateFile)).mode & 0o777
+    const stateDirectoryMode = (await stat(path.dirname(stateFile))).mode & 0o777
+    assertEqual("manual_state_file_mode", stateMode, 0o600, "mode")
+    assertEqual("manual_state_directory_mode", stateDirectoryMode, 0o700, "mode")
+    let envelope = JSON.parse(await readFile(stateFile, "utf8"))
+    const readyInitialEnvelope = JSON.parse(JSON.stringify(envelope))
+    assertEqual("manual_state_session_binding", envelope.session_id, sessionID, "session_id")
+    assertEqual("manual_state_worktree_binding", envelope.worktree, path.resolve(projectRoot), "worktree")
+    assertEqual("manual_state_schema_v6", envelope.command_loop_state.schema_version, 6, "schema_version")
+    assertEqual("manual_state_initial_control", envelope.command_loop_state.control.decision, "verify_required", "control.decision")
+    assertEqual("manual_state_command_persisted", envelope.command, "smell-refactor-run", "command")
+    assertEqual("manual_state_agent_persisted", envelope.agent, "smell-refactor-agent", "agent")
+    assertEqual("manual_state_initialization_ready", envelope.initialization, "ready", "initialization")
+    assertEqual("manual_state_baseline_seal", envelope.baseline_seal, "manual-seal", "baseline_seal")
+    assertCond("manual_state_baseline_context", envelope.command_loop_state.target_identity_context.includes("Frozen target:"), "missing baseline context")
+    assertEqual(
+      "manual_state_deadline_derived",
+      envelope.deadline_epoch_ms,
+      envelope.command_loop_state.started_at + 60_000,
+      "deadline_epoch_ms",
+    )
+    let logEntries = (await readFile(logFile, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    const resolveLog = logEntries.find((entry) => entry.command === "resolve-command")
+    const baselineLog = logEntries.find((entry) => entry.command === "capture-baseline")
+    assertCond("manual_resolve_is_deadline_bounded", Number(resolveLog?.deadline) > 0, "resolve-command lacked deadline env")
+    assertEqual("manual_baseline_state_preexists", baselineLog?.state_file_count, 1, "state_file_count")
+    assertEqual("manual_baseline_initial_generation", baselineLog?.state?.command_loop_state?.control?.generation, 0, "generation")
+    assertEqual("manual_baseline_pending_before_capture", baselineLog?.state?.initialization, "baseline_pending", "initialization")
+    assertEqual("manual_baseline_deadline_env", Number(baselineLog?.deadline), envelope.deadline_epoch_ms, "deadline env")
+    await plugin.dispose?.()
+
+    delete process.env.SMELL_COMMAND_LOOP_STATE_JSON
+    delete process.env.SMELL_BASELINE_SEAL
+    const reloaded = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    const systemOutput = { system: [] }
+    await reloaded["experimental.chat.system.transform"]({ sessionID, model: {} }, systemOutput)
+    assertCond("manual_state_cross_process_context", systemOutput.system[0]?.includes("Frozen target:"), "state did not restore")
+    await reloaded.event({ event: { type: "session.idle", properties: { sessionID } } })
+    await flush()
+    assertEqual("manual_verify_required_rehydrated_after_restart", promptCalls.length, 1, "prompt calls")
+    assertCond(
+      "manual_verify_required_rehydrate_instruction",
+      promptCalls[0]?.body?.parts?.[0]?.text?.includes("verify-required/initial"),
+      "restart did not dispatch the persisted verify-required control",
+    )
+    await reloaded.event({ event: { type: "session.idle", properties: { sessionID } } })
+    await flush()
+    assertEqual("manual_verify_required_rehydrate_once", promptCalls.length, 1, "prompt calls")
+    const verifyResult = await reloaded.tool.smell_verify.execute(
+      {
+        projectRoot,
+        smell: "long_method",
+        location: "sample.py:method=target|line=1",
+        verificationMode: "project_full",
+      },
+      { sessionID, agent: "smell-refactor-agent", directory: projectRoot },
+    )
+    const verifyPayload = parseJson("manual_state_verify", verifyResult.output)
+    assertEqual("manual_state_formal_pass", verifyPayload.status, "PASS", "status")
+    assertEqual("manual_state_formal_stage", verifyResult.metadata?.command_loop_state?.terminal_receipt?.stage, "formal_verify", "stage")
+    assertEqual("manual_state_control_stop", verifyResult.metadata?.command_loop_state?.control?.decision, "stop", "control.decision")
+    assertEqual("manual_state_generation_matches_loop", verifyResult.metadata?.command_loop_state?.control?.generation, verifyPayload.loop?.generation, "generation")
+    envelope = JSON.parse(await readFile(stateFile, "utf8"))
+    assertEqual("manual_state_terminal_persisted", envelope.command_loop_state.terminal_receipt.stage, "formal_verify", "terminal stage")
+    logEntries = (await readFile(logFile, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
+    for (const entry of logEntries.filter((item) => item.command === "verify")) {
+      assertEqual("manual_verify_deadline_env", Number(entry.deadline), envelope.deadline_epoch_ms, "deadline env")
+    }
+    const childSessionID = `${sessionID}-existing-child`
+    await reloaded.event({
+      event: {
+        type: "session.created",
+        properties: { info: { id: childSessionID, parentID: sessionID } },
+      },
+    })
+    const lineageFile = hooks.commandSessionLineageFile(childSessionID)
+    assertEqual("manual_child_lineage_persisted", existsSync(lineageFile), true, "lineage file exists")
+    await reloaded.dispose?.()
+
+    const lineageRestart = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    let childTerminalError = ""
+    try {
+      await lineageRestart["tool.execute.before"](
+        { tool: "edit", sessionID: childSessionID },
+        { args: {} },
+      )
+    } catch (error) {
+      childTerminalError = String(error?.message || error)
+    }
+    assertCond(
+      "manual_existing_child_terminal_survives_restart_without_created_replay",
+      childTerminalError.includes("SMELL_LOOP_TERMINAL"),
+      childTerminalError,
+    )
+    await lineageRestart.event({ event: { type: "session.deleted", properties: { info: { id: childSessionID } } } })
+    await lineageRestart.event({ event: { type: "session.deleted", properties: { info: { id: sessionID } } } })
+    assertEqual("manual_child_lineage_deleted_with_session", existsSync(lineageFile), false, "lineage file exists")
+    assertEqual("manual_state_deleted_with_session", existsSync(stateFile), false, "state file exists")
+    await lineageRestart.dispose?.()
+
+    const confirmationSession = "manual-confirmation-restart"
+    const confirmationState = hooks.restoreCommandLoopState(
+      JSON.stringify(readyInitialEnvelope.command_loop_state),
+    )
+    assertCond("manual_confirmation_fixture_restores", Boolean(confirmationState), "initial state did not restore")
+    confirmationState.control = {
+      generation: 1,
+      decision: "continue",
+      instruction: "Do not edit the candidate; call smell_verify again for one fresh confirmation.",
+      terminationReason: "",
+    }
+    confirmationState.continuationCount = 1
+    confirmationState.formalCandidateState = {
+      candidateIdentity: {
+        baselineRevision: "manual-seal",
+        baselineTree: "",
+        productionDiff: "manual-production-diff",
+        testTree: "manual-test-tree",
+        verificationConfigTree: "manual-verification-config-tree",
+      },
+      outcome: "pass",
+      diagnosticSignature: "PASS",
+      confirmationRequired: true,
+    }
+    hooks.writeCommandSessionState({
+      sessionID: confirmationSession,
+      worktree: projectRoot,
+      state: confirmationState,
+      baselineSeal: "manual-seal",
+      command: "smell-refactor-run",
+      agent: "smell-refactor-agent",
+      initialization: "ready",
+    })
+    const confirmationPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    const confirmationPromptStart = promptCalls.length
+    const confirmationIdle = confirmationPlugin.event({
+      event: { type: "session.idle", properties: { sessionID: confirmationSession } },
+    })
+    await confirmationPlugin.event({
+      event: { type: "session.idle", properties: { sessionID: confirmationSession } },
+    })
+    await confirmationIdle
+    await flush()
+    assertEqual(
+      "manual_continue_rehydrated_once_after_restart",
+      promptCalls.length,
+      confirmationPromptStart + 1,
+      "prompt calls",
+    )
+    const confirmationPrompt = promptCalls.at(-1)?.body?.parts?.[0]?.text || ""
+    assertCond(
+      "manual_continue_rehydrates_authoritative_confirmation_instruction",
+      confirmationPrompt.includes("Do not edit the candidate; call smell_verify again for one fresh confirmation.")
+        && !confirmationPrompt.includes("After one narrow corrective edit"),
+      confirmationPrompt,
+    )
+    let confirmationMutationError = ""
+    try {
+      await confirmationPlugin["tool.execute.before"](
+        { tool: "edit", sessionID: confirmationSession },
+        { args: {} },
+      )
+    } catch (error) {
+      confirmationMutationError = String(error?.message || error)
+    }
+    assertCond(
+      "manual_confirmation_pending_blocks_mutation_after_restart",
+      confirmationMutationError.includes("SMELL_FRESH_CONFIRMATION_PENDING"),
+      confirmationMutationError,
+    )
+    await confirmationPlugin.event({
+      event: { type: "session.deleted", properties: { info: { id: confirmationSession } } },
+    })
+    await confirmationPlugin.dispose?.()
+
+    const pendingSession = "manual-baseline-pending-restart"
+    const pendingState = hooks.restoreCommandLoopState(
+      JSON.stringify(readyInitialEnvelope.command_loop_state),
+    )
+    hooks.writeCommandSessionState({
+      sessionID: pendingSession,
+      worktree: projectRoot,
+      state: pendingState,
+      baselineSeal: "",
+      command: "smell-refactor-run",
+      agent: "smell-refactor-agent",
+      initialization: "baseline_pending",
+    })
+    const pendingPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    const pendingPromptStart = promptCalls.length
+    await pendingPlugin.event({
+      event: { type: "session.idle", properties: { sessionID: pendingSession } },
+    })
+    await flush()
+    assertEqual(
+      "manual_baseline_pending_restart_does_not_dispatch_verify",
+      promptCalls.length,
+      pendingPromptStart,
+      "prompt calls",
+    )
+    const pendingVerify = await pendingPlugin.tool.smell_verify.execute(
+      { projectRoot, smell: "long_method", location: "sample.py:method=target|line=1", verificationMode: "project_full" },
+      { sessionID: pendingSession, agent: "smell-refactor-agent", directory: projectRoot },
+    )
+    assertEqual(
+      "manual_baseline_pending_restart_fails_closed",
+      parseJson("manual_pending_terminal", pendingVerify.output).status,
+      "COMMAND_INITIALIZATION_INCOMPLETE",
+      "status",
+    )
+    await pendingPlugin.event({
+      event: { type: "session.deleted", properties: { info: { id: pendingSession } } },
+    })
+    await pendingPlugin.dispose?.()
+
+    const invalidStateSession = "manual-invalid-state"
+    await writeFile(hooks.commandSessionStateFile(invalidStateSession), "{invalid-json\n", "utf8")
+    const invalidStatePlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    let invalidStateEditError = ""
+    try {
+      await invalidStatePlugin["tool.execute.before"](
+        { tool: "edit", sessionID: invalidStateSession },
+        { args: {} },
+      )
+    } catch (error) {
+      invalidStateEditError = String(error?.message || error)
+    }
+    assertCond(
+      "manual_invalid_state_json_blocks_edit",
+      invalidStateEditError.includes("COMMAND_SESSION_STATE_INVALID"),
+      invalidStateEditError,
+    )
+    let invalidStateVerifyError = ""
+    try {
+      await invalidStatePlugin.tool.smell_verify.execute(
+        { projectRoot, smell: "long_method", location: "sample.py:method=target|line=1", verificationMode: "project_full" },
+        { sessionID: invalidStateSession, agent: "smell-refactor-agent", directory: projectRoot },
+      )
+    } catch (error) {
+      invalidStateVerifyError = String(error?.message || error)
+    }
+    assertCond(
+      "manual_invalid_state_json_blocks_verify",
+      invalidStateVerifyError.includes("COMMAND_SESSION_STATE_INVALID"),
+      invalidStateVerifyError,
+    )
+    await invalidStatePlugin.event({
+      event: { type: "session.deleted", properties: { info: { id: invalidStateSession } } },
+    })
+    await invalidStatePlugin.dispose?.()
+
+    const invalidLineageSession = "manual-invalid-lineage"
+    await writeFile(hooks.commandSessionLineageFile(invalidLineageSession), "{invalid-json\n", "utf8")
+    const invalidLineagePlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    let invalidLineageEditError = ""
+    try {
+      await invalidLineagePlugin["tool.execute.before"](
+        { tool: "edit", sessionID: invalidLineageSession },
+        { args: {} },
+      )
+    } catch (error) {
+      invalidLineageEditError = String(error?.message || error)
+    }
+    assertCond(
+      "manual_invalid_lineage_json_blocks_edit",
+      invalidLineageEditError.includes("COMMAND_SESSION_LINEAGE_INVALID"),
+      invalidLineageEditError,
+    )
+    await invalidLineagePlugin.event({
+      event: { type: "session.deleted", properties: { info: { id: invalidLineageSession } } },
+    })
+    await invalidLineagePlugin.dispose?.()
+
+    const replacementSession = "manual-command-replacement"
+    const replacementSeedPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await replacementSeedPlugin["command.execute.before"](
+      { command: "smell-refactor-run", sessionID: replacementSession, arguments: commandArguments },
+      { parts: [] },
+    )
+    const replacementStateFile = hooks.commandSessionStateFile(replacementSession)
+    const nearDeadlineEnvelope = JSON.parse(await readFile(replacementStateFile, "utf8"))
+    nearDeadlineEnvelope.command_loop_state.started_at = Date.now() - 59_000
+    nearDeadlineEnvelope.deadline_epoch_ms = nearDeadlineEnvelope.command_loop_state.started_at + 60_000
+    await writeFile(replacementStateFile, `${JSON.stringify(nearDeadlineEnvelope)}\n`, "utf8")
+    await replacementSeedPlugin.dispose?.()
+
+    const replacementPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await replacementPlugin["experimental.chat.system.transform"](
+      { sessionID: replacementSession, model: {} },
+      { system: [] },
+    )
+    process.env.SMELL_MANUAL_RESOLVE_DELAY_MS = "1500"
+    const replacementAbortStart = abortCalls.length
+    const replacementPromptStart = promptCalls.length
+    const replacementPromise = replacementPlugin["command.execute.before"](
+      { command: "smell-refactor-run", sessionID: replacementSession, arguments: commandArguments },
+      { parts: [] },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    await replacementPlugin.event({
+      event: { type: "session.idle", properties: { sessionID: replacementSession } },
+    })
+    await flush()
+    assertEqual(
+      "manual_new_command_clears_old_deadline_before_resolution",
+      abortCalls.length,
+      replacementAbortStart,
+      "abort calls",
+    )
+    assertEqual(
+      "manual_new_command_clears_old_idle_before_resolution",
+      promptCalls.length,
+      replacementPromptStart,
+      "prompt calls",
+    )
+    await replacementPromise
+    delete process.env.SMELL_MANUAL_RESOLVE_DELAY_MS
+    await replacementPlugin.event({
+      event: { type: "session.deleted", properties: { info: { id: replacementSession } } },
+    })
+    await replacementPlugin.dispose?.()
+
+    const failedReplacementSession = "manual-command-replacement-failure"
+    const failedReplacementSeed = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await failedReplacementSeed["command.execute.before"](
+      { command: "smell-refactor-run", sessionID: failedReplacementSession, arguments: commandArguments },
+      { parts: [] },
+    )
+    const failedReplacementStateFile = hooks.commandSessionStateFile(failedReplacementSession)
+    const failedNearDeadlineEnvelope = JSON.parse(await readFile(failedReplacementStateFile, "utf8"))
+    failedNearDeadlineEnvelope.command_loop_state.started_at = Date.now() - 59_000
+    failedNearDeadlineEnvelope.deadline_epoch_ms = failedNearDeadlineEnvelope.command_loop_state.started_at + 60_000
+    await writeFile(failedReplacementStateFile, `${JSON.stringify(failedNearDeadlineEnvelope)}\n`, "utf8")
+    await failedReplacementSeed.dispose?.()
+    const failedReplacementPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await failedReplacementPlugin["experimental.chat.system.transform"](
+      { sessionID: failedReplacementSession, model: {} },
+      { system: [] },
+    )
+    process.env.SMELL_MANUAL_RESOLVE_FAIL = "1"
+    const failedReplacementAbortStart = abortCalls.length
+    const failedReplacementPromptStart = promptCalls.length
+    let replacementFailure = ""
+    try {
+      await failedReplacementPlugin["command.execute.before"](
+        { command: "smell-refactor-run", sessionID: failedReplacementSession, arguments: commandArguments },
+        { parts: [] },
+      )
+    } catch (error) {
+      replacementFailure = String(error?.message || error)
+    }
+    delete process.env.SMELL_MANUAL_RESOLVE_FAIL
+    assertCond("manual_replacement_resolve_failure_is_reported", Boolean(replacementFailure), "resolve failure was swallowed")
+    assertEqual(
+      "manual_replacement_resolve_failure_removes_old_state",
+      existsSync(failedReplacementStateFile),
+      false,
+      "state file exists",
+    )
+    await new Promise((resolve) => setTimeout(resolve, 1100))
+    await failedReplacementPlugin.event({
+      event: { type: "session.idle", properties: { sessionID: failedReplacementSession } },
+    })
+    await flush()
+    assertEqual(
+      "manual_replacement_failure_does_not_resurrect_old_deadline",
+      abortCalls.length,
+      failedReplacementAbortStart,
+      "abort calls",
+    )
+    assertEqual(
+      "manual_replacement_failure_does_not_resurrect_old_idle",
+      promptCalls.length,
+      failedReplacementPromptStart,
+      "prompt calls",
+    )
+    await failedReplacementPlugin.dispose?.()
+
+    const deadlineSession = "manual-deadline-expired"
+    const deadlinePlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await deadlinePlugin["command.execute.before"](
+      { command: "smell-refactor-run", sessionID: deadlineSession, arguments: commandArguments },
+      { parts: [] },
+    )
+    const deadlineStateFile = hooks.commandSessionStateFile(deadlineSession)
+    const deadlineEnvelope = JSON.parse(await readFile(deadlineStateFile, "utf8"))
+    await deadlinePlugin.dispose?.()
+    Date.now = () => deadlineEnvelope.deadline_epoch_ms + 1
+    const expiredPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await expiredPlugin["experimental.chat.system.transform"]({ sessionID: deadlineSession, model: {} }, { system: [] })
+    assertEqual("manual_deadline_aborts_model_round", abortCalls.length, 1, "abort calls")
+    let mutationError = ""
+    try {
+      await expiredPlugin["tool.execute.before"](
+        { tool: "edit", sessionID: deadlineSession },
+        { args: {} },
+      )
+    } catch (error) {
+      mutationError = String(error?.message || error)
+    }
+    assertCond("manual_deadline_freezes_mutation", mutationError.includes("SAMPLE_DEADLINE_REACHED"), mutationError)
+    const expiredVerify = await expiredPlugin.tool.smell_verify.execute(
+      { projectRoot, smell: "long_method", location: "sample.py:method=target|line=1", verificationMode: "project_full" },
+      { sessionID: deadlineSession, agent: "smell-refactor-agent", directory: projectRoot },
+    )
+    const expiredPayload = parseJson("manual_deadline_terminal", expiredVerify.output)
+    assertEqual("manual_deadline_terminal_status", expiredPayload.status, "SAMPLE_DEADLINE_REACHED", "status")
+    assertEqual("manual_deadline_terminal_stage", expiredPayload.stage, "protocol", "stage")
+    await expiredPlugin.event({ event: { type: "session.deleted", properties: { info: { id: deadlineSession } } } })
+    await expiredPlugin.dispose?.()
+    Date.now = realNow
+
+    process.env.SMELL_BATCH_RUN = "1"
+    const batchSession = "batch-deadline-no-abort"
+    const batchPlugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
+    await batchPlugin["command.execute.before"](
+      { command: "smell-refactor-run", sessionID: batchSession, arguments: commandArguments },
+      { parts: [] },
+    )
+    const batchEnvelope = JSON.parse(await readFile(hooks.commandSessionStateFile(batchSession), "utf8"))
+    Date.now = () => batchEnvelope.deadline_epoch_ms + 1
+    let batchMutationError = ""
+    try {
+      await batchPlugin["tool.execute.before"](
+        { tool: "edit", sessionID: batchSession },
+        { args: {} },
+      )
+    } catch (error) {
+      batchMutationError = String(error?.message || error)
+    }
+    assertCond("batch_deadline_still_latches", batchMutationError.includes("SAMPLE_DEADLINE_REACHED"), batchMutationError)
+    assertEqual("batch_deadline_does_not_abort_session", abortCalls.length, 1, "abort calls")
+    await batchPlugin.event({ event: { type: "session.deleted", properties: { info: { id: batchSession } } } })
+    await batchPlugin.dispose?.()
+    delete process.env.SMELL_BATCH_RUN
+    Date.now = realNow
+
+    const boundedStartedAt = Date.now()
+    const bounded = await hooks.runBridge(projectRoot, ["sleep"], boundedStartedAt + 100)
+    assertEqual("manual_bridge_timeout_status", bounded.json?.status, "SAMPLE_DEADLINE_REACHED", "status")
+    assertEqual("manual_bridge_timeout_exit", bounded.exitCode, 124, "exitCode")
+    assertCond("manual_bridge_timeout_bounded", Date.now() - boundedStartedAt < 2500, "deadline termination was not bounded")
+    return {
+      persistence: true,
+      crossProcessRestore: true,
+      deadlineAbort: true,
+      batchAbortSuppressed: true,
+      boundedProcessTermination: true,
+    }
+  } finally {
+    Date.now = realNow
+    for (const key of Object.keys(process.env)) {
+      if (!(key in envBefore)) delete process.env[key]
+    }
+    Object.assign(process.env, envBefore)
+    await rm(tempRoot, { recursive: true, force: true })
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
+  if (options.manualStateOnly) {
+    console.log(JSON.stringify({
+      success: true,
+      manualState: await runManualStateDeadlineSelfCheck(),
+    }, null, 2))
+    return
+  }
   if (options.guardProgressOnly) {
     console.log(JSON.stringify({
       success: true,
@@ -4178,12 +5980,14 @@ async function main() {
       const pluginModule = await import(`${pathToFileURL(compiledFile).href}?idea_protocol=${Date.now()}`)
       const backendSurface = await runIdeaBackendSurfaceSelfCheck(pluginModule)
       const result = await runPluginNormalizeSelfCheck(pluginModule)
+      const manualCommandProtocol = await runIdeaManualCommandProtocolSelfCheck()
       console.log(JSON.stringify({
         success: true,
         node: process.version,
         ideaSkillDocs: skillDocs,
         ideaBackendSurface: backendSurface,
         ideaProposalProtocol: result.ideaProposalResults,
+        ideaManualCommandProtocol: manualCommandProtocol,
       }, null, 2))
       return
     } finally {

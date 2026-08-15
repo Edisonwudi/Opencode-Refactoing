@@ -273,13 +273,11 @@ with tempfile.TemporaryDirectory() as tmp:
         "BUILD_COMPILE_ERROR",
     )
     prioritized_prompt = R._runner_continuation_prompt(
-        "continue",
-        1,
-        3,
+        {"instruction": "Follow the typed plugin instruction."}
     )
     check(
-        "continuation_reads_build_test_priority_from_latest_tool_result",
-        "latest smell_verify tool result" in prioritized_prompt
+        "continuation_transports_plugin_instruction_without_runner_diagnosis",
+        prioritized_prompt == "Follow the typed plugin instruction."
         and "BUILD_COMPILE_ERROR" not in prioritized_prompt
         and "smell-only repair advice" not in prioritized_prompt,
         True,

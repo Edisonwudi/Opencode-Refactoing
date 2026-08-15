@@ -461,6 +461,21 @@ Project test command: ./gradlew --offline test
 Verification cwd: .
 ```
 
+选择 IDEA 后端时，仍使用同一个手动 command，只增加显式 policy 参数：
+
+```text
+/java-refactor-run --refactoring-backend=idea --verification-mode=project_full --loop-max=2 -- Project root: /abs/java-project
+Smell type: long_method
+Target location: src/main/java/Foo.java:42
+```
+
+该 flag 会冻结进 v6 会话状态。plugin 会在模型开始前、同一个 sample deadline
+内执行 `ensure-service --open`；失败直接形成 protocol terminal。IDEA 路径禁止 bash
+和普通 edit/write，项目根目录也不能被工具参数改写。合法变更链只有
+`preview -> matching apply -> smell_verify`，或明确 `unsupported_target` 后的
+`preview -> idea_edit -> smell_verify`；正式终态会携带与 mutation generation 绑定的
+compact IDEA receipt。该合同由 command/plugin 直接提供，不依赖 dataset runner。
+
 command 展开后的用户消息会原样保留；plugin 不再重写 `output.parts`。解析出的
 验证模式、目标身份、测试修改策略、backend 与 loop 上限通过独立且稳定的
 controller system context 注入。失败类别、`failure_pack`、`next_action` 和
@@ -476,6 +491,7 @@ backend、验证模式与测试修改策略不在用户任务中重复展示。
 合成消息 provenance。
 
 Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_full`、
+`--refactoring-backend=direct|idea`（默认 `direct`）、
 `--allow-test-changes`（默认关闭并冻结到 c000；启用时必须使用
 `project_full`）、
 `--loop-mode=off|verify-failure`、`--loop-max=0..5`、

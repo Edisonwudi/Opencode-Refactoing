@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial checks for exact-candidate project_full receipt reuse."""
+"""Adversarial checks for runner confirm-only final verification."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import replace
 from pathlib import Path
 
 
@@ -19,6 +18,9 @@ sys.path.insert(0, str(ROOT / "runtime" / "python"))
 
 import run_smell_dataset as R  # noqa: E402
 from bridge.smell_bridge import _snapshot_project  # noqa: E402
+from smell_core.verification_receipt import (  # noqa: E402
+    validate_formal_verification_decision,
+)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -189,10 +191,49 @@ def _fixture(root: Path) -> tuple[R.Sample, Path, dict[str, object], dict[str, o
             "resolution": "resolved",
             "verify_status": "PASS",
             "build_test_success": True,
+            "baseline_project_commit": base_commit,
+            "baseline_tree_hash": "",
+            "production_diff_hash": "fixture-production-diff",
+            "test_changes": {
+                "current_tree_sha256": "",
+                "current_verification_config_tree_sha256": "",
+            },
         },
         "artifacts": artifacts,
         "artifact_index": artifact_index,
         "loop": {"decision": "stop"},
+    }
+    payload["formal_verification_receipt"] = {
+        "schema_version": "smell.formal-verification-receipt/v1",
+        "terminal_stage": "formal_verify",
+        "status": "PASS",
+        "success": True,
+        "accepted": True,
+        "resolution": "resolved",
+        "candidate_identity": {
+            "baseline_revision": base_commit,
+            "baseline_tree": "",
+            "production_diff": "fixture-production-diff",
+            "test_tree": "",
+            "verification_config_tree": "",
+        },
+        "outcome": "pass",
+        "diagnostic_signature": "PASS",
+        "guard": {
+            "success": True,
+            "failure_count": 0,
+            "artifact_ref": str(paths["guard_evidence"]),
+        },
+        "build_test": {
+            "success": True,
+            "reason": "",
+            "project_full_executed": True,
+            "build_status": "ok",
+            "test_status": "ok",
+            "sample_test_status": "",
+        },
+        "fresh_isolation": isolation,
+        "artifact_refs": artifacts,
     }
     attempt = R._compact_verify_attempt(payload, verify_source="agent", verify_returncode=0)
     trace: dict[str, object] = {
@@ -215,342 +256,879 @@ def _fixture(root: Path) -> tuple[R.Sample, Path, dict[str, object], dict[str, o
     return sample, sample_dir, payload, trace, [attempt]
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="runner-final-receipt-") as raw:
-        root = Path(raw)
-        sample, sample_dir, payload, trace, history = _fixture(root)
-        args = argparse.Namespace(
-            projects="",
-            sample_deadline=60,
-            allow_test_changes=True,
-        )
-
-        original_run_verify = R._run_verify
-        calls: list[str] = []
-
-        def unexpected_verify(*_args, **_kwargs):
-            calls.append("fresh")
-            raise AssertionError("trusted exact-candidate receipt must skip duplicate project_full")
-
-        R._run_verify = unexpected_verify
-        try:
-            rc, reused, audit = R._runner_final_verify(
-                sample,
-                sample_dir,
-                args,
-                "project_full",
-                baseline_seal="c000-seal",
-                deadline_monotonic=None,
-                opencode_returncode=0,
-                last_trace=trace,
-                agent_verification_history=history,
-            )
-        finally:
-            R._run_verify = original_run_verify
-        assert rc == 0 and reused["status"] == "PASS", (rc, reused)
-        assert audit["reused"] is True and audit["reason"] == "REUSED", audit
-        assert calls == [], calls
-        persisted = json.loads((sample_dir / "verify.json").read_text(encoding="utf-8"))
-        assert persisted == payload, persisted
-        persisted_audit = json.loads(
-            (sample_dir / "runner-final-receipt.json").read_text(encoding="utf-8")
-        )
-        assert persisted_audit["reused"] is True, persisted_audit
-
-        read_only_trace = {
-            **trace,
-            "tools_after_last_verify": 1,
-            "tool_attempts_after_last_verify": 1,
-            "completed_tools_after_last_verify": ["todowrite"],
-            "attempted_tools_after_last_verify": ["todowrite"],
+def _state(
+    *,
+    generation: int,
+    decision: str,
+    instruction: str,
+    termination_reason: str,
+    stage: str | None = None,
+    status: str = "",
+    success: bool = False,
+    accepted: bool = False,
+    resolution: str = "rejected",
+    formal_receipt: dict[str, object] | None = None,
+    language: str = "python",
+) -> dict[str, object]:
+    control = {
+        "generation": generation,
+        "decision": decision,
+        "instruction": instruction,
+        "termination_reason": termination_reason,
+    }
+    receipt = None
+    if stage is not None:
+        receipt = {
+            "stage": stage,
+            "status": status,
+            "success": success,
+            "accepted": accepted,
+            "resolution": resolution,
+            "terminationReason": termination_reason,
+            "failureCategory": "",
+            "failureGroup": "",
+            "formalVerificationReceipt": (
+                formal_receipt if stage == "formal_verify" else None
+            ),
+            "ideaProtocolReceipt": None,
+            "loop": control,
         }
-        read_only_payload, read_only_audit = R._agent_project_full_receipt(
-            sample,
-            sample_dir,
-            "project_full",
-            0,
-            read_only_trace,
-            history,
-        )
-        assert read_only_payload is payload, read_only_payload
-        assert read_only_audit["reused"] is True, read_only_audit
+    candidate = (
+        formal_receipt.get("candidate_identity")
+        if isinstance(formal_receipt, dict)
+        else None
+    )
+    return {
+        "schema_version": 6,
+        "policy": {
+            "task": "Continue the current smell refactoring task.",
+            "verification_mode": "project_full",
+            "refactoring_backend": "direct",
+            "allow_test_changes": False,
+            "checkpoint_required": True,
+            "identity": {
+                "project_root": "/tmp/project",
+                "smell": "long_method",
+                "location": "sample.py:method=target|line=1",
+                "verification_mode": "project_full",
+                "project_override_root": "",
+                "language": language,
+                "target_context_json": "",
+                "sample_test_location": "",
+                "sample_test_command": "",
+                "build_command": "",
+                "project_test_command": "",
+                "verification_cwd": "",
+                "verification_command_source": "",
+                "sample_test_source": "",
+            },
+            "loop": {
+                "mode": "verify-failure",
+                "max_continuations": 5,
+                "no_progress_limit": 1,
+                "allowed_failure_groups": ["smell", "compile", "test"],
+                "instruction": "repair narrowly",
+                "sample_deadline_seconds": 1800,
+            },
+        },
+        "target_identity_context": "",
+        "started_at": 1,
+        "control": control,
+        "continuation_count": 0,
+        "cap_recovery_used": False,
+        "no_progress_count": 0,
+        "last_failure_fingerprint": "",
+        "best_metric_deficit": None,
+        "best_structural_failure_count": None,
+        "last_blocker_codes": [],
+        "seen_structural_states": [],
+        "formal_candidate_state": {
+            "candidate_identity": candidate,
+            "outcome": (
+                formal_receipt.get("outcome")
+                if isinstance(formal_receipt, dict)
+                else ""
+            ),
+            "diagnostic_signature": (
+                formal_receipt.get("diagnostic_signature")
+                if isinstance(formal_receipt, dict)
+                else ""
+            ),
+            "confirmation_required": False,
+        },
+        "idea_protocol_state": {
+            "active_proposal": None,
+            "proposal_blocker": None,
+            "mutation_generation": 0,
+            "verified_generation": 0,
+            "mutation_route": "",
+            "mutation_proposal_id": "",
+            "revertible_apply_generation": None,
+        },
+        "terminal_receipt": receipt,
+    }
 
-        expired_rc, expired, expired_audit = R._runner_final_verify(
+
+def _trace(state: dict[str, object] | None, payload: dict[str, object] | None) -> dict[str, object]:
+    trace: dict[str, object] = {
+        "smell_verify_calls": 1 if payload is not None else 0,
+        "last_output_parsed": payload is not None,
+        "last_payload": payload,
+        "command_loop_state": state,
+    }
+    if state is not None and payload is not None:
+        initial = _state(
+            generation=0,
+            decision="verify_required",
+            instruction="Call smell_verify now using the frozen command identity.",
+            termination_reason="",
+        )
+        trace["runner_control_plan"] = R._runner_transport_plan(
+            trace,
+            previous_state=initial,
+            transported_generations=set(),
+        )
+    return trace
+
+
+def _pass_payload(*, language: str = "python") -> dict[str, object]:
+    java = language == "java"
+    isolation = {
+        "contract_version": (
+            "project-full-direct-output-cleanup/v1"
+            if java
+            else "project-full-fresh-worktree/v1"
+        ),
+        "mode": (
+            "runner_checkout_with_output_cleanup"
+            if java
+            else "detached_git_worktree"
+        ),
+        "success": True,
+        "stage": "completed",
+        "cleanup_success": True,
+    }
+    artifacts = {
+        "guard_evidence": "/tmp/guard.json",
+        "build_result": "/tmp/build.json",
+        "test_result": "/tmp/test.json",
+        "diff": "/tmp/diff.patch",
+    }
+    receipt = {
+        "schema_version": "smell.formal-verification-receipt/v1",
+        "terminal_stage": "formal_verify",
+        "status": "PASS",
+        "success": True,
+        "accepted": True,
+        "resolution": "resolved",
+        "candidate_identity": {
+            "baseline_revision": "base-revision",
+            "baseline_tree": "base-tree" if java else "",
+            "production_diff": "production-diff",
+            "test_tree": "test-tree" if java else "",
+            "verification_config_tree": "verification-config-tree" if java else "",
+        },
+        "outcome": "pass",
+        "diagnostic_signature": "PASS",
+        "guard": {
+            "success": True,
+            "failure_count": 0,
+            "artifact_ref": artifacts["guard_evidence"],
+        },
+        "build_test": {
+            "success": True,
+            "reason": "",
+            "project_full_executed": True,
+            "build_status": "ok",
+            "test_status": "ok",
+            "sample_test_status": "",
+        },
+        "fresh_isolation": isolation,
+        "artifact_refs": artifacts,
+    }
+    return {
+        "schema_version": "smell.verify.decision/v1",
+        "success": True,
+        "accepted": True,
+        "status": "PASS",
+        "resolution": "resolved",
+        "termination_reason": "PASS",
+        "project_full_executed": True,
+        "smell_guard": {"success": True, "failure_count": 0, "results": []},
+        "build_test_guard": {
+            "success": True,
+            "verification_mode": "project_full",
+            "project_full_executed": True,
+        },
+        "test_changes": {"success": True, "status": "TEST_SOURCE_UNCHANGED"},
+        "checkpoint": {
+            "accepted": True,
+            "resolution": "resolved",
+            "verify_status": "PASS",
+            "build_test_success": True,
+        },
+        "artifacts": artifacts,
+        "artifact_index": {
+            name: {"path": path, "bytes": 1}
+            for name, path in artifacts.items()
+        },
+        "formal_verification_receipt": receipt,
+    }
+
+
+def _authorized_receipt_fixture(
+    root: Path,
+    *,
+    language: str = "c",
+) -> tuple[R.Sample, Path, dict[str, object], dict[str, object], list[dict[str, object]]]:
+    sample, sample_dir, payload, trace, _history = _fixture(root)
+    if language == "java":
+        sample = R.Sample(**{**sample.__dict__, "language": "java"})
+        isolation = payload["build_test_guard"]["verification_isolation"]
+        isolation.update(
+            {
+                "contract_version": "project-full-direct-output-cleanup/v1",
+                "mode": "runner_checkout_with_output_cleanup",
+            }
+        )
+        full_guard_path = Path(payload["artifacts"]["build_test_guard"])
+        full_guard = json.loads(full_guard_path.read_text(encoding="utf-8"))
+        full_guard["verification_isolation"].update(
+            {
+                "contract_version": "project-full-direct-output-cleanup/v1",
+                "mode": "runner_checkout_with_output_cleanup",
+            }
+        )
+        _write_json(full_guard_path, full_guard)
+        payload["artifact_index"]["build_test_guard"]["bytes"] = (
+            full_guard_path.stat().st_size
+        )
+        candidate = payload["formal_verification_receipt"]["candidate_identity"]
+        candidate["test_tree"] = "java-test-tree"
+        candidate["verification_config_tree"] = "java-verification-config-tree"
+        payload["checkpoint"]["test_changes"].update(
+            {
+                "current_tree_sha256": "java-test-tree",
+                "current_verification_config_tree_sha256": (
+                    "java-verification-config-tree"
+                ),
+            }
+        )
+    loop = {
+        "generation": 1,
+        "decision": "stop",
+        "instruction": "",
+        "termination_reason": "PASS",
+    }
+    state = _state(
+        generation=1,
+        decision="stop",
+        instruction="",
+        termination_reason="PASS",
+        stage="formal_verify",
+        status="PASS",
+        success=True,
+        accepted=True,
+        resolution="resolved",
+        formal_receipt=payload["formal_verification_receipt"],
+        language=language,
+    )
+    payload["loop"] = loop
+    trace.update(
+        {
+            "smell_verify_calls": 1,
+            "last_payload": payload,
+            "last_output_parsed": True,
+            "last_loop_decision": "stop",
+            "command_loop_state": state,
+        }
+    )
+    initial = _state(
+        generation=0,
+        decision="verify_required",
+        instruction="Call smell_verify now using the frozen command identity.",
+        termination_reason="",
+        language=language,
+    )
+    trace["runner_control_plan"] = R._runner_transport_plan(
+        trace,
+        previous_state=initial,
+        transported_generations=set(),
+    )
+    history = [R._compact_verify_attempt(payload, verify_source="agent", verify_returncode=0)]
+    return sample, sample_dir, payload, trace, history
+
+
+def _check_receipt_reuse(root: Path) -> None:
+    sample, sample_dir, payload, trace, history = _authorized_receipt_fixture(root)
+    args = argparse.Namespace(projects="", sample_deadline=60, allow_test_changes=True)
+    original_run_verify = R._run_verify
+    calls: list[str] = []
+
+    def unexpected_verify(*_args, **_kwargs):
+        calls.append("fresh")
+        raise AssertionError("qualified formal project_full receipt must skip duplicate full verification")
+
+    R._run_verify = unexpected_verify
+    try:
+        rc, reused, audit = R._runner_final_verify(
             sample,
             sample_dir,
             args,
             "project_full",
             baseline_seal="c000-seal",
-            deadline_monotonic=time.monotonic() - 1,
+            deadline_monotonic=None,
             opencode_returncode=0,
             last_trace=trace,
             agent_verification_history=history,
         )
-        assert expired_rc == 124 and expired["status"] == "OPENCODE_TIMEOUT", expired
-        assert expired_audit["reason"] == "SAMPLE_DEADLINE_REACHED", expired_audit
-        assert "runner_final_receipt" not in expired, expired
+    finally:
+        R._run_verify = original_run_verify
+    assert rc == 0 and reused["status"] == "PASS" and reused["accepted"] is True, reused
+    assert audit["reused"] is True and audit["reason"] == "REUSED", audit
+    assert audit["terminal_evidence"]["authorized"] is True, audit
+    assert calls == [], calls
 
-        fallback_payload = copy.deepcopy(payload)
-        fallback_payload["status"] = "SMELL_GUARD_FAILED"
-        fallback_payload["success"] = False
-        fallback_payload["accepted"] = False
-        fallback_payload["resolution"] = "unresolved"
-        fallback_calls: list[str] = []
+    # Receipt reuse re-snapshots the live candidate.  That read-only Git work
+    # must share the sample deadline; once it expires, reuse is rejected and
+    # the canonical final result is the existing typed timeout.
+    original_snapshot = R._capture_candidate_snapshot
+    original_run_verify = R._run_verify
+    snapshot_deadlines: list[float | None] = []
+    verify_deadlines: list[float | None] = []
+    deadline = time.monotonic() + 0.05
 
-        def fallback_verify(*_args, **_kwargs):
-            fallback_calls.append("fresh")
-            return 1, fallback_payload
+    def blocked_snapshot(*_args, deadline_monotonic=None, **_kwargs):
+        snapshot_deadlines.append(deadline_monotonic)
+        assert deadline_monotonic == deadline, deadline_monotonic
+        while time.monotonic() < deadline_monotonic:
+            time.sleep(0.001)
+        raise subprocess.TimeoutExpired(["git", "diff"], timeout=0.05)
 
-        def assert_fallback(
-            reason: str,
+    def deadline_verify(*_args, deadline_monotonic=None, **_kwargs):
+        verify_deadlines.append(deadline_monotonic)
+        return 124, {
+            "schema_version": "smell.verify.decision/v1",
+            "success": False,
+            "accepted": False,
+            "status": "OPENCODE_TIMEOUT",
+            "resolution": "rejected",
+        }
+
+    R._capture_candidate_snapshot = blocked_snapshot
+    R._run_verify = deadline_verify
+    try:
+        timeout_rc, timeout_payload, timeout_audit = R._runner_final_verify(
+            sample,
+            sample_dir,
+            args,
+            "project_full",
+            baseline_seal="c000-seal",
+            deadline_monotonic=deadline,
+            opencode_returncode=0,
+            last_trace=trace,
+            agent_verification_history=history,
+        )
+    finally:
+        R._capture_candidate_snapshot = original_snapshot
+        R._run_verify = original_run_verify
+    assert snapshot_deadlines == [deadline], snapshot_deadlines
+    assert verify_deadlines == [deadline], verify_deadlines
+    assert timeout_rc == 124 and timeout_payload["accepted"] is False, timeout_payload
+    assert timeout_audit["reuse_rejected_reason"] == "SAMPLE_DEADLINE_REACHED", timeout_audit
+
+    java_root = root / "java-direct-output-cleanup"
+    java_root.mkdir()
+    (
+        java_sample,
+        java_sample_dir,
+        _java_payload,
+        java_trace,
+        java_history,
+    ) = _authorized_receipt_fixture(java_root, language="java")
+    R._run_verify = unexpected_verify
+    try:
+        java_rc, java_reused, java_audit = R._runner_final_verify(
+            java_sample,
+            java_sample_dir,
+            args,
+            "project_full",
+            baseline_seal="c000-seal",
+            deadline_monotonic=None,
+            opencode_returncode=0,
+            last_trace=java_trace,
+            agent_verification_history=java_history,
+        )
+    finally:
+        R._run_verify = original_run_verify
+    assert java_rc == 0 and java_reused["accepted"] is True, java_reused
+    assert java_audit["reused"] is True and java_audit["reason"] == "REUSED", (
+        java_audit
+    )
+    assert calls == [], calls
+
+    fresh_pass = _pass_payload()
+
+    def trace_for_payload(changed_payload: dict[str, object]) -> dict[str, object]:
+        changed_state = copy.deepcopy(trace["command_loop_state"])
+        changed_receipt = changed_payload.get("formal_verification_receipt")
+        changed_state["terminal_receipt"]["formalVerificationReceipt"] = changed_receipt
+        if isinstance(changed_receipt, dict):
+            changed_state["formal_candidate_state"] = {
+                "candidate_identity": changed_receipt.get("candidate_identity"),
+                "outcome": changed_receipt.get("outcome"),
+                "diagnostic_signature": changed_receipt.get("diagnostic_signature"),
+                "confirmation_required": False,
+            }
+        changed_trace = {
+            **trace,
+            "last_payload": changed_payload,
+            "command_loop_state": changed_state,
+        }
+        initial = _state(
+            generation=0,
+            decision="verify_required",
+            instruction="Call smell_verify now using the frozen command identity.",
+            termination_reason="",
+        )
+        changed_trace["runner_control_plan"] = R._runner_transport_plan(
+            changed_trace,
+            previous_state=initial,
+            transported_generations=set(),
+        )
+        return changed_trace
+
+    def assert_fresh(
+        reason: str,
+        *,
+        changed_args: argparse.Namespace | None = None,
+        changed_sample: R.Sample | None = None,
+        changed_trace: dict[str, object] | None = None,
+        changed_history: list[dict[str, object]] | None = None,
+        opencode_returncode: int = 0,
+        deadline_monotonic: float | None = None,
+        fresh_payload: dict[str, object] | None = None,
+        fresh_returncode: int = 0,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        calls.clear()
+        observation = fresh_payload or fresh_pass
+
+        def fresh(*_args, **_kwargs):
+            calls.append("fresh")
+            return fresh_returncode, copy.deepcopy(observation)
+
+        R._run_verify = fresh
+        try:
+            _rc, decision, receipt = R._runner_final_verify(
+                changed_sample or sample,
+                sample_dir,
+                changed_args or args,
+                "project_full",
+                baseline_seal="c000-seal",
+                deadline_monotonic=deadline_monotonic,
+                opencode_returncode=opencode_returncode,
+                last_trace=changed_trace or trace,
+                agent_verification_history=changed_history or history,
+            )
+        finally:
+            R._run_verify = original_run_verify
+        assert calls == ["fresh"], (reason, calls)
+        assert receipt["reused"] is False, (reason, receipt)
+        assert receipt["reuse_rejected_reason"] == reason, (reason, receipt)
+        return decision, receipt
+
+    assert_fresh(
+        "IDEA_REQUIRES_FRESH_VERIFY",
+        changed_args=argparse.Namespace(
+            **{**vars(args), "refactoring_backend": "idea"}
+        ),
+    )
+
+    read_only_after = {
+        **trace,
+        "tools_after_last_verify": 1,
+        "tool_attempts_after_last_verify": 1,
+        "completed_tools_after_last_verify": ["todowrite"],
+        "attempted_tools_after_last_verify": ["todowrite"],
+    }
+    assert_fresh("TOOLS_AFTER_LAST_VERIFY", changed_trace=read_only_after)
+    assert_fresh(
+        "TOOL_ATTEMPT_AFTER_LAST_VERIFY",
+        changed_trace={**trace, "tool_attempts_after_last_verify": 1},
+    )
+
+    changed_tests = copy.deepcopy(payload)
+    changed_tests["test_changes"]["status"] = "TEST_SOURCE_CHANGE_ALLOWED"
+    changed_tests["test_changes"]["changed_count"] = 1
+    assert_fresh(
+        "TEST_SOURCE_CHANGED",
+        changed_trace=trace_for_payload(changed_tests),
+        changed_history=[R._compact_verify_attempt(changed_tests, verify_source="agent", verify_returncode=0)],
+    )
+
+    missing_artifact = copy.deepcopy(payload)
+    del missing_artifact["artifacts"]["test_result"]
+    del missing_artifact["artifact_index"]["test_result"]
+    assert_fresh(
+        "EVIDENCE_INCOMPLETE",
+        changed_trace=trace_for_payload(missing_artifact),
+        changed_history=[R._compact_verify_attempt(missing_artifact, verify_source="agent", verify_returncode=0)],
+    )
+
+    no_cleanup = copy.deepcopy(payload)
+    no_cleanup["build_test_guard"]["verification_isolation"]["cleanup_success"] = False
+    assert_fresh(
+        "FRESH_ISOLATION_INCOMPLETE",
+        changed_trace=trace_for_payload(no_cleanup),
+        changed_history=[R._compact_verify_attempt(no_cleanup, verify_source="agent", verify_returncode=0)],
+    )
+
+    failed_focused = copy.deepcopy(payload)
+    failed_focused["build_test_guard"]["focused_preflight"].update(
+        {"success": False, "status": "FAILED"}
+    )
+    assert_fresh(
+        "FRESH_ISOLATION_INCOMPLETE",
+        changed_trace=trace_for_payload(failed_focused),
+        changed_history=[R._compact_verify_attempt(failed_focused, verify_source="agent", verify_returncode=0)],
+    )
+    assert_fresh(
+        "FRESH_ISOLATION_INCOMPLETE",
+        changed_sample=R.Sample(
+            **{**sample.__dict__, "test_command": "./focused-sample-test"}
+        ),
+    )
+
+    contradiction = copy.deepcopy(history[0])
+    contradiction.update(
+        {
+            "status": "TEST_FAILED",
+            "accepted": False,
+            "success": False,
+            "failure_category": "TEST_BEHAVIOR_REGRESSION",
+        }
+    )
+    assert_fresh(
+        "SAME_DIFF_CONTRADICTION",
+        changed_history=[contradiction, history[0]],
+    )
+
+    source = sample.project_root / "sample.c"
+    original_source = source.read_text(encoding="utf-8")
+    source.write_text(original_source + "int later(void) { return 2; }\n", encoding="utf-8")
+    try:
+        assert_fresh("CURRENT_DIFF_MISMATCH")
+    finally:
+        source.write_text(original_source, encoding="utf-8")
+
+    timeout_payload = {
+        "schema_version": "smell.verify.decision/v1",
+        "success": False,
+        "accepted": False,
+        "status": "OPENCODE_TIMEOUT",
+        "resolution": "rejected",
+    }
+    deadline_decision, _ = assert_fresh(
+        "SAMPLE_DEADLINE_REACHED",
+        deadline_monotonic=time.monotonic() - 1,
+        fresh_payload=timeout_payload,
+        fresh_returncode=124,
+    )
+    assert deadline_decision["accepted"] is False, deadline_decision
+
+    runtime_decision, _ = assert_fresh(
+        "OPENCODE_NONZERO",
+        opencode_returncode=124,
+    )
+    assert runtime_decision["accepted"] is False, runtime_decision
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="runner-confirm-only-") as raw:
+        root = Path(raw)
+        reuse_root = root / "reuse"
+        reuse_root.mkdir()
+        _check_receipt_reuse(reuse_root)
+        project = root / "project"
+        sample_dir = root / "sample"
+        project.mkdir()
+        sample_dir.mkdir()
+        sample = R.Sample(
+            sample_id="confirm-only",
+            language="python",
+            smell="long_method",
+            project_name="fixture",
+            project_root=project,
+            location="sample.py:function=target|line=1",
+            evidence="",
+            raw={},
+        )
+        args = argparse.Namespace(projects="", sample_deadline=60, allow_test_changes=False)
+
+        formal_loop = {
+            "generation": 1,
+            "decision": "stop",
+            "instruction": "",
+            "termination_reason": "PASS",
+        }
+        formal_payload = {**_pass_payload(), "loop": formal_loop}
+        formal_state = _state(
+            generation=1,
+            decision="stop",
+            instruction="",
+            termination_reason="PASS",
+            stage="formal_verify",
+            status="PASS",
+            success=True,
+            accepted=True,
+            resolution="resolved",
+            formal_receipt=formal_payload["formal_verification_receipt"],
+        )
+        formal_trace = _trace(formal_state, formal_payload)
+
+        original_run_verify = R._run_verify
+        calls: list[str] = []
+
+        def run_case(
+            name: str,
+            trace: dict[str, object],
+            fresh_payload: dict[str, object],
             *,
-            changed_sample: R.Sample | None = None,
-            changed_trace: dict[str, object] | None = None,
-            changed_history: list[dict[str, object]] | None = None,
+            fresh_returncode: int = 0,
             opencode_returncode: int = 0,
-        ) -> None:
-            fallback_calls.clear()
-            R._run_verify = fallback_verify
+        ) -> tuple[dict[str, object], dict[str, object]]:
+            calls.clear()
+
+            def fresh(*_args, **_kwargs):
+                calls.append("fresh")
+                return fresh_returncode, copy.deepcopy(fresh_payload)
+
+            R._run_verify = fresh
             try:
-                _rc, decision, receipt = R._runner_final_verify(
-                    changed_sample or sample,
+                _rc, decision, audit = R._runner_final_verify(
+                    sample,
                     sample_dir,
                     args,
                     "project_full",
                     baseline_seal="c000-seal",
                     deadline_monotonic=None,
                     opencode_returncode=opencode_returncode,
-                    last_trace=changed_trace or trace,
-                    agent_verification_history=changed_history or history,
+                    last_trace=trace,
+                    agent_verification_history=[],
                 )
             finally:
                 R._run_verify = original_run_verify
-            assert fallback_calls == ["fresh"], (reason, fallback_calls)
-            assert decision["status"] == "SMELL_GUARD_FAILED", decision
-            assert receipt["reused"] is False and receipt["reason"] == reason, receipt
+            assert calls == ["fresh"], (name, calls)
+            raw_observation = json.loads(
+                (sample_dir / "verify.runner-observation.json").read_text(encoding="utf-8")
+            )
+            assert raw_observation == fresh_payload, (name, raw_observation)
+            persisted = json.loads((sample_dir / "verify.json").read_text(encoding="utf-8"))
+            receipt = json.loads(
+                (sample_dir / "runner-final-receipt.json").read_text(encoding="utf-8")
+            )
+            assert persisted == decision, (name, persisted, decision)
+            assert receipt == audit, (name, receipt, audit)
+            assert audit["canonical_status"] == decision["status"], (name, audit, decision)
+            assert audit["canonical_accepted"] is (decision.get("accepted") is True), (name, audit, decision)
+            return decision, audit
 
-        after_tool = {**trace, "tools_after_last_verify": 1}
-        assert_fallback("TOOLS_AFTER_LAST_VERIFY", changed_trace=after_tool)
-        attempted_tool = {**trace, "tool_attempts_after_last_verify": 1}
-        assert_fallback(
-            "TOOL_ATTEMPT_AFTER_LAST_VERIFY", changed_trace=attempted_tool
-        )
-        assert_fallback("OPENCODE_NONZERO", opencode_returncode=7)
+        confirmed, confirmed_audit = run_case("formal-pass", formal_trace, _pass_payload())
+        assert confirmed["status"] == "PASS" and confirmed["accepted"] is True, confirmed
+        assert confirmed_audit["reason"] == "FORMAL_PASS_CONFIRMED", confirmed_audit
+        assert confirmed_audit["reused"] is False, confirmed_audit
+        assert validate_formal_verification_decision(
+            confirmed,
+            require_project_full_pass=True,
+        ), confirmed
 
-        modified_tests = copy.deepcopy(payload)
-        modified_tests["test_changes"]["status"] = "TEST_SOURCE_CHANGE_ALLOWED"
-        modified_tests["test_changes"]["changed_count"] = 1
-        modified_attempt = R._compact_verify_attempt(
-            modified_tests, verify_source="agent", verify_returncode=0
-        )
-        assert_fallback(
-            "TEST_SOURCE_CHANGED",
-            changed_trace={**trace, "last_payload": modified_tests},
-            changed_history=[modified_attempt],
-        )
-
-        missing_evidence = copy.deepcopy(payload)
-        del missing_evidence["artifacts"]["test_result"]
-        del missing_evidence["artifact_index"]["test_result"]
-        missing_attempt = R._compact_verify_attempt(
-            missing_evidence, verify_source="agent", verify_returncode=0
-        )
-        assert_fallback(
-            "EVIDENCE_INCOMPLETE",
-            changed_trace={**trace, "last_payload": missing_evidence},
-            changed_history=[missing_attempt],
-        )
-
-        no_cleanup = copy.deepcopy(payload)
-        no_cleanup["build_test_guard"]["verification_isolation"]["cleanup_success"] = False
-        cleanup_attempt = R._compact_verify_attempt(
-            no_cleanup, verify_source="agent", verify_returncode=0
-        )
-        assert_fallback(
-            "FRESH_ISOLATION_INCOMPLETE",
-            changed_trace={**trace, "last_payload": no_cleanup},
-            changed_history=[cleanup_attempt],
-        )
-
-        failed_preflight = copy.deepcopy(payload)
-        failed_preflight["build_test_guard"]["focused_preflight"].update(
-            {"success": False, "status": "FAILED"}
-        )
-        failed_preflight_attempt = R._compact_verify_attempt(
-            failed_preflight, verify_source="agent", verify_returncode=0
-        )
-        assert_fallback(
-            "FRESH_ISOLATION_INCOMPLETE",
-            changed_trace={**trace, "last_payload": failed_preflight},
-            changed_history=[failed_preflight_attempt],
-        )
-
-        missing_preflight = copy.deepcopy(payload)
-        del missing_preflight["build_test_guard"]["focused_preflight"]
-        missing_preflight_attempt = R._compact_verify_attempt(
-            missing_preflight, verify_source="agent", verify_returncode=0
-        )
-        assert_fallback(
-            "FRESH_ISOLATION_INCOMPLETE",
-            changed_trace={**trace, "last_payload": missing_preflight},
-            changed_history=[missing_preflight_attempt],
-        )
-
-        assert_fallback(
-            "FRESH_ISOLATION_INCOMPLETE",
-            changed_sample=replace(sample, test_command="./focused-sample-test"),
-        )
-
-        build_guard_path = Path(payload["artifacts"]["build_test_guard"])
-        original_build_guard = build_guard_path.read_text(encoding="utf-8")
-
-        sample_mismatch_guard = json.loads(original_build_guard)
-        sample_mismatch_guard["details"]["sample_test"] = {
-            "label": "sample_test",
-            "success": False,
-            "status": "fail",
-            "returncode": 1,
-            "command": "./focused-sample-test",
-            "script": "",
-            "cwd": str(sample.project_root),
-            "source": "dataset",
+        java_payload = {
+            **_pass_payload(language="java"),
+            "loop": formal_loop,
         }
-        _write_json(build_guard_path, sample_mismatch_guard)
-        sample_mismatch_payload = copy.deepcopy(payload)
-        sample_mismatch_payload["artifact_index"]["build_test_guard"]["bytes"] = (
-            build_guard_path.stat().st_size
+        java_state = _state(
+            generation=1,
+            decision="stop",
+            instruction="",
+            termination_reason="PASS",
+            stage="formal_verify",
+            status="PASS",
+            success=True,
+            accepted=True,
+            resolution="resolved",
+            formal_receipt=java_payload["formal_verification_receipt"],
+            language="java",
         )
-        sample_mismatch_attempt = R._compact_verify_attempt(
-            sample_mismatch_payload, verify_source="agent", verify_returncode=0
+        java_trace = _trace(java_state, java_payload)
+        java_confirmed, java_audit = run_case(
+            "java-direct-output-cleanup-pass",
+            java_trace,
+            _pass_payload(language="java"),
         )
-        try:
-            assert_fallback(
-                "FRESH_ISOLATION_INCOMPLETE",
-                changed_trace={**trace, "last_payload": sample_mismatch_payload},
-                changed_history=[sample_mismatch_attempt],
+        assert java_confirmed["accepted"] is True, java_confirmed
+        assert java_audit["reason"] == "FORMAL_PASS_CONFIRMED", java_audit
+        assert validate_formal_verification_decision(
+            java_confirmed,
+            require_project_full_pass=True,
+        ), java_confirmed
+
+        invalid_java_isolation = _pass_payload(language="java")
+        invalid_java_isolation["formal_verification_receipt"]["fresh_isolation"][
+            "mode"
+        ] = "detached_git_worktree"
+        invalid_java, invalid_java_audit = run_case(
+            "java-mismatched-isolation-contract",
+            java_trace,
+            invalid_java_isolation,
+        )
+        assert invalid_java["status"] == "FRESH_VERIFY_PROTOCOL_INVALID", invalid_java
+        assert invalid_java["accepted"] is False, invalid_java
+        assert invalid_java_audit["reason"] == "FRESH_VERIFY_PROTOCOL_INVALID", (
+            invalid_java_audit
+        )
+
+        zero_decision, _ = run_case("zero-verify", _trace(None, None), _pass_payload())
+        assert zero_decision["status"] == "RUNNER_CONFIRMATION_NOT_AUTHORIZED", zero_decision
+
+        continue_loop = {
+            "generation": 1,
+            "decision": "continue",
+            "instruction": "Repair and verify again.",
+            "termination_reason": "",
+        }
+        continue_state = _state(
+            generation=1,
+            decision="continue",
+            instruction=continue_loop["instruction"],
+            termination_reason="",
+        )
+        continue_decision, _ = run_case(
+            "continue-open",
+            _trace(continue_state, {"status": "SMELL_GUARD_FAILED", "loop": continue_loop}),
+            _pass_payload(),
+        )
+        assert continue_decision["accepted"] is False, continue_decision
+
+        for stage in ("cheap_guard", "protocol"):
+            state = _state(
+                generation=1,
+                decision="stop",
+                instruction="",
+                termination_reason="PASS",
+                stage=stage,
+                status="PASS",
+                success=True,
+                accepted=True,
+                resolution="resolved",
             )
-        finally:
-            build_guard_path.write_text(original_build_guard, encoding="utf-8")
+            decision, _ = run_case(stage, _trace(state, formal_payload), _pass_payload())
+            assert decision["accepted"] is False, (stage, decision)
 
-        build_result_path = Path(payload["artifacts"]["build_result"])
-        original_build_result = build_result_path.read_text(encoding="utf-8")
-        forged_guard = json.loads(original_build_guard)
-        forged_build = json.loads(original_build_result)
-        forged_guard["details"]["build"]["command"] = "true # forged build"
-        forged_build["command"] = "true # forged build"
-        _write_json(build_guard_path, forged_guard)
-        _write_json(build_result_path, forged_build)
-        forged_stage_payload = copy.deepcopy(payload)
-        forged_stage_payload["artifact_index"]["build_test_guard"]["bytes"] = (
-            build_guard_path.stat().st_size
+        improved_loop = {**formal_loop, "termination_reason": "IMPROVED"}
+        improved_state = _state(
+            generation=1,
+            decision="stop",
+            instruction="",
+            termination_reason="IMPROVED",
+            stage="formal_verify",
+            status="IMPROVED",
+            success=True,
+            accepted=False,
+            resolution="improved",
         )
-        forged_stage_payload["artifact_index"]["build_result"]["bytes"] = (
-            build_result_path.stat().st_size
+        improved_decision, _ = run_case(
+            "formal-improved",
+            _trace(improved_state, {"status": "IMPROVED", "loop": improved_loop}),
+            _pass_payload(),
         )
-        forged_stage_attempt = R._compact_verify_attempt(
-            forged_stage_payload, verify_source="agent", verify_returncode=0
-        )
-        try:
-            assert_fallback(
-                "FRESH_ISOLATION_INCOMPLETE",
-                changed_trace={**trace, "last_payload": forged_stage_payload},
-                changed_history=[forged_stage_attempt],
-            )
-        finally:
-            build_guard_path.write_text(original_build_guard, encoding="utf-8")
-            build_result_path.write_text(original_build_result, encoding="utf-8")
+        assert improved_decision["accepted"] is False, improved_decision
 
-        corrupted_build_guard = json.loads(original_build_guard)
-        corrupted_build_guard.update(
-            {"success": False, "project_full_executed": False}
+        formal_reject_loop = {**formal_loop, "termination_reason": "SMELL_GUARD_FAILED"}
+        formal_reject_state = _state(
+            generation=1,
+            decision="stop",
+            instruction="",
+            termination_reason="SMELL_GUARD_FAILED",
+            stage="formal_verify",
+            status="SMELL_GUARD_FAILED",
+            success=False,
+            accepted=False,
+            resolution="rejected",
         )
-        _write_json(build_guard_path, corrupted_build_guard)
-        corrupted_build_payload = copy.deepcopy(payload)
-        corrupted_build_payload["artifact_index"]["build_test_guard"]["bytes"] = (
-            build_guard_path.stat().st_size
+        formal_reject, _ = run_case(
+            "formal-nonaccept",
+            _trace(
+                formal_reject_state,
+                {"status": "SMELL_GUARD_FAILED", "loop": formal_reject_loop},
+            ),
+            _pass_payload(),
         )
-        corrupted_build_attempt = R._compact_verify_attempt(
-            corrupted_build_payload, verify_source="agent", verify_returncode=0
-        )
-        try:
-            assert_fallback(
-                "FRESH_ISOLATION_INCOMPLETE",
-                changed_trace={**trace, "last_payload": corrupted_build_payload},
-                changed_history=[corrupted_build_attempt],
-            )
-        finally:
-            build_guard_path.write_text(original_build_guard, encoding="utf-8")
+        assert formal_reject["accepted"] is False, formal_reject
 
-        guard_evidence_path = Path(payload["artifacts"]["guard_evidence"])
-        original_guard_evidence = guard_evidence_path.read_text(encoding="utf-8")
+        stale_state = _state(
+            generation=2,
+            decision="stop",
+            instruction="",
+            termination_reason="PASS",
+            stage="formal_verify",
+            status="PASS",
+            success=True,
+            accepted=True,
+            resolution="resolved",
+            formal_receipt=formal_payload["formal_verification_receipt"],
+        )
+        stale_loop = {**formal_loop, "generation": 2}
+        stale, stale_audit = run_case(
+            "stale-generation",
+            _trace(stale_state, {**formal_payload, "loop": stale_loop}),
+            _pass_payload(),
+        )
+        assert stale["accepted"] is False, stale
+        assert (
+            stale_audit["terminal_evidence"]["reason"]
+            == "TERMINAL_CONTROL_TRANSITION_UNCONFIRMED"
+        ), stale_audit
 
-        changed_test_evidence = json.loads(original_guard_evidence)
-        changed_test_evidence["test_changes"].update(
-            {"status": "TEST_SOURCE_CHANGE_ALLOWED", "changed_count": 1}
+        contradictory_payload = {**formal_payload, "loop": {**formal_loop, "termination_reason": "OTHER"}}
+        contradiction, contradiction_audit = run_case(
+            "terminal-payload-state-mismatch",
+            _trace(formal_state, contradictory_payload),
+            _pass_payload(),
         )
-        _write_json(guard_evidence_path, changed_test_evidence)
-        changed_test_evidence_payload = copy.deepcopy(payload)
-        changed_test_evidence_payload["artifact_index"]["guard_evidence"]["bytes"] = (
-            guard_evidence_path.stat().st_size
-        )
-        changed_test_evidence_attempt = R._compact_verify_attempt(
-            changed_test_evidence_payload, verify_source="agent", verify_returncode=0
-        )
-        try:
-            assert_fallback(
-                "FRESH_ISOLATION_INCOMPLETE",
-                changed_trace={**trace, "last_payload": changed_test_evidence_payload},
-                changed_history=[changed_test_evidence_attempt],
-            )
-        finally:
-            guard_evidence_path.write_text(original_guard_evidence, encoding="utf-8")
+        assert contradiction["accepted"] is False, contradiction
+        assert (
+            contradiction_audit["terminal_evidence"]["reason"]
+            == "TERMINAL_PAYLOAD_STATE_MISMATCH"
+        ), contradiction_audit
 
-        corrupted_guard_evidence = json.loads(original_guard_evidence)
-        corrupted_guard_evidence.update(
-            {"success": False, "accepted": False, "status": "SMELL_GUARD_FAILED"}
+        aborted, aborted_audit = run_case(
+            "runtime-abort",
+            formal_trace,
+            _pass_payload(),
+            opencode_returncode=124,
         )
-        _write_json(guard_evidence_path, corrupted_guard_evidence)
-        corrupted_evidence_payload = copy.deepcopy(payload)
-        corrupted_evidence_payload["artifact_index"]["guard_evidence"]["bytes"] = (
-            guard_evidence_path.stat().st_size
-        )
-        corrupted_evidence_attempt = R._compact_verify_attempt(
-            corrupted_evidence_payload, verify_source="agent", verify_returncode=0
-        )
-        try:
-            assert_fallback(
-                "FRESH_ISOLATION_INCOMPLETE",
-                changed_trace={**trace, "last_payload": corrupted_evidence_payload},
-                changed_history=[corrupted_evidence_attempt],
-            )
-        finally:
-            guard_evidence_path.write_text(original_guard_evidence, encoding="utf-8")
+        assert aborted["accepted"] is False, aborted
+        assert aborted_audit["terminal_evidence"]["reason"] == "OPENCODE_NONZERO", aborted_audit
 
-        contradiction = copy.deepcopy(history[0])
-        contradiction.update({
-            "status": "TEST_FAILED",
-            "reported_status": "TEST_FAILED",
-            "accepted": False,
+        fresh_failure = {
+            "schema_version": "smell.verify.decision/v1",
             "success": False,
-            "failure_category": "TEST_BEHAVIOR_REGRESSION",
-        })
-        assert_fallback(
-            "SAME_DIFF_CONTRADICTION",
-            changed_history=[contradiction, history[0]],
+            "accepted": False,
+            "status": "SMELL_GUARD_FAILED",
+            "resolution": "unresolved",
+        }
+        rejected, rejected_audit = run_case(
+            "fresh-downgrade",
+            formal_trace,
+            fresh_failure,
+            fresh_returncode=1,
         )
-
-        source = sample.project_root / "sample.c"
-        original = source.read_text(encoding="utf-8")
-        source.write_text(original + "int later(void) { return 2; }\n", encoding="utf-8")
-        try:
-            assert_fallback("CURRENT_DIFF_MISMATCH")
-        finally:
-            source.write_text(original, encoding="utf-8")
+        assert rejected["status"] == "SMELL_GUARD_FAILED" and rejected["accepted"] is False, rejected
+        assert rejected_audit["reason"] == "FRESH_VERIFY_REJECTED", rejected_audit
 
     print(
-        "runner final receipt self-check passed: exact agent project_full reused; "
-        "deadline, post-verify tools, rc, test edits, missing evidence, isolation, "
-        "contradictions, and diff drift fall back"
+        "runner final receipt self-check passed: a complete typed formal project_full receipt is reused; "
+        "otherwise fresh verification only confirms or downgrades and invalid terminal/runtime states reject promotion"
     )
     return 0
 

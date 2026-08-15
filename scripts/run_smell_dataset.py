@@ -29,6 +29,10 @@ from smell_core.loop_policy import (  # noqa: E402
     LoopPolicy,
     parse_command_policy,
     resolve_command_payload,
+    validate_transferable_command_loop_state,
+)
+from smell_core.verification_receipt import (  # noqa: E402
+    validate_formal_verification_decision,
 )
 from smell_core.location import split_location_descriptors  # noqa: E402
 from smell_core.feature_envy_target_contract import (  # noqa: E402
@@ -50,7 +54,6 @@ from bridge.smell_bridge import (  # noqa: E402
     _snapshot_project as _capture_candidate_snapshot,
     _summarize_command_result as _summarize_receipt_command_result,
 )
-
 
 OPENCODE_BATCH_API_KEY_ENV = "SMELL_OPENCODE_API_KEY"
 ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
@@ -78,6 +81,9 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
 
 FINAL_VERIFICATION_MODES = {"sample_optimized", "project_full"}
 RUNNER_FINAL_RECEIPT_SCHEMA = "smell.runner-final-receipt/v1"
+PROCESS_TERM_TIMEOUT_SECONDS = 2.0
+PROCESS_KILL_TIMEOUT_SECONDS = 2.0
+PROCESS_DRAIN_TIMEOUT_SECONDS = 2.0
 
 @dataclass(frozen=True)
 class Sample:
@@ -136,14 +142,16 @@ def _run(
     try:
         captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        _terminate_process_tree(proc)
-        final_stdout, final_stderr = proc.communicate()
-        raise subprocess.TimeoutExpired(
+        shutdown = _terminate_process_tree(proc)
+        final_stdout, final_stderr, drain = _bounded_process_communicate(proc)
+        timeout_error = subprocess.TimeoutExpired(
             exc.cmd,
             exc.timeout,
             output=final_stdout if final_stdout is not None else exc.stdout,
             stderr=final_stderr if final_stderr is not None else exc.stderr,
-        ) from exc
+        )
+        timeout_error.shutdown = {**shutdown, **drain}  # type: ignore[attr-defined]
+        raise timeout_error from exc
     return subprocess.CompletedProcess(
         args,
         proc.returncode,
@@ -212,35 +220,104 @@ def _process_tree_has_descendants(root_pid: int) -> bool:
     return bool(descendants)
 
 
-def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
-    """Terminate the OpenCode/bridge tree, including nested build groups."""
-    if os.name != "posix":  # pragma: no cover - delivery/runtime is POSIX
-        if proc.poll() is None:
-            proc.terminate()
+def _terminate_process_tree(
+    proc: subprocess.Popen[str],
+    *,
+    term_timeout: float = PROCESS_TERM_TIMEOUT_SECONDS,
+    kill_timeout: float = PROCESS_KILL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Bounded TERM/KILL closure for one runner-owned process tree."""
+    started = time.monotonic()
+    groups = _process_tree_groups(proc.pid) if os.name == "posix" else []
+
+    term_started = time.monotonic()
+    if os.name == "posix":  # pragma: no branch - delivery/runtime is POSIX
+        for group_id in groups:
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        return
-    groups = _process_tree_groups(proc.pid)
-    for group_id in groups:
+                os.killpg(group_id, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    elif proc.poll() is None:  # pragma: no cover - delivery/runtime is POSIX
+        proc.terminate()
+    term_signal_ms = round((time.monotonic() - term_started) * 1000, 3)
+
+    term_wait_started = time.monotonic()
+    term_reaped = proc.poll() is not None
+    if not term_reaped:
         try:
-            os.killpg(group_id, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        pass
-    for group_id in groups:
-        try:
-            os.killpg(group_id, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+            proc.wait(timeout=max(0.0, term_timeout))
+            term_reaped = True
+        except subprocess.TimeoutExpired:
+            term_reaped = False
+    term_wait_ms = round((time.monotonic() - term_wait_started) * 1000, 3)
+
+    kill_started = time.monotonic()
+    if os.name == "posix":  # pragma: no branch - delivery/runtime is POSIX
+        # The root may have exited while a nested build group remains alive.
+        for group_id in groups:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
     if proc.poll() is None:
-        proc.kill()
-    proc.wait()
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    kill_signal_ms = round((time.monotonic() - kill_started) * 1000, 3)
+
+    kill_wait_started = time.monotonic()
+    process_reaped = proc.poll() is not None
+    if not process_reaped:
+        try:
+            proc.wait(timeout=max(0.0, kill_timeout))
+            process_reaped = True
+        except subprocess.TimeoutExpired:
+            process_reaped = False
+    kill_wait_ms = round((time.monotonic() - kill_wait_started) * 1000, 3)
+    return {
+        "schema_version": 1,
+        "bounded": True,
+        "term_timeout_seconds": term_timeout,
+        "kill_timeout_seconds": kill_timeout,
+        "term_signal_ms": term_signal_ms,
+        "term_wait_ms": term_wait_ms,
+        "term_reaped": term_reaped,
+        "kill_signal_ms": kill_signal_ms,
+        "kill_wait_ms": kill_wait_ms,
+        "process_reaped": process_reaped,
+        "total_ms": round((time.monotonic() - started) * 1000, 3),
+    }
+
+
+def _bounded_process_communicate(
+    proc: subprocess.Popen[str],
+    *,
+    timeout: float = PROCESS_DRAIN_TIMEOUT_SECONDS,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Drain a terminated child's pipes without creating an unbounded tail."""
+    started = time.monotonic()
+    completed = False
+    captured_stdout: Any = None
+    captured_stderr: Any = None
+    try:
+        captured_stdout, captured_stderr = proc.communicate(timeout=max(0.0, timeout))
+        completed = True
+    except subprocess.TimeoutExpired as exc:
+        captured_stdout = exc.stdout
+        captured_stderr = exc.stderr
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+    return captured_stdout, captured_stderr, {
+        "communicate_timeout_seconds": timeout,
+        "communicate_completed": completed,
+        "communicate_ms": round((time.monotonic() - started) * 1000, 3),
+    }
 
 
 def _git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -264,40 +341,6 @@ def _sanitize_idea_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
         sanitized["server"] = sanitized_server
     sanitized.pop("token", None)
     return sanitized
-
-
-def _prepare_idea_service(project_root: Path, sample_dir: Path) -> dict[str, Any]:
-    precheck_timeout = max(30, min(600, int(os.environ.get("SMELL_IDEA_PRECHECK_TIMEOUT", "300"))))
-    proc = _run(
-        [
-            _idea_refactor_cli(),
-            "ensure-service",
-            "--project-root",
-            str(project_root),
-            "--open",
-            "--timeout",
-            str(precheck_timeout),
-            "--poll-interval",
-            "1",
-        ],
-        project_root,
-        timeout=precheck_timeout + 60,
-    )
-    try:
-        decoded = json.loads(proc.stdout)
-        payload = decoded if isinstance(decoded, dict) else {"status": "failed"}
-    except json.JSONDecodeError:
-        payload = {
-            "status": "failed",
-            "diagnostics": [{"code": "IDEA_PRECHECK_INVALID_JSON", "summary": proc.stderr or proc.stdout}],
-        }
-    payload = _sanitize_idea_service_payload(payload)
-    payload["returncode"] = proc.returncode
-    payload["stderr"] = proc.stderr
-    (sample_dir / "idea-preflight.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
-    )
-    return payload
 
 
 def _close_idea_project(project_root: Path, sample_dir: Path) -> None:
@@ -1734,6 +1777,7 @@ def _task_prompt(sample: Sample) -> str:
 def _command_arguments(task: str, args: argparse.Namespace, verification_mode: str) -> str:
     options = [
         f"--verification-mode={verification_mode}",
+        f"--refactoring-backend={getattr(args, 'refactoring_backend', 'direct')}",
         f"--loop-mode={args.loop_mode}",
         f"--loop-max={args.loop_max}",
         f"--loop-no-progress-limit={args.loop_no_progress_limit}",
@@ -1755,7 +1799,7 @@ def _initial_command_loop_state(
     *,
     started_at_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Freeze trusted v4 state before the first OpenCode process starts.
+    """Freeze trusted v6 state before the first OpenCode process starts.
 
     A verify-required reminder runs in a new OpenCode process.  The first
     model turn may have made no ``smell_verify`` call, so there may be no tool
@@ -2253,15 +2297,29 @@ def _receipt_build_test_complete(payload: dict[str, Any], sample: Sample) -> boo
         return False
     isolation = guard.get("verification_isolation")
     snapshot = payload.get("snapshot")
+    isolation_contract = (
+        isolation.get("contract_version"),
+        isolation.get("mode"),
+    ) if isinstance(isolation, dict) else (None, None)
     if not (
         isinstance(isolation, dict)
         and isinstance(snapshot, dict)
-        and isolation.get("contract_version") == "project-full-fresh-worktree/v1"
-        and isolation.get("mode") == "detached_git_worktree"
+        and isolation_contract
+        in {
+            ("project-full-fresh-worktree/v1", "detached_git_worktree"),
+            (
+                "project-full-direct-output-cleanup/v1",
+                "runner_checkout_with_output_cleanup",
+            ),
+        }
         and isolation.get("success") is True
         and isolation.get("stage") == "completed"
         and isolation.get("cleanup_success") is True
-        and isolation.get("base_commit") == snapshot.get("base_commit")
+        and (
+            isolation_contract
+            != ("project-full-fresh-worktree/v1", "detached_git_worktree")
+            or isolation.get("base_commit") == snapshot.get("base_commit")
+        )
     ):
         return False
     full_guard = _read_receipt_json(payload, "build_test_guard")
@@ -2280,8 +2338,12 @@ def _receipt_build_test_complete(payload: dict[str, Any], sample: Sample) -> boo
         and full_isolation.get("mode") == isolation.get("mode")
         and full_isolation.get("success") is True
         and full_isolation.get("stage") == isolation.get("stage")
-        and full_isolation.get("base_commit") == isolation.get("base_commit")
         and full_isolation.get("cleanup_success") is True
+        and (
+            isolation_contract
+            != ("project-full-fresh-worktree/v1", "detached_git_worktree")
+            or full_isolation.get("base_commit") == isolation.get("base_commit")
+        )
     ):
         return False
     full_focused = full_guard.get("focused_preflight")
@@ -2383,6 +2445,8 @@ def _receipt_tests_unchanged(payload: dict[str, Any]) -> bool:
 def _receipt_matches_current_candidate(
     sample: Sample,
     payload: dict[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
 ) -> bool:
     snapshot_summary = payload.get("snapshot")
     snapshot = _read_receipt_json(payload, "snapshot")
@@ -2439,8 +2503,9 @@ def _receipt_matches_current_candidate(
             sample.project_root,
             declared_test_paths=declared_test_paths,
             base_commit=base_commit,
+            deadline_monotonic=deadline_monotonic,
         )
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, subprocess.TimeoutExpired):
         return False
     current_audit = current.get("change_audit")
     current_diff = current.get("diff")
@@ -2465,6 +2530,9 @@ def _agent_project_full_receipt(
     opencode_returncode: int,
     last_trace: dict[str, Any],
     agent_verification_history: list[dict[str, Any]],
+    terminal_authorization: dict[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     def reject(reason: str, digest: str = "") -> tuple[None, dict[str, Any]]:
         return None, _runner_final_receipt_audit(reason, agent_diff_sha256=digest)
@@ -2473,22 +2541,15 @@ def _agent_project_full_receipt(
         return reject("NOT_PROJECT_FULL")
     if opencode_returncode != 0:
         return reject("OPENCODE_NONZERO")
-    read_only_tools = {"glob", "grep", "read", "todowrite"}
-    completed_after = last_trace.get("completed_tools_after_last_verify")
-    attempted_after = last_trace.get("attempted_tools_after_last_verify")
+    if terminal_authorization.get("authorized") is not True:
+        return reject(
+            str(terminal_authorization.get("reason") or "FORMAL_PASS_TERMINAL_MISSING")
+        )
     completed_count = int(last_trace.get("tools_after_last_verify") or 0)
     attempted_count = int(last_trace.get("tool_attempts_after_last_verify") or 0)
-    if completed_count and (
-        not isinstance(completed_after, list)
-        or len(completed_after) != completed_count
-        or any(str(tool) not in read_only_tools for tool in completed_after)
-    ):
+    if completed_count:
         return reject("TOOLS_AFTER_LAST_VERIFY")
-    if attempted_count and (
-        not isinstance(attempted_after, list)
-        or len(attempted_after) != attempted_count
-        or any(str(tool) not in read_only_tools for tool in attempted_after)
-    ):
+    if attempted_count:
         return reject("TOOL_ATTEMPT_AFTER_LAST_VERIFY")
     if (
         last_trace.get("last_output_parsed") is not True
@@ -2548,8 +2609,17 @@ def _agent_project_full_receipt(
         if isinstance(attempt, dict)
     ):
         return reject("SAME_DIFF_CONTRADICTION", digest)
-    if not _receipt_matches_current_candidate(sample, payload):
+    if not _receipt_matches_current_candidate(
+        sample,
+        payload,
+        deadline_monotonic=deadline_monotonic,
+    ):
         return reject("CURRENT_DIFF_MISMATCH", digest)
+    if validate_formal_verification_decision(
+        payload,
+        require_project_full_pass=True,
+    ) is None:
+        return reject("AGENT_FORMAL_PASS_REQUIRED", digest)
     return payload, _runner_final_receipt_audit(
         "REUSED",
         reused=True,
@@ -2569,30 +2639,43 @@ def _runner_final_verify(
     last_trace: dict[str, Any],
     agent_verification_history: list[dict[str, Any]],
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
-    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-        receipt_payload = None
-        receipt_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
+    authorization = _runner_terminal_authorization(last_trace, opencode_returncode)
+    receipt_payload: dict[str, Any] | None = None
+    if getattr(args, "refactoring_backend", "direct") == "idea":
+        reuse_audit = _runner_final_receipt_audit("IDEA_REQUIRES_FRESH_VERIFY")
+    elif deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        reuse_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
     else:
-        receipt_payload, receipt_audit = _agent_project_full_receipt(
+        receipt_payload, reuse_audit = _agent_project_full_receipt(
             sample,
             sample_dir,
             verification_mode,
             opencode_returncode,
             last_trace,
             agent_verification_history,
+            authorization,
+            deadline_monotonic=deadline_monotonic,
         )
         if (
-            receipt_payload is not None
-            and deadline_monotonic is not None
+            deadline_monotonic is not None
             and time.monotonic() >= deadline_monotonic
         ):
             receipt_payload = None
-            receipt_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
+            reuse_audit = _runner_final_receipt_audit("SAMPLE_DEADLINE_REACHED")
     if receipt_payload is not None:
+        receipt_audit = {
+            **reuse_audit,
+            "source": "agent_smell_verify",
+            "promotion_authorized": True,
+            "raw_observation": _runner_observation_summary(0, receipt_payload),
+            "terminal_evidence": authorization,
+            "canonical_status": "PASS",
+            "canonical_accepted": True,
+        }
         _persist_verify_payload(sample_dir, receipt_payload)
         _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
         return 0, receipt_payload, receipt_audit
-    verify_returncode, verify_payload = _run_verify(
+    verify_returncode, raw_verify_payload = _run_verify(
         sample,
         sample_dir,
         args,
@@ -2600,6 +2683,27 @@ def _runner_final_verify(
         baseline_seal=baseline_seal,
         deadline_monotonic=deadline_monotonic,
     )
+    (sample_dir / "verify.runner-observation.json").write_text(
+        json.dumps(raw_verify_payload, indent=2, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    verify_payload, confirmation = _apply_runner_confirmation(
+        verify_returncode,
+        raw_verify_payload,
+        authorization,
+        require_project_full_pass=verification_mode == "project_full",
+    )
+    receipt_audit = {
+        **_runner_final_receipt_audit(str(confirmation["reason"])),
+        "source": "fresh_runner_verify",
+        "promotion_authorized": confirmation["promotion_authorized"],
+        "raw_observation": confirmation["raw_observation"],
+        "terminal_evidence": confirmation["terminal_evidence"],
+        "canonical_status": str(verify_payload.get("status") or ""),
+        "canonical_accepted": verify_payload.get("accepted") is True,
+        "reuse_rejected_reason": str(reuse_audit.get("reason") or ""),
+    }
+    _persist_verify_payload(sample_dir, verify_payload)
     _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
     return verify_returncode, verify_payload, receipt_audit
 
@@ -2647,8 +2751,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     last_decision = ""
     last_termination_reason = ""
     last_status = ""
-    last_cap_recovery_used = False
     last_command_loop_state: dict[str, Any] | None = None
+    control_events: list[dict[str, Any]] = []
     tool_sequence: list[str] = []
     attempted_tool_sequence: list[str] = []
     direct_idea_cli_calls = 0
@@ -2687,6 +2791,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             last_decision = ""
             last_termination_reason = ""
             last_status = ""
+            last_command_loop_state = None
         if state.get("status") != "completed":
             continue
         if tool_name:
@@ -2705,6 +2810,7 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         last_payload = None
         metadata = state.get("metadata")
         verify_returncode = 0
+        event_command_loop_state: dict[str, Any] | None = None
         if isinstance(metadata, dict):
             metadata_exit_code = metadata.get("exitCode")
             if isinstance(metadata_exit_code, int):
@@ -2715,10 +2821,10 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
                 last_termination_reason = str(
                     meta_loop.get("termination_reason") or ""
                 )
-                last_cap_recovery_used = meta_loop.get("cap_recovery_used") is True
             command_loop_state = metadata.get("command_loop_state")
             if isinstance(command_loop_state, dict):
                 last_command_loop_state = command_loop_state
+                event_command_loop_state = command_loop_state
             auto = metadata.get("auto_continuation")
             if isinstance(auto, dict):
                 last_status = str(auto.get("status") or "")
@@ -2731,6 +2837,12 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             last_payload = payload
+            control_events.append(
+                {
+                    "command_loop_state": event_command_loop_state,
+                    "loop": payload.get("loop"),
+                }
+            )
             verification_history.append(
                 {
                     "verification_call": calls - 1,
@@ -2747,20 +2859,8 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
     if not last_decision and isinstance(loop, dict):
         last_decision = str(loop.get("decision") or "")
         last_termination_reason = str(loop.get("termination_reason") or "")
-        last_cap_recovery_used = loop.get("cap_recovery_used") is True
     if not last_status and isinstance(last_payload, dict):
         last_status = str(last_payload.get("status") or "")
-    last_guard_progress_required = bool(
-        isinstance(last_payload, dict)
-        and last_payload.get("schema_version") == "smell.guard-progress/v1"
-        and last_payload.get("success") is False
-        and last_payload.get("status") == "GUARD_PROGRESS_REQUIRED"
-        and last_payload.get("applicable") is True
-        and last_payload.get("checkpoint_required") is True
-        and last_payload.get("source_guard_passed") is False
-        and last_payload.get("ready_for_project_full") is False
-        and last_payload.get("project_full_executed") is False
-    )
     return {
         "smell_verify_calls": calls,
         "verification_history": verification_history,
@@ -2772,13 +2872,12 @@ def _verification_trace(events_text: str) -> dict[str, Any]:
         "last_loop_decision": last_decision,
         "last_loop_termination_reason": last_termination_reason,
         "last_status": last_status,
-        "last_guard_progress_required": last_guard_progress_required,
         "last_failure_category": _failure_category_from_verify_payload(last_payload or {}),
         "last_native_diagnostics": _native_failure_diagnostics(last_payload or {}),
         "last_output_parsed": last_payload is not None,
         "last_payload": last_payload,
-        "last_cap_recovery_used": last_cap_recovery_used,
         "command_loop_state": last_command_loop_state,
+        "control_events": control_events,
         "tool_sequence": tool_sequence,
         "attempted_tool_sequence": attempted_tool_sequence,
         "idea_refactor_preview_calls": tool_sequence.count("idea_refactor_preview"),
@@ -2841,71 +2940,343 @@ def _idea_protocol_contract(controller_attempts: list[dict[str, Any]]) -> dict[s
     }
 
 
+def _typed_command_control(state: Any) -> dict[str, Any] | None:
+    """Read the v6 transport projection without interpreting smell policy."""
+    validated = validate_transferable_command_loop_state(state)
+    if validated is None:
+        return None
+    control = validated.get("control")
+    if not isinstance(control, dict):
+        return None
+    generation = control.get("generation")
+    decision = control.get("decision")
+    instruction = control.get("instruction")
+    termination_reason = control.get("termination_reason")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+        or decision not in {"verify_required", "continue", "stop"}
+        or not isinstance(instruction, str)
+        or not isinstance(termination_reason, str)
+        or (decision == "verify_required" and (
+            generation != 0
+            or instruction != "Call smell_verify now using the frozen command identity."
+            or termination_reason
+        ))
+        or (decision == "continue" and (not instruction or termination_reason))
+        or (decision == "stop" and (instruction or not termination_reason))
+    ):
+        return None
+    return {
+        "generation": generation,
+        "decision": decision,
+        "instruction": instruction,
+        "termination_reason": termination_reason,
+    }
+
+
+def _runner_transport_plan(
+    trace: dict[str, Any],
+    *,
+    previous_state: dict[str, Any] | None,
+    transported_generations: set[int],
+) -> dict[str, Any]:
+    """Validate one plugin-owned control transition and return transport only."""
+    stopped = {
+        "action": "stop",
+        "generation": None,
+        "instruction": "",
+        "state": None,
+        "reason": "CONTROL_EVIDENCE_INVALID",
+    }
+    previous = _typed_command_control(previous_state)
+    if previous is None:
+        return stopped
+    verify_calls = int(trace.get("smell_verify_calls") or 0)
+    if verify_calls == 0:
+        if previous["decision"] != "verify_required":
+            return {**stopped, "reason": "VERIFY_REQUIRED_CONTROL_MISSING"}
+        generation = int(previous["generation"])
+        if generation in transported_generations:
+            return {**stopped, "reason": "CONTROL_GENERATION_ALREADY_TRANSPORTED"}
+        return {
+            "action": "verify_required",
+            "generation": generation,
+            "instruction": previous["instruction"],
+            "state": previous_state,
+            "reason": "",
+        }
+
+    raw_control_events = trace.get("control_events")
+    if "control_events" in trace:
+        if not isinstance(raw_control_events, list) or len(raw_control_events) != verify_calls:
+            return {**stopped, "reason": "CONTROL_EVENT_CHAIN_INCOMPLETE"}
+        control_events = raw_control_events
+    else:
+        payload = trace.get("last_payload")
+        control_events = [
+            {
+                "command_loop_state": trace.get("command_loop_state"),
+                "loop": payload.get("loop") if isinstance(payload, dict) else None,
+            }
+        ]
+    current = previous
+    state: dict[str, Any] | None = None
+    for event in control_events:
+        if not isinstance(event, dict):
+            return stopped
+        event_state = event.get("command_loop_state")
+        event_control = _typed_command_control(event_state)
+        loop = event.get("loop")
+        if event_control is None or not isinstance(loop, dict):
+            return stopped
+        if event_control["decision"] not in {"continue", "stop"}:
+            return {**stopped, "reason": "COMPLETED_VERIFY_CONTROL_INVALID"}
+        if event_control["generation"] != current["generation"] + 1:
+            return {**stopped, "reason": "CONTROL_GENERATION_INVALID"}
+        for key in ("generation", "decision", "instruction", "termination_reason"):
+            if loop.get(key) != event_control[key]:
+                return {**stopped, "reason": "CONTROL_PAYLOAD_STATE_MISMATCH"}
+        current = event_control
+        state = event_state
+    if state != trace.get("command_loop_state"):
+        return {**stopped, "reason": "CONTROL_FINAL_STATE_MISMATCH"}
+    generation = int(current["generation"])
+    if current["decision"] == "continue" and generation in transported_generations:
+        return {**stopped, "reason": "CONTROL_GENERATION_ALREADY_TRANSPORTED"}
+    return {
+        "action": current["decision"],
+        "generation": generation,
+        "instruction": current["instruction"],
+        "state": state,
+        "reason": "",
+    }
+
+
 def _runner_closure_action(
     trace: dict[str, Any],
     *,
-    reminder_used: bool,
-    continuations_dispatched: int,
-    max_continuations: int,
+    previous_state: dict[str, Any] | None,
+    transported_generations: set[int],
 ) -> str:
-    """Return the next synchronous runner action for a completed OpenCode turn."""
-    if int(trace.get("smell_verify_calls") or 0) == 0:
-        return "stop" if reminder_used else "verify_required"
-    # Cheap Guard progress is a controller-owned editing phase, not a formal
-    # verification failure. Resume the same OpenCode session without spending
-    # the plugin continuation budget, unless the command-owned no-progress or
-    # deadline decision has already stopped that editing phase.
-    if trace.get("last_guard_progress_required") is True:
-        if trace.get("last_loop_decision") == "stop":
-            return "stop"
-        return "guard_progress"
-    # The plugin owns all semantic continuation policy across UI and batch.
-    # This is only a transport safety bound. The extra transport is available
-    # only when the plugin explicitly persisted that its one cap recovery was
-    # consumed; a bare `continue` must never manufacture an extra retry.
-    transport_limit = max_continuations + (
-        1 if trace.get("last_cap_recovery_used") is True else 0
+    return str(
+        _runner_transport_plan(
+            trace,
+            previous_state=previous_state,
+            transported_generations=transported_generations,
+        )["action"]
     )
+
+
+def _runner_continuation_prompt(plan: dict[str, Any]) -> str:
+    """Transport the plugin instruction verbatim; the runner adds no policy."""
+    instruction = plan.get("instruction")
+    return instruction if isinstance(instruction, str) else ""
+
+
+def _runner_terminal_authorization(
+    trace: dict[str, Any],
+    opencode_returncode: int,
+) -> dict[str, Any]:
+    """Authorize only confirmation of one typed plugin formal PASS terminal."""
+    evidence: dict[str, Any] = {
+        "authorized": False,
+        "reason": "FORMAL_PASS_TERMINAL_MISSING",
+        "control": None,
+        "terminal_receipt": None,
+    }
+    if opencode_returncode != 0:
+        return {**evidence, "reason": "OPENCODE_NONZERO"}
+    if int(trace.get("smell_verify_calls") or 0) <= 0:
+        return {**evidence, "reason": "ZERO_VERIFY"}
+    state = trace.get("command_loop_state")
+    control = _typed_command_control(state)
+    payload = trace.get("last_payload")
+    loop = payload.get("loop") if isinstance(payload, dict) else None
+    formal_decision = validate_formal_verification_decision(payload)
     if (
-        trace.get("last_loop_decision") == "continue"
-        and continuations_dispatched < transport_limit
+        control is None
+        or control["decision"] != "stop"
+        or not isinstance(loop, dict)
+        or formal_decision is None
     ):
-        return "continue"
-    return "stop"
-
-
-def _runner_continuation_prompt(
-    action: str,
-    continuation: int,
-    max_continuations: int,
-) -> str:
-    # Policy and failure details already live in the stable controller context
-    # and latest smell_verify result. This message only resumes transport.
-    if action == "verify_required":
-        return "\n".join(
-            [
-                "[runner-resume verify-required]",
-                "Resume the existing task in this session and call smell_verify now.",
-                "The controller policy is unchanged; use the current source state.",
-            ]
-        )
-    if action == "guard_progress":
-        return "\n".join(
-            [
-                "[runner-resume guard-progress]",
-                "Resume the existing task in this session from the current source state.",
-                "Read metric_budget and next_action from the latest smell_verify tool result.",
-                "Make only the needed narrow production edit, then call smell_verify again.",
-            ]
-        )
-    return "\n".join(
-        [
-            f"[runner-resume continue {continuation}/{max_continuations}]",
-            "Resume the existing task in this session.",
-            "Read the latest smell_verify tool result and follow its loop.instruction.",
-            "After one narrow corrective edit, call smell_verify again.",
-        ]
+        return {**evidence, "reason": "TERMINAL_CONTROL_INVALID"}
+    if any(
+        loop.get(key) != control[key]
+        for key in ("generation", "decision", "instruction", "termination_reason")
+    ):
+        return {**evidence, "reason": "TERMINAL_PAYLOAD_STATE_MISMATCH"}
+    control_plan = trace.get("runner_control_plan")
+    if not (
+        isinstance(control_plan, dict)
+        and control_plan.get("action") == "stop"
+        and control_plan.get("reason") == ""
+        and control_plan.get("generation") == control["generation"]
+        and control_plan.get("state") == state
+    ):
+        return {
+            **evidence,
+            "reason": "TERMINAL_CONTROL_TRANSITION_UNCONFIRMED",
+            "control": control,
+        }
+    receipt = state.get("terminal_receipt") if isinstance(state, dict) else None
+    receipt_loop = receipt.get("loop") if isinstance(receipt, dict) else None
+    if not isinstance(receipt, dict) or not isinstance(receipt_loop, dict):
+        return {**evidence, "reason": "TERMINAL_RECEIPT_INVALID", "control": control}
+    if any(
+        receipt_loop.get(key) != control[key]
+        for key in ("generation", "decision", "instruction", "termination_reason")
+    ):
+        return {**evidence, "reason": "TERMINAL_RECEIPT_CONTROL_MISMATCH", "control": control}
+    if receipt.get("formalVerificationReceipt") != formal_decision.get(
+        "formal_verification_receipt"
+    ):
+        return {
+            **evidence,
+            "reason": "TERMINAL_FORMAL_RECEIPT_MISMATCH",
+            "control": control,
+        }
+    typed_receipt = {
+        "stage": receipt.get("stage"),
+        "status": receipt.get("status"),
+        "success": receipt.get("success"),
+        "accepted": receipt.get("accepted"),
+        "resolution": receipt.get("resolution"),
+        "termination_reason": receipt.get("terminationReason"),
+        "failure_category": receipt.get("failureCategory"),
+        "failure_group": receipt.get("failureGroup"),
+        "loop": receipt_loop,
+    }
+    authorized = bool(
+        typed_receipt["stage"] == "formal_verify"
+        and typed_receipt["status"] == "PASS"
+        and typed_receipt["success"] is True
+        and typed_receipt["accepted"] is True
+        and typed_receipt["resolution"] == "resolved"
+        and typed_receipt["termination_reason"] == "PASS"
+        and control["termination_reason"] == "PASS"
     )
+    return {
+        "authorized": authorized,
+        "reason": "FORMAL_PASS_TERMINAL" if authorized else "FORMAL_PASS_TERMINAL_MISSING",
+        "control": control,
+        "terminal_receipt": typed_receipt,
+    }
+
+
+def _runner_observation_summary(
+    verify_returncode: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "verify_returncode": verify_returncode,
+        "schema_version": payload.get("schema_version"),
+        "status": payload.get("status"),
+        "success": payload.get("success") is True,
+        "accepted": payload.get("accepted") is True,
+        "resolution": payload.get("resolution"),
+        "termination_reason": payload.get("termination_reason"),
+    }
+
+
+def _apply_runner_confirmation(
+    verify_returncode: int,
+    payload: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    require_project_full_pass: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Confirm or downgrade plugin closure; never create acceptance."""
+    raw_observation = _runner_observation_summary(verify_returncode, payload)
+    raw_fresh_pass = _accepted_verify_pass(payload, verify_returncode)
+    formal_fresh_pass = bool(
+        raw_fresh_pass
+        and validate_formal_verification_decision(
+            payload,
+            require_project_full_pass=require_project_full_pass,
+        )
+    )
+    if formal_fresh_pass and authorization.get("authorized") is True:
+        return payload, {
+            "reason": "FORMAL_PASS_CONFIRMED",
+            "promotion_authorized": True,
+            "raw_observation": raw_observation,
+            "terminal_evidence": authorization,
+        }
+    if not raw_fresh_pass:
+        return payload, {
+            "reason": "FRESH_VERIFY_REJECTED",
+            "promotion_authorized": authorization.get("authorized") is True,
+            "raw_observation": raw_observation,
+            "terminal_evidence": authorization,
+        }
+    status = (
+        "FRESH_VERIFY_PROTOCOL_INVALID"
+        if not formal_fresh_pass
+        else "RUNNER_CONFIRMATION_NOT_AUTHORIZED"
+    )
+    canonical = {
+        **payload,
+        "schema_version": "smell.verify.decision/v1",
+        "success": False,
+        "accepted": False,
+        "status": status,
+        "resolution": "rejected",
+        "progress": False,
+        "termination_reason": status,
+        "failure_pack": {
+            "failure_category": status,
+            "failure_group": "controller",
+            "retryable": False,
+            "verify_status": status,
+            "highlights": [
+                (
+                    "Fresh verification returned PASS without one complete formal decision receipt."
+                    if status == "FRESH_VERIFY_PROTOCOL_INVALID"
+                    else "Fresh verification passed, but no typed formal PASS terminal authorized acceptance."
+                )
+            ],
+            "next_action": "",
+            "recommendations": [],
+        },
+    }
+    checkpoint = payload.get("checkpoint")
+    if isinstance(checkpoint, dict):
+        canonical["checkpoint"] = {
+            **checkpoint,
+            "accepted": False,
+            "resolution": "rejected",
+            "verify_status": status,
+        }
+    return canonical, {
+        "reason": (
+            "FRESH_VERIFY_PROTOCOL_INVALID"
+            if status == "FRESH_VERIFY_PROTOCOL_INVALID"
+            else "FRESH_PASS_NOT_AUTHORIZED"
+        ),
+        "promotion_authorized": False,
+        "raw_observation": raw_observation,
+        "terminal_evidence": authorization,
+    }
+
+
+def _termination_reasons(
+    verify_payload: dict[str, Any],
+    trace: dict[str, Any],
+    runtime_reason: str,
+) -> tuple[str, str, str]:
+    """Keep controller closure distinct from final verification diagnosis."""
+    loop_payload = verify_payload.get("loop")
+    verification_reason = (
+        str(loop_payload.get("termination_reason") or "")
+        if isinstance(loop_payload, dict)
+        else ""
+    ) or str(verify_payload.get("termination_reason") or "")
+    control_reason = str(runtime_reason or "") or str(
+        trace.get("last_loop_termination_reason") or ""
+    )
+    return control_reason, verification_reason, verification_reason or control_reason
 
 
 def _opencode_run_command(args: argparse.Namespace, agent: str, session_id: str = "") -> list[str]:
@@ -3022,21 +3393,22 @@ def _run_opencode(
     )
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
     refactoring_backend = getattr(args, "refactoring_backend", "direct")
-    env["SMELL_REFACTORING_BACKEND"] = refactoring_backend
     baseline_context_path = sample_dir / "baseline-capture.json"
     if baseline_context_path.is_file():
         env["SMELL_BASELINE_CONTEXT_FILE"] = str(baseline_context_path)
     else:
         env.pop("SMELL_BASELINE_CONTEXT_FILE", None)
     env["SMELL_CONTROLLER_CONTEXT_AUDIT_FILE"] = str(controller_system_path)
-    if refactoring_backend == "idea":
-        env["SMELL_ENABLE_IDEA_TOOLS"] = "1"
-        env["SMELL_IDEA_PREPARED"] = "1"
-        env["SMELL_IDEA_PROJECT_ROOT"] = str(sample.project_root)
-    else:
-        env.pop("SMELL_ENABLE_IDEA_TOOLS", None)
-        env.pop("SMELL_IDEA_PREPARED", None)
-        env.pop("SMELL_IDEA_PROJECT_ROOT", None)
+    # Backend authority is the frozen command policy transported through the
+    # same CLI surface used by an interactive command.  Do not add runner-only
+    # environment switches that a manual `opencode run` cannot reproduce.
+    for legacy_backend_env in (
+        "SMELL_REFACTORING_BACKEND",
+        "SMELL_ENABLE_IDEA_TOOLS",
+        "SMELL_IDEA_PREPARED",
+        "SMELL_IDEA_PROJECT_ROOT",
+    ):
+        env.pop(legacy_backend_env, None)
     if baseline_seal:
         env["SMELL_BASELINE_SEAL"] = baseline_seal
     else:
@@ -3125,20 +3497,27 @@ def _run_opencode(
         def _drain_stdout():
             nonlocal detected_sid, last_event_at
             assert proc.stdout is not None
-            for line in proc.stdout:
-                last_event_at = time.monotonic()
-                events_file.write(line)
-                events_file.flush()
-                if not detected_sid:
-                    sid = _parse_session_id_from_json_events(line)
-                    if sid:
-                        detected_sid = sid
+            try:
+                for line in proc.stdout:
+                    last_event_at = time.monotonic()
+                    events_file.write(line)
+                    events_file.flush()
+                    if not detected_sid:
+                        sid = _parse_session_id_from_json_events(line)
+                        if sid:
+                            detected_sid = sid
+            except (OSError, ValueError):
+                # The bounded shutdown path may close stdout to release this
+                # daemon reader after its drain allowance expires.
+                return
 
         reader = threading.Thread(target=_drain_stdout, daemon=True)
         reader.start()
         deadline = time.monotonic() + turn_timeout_seconds
         timeout_code = 0
         termination_reason = ""
+        shutdown: dict[str, Any] = {}
+        provider_failure = ""
         log_scan_offset = 0
         log_scan_tail = ""
         while proc.poll() is None:
@@ -3152,28 +3531,12 @@ def _run_opencode(
             provider_failure = _fatal_provider_error(log_scan_tail + log_chunk)
             log_scan_tail = (log_scan_tail + log_chunk)[-256:]
             if provider_failure:
-                _terminate_process_tree(proc)
+                shutdown = _terminate_process_tree(proc)
                 timeout_code = OPENCODE_FATAL_PROVIDER_RETURN_CODE
-                provider_failure_path = _attempt_artifact_path(
-                    sample_dir, "provider.failure.json", attempt_suffix
-                )
-                provider_failure_path.write_text(
-                    json.dumps(
-                        {
-                            "failure_category": "PROVIDER_QUOTA_FAILED",
-                            "provider_failure": provider_failure,
-                            "retryable": False,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
                 break
             now = time.monotonic()
             if now > deadline:
-                _terminate_process_tree(proc)
+                shutdown = _terminate_process_tree(proc)
                 timeout_code = 124
                 termination_reason = "SAMPLE_DEADLINE_REACHED"
                 break
@@ -3184,43 +3547,76 @@ def _run_opencode(
                     # work completes instead of charging tool time as silence.
                     last_event_at = now
                 else:
-                    _terminate_process_tree(proc)
+                    shutdown = _terminate_process_tree(proc)
                     timeout_code = 124
                     termination_reason = "MODEL_EVENT_INACTIVITY_TIMEOUT"
-                    termination_path = _attempt_artifact_path(
-                        sample_dir, "opencode-termination.json", attempt_suffix
-                    )
-                    termination_path.write_text(
-                        json.dumps(
-                            {
-                                "schema_version": 1,
-                                "status": "OPENCODE_TIMEOUT",
-                                "termination_reason": termination_reason,
-                                "model_event_inactivity_timeout_seconds": (
-                                    model_event_inactivity_timeout
-                                ),
-                            },
-                            indent=2,
-                            sort_keys=True,
-                        )
-                        + "\n",
-                        encoding="utf-8",
-                    )
                     break
             time.sleep(1)
-        reader.join(timeout=5)
+        drain_started = time.monotonic()
+        reader.join(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
+        if reader.is_alive() and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+            reader.join(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
+        stdout_drain_ms = round((time.monotonic() - drain_started) * 1000, 3)
+        log_drain_started = time.monotonic()
+        events_file.flush()
+        log.flush()
+        log_drain_ms = round((time.monotonic() - log_drain_started) * 1000, 3)
+        if shutdown:
+            shutdown.update(
+                {
+                    "stdout_drain_timeout_seconds": PROCESS_DRAIN_TIMEOUT_SECONDS,
+                    "stdout_drain_completed": not reader.is_alive(),
+                    "stdout_drain_ms": stdout_drain_ms,
+                    "log_drain_ms": log_drain_ms,
+                }
+            )
+        if provider_failure:
+            provider_failure_path = _attempt_artifact_path(
+                sample_dir, "provider.failure.json", attempt_suffix
+            )
+            provider_failure_path.write_text(
+                json.dumps(
+                    {
+                        "failure_category": "PROVIDER_QUOTA_FAILED",
+                        "provider_failure": provider_failure,
+                        "retryable": False,
+                        "shutdown": shutdown,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        if termination_reason:
+            termination_path = _attempt_artifact_path(
+                sample_dir, "opencode-termination.json", attempt_suffix
+            )
+            termination_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "OPENCODE_TIMEOUT",
+                        "termination_reason": termination_reason,
+                        "model_event_inactivity_timeout_seconds": (
+                            model_event_inactivity_timeout
+                        ),
+                        "shutdown": shutdown,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         rc = timeout_code if timeout_code else int(proc.returncode or 0)
         if not detected_sid:
             # Fallback: re-parse the full events file (thread may have set it
             # after the poll loop checked).
-            try:
-                detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
-            except OSError:
-                pass
-        # If still no sid and the reader thread is alive (proc was killed before
-        # EOF), drain it fully then re-parse to avoid losing the session id.
-        if not detected_sid and reader.is_alive():
-            reader.join(timeout=10)
             try:
                 detected_sid = _parse_session_id_from_json_events(events_path.read_text(encoding="utf-8"))
             except OSError:
@@ -3274,6 +3670,8 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         "accepted",
         "progress",
         "termination_reason",
+        "control_termination_reason",
+        "verification_termination_reason",
         "opencode_returncode",
         "opencode_timed_out",
         "opencode_failure_category",
@@ -3545,6 +3943,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "accepted": False,
                 "progress": False,
                 "termination_reason": "SAMPLE_DEADLINE_REACHED",
+                "control_termination_reason": "SAMPLE_DEADLINE_REACHED",
+                "verification_termination_reason": str(
+                    timeout_payload.get("termination_reason") or ""
+                ),
                 "opencode_returncode": 124,
                 "opencode_timed_out": True,
                 "opencode_failure_category": "OPENCODE_TIMEOUT",
@@ -3636,53 +4038,13 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             )
             return row
 
-    if getattr(args, "refactoring_backend", "direct") == "idea":
-        idea_preflight = _prepare_idea_service(execution_sample.project_root, sample_dir)
-        if idea_preflight.get("status") != "ok" or idea_preflight.get("returncode") != 0:
-            row = {
-                "sample_id": sample.sample_id,
-                "smell": sample.smell,
-                "project_name": sample.project_name,
-                "project_root": str(sample.project_root),
-                "execution_project_root": str(execution_sample.project_root),
-                "location": execution_sample.location,
-                "verification_mode": verification_mode,
-                "verification_command_source": sample.verification_command_source,
-                "refactoring_backend": "idea",
-                "agent": agent,
-                "status": "IDEA_PRECHECK_FAILED",
-                "opencode_returncode": -1,
-                "verify_returncode": -1,
-                "duration_seconds": f"{time.time() - started:.1f}",
-                "sample_dir": str(sample_dir),
-                "note": "IDEA service did not become ready for the execution worktree; see idea-preflight.json",
-            }
-            (sample_dir / "result.json").write_text(
-                json.dumps(
-                    {
-                        **row,
-                        "attempts": [],
-                        "controller_attempts": [],
-                        "revision_audit": revision_audit,
-                        "dataset_audit": dataset_audit,
-                        "baseline_capture": baseline_capture,
-                        "idea_preflight": idea_preflight,
-                    },
-                    indent=2,
-                    ensure_ascii=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            return row
-
     # Bootstrap .opencode once before starting the command-owned loop.
     _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
     # Batch `opencode run` exits as the session becomes idle, so a fire-and-forget
-    # plugin promptAsync cannot reliably create another turn. Keep the policy in
-    # one OpenCode session, but synchronously resume that session from the runner
-    # when the completed event stream proves verification closure is missing.
+    # plugin promptAsync cannot reliably create another turn. The plugin still
+    # owns every decision; the runner only transports each validated v6 control
+    # generation into the same OpenCode session once.
     controller_attempts: list[dict[str, Any]] = []
     agent_verification_history: list[dict[str, Any]] = []
     seen_agent_verification_ids: set[str] = set()
@@ -3695,8 +4057,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         started_at_ms=sample_deadline_started_at_ms,
     )
     continuations_dispatched = 0
-    reminders_dispatched = 0
-    reminder_used = False
+    transported_control_generations: set[int] = set()
     attempt_index = 0
     opencode_returncode = 0
     opencode_termination_reason = ""
@@ -3757,7 +4118,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         trace_summary = {
             key: value
             for key, value in trace.items()
-            if key not in {"last_payload", "verification_history"}
+            if key not in {"last_payload", "verification_history", "control_events"}
         }
         controller_attempts.append(
             {
@@ -3769,35 +4130,30 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 **trace_summary,
             }
         )
-        restored_state = trace.get("command_loop_state")
-        if isinstance(restored_state, dict):
-            command_loop_state = restored_state
         if opencode_returncode != 0 or not session_id:
             break
-        action = _runner_closure_action(
+        transport_plan = _runner_transport_plan(
             trace,
-            reminder_used=reminder_used,
-            continuations_dispatched=continuations_dispatched,
-            max_continuations=args.loop_max if args.loop_mode == "verify-failure" else 0,
+            previous_state=command_loop_state,
+            transported_generations=transported_control_generations,
         )
+        last_trace["runner_control_plan"] = transport_plan
+        controller_attempts[-1]["runner_control"] = {
+            key: transport_plan.get(key)
+            for key in ("action", "generation", "reason")
+        }
+        action = str(transport_plan["action"])
         if action == "stop":
             break
-        if action == "verify_required":
-            reminders_dispatched += 1
-            reminder_used = True
-        elif action == "continue":
-            continuations_dispatched += 1
-            reminder_used = False
-        else:
-            # guard_progress is an editing-phase transport resume. The plugin
-            # tracks its no-progress fingerprint, but it does not consume the
-            # formal verification continuation counter.
-            reminder_used = False
-        continuation_prompt = _runner_continuation_prompt(
-            action,
-            continuations_dispatched,
-            args.loop_max,
-        )
+        generation = transport_plan.get("generation")
+        if not isinstance(generation, int):
+            break
+        transported_control_generations.add(generation)
+        continuations_dispatched += 1
+        next_state = transport_plan.get("state")
+        if isinstance(next_state, dict):
+            command_loop_state = next_state
+        continuation_prompt = _runner_continuation_prompt(transport_plan)
         _append_synthetic_message_event(
             sample_dir,
             {
@@ -3809,7 +4165,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "from_attempt": attempt_index,
                 "to_attempt": attempt_index + 1,
                 "continuation": continuations_dispatched,
-                "details_source": "latest_smell_verify_tool_result",
+                "control_generation": generation,
+                "details_source": "command_loop_state.control",
             },
         )
         attempt_index += 1
@@ -3825,14 +4182,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         last_trace=last_trace,
         agent_verification_history=agent_verification_history,
     )
-    if (
-        last_trace.get("last_guard_progress_required") is True
-        and last_trace.get("last_loop_termination_reason")
-    ):
-        verify_payload["termination_reason"] = str(
-            last_trace["last_loop_termination_reason"]
-        )
-        _persist_verify_payload(sample_dir, verify_payload)
     if (
         opencode_returncode == 0
         and verify_returncode == 124
@@ -3875,23 +4224,20 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     )
     final_status = _compute_status(opencode_returncode, verify_returncode, verify_payload)
     idea_protocol = (
-        _idea_protocol_contract(controller_attempts)
+        {
+            **_idea_protocol_contract(controller_attempts),
+            "authority": "audit_only",
+        }
         if getattr(args, "refactoring_backend", "direct") == "idea"
         else None
     )
-    if (
-        not opencode_failure_category
-        and idea_protocol is not None
-        and idea_protocol["success"] is not True
-    ):
-        final_status = "IDEA_PROTOCOL_FAILED"
     final_verify_raw_status = final_status
     final_status, final_verify_audit = _reconcile_final_verify_status(
         final_verify_raw_status,
         verify_payload,
         agent_verification_history,
     )
-    if final_status == "IDEA_PROTOCOL_FAILED" and isinstance(idea_protocol, dict):
+    if isinstance(idea_protocol, dict):
         final_verify_audit["idea_protocol"] = idea_protocol
     raw_reconciled_verify_payload: dict[str, Any] | None = None
     if final_status in {
@@ -3906,14 +4252,32 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             final_verify_audit,
         )
         _persist_verify_payload(sample_dir, verify_payload)
-    resolution = str(verify_payload.get("resolution") or "")
     accepted = _is_accepted_status(final_status)
+    if (
+        str(verify_payload.get("status") or "") != final_status
+        or (verify_payload.get("accepted") is True) != accepted
+    ):
+        verify_payload = {
+            **verify_payload,
+            "status": final_status,
+            "accepted": accepted,
+            "success": accepted,
+            "resolution": "resolved" if accepted else "rejected",
+        }
+        _persist_verify_payload(sample_dir, verify_payload)
+    resolution = str(verify_payload.get("resolution") or "")
     progress = bool(verify_payload.get("progress")) or accepted
-    loop_payload = verify_payload.get("loop")
-    termination_reason = (
-        str(loop_payload.get("termination_reason") or "")
-        if isinstance(loop_payload, dict)
-        else str(verify_payload.get("termination_reason") or "")
+    runner_final_receipt["canonical_status"] = final_status
+    runner_final_receipt["canonical_accepted"] = accepted
+    _persist_runner_final_receipt_audit(sample_dir, runner_final_receipt)
+    (
+        control_termination_reason,
+        verification_termination_reason,
+        termination_reason,
+    ) = _termination_reasons(
+        verify_payload,
+        last_trace,
+        opencode_termination_reason,
     )
     build_test_guard = verify_payload.get("build_test_guard")
     verification_command_source = (
@@ -3957,8 +4321,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     attempts = _verification_attempt_history(agent_verification_history, last)
     note = (
         f"loop_policy={args.loop_mode}:{args.loop_max};"
-        f"runner_continuations={continuations_dispatched};"
-        f"verify_reminders={reminders_dispatched};"
+        f"runner_transports={continuations_dispatched};"
         f"opencode_timed_out={str(opencode_returncode == 124).lower()};"
         f"final_verify_source={final_verify_source};"
         f"final_verify_execution={final_verify_execution};"
@@ -3985,6 +4348,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "accepted": accepted,
         "progress": progress,
         "termination_reason": termination_reason,
+        "control_termination_reason": control_termination_reason,
+        "verification_termination_reason": verification_termination_reason,
         "opencode_returncode": last["opencode_returncode"],
         "opencode_timed_out": opencode_returncode == 124,
         "opencode_failure_category": opencode_failure_category,

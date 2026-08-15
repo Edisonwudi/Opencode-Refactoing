@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -40,7 +41,10 @@ from smell_core.checkpoints import (  # noqa: E402
 )
 from smell_core.checkpoint_adapters import CHECKPOINT_SMELLS  # noqa: E402
 from smell_core.checkpoint_contract import checkpoint_feedback_highlights  # noqa: E402
-from smell_core.resolution_plan import resolution_plan_next_action  # noqa: E402
+from smell_core.resolution_plan import (  # noqa: E402
+    build_source_guard_feedback,
+    resolution_plan_next_action,
+)
 from smell_core.guards import (  # noqa: E402
     GuardRunContext,
     dead_code_checkpoint_absence_allowed,
@@ -64,10 +68,13 @@ from smell_core.verification_slots import (  # noqa: E402
 VERIFY_DECISION_SCHEMA = "smell.verify.decision/v1"
 BASELINE_DECISION_SCHEMA = "smell.baseline.decision/v1"
 GUARD_PROGRESS_SCHEMA = "smell.guard-progress/v1"
+FOCUSED_PREFLIGHT_DECISION_SCHEMA = "smell.focused-preflight.decision/v1"
+FORMAL_VERIFICATION_RECEIPT_SCHEMA = "smell.formal-verification-receipt/v1"
 DECISION_MAX_BYTES = 64 * 1024
 GUARD_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024
 DECISION_TEXT_LIMIT = 512
 DECISION_HIGHLIGHT_LIMIT = 3
+SAMPLE_DEADLINE_EPOCH_MS_ENV = "SMELL_SAMPLE_DEADLINE_EPOCH_MS"
 
 
 def _config_path(value: Optional[str], env_name: str, bundled) -> str:
@@ -634,6 +641,57 @@ def _compact_failure_pack(value: Any) -> Optional[dict[str, Any]]:
         "next_action": _bounded_text(value.get("next_action")),
         "recommendations": _bounded_strings(value.get("recommendations")),
         "repair_contract": _compact_scalar_mapping(value.get("repair_contract"), count=12),
+        "source_guard_feedback": _compact_source_guard_feedback(
+            value.get("source_guard_feedback")
+        ),
+    }
+
+
+def _compact_source_guard_feedback(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    passed = value.get("passed")
+    blocker = value.get("blocker")
+    compact_blocker = None
+    if isinstance(blocker, dict):
+        compact_blocker = {
+            "kind": _bounded_text(blocker.get("kind"), limit=128),
+            "code": _bounded_text(blocker.get("code"), limit=128),
+            "guard_type": _bounded_text(blocker.get("guard_type"), limit=128),
+            "message": _bounded_text(blocker.get("message")),
+        }
+    observation = value.get("progress_observation")
+    compact_observation = None
+    if isinstance(observation, dict):
+        raw_deficit = observation.get("metric_deficit")
+        raw_structural_count = observation.get("structural_failure_count")
+        metric_deficit = (
+            raw_deficit
+            if isinstance(raw_deficit, (int, float))
+            and not isinstance(raw_deficit, bool)
+            and math.isfinite(float(raw_deficit))
+            else 0
+        )
+        compact_observation = {
+            "metric_deficit": metric_deficit,
+            "structural_failure_count": (
+                raw_structural_count
+                if isinstance(raw_structural_count, int)
+                and not isinstance(raw_structural_count, bool)
+                and raw_structural_count >= 0
+                else 0
+            ),
+            "blocker_codes": _bounded_strings(
+                observation.get("blocker_codes"), count=8, limit=128
+            ),
+        }
+    return {
+        "schema_version": _bounded_text(value.get("schema_version"), limit=128),
+        "passed": passed if isinstance(passed, bool) or passed is None else False,
+        "blocker": compact_blocker,
+        "metric_budget": _compact_metric_budget(value.get("metric_budget")),
+        "next_action": _bounded_text(value.get("next_action")),
+        "progress_observation": compact_observation,
     }
 
 
@@ -749,7 +807,7 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
         and resolved.locations
     )
     if not applicable:
-        return {
+        return _assert_decision_size({
             "schema_version": GUARD_PROGRESS_SCHEMA,
             "success": True,
             "status": "GUARD_PROGRESS_NOT_APPLICABLE",
@@ -760,7 +818,12 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
             "project_full_executed": False,
             "metric_budget": [],
             "next_action": "",
-        }
+            "source_guard_feedback": build_source_guard_feedback(
+                guard_results=(),
+                resolution_plan=None,
+                source_guard_passed=None,
+            ),
+        })
 
     evidence = (
         getattr(args, "smell_evidence", "")
@@ -793,14 +856,13 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(checkpoint_payload.get("resolution_plan"), dict)
         else {}
     )
-    metric_budget = _compact_metric_budget(
-        resolution_plan.get("metric_budget")
-    )
-    next_action = _guard_progress_next_action(
-        metric_budget,
+    source_guard_feedback = build_source_guard_feedback(
+        guard_results=guard_results,
+        resolution_plan=resolution_plan,
         source_guard_passed=source_guard_passed,
     )
-    return {
+    metric_budget = source_guard_feedback["metric_budget"]
+    return _assert_decision_size({
         "schema_version": GUARD_PROGRESS_SCHEMA,
         "success": source_guard_passed,
         "status": (
@@ -815,8 +877,9 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
         "project_full_executed": False,
         "guard_failure_count": failed_guard_count,
         "metric_budget": metric_budget,
-        "next_action": _bounded_text(next_action),
-    }
+        "next_action": source_guard_feedback["next_action"],
+        "source_guard_feedback": source_guard_feedback,
+    })
 
 
 def cmd_focused_preflight_progress(args: argparse.Namespace) -> dict[str, Any]:
@@ -833,7 +896,9 @@ def cmd_focused_preflight_progress(args: argparse.Namespace) -> dict[str, Any]:
         or resolved.verification_mode != "project_full"
         or (not command.command and not command.script)
     ):
-        return run_focused_preflight(resolved)
+        return _focused_preflight_decision_payload(
+            run_focused_preflight(resolved)
+        )
 
     evidence = (
         getattr(args, "smell_evidence", "")
@@ -876,7 +941,7 @@ def cmd_focused_preflight_progress(args: argparse.Namespace) -> dict[str, Any]:
         isinstance(generated_audit, dict)
         and generated_audit.get("status") == "FINAL_DIFF_GENERATED_ARTIFACTS"
     ):
-        return {
+        return _focused_preflight_decision_payload({
             "schema_version": 1,
             "type": "focused_preflight",
             "success": False,
@@ -895,39 +960,13 @@ def cmd_focused_preflight_progress(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             },
             "execution": None,
-        }
-    return _run_project_full_in_fresh_worktree(
-        resolved,
-        snapshot,
-        focused_only=True,
-    )
-
-
-def _guard_progress_next_action(
-    metric_budget: list[dict[str, Any]],
-    *,
-    source_guard_passed: bool,
-) -> str:
-    """Render editing guidance from scalar Guard budgets only."""
-    if source_guard_passed:
-        return ""
-    if not metric_budget:
-        return "restore frozen source Guard"
-    routes: list[str] = []
-    for item in metric_budget:
-        boundary_key = (
-            "passing_max"
-            if "passing_max" in item
-            else "passing_exclusive_max"
+        })
+    return _focused_preflight_decision_payload(
+        _run_project_full_in_fresh_worktree(
+            resolved,
+            snapshot,
+            focused_only=True,
         )
-        routes.append(
-            f"metric={item['metric']}, current={item['current']}, "
-            f"{boundary_key}={item[boundary_key]}, "
-            f"required_reduction={item['required_reduction']}"
-        )
-    return (
-        "make one narrow production edit that crosses at least one frozen "
-        "scalar Guard route: " + "; ".join(routes)
     )
 
 
@@ -1797,6 +1836,7 @@ def _run_project_full_in_candidate_with_cleanup(
         "stage": "completed",
         "cleanup_success": True,
     }
+    result["project_full_executed"] = True
     result["verification_cleanup"] = cleanup
     return result
 
@@ -2208,6 +2248,46 @@ def _summarize_command_result(result: Optional[dict[str, Any]]) -> Optional[dict
     return summary
 
 
+def _focused_preflight_decision_payload(value: Any) -> dict[str, Any]:
+    """Return bounded editing feedback without duplicating process output."""
+    result = value if isinstance(value, dict) else {}
+    isolation = result.get("verification_isolation")
+    generated_audit = result.get("generated_artifact_audit")
+    payload: dict[str, Any] = {
+        "schema_version": FOCUSED_PREFLIGHT_DECISION_SCHEMA,
+        "type": _bounded_text(result.get("type"), limit=128),
+        "success": result.get("success") is True,
+        "status": _bounded_text(result.get("status"), limit=128),
+        "acceptance": False,
+        "project_full_executed": False,
+        "cache_scope": _bounded_text(result.get("cache_scope"), limit=128),
+        "test_result_reused": False,
+        "pass_reused": False,
+        "reason": _bounded_text(result.get("reason"), limit=128),
+        "message": _bounded_text(result.get("message")),
+        # _summarize_command_result intentionally omits execution.output.
+        "execution": _summarize_command_result(result.get("execution")),
+        "verification_isolation": (
+            _compact_scalar_mapping(isolation, count=16)
+            if isinstance(isolation, dict)
+            else None
+        ),
+        "generated_artifact_audit": (
+            {
+                "status": _bounded_text(
+                    generated_audit.get("status"), limit=128
+                ),
+                "paths": _bounded_strings(
+                    generated_audit.get("paths"), count=64, limit=512
+                ),
+            }
+            if isinstance(generated_audit, dict)
+            else None
+        ),
+    }
+    return _assert_decision_size(payload)
+
+
 def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if result is None:
         return None
@@ -2367,6 +2447,11 @@ def _verify_decision_payload(
     artifacts: dict[str, str],
 ) -> dict[str, Any]:
     failure_pack = _compact_failure_pack(full_payload.get("failure_pack"))
+    failure_fingerprint = (
+        _failure_fingerprint(full_payload, failure_pack)
+        if failure_pack is not None
+        else ""
+    )
     payload: dict[str, Any] = {
         "schema_version": VERIFY_DECISION_SCHEMA,
         "success": bool(full_payload.get("success")),
@@ -2384,10 +2469,156 @@ def _verify_decision_payload(
         "failure_pack": failure_pack,
         "artifacts": artifacts,
         "artifact_index": _artifact_index(artifacts),
+        "formal_verification_receipt": _formal_verification_receipt(
+            full_payload,
+            artifacts,
+            diagnostic_signature=(
+                failure_fingerprint
+                or (
+                    "PASS"
+                    if full_payload.get("status") == "PASS"
+                    else _bounded_text(full_payload.get("status"), limit=128)
+                )
+            ),
+        ),
     }
-    if failure_pack is not None:
-        payload["failure_fingerprint"] = _failure_fingerprint(full_payload, failure_pack)
+    if failure_fingerprint:
+        payload["failure_fingerprint"] = failure_fingerprint
     return _assert_decision_size(payload)
+
+
+def _formal_verification_receipt(
+    full_payload: dict[str, Any],
+    artifacts: dict[str, str],
+    *,
+    diagnostic_signature: str,
+) -> dict[str, Any]:
+    checkpoint = (
+        full_payload.get("checkpoint")
+        if isinstance(full_payload.get("checkpoint"), dict)
+        else {}
+    )
+    snapshot = (
+        full_payload.get("snapshot")
+        if isinstance(full_payload.get("snapshot"), dict)
+        else {}
+    )
+    test_changes = (
+        checkpoint.get("test_changes")
+        if isinstance(checkpoint.get("test_changes"), dict)
+        else {}
+    )
+    candidate_identity = {
+        "baseline_revision": _bounded_text(
+            checkpoint.get("baseline_project_commit")
+            or snapshot.get("base_commit"),
+            limit=128,
+        ),
+        "baseline_tree": _bounded_text(
+            checkpoint.get("baseline_tree_hash")
+            or checkpoint.get("tree_hash"),
+            limit=128,
+        ),
+        "production_diff": _bounded_text(
+            checkpoint.get("production_diff_hash"),
+            limit=128,
+        ),
+        "test_tree": _bounded_text(
+            test_changes.get("current_tree_sha256"),
+            limit=128,
+        ),
+        "verification_config_tree": _bounded_text(
+            test_changes.get("current_verification_config_tree_sha256"),
+            limit=128,
+        ),
+    }
+    status = _bounded_text(full_payload.get("status"), limit=128)
+    accepted_pass = bool(
+        status == "PASS"
+        and full_payload.get("success") is True
+        and full_payload.get("accepted") is True
+        and full_payload.get("resolution") == "resolved"
+    )
+    failure_pack = (
+        full_payload.get("failure_pack")
+        if isinstance(full_payload.get("failure_pack"), dict)
+        else {}
+    )
+    outcome = (
+        "pass"
+        if accepted_pass
+        else "test_failed"
+        if status in {"TEST_FAILED", "SAMPLE_TEST_FAILED"}
+        or failure_pack.get("failure_group") == "test"
+        else "failed"
+    )
+    smell_guard = _compact_smell_guard(full_payload.get("smell_guard"))
+    build_test = _summarize_build_test_guard(
+        full_payload.get("build_test_guard")
+    )
+    details = (
+        build_test.get("details")
+        if isinstance(build_test, dict)
+        and isinstance(build_test.get("details"), dict)
+        else {}
+    )
+
+    def result_status(name: str) -> str:
+        result = details.get(name)
+        return _bounded_text(
+            result.get("status") if isinstance(result, dict) else "",
+            limit=128,
+        )
+
+    return {
+        "schema_version": FORMAL_VERIFICATION_RECEIPT_SCHEMA,
+        "terminal_stage": "formal_verify",
+        "status": status,
+        "success": full_payload.get("success") is True,
+        "accepted": full_payload.get("accepted") is True,
+        "resolution": _bounded_text(full_payload.get("resolution"), limit=128),
+        "candidate_identity": candidate_identity,
+        "outcome": outcome,
+        "diagnostic_signature": _bounded_text(
+            diagnostic_signature,
+            limit=128,
+        ),
+        "guard": {
+            "success": smell_guard.get("success") is True,
+            "failure_count": int(smell_guard.get("failure_count") or 0),
+            "artifact_ref": _bounded_text(
+                artifacts.get("guard_evidence"),
+                limit=1024,
+            ),
+        },
+        "build_test": {
+            "success": (
+                build_test.get("success") is True
+                if isinstance(build_test, dict)
+                else None
+            ),
+            "reason": _bounded_text(
+                build_test.get("reason") if isinstance(build_test, dict) else "",
+                limit=128,
+            ),
+            "project_full_executed": full_payload.get(
+                "project_full_executed"
+            ) is True,
+            "build_status": result_status("build"),
+            "test_status": result_status("test"),
+            "sample_test_status": result_status("sample_test"),
+        },
+        "fresh_isolation": (
+            build_test.get("verification_isolation")
+            if isinstance(build_test, dict)
+            else None
+        ),
+        "artifact_refs": {
+            str(name): _bounded_text(path, limit=1024)
+            for name, path in sorted(artifacts.items())[:24]
+            if isinstance(path, str) and path
+        },
+    }
 
 
 def _finalize_verify_artifacts_and_output(
@@ -2514,9 +2745,33 @@ def _write_verify_artifacts(artifact_dir: Path, full_payload: dict[str, Any]) ->
     return artifacts
 
 
-def _run_git(args: list[str], cwd: Path) -> dict[str, Any]:
+def _git_deadline_monotonic(
+    deadline_monotonic: float | None,
+) -> float | None:
+    if deadline_monotonic is not None:
+        return deadline_monotonic
+    raw = os.environ.get(SAMPLE_DEADLINE_EPOCH_MS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        remaining = float(raw) / 1000.0 - time.time()
+    except ValueError:
+        return None
+    return time.monotonic() + remaining
+
+
+def _run_git(
+    args: list[str],
+    cwd: Path,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
     # surrogateescape mirrors smell_core.checkpoints: non-UTF-8 source bytes in
     # git diff output must survive a write-back round-trip byte-exactly.
+    deadline = _git_deadline_monotonic(deadline_monotonic)
+    timeout = None if deadline is None else deadline - time.monotonic()
+    if timeout is not None and timeout <= 0:
+        raise subprocess.TimeoutExpired(["git", *args], timeout=max(0.0, timeout))
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
@@ -2526,6 +2781,7 @@ def _run_git(args: list[str], cwd: Path) -> dict[str, Any]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=timeout,
     )
     return {
         "returncode": proc.returncode,
@@ -2534,11 +2790,16 @@ def _run_git(args: list[str], cwd: Path) -> dict[str, Any]:
     }
 
 
-def _git_untracked_files(root: Path, pathspecs: list[str] | None = None) -> list[str]:
+def _git_untracked_files(
+    root: Path,
+    pathspecs: list[str] | None = None,
+    *,
+    deadline_monotonic: float | None = None,
+) -> list[str]:
     args = ["ls-files", "--others", "--exclude-standard", "-z"]
     if pathspecs:
         args.extend(["--", *pathspecs])
-    result = _run_git(args, root)
+    result = _run_git(args, root, deadline_monotonic=deadline_monotonic)
     if result.get("returncode") != 0:
         return []
     stdout = result.get("stdout")
@@ -2730,6 +2991,7 @@ def _tracked_autotools_generated_artifact(
     *,
     operation: str,
     base_commit: str,
+    deadline_monotonic: float | None = None,
 ) -> bool:
     """Identify a visible tracked Autotools product by its own provenance."""
     normalized = path.replace("\\", "/").strip("/")
@@ -2758,7 +3020,11 @@ def _tracked_autotools_generated_artifact(
         belongs_to_autotools = _has_autotools_input(root, parent)
     if not belongs_to_autotools:
         return False
-    blob = _run_git(["show", f"{base_commit}:{normalized}"], root)
+    blob = _run_git(
+        ["show", f"{base_commit}:{normalized}"],
+        root,
+        deadline_monotonic=deadline_monotonic,
+    )
     stdout = blob.get("stdout")
     return bool(
         blob.get("returncode") == 0
@@ -2957,6 +3223,7 @@ def _git_change_records(
     *,
     declared_test_paths: list[str] | None = None,
     base_commit: str = "HEAD",
+    deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Inventory every visible path changed since the frozen c000 commit."""
     result = _run_git(
@@ -2971,6 +3238,7 @@ def _git_change_records(
             "--",
         ],
         root,
+        deadline_monotonic=deadline_monotonic,
     )
     stdout = result.get("stdout")
     if result.get("returncode") != 0 or not isinstance(stdout, str):
@@ -3000,6 +3268,7 @@ def _git_change_records(
     untracked = _run_git(
         ["ls-files", "--others", "--exclude-standard", "-z", "--"],
         root,
+        deadline_monotonic=deadline_monotonic,
     )
     untracked_stdout = untracked.get("stdout")
     if untracked.get("returncode") != 0 or not isinstance(untracked_stdout, str):
@@ -3021,7 +3290,10 @@ def _git_change_records(
             "status": "??",
             "category": _change_category(path, declared),
         })
-    ignored, ignored_output_records = _ignored_output_evidence_records(root)
+    ignored, ignored_output_records = _ignored_output_evidence_records(
+        root,
+        deadline_monotonic=deadline_monotonic,
+    )
     if ignored.get("returncode") != 0:
         return {
             **result,
@@ -3056,6 +3328,7 @@ def _change_header(
     *,
     operation: str,
     base_commit: str,
+    deadline_monotonic: float | None = None,
 ) -> str:
     """Read bounded current-or-baseline text used only for provenance."""
     current = ""
@@ -3073,7 +3346,11 @@ def _change_header(
         and "CMakeFiles" not in pure.parts
     ):
         return current
-    baseline = _run_git(["show", f"{base_commit}:{path}"], root)
+    baseline = _run_git(
+        ["show", f"{base_commit}:{path}"],
+        root,
+        deadline_monotonic=deadline_monotonic,
+    )
     stdout = baseline.get("stdout")
     if baseline.get("returncode") != 0 or not isinstance(stdout, str):
         return current
@@ -3131,6 +3408,8 @@ def _proven_ignored_generator_marker(path: Path) -> bool:
 
 def _ignored_output_evidence_records(
     root: Path,
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Inspect collapsed ignored roots without walking dependency caches.
 
@@ -3150,6 +3429,7 @@ def _ignored_output_evidence_records(
             "--",
         ],
         root,
+        deadline_monotonic=deadline_monotonic,
     )
     stdout = result.get("stdout")
     if result.get("returncode") != 0 or not isinstance(stdout, str):
@@ -3226,6 +3506,7 @@ def _derive_generated_output_roots(
     *,
     project_root: Path | None,
     base_commit: str,
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
     """Pass two: derive build roots only from generator-owned evidence."""
     if project_root is None:
@@ -3246,6 +3527,7 @@ def _derive_generated_output_roots(
             path,
             operation=operation,
             base_commit=base_commit,
+            deadline_monotonic=deadline_monotonic,
         )
         proven_cmake = bool(
             cmake_evidence_path and _looks_like_cmake_generated_header(header)
@@ -3330,6 +3612,7 @@ def _final_diff_generated_artifact_audit(
     change_audit: dict[str, Any],
     *,
     project_root: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Reject generated output using inventory, provenance and file content.
 
@@ -3346,6 +3629,7 @@ def _final_diff_generated_artifact_audit(
         changes,
         project_root=project_root,
         base_commit=base_commit,
+        deadline_monotonic=deadline_monotonic,
     )
     root_paths = [str(item["path"]) for item in output_roots]
     root_evidence_paths = {
@@ -3386,6 +3670,7 @@ def _final_diff_generated_artifact_audit(
                 path,
                 operation=operation,
                 base_commit=base_commit,
+                deadline_monotonic=deadline_monotonic,
             )
         ):
             evidence = "autotools-provenance"
@@ -3441,11 +3726,13 @@ def _project_change_audit(
     *,
     declared_test_paths: list[str] | None = None,
     base_commit: str = "HEAD",
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     status, records = _git_change_records(
         root,
         declared_test_paths=declared_test_paths,
         base_commit=base_commit,
+        deadline_monotonic=deadline_monotonic,
     )
     categories = {
         category: [dict(item) for item in records if item["category"] == category]
@@ -3466,7 +3753,11 @@ def _project_change_audit(
         "ignored_generated_paths": list(status.get("ignored_generated_paths") or []),
     }
     audit["final_diff_generated_artifact_audit"] = (
-        _final_diff_generated_artifact_audit(audit, project_root=root)
+        _final_diff_generated_artifact_audit(
+            audit,
+            project_root=root,
+            deadline_monotonic=deadline_monotonic,
+        )
     )
     return audit
 
@@ -3520,6 +3811,7 @@ def _git_status_snapshot(
     *,
     base_commit: str = "HEAD",
     paths: list[str] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     if paths is not None and not paths:
         return {
@@ -3540,20 +3832,31 @@ def _git_status_snapshot(
             "--", *pathspec,
         ],
         root,
+        deadline_monotonic=deadline_monotonic,
     )
     stdout = result.get("stdout")
     if not isinstance(stdout, str):
         return result
     filtered_lines: list[str] = []
     filtered_lines.extend(stdout.splitlines())
-    for path in _git_untracked_files(root, pathspec or None):
+    for path in _git_untracked_files(
+        root,
+        pathspec or None,
+        deadline_monotonic=deadline_monotonic,
+    ):
         filtered_lines.append(f"??\t{path}")
     result["stdout"] = ("\n".join(filtered_lines) + "\n") if filtered_lines else ""
     result["ignored_untracked_count"] = 0
     return result
 
 
-def _diff_untracked_files(root: Path, paths: list[str], *, stat: bool = False) -> str:
+def _diff_untracked_files(
+    root: Path,
+    paths: list[str],
+    *,
+    stat: bool = False,
+    deadline_monotonic: float | None = None,
+) -> str:
     chunks: list[str] = []
     for path in paths:
         args = [
@@ -3567,7 +3870,11 @@ def _diff_untracked_files(root: Path, paths: list[str], *, stat: bool = False) -
         else:
             args.append("--binary")
         args.extend(["--", "/dev/null", path])
-        result = _run_git(args, root)
+        result = _run_git(
+            args,
+            root,
+            deadline_monotonic=deadline_monotonic,
+        )
         stdout = result.get("stdout")
         stderr = result.get("stderr")
         output = stdout if isinstance(stdout, str) and stdout else stderr
@@ -3581,6 +3888,7 @@ def _git_diff_with_untracked(
     args: list[str],
     *,
     paths: list[str] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     if paths is not None and not paths:
         return {
@@ -3590,12 +3898,25 @@ def _git_diff_with_untracked(
             "untracked_files": [],
         }
     pathspec = list(paths or [])
-    result = _run_git([*args, "--", *pathspec], root)
+    result = _run_git(
+        [*args, "--", *pathspec],
+        root,
+        deadline_monotonic=deadline_monotonic,
+    )
     tracked_diff = result.get("stdout")
     if not isinstance(tracked_diff, str):
         tracked_diff = ""
-    untracked_files = _git_untracked_files(root, pathspec or None)
-    untracked_diff = _diff_untracked_files(root, untracked_files, stat="--stat" in args)
+    untracked_files = _git_untracked_files(
+        root,
+        pathspec or None,
+        deadline_monotonic=deadline_monotonic,
+    )
+    untracked_diff = _diff_untracked_files(
+        root,
+        untracked_files,
+        stat="--stat" in args,
+        deadline_monotonic=deadline_monotonic,
+    )
     result["stdout"] = tracked_diff + untracked_diff
     result["untracked_files"] = untracked_files
     return result
@@ -3606,12 +3927,14 @@ def _snapshot_project(
     *,
     declared_test_paths: list[str] | None = None,
     base_commit: str = "HEAD",
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Capture the complete pre-verification deliverable patch and path audit."""
     change_audit = _project_change_audit(
         root,
         declared_test_paths=declared_test_paths,
         base_commit=base_commit,
+        deadline_monotonic=deadline_monotonic,
     )
     deliverable_paths = [
         str(item.get("path") or "")
@@ -3675,6 +3998,7 @@ def _snapshot_project(
         root,
         base_commit=base_commit,
         paths=deliverable_paths,
+        deadline_monotonic=deadline_monotonic,
     )
     status.update({
         "ignored_tracked_count": int(
@@ -3706,6 +4030,7 @@ def _snapshot_project(
                 base_commit, "--stat",
             ],
             paths=deliverable_paths,
+            deadline_monotonic=deadline_monotonic,
         ),
         "diff": _git_diff_with_untracked(
             root,
@@ -3717,6 +4042,7 @@ def _snapshot_project(
                 base_commit,
             ],
             paths=deliverable_paths,
+            deadline_monotonic=deadline_monotonic,
         ),
     }
 
@@ -4189,7 +4515,25 @@ def _build_failure_pack(
         and isinstance(checkpoint.get("resolution_plan"), dict)
         else None
     )
-    next_action = resolution_plan_next_action(resolution_plan)
+    smell_guard = payload.get("smell_guard") if isinstance(payload, dict) else None
+    guard_results = (
+        smell_guard.get("results")
+        if isinstance(smell_guard, dict)
+        and isinstance(smell_guard.get("results"), list)
+        else ()
+    )
+    guard_passed = (
+        smell_guard.get("success")
+        if isinstance(smell_guard, dict)
+        and isinstance(smell_guard.get("success"), bool)
+        else None
+    )
+    source_guard_feedback = build_source_guard_feedback(
+        guard_results=guard_results,
+        resolution_plan=resolution_plan,
+        source_guard_passed=guard_passed,
+    )
+    next_action = source_guard_feedback["next_action"]
     return {
         "failure_category": category,
         "failure_group": failure_group,
@@ -4198,6 +4542,7 @@ def _build_failure_pack(
         "artifact_paths": paths,
         "highlights": highlights,
         "next_action": _bounded_text(next_action),
+        "source_guard_feedback": source_guard_feedback,
         "recommendations": _bounded_strings(recommendations),
         "repair_contract": {
             "repair_agent_may_edit": repairable,

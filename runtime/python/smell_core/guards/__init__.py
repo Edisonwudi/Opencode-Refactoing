@@ -29,6 +29,9 @@ from .context import GuardRunContext
 
 
 SAMPLE_DEADLINE_EPOCH_MS_ENV = "SMELL_SAMPLE_DEADLINE_EPOCH_MS"
+COMMAND_TERMINATE_GRACE_SECONDS = 1.0
+COMMAND_KILL_WAIT_SECONDS = 1.0
+COMMAND_OUTPUT_DRAIN_SECONDS = 1.0
 
 
 SUMMARY_PATTERNS = [
@@ -1331,7 +1334,15 @@ def _run_captured_command(
         stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _terminate_process_group(proc)
-        stdout, _ = proc.communicate()
+        try:
+            stdout, _ = proc.communicate(timeout=COMMAND_OUTPUT_DRAIN_SECONDS)
+        except subprocess.TimeoutExpired as drain_exc:
+            stdout = drain_exc.stdout or ""
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except (OSError, ValueError):
+                    pass
         captured = exc.stdout or ""
         if isinstance(captured, bytes):
             captured = captured.decode("utf-8", errors="replace")
@@ -1362,20 +1373,26 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
-            proc.wait()
+            try:
+                proc.wait(timeout=COMMAND_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
             return
         # Give every group member a bounded grace period to flush termination
         # diagnostics. Waiting only on the leader is insufficient: it may
         # already have exited while a background child still owns the pipe.
-        grace_deadline = time.monotonic() + 1.0
+        grace_deadline = time.monotonic() + COMMAND_TERMINATE_GRACE_SECONDS
         try:
-            proc.wait(timeout=1.0)
+            proc.wait(timeout=COMMAND_TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
         try:
             os.killpg(proc.pid, 0)
         except ProcessLookupError:
-            proc.wait()
+            try:
+                proc.wait(timeout=COMMAND_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
             return
         except PermissionError:
             # macOS can report EPERM briefly for an exited/zombie group.
@@ -1387,7 +1404,10 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        proc.wait()
+        try:
+            proc.wait(timeout=COMMAND_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
         return
 
     # Non-POSIX runtimes cannot address a process group by the leader's pid.
@@ -1399,7 +1419,10 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:  # pragma: no cover - delivery/runtime is POSIX
         proc.kill()
-        proc.wait()
+        try:
+            proc.wait(timeout=COMMAND_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _force_fresh_gradle_test_execution(command_text: str) -> str:

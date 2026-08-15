@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import shlex
 import sys
 import tempfile
@@ -27,7 +28,11 @@ from smell_core.config import (  # noqa: E402
     load_project_overrides,
     resolve_run_config,
 )
-from smell_core.guards import _run_command_config  # noqa: E402
+from smell_core.guards import (  # noqa: E402
+    _run_captured_command,
+    _run_command_config,
+    _terminate_process_group,
+)
 
 
 def main() -> int:
@@ -307,6 +312,8 @@ def main() -> int:
         )
         assert background_timeout["status"] == "timeout", background_timeout
         assert time.monotonic() - started < 3
+        assert "proc.communicate()" not in inspect.getsource(_run_captured_command)
+        assert "proc.wait()" not in inspect.getsource(_terminate_process_group)
 
         missing_overlay = temp / "missing-project-test-overlay.yaml"
         with patch(

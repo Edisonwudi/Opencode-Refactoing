@@ -12,6 +12,48 @@ from typing import Any, Iterable, Mapping
 
 
 RESOLUTION_PLAN_VERSION = 4
+SOURCE_GUARD_FEEDBACK_SCHEMA = "smell.source-guard-feedback/v1"
+_SOURCE_GUARD_FEEDBACK_TEXT_LIMIT = 512
+_SOURCE_GUARD_BLOCKER_CODE_LIMIT = 8
+
+
+_SOURCE_GUARD_CONTRACT_ACTIONS: dict[str, str] = {
+    "CLONE_TARGET_DECLARATION_IDENTITY_FAILED": (
+        "restore every frozen clone target declaration at its original owner "
+        "and signature as a thin wrapper over one shared implementation; do "
+        "not delete, rename, or move a frozen declaration"
+    ),
+    "TARGET_NOT_LOCATED": (
+        "restore or re-anchor the frozen target declaration at its original "
+        "identity; target disappearance is not resolution; obtain one "
+        "unambiguous current target match before continuing"
+    ),
+    "CURRENT_DETECTOR_UNAVAILABLE": (
+        "restore source parseability and target Guard availability, then "
+        "obtain one valid current snapshot before making further refactoring "
+        "edits"
+    ),
+    "MN_REFERENCE_CLOSURE_MISMATCH": (
+        "complete the rename across the frozen symbol's full production "
+        "reference closure so no stale old-name reference remains; preserve "
+        "declaration and container continuity"
+    ),
+    "MN_STALE_REFERENCE_REMAINS": (
+        "complete the rename across the frozen symbol's full production "
+        "reference closure so no stale old-name reference remains; preserve "
+        "declaration and container continuity"
+    ),
+    "parameter_group_continuity_unavailable": (
+        "restore or re-anchor every frozen parameter-group occurrence and "
+        "provide verifiable same-owner and same-file successor lineage; do "
+        "not treat an unlocatable group as removed"
+    ),
+    "CPP_PURE_VIRTUAL_ABI_CHANGED": (
+        "restore the original pure-virtual declaration, signature, and vtable "
+        "slot; keep any parameter-object API additive behind an ABI-compatible "
+        "bridge and do not delete or replace the frozen virtual entry"
+    ),
+}
 
 
 _PRIMARY_OBJECTIVES: dict[str, tuple[str, ...]] = {
@@ -156,6 +198,275 @@ def resolution_plan_next_action(value: Mapping[str, Any] | None) -> str:
     if not isinstance(value, Mapping):
         return ""
     return " ".join(str(value.get("next_action") or "").split())
+
+
+def build_source_guard_feedback(
+    *,
+    guard_results: Iterable[Mapping[str, Any]] | None,
+    resolution_plan: Mapping[str, Any] | None,
+    source_guard_passed: bool | None,
+) -> dict[str, Any]:
+    """Project one typed, bounded source-Guard decision for every caller.
+
+    Scalar budgets are editing aids, not the Guard verdict.  Once every
+    scalar route is below its product boundary, an authoritative structural
+    failure must replace the old "reduce the metric" prompt.  Both cheap
+    progress checks and full verification use this projection.
+    """
+    plan = resolution_plan if isinstance(resolution_plan, Mapping) else {}
+    metric_budget = _source_guard_metric_budget(plan.get("metric_budget"))
+    if source_guard_passed is None:
+        return {
+            "schema_version": SOURCE_GUARD_FEEDBACK_SCHEMA,
+            "passed": None,
+            "blocker": None,
+            "metric_budget": metric_budget,
+            "next_action": "",
+            "progress_observation": _source_guard_progress_observation(
+                metric_budget
+            ),
+        }
+    if source_guard_passed:
+        return {
+            "schema_version": SOURCE_GUARD_FEEDBACK_SCHEMA,
+            "passed": True,
+            "blocker": None,
+            "metric_budget": metric_budget,
+            "next_action": "",
+            "progress_observation": _source_guard_progress_observation(
+                metric_budget
+            ),
+        }
+
+    failures = [
+        item
+        for item in (guard_results or ())
+        if isinstance(item, Mapping) and item.get("success") is not True
+    ]
+    first_failure = failures[0] if failures else {}
+    guard_type = _source_guard_text(first_failure.get("type"), limit=128)
+    message = _source_guard_text(first_failure.get("message"))
+    details = (
+        first_failure.get("details")
+        if isinstance(first_failure.get("details"), Mapping)
+        else {}
+    )
+    reason = _source_guard_text(details.get("reason"), limit=128)
+    regression_count, regression_codes = _source_guard_regression_summary(
+        plan.get("semantic_regressions")
+    )
+    detector_blocker = _source_guard_text(
+        plan.get("detector_blocker"), limit=128
+    )
+    target_unlocated = plan.get("target_unlocated") is True
+    typed_structural_blocker = bool(
+        regression_count
+        or detector_blocker
+        or target_unlocated
+        or reason not in {"", "FINDING_REMAINS", "NO_STRUCTURAL_PROGRESS"}
+    )
+    pending_budget = bool(
+        plan.get("finding_present") is not False
+        and any(
+            (_source_guard_number(item.get("required_reduction")) or 0.0) > 0
+            for item in metric_budget
+        )
+    )
+    if pending_budget and not typed_structural_blocker:
+        return {
+            "schema_version": SOURCE_GUARD_FEEDBACK_SCHEMA,
+            "passed": False,
+            "blocker": {
+                "kind": "metric_budget",
+                "code": "SCALAR_GUARD_THRESHOLD_NOT_MET",
+                "guard_type": guard_type,
+                "message": message,
+            },
+            "metric_budget": metric_budget,
+            "next_action": _source_guard_scalar_next_action(metric_budget),
+            "progress_observation": _source_guard_progress_observation(
+                metric_budget,
+                blocker_codes=["SCALAR_GUARD_THRESHOLD_NOT_MET"],
+            ),
+        }
+
+    if regression_codes:
+        kind = "semantic_contract"
+        code = regression_codes[0]
+    elif detector_blocker:
+        kind = "detector"
+        code = detector_blocker
+    elif target_unlocated or reason == "TARGET_NOT_LOCATED":
+        kind = "target_identity"
+        code = reason or "TARGET_NOT_LOCATED"
+    elif reason:
+        kind = (
+            "semantic_contract"
+            if reason == "SEMANTIC_CONTRACT_REGRESSION"
+            else "source_guard"
+        )
+        code = reason
+    else:
+        kind = "source_guard"
+        code = "SOURCE_GUARD_FAILED"
+
+    planned_action = _source_guard_text(plan.get("next_action"))
+    contract_action = _source_guard_contract_action(code)
+    if metric_budget or typed_structural_blocker:
+        next_action = _source_guard_text(
+            f"repair source Guard blocker {code}: "
+            f"{contract_action or planned_action or 'restore the frozen source contract and verify again'}"
+        )
+    else:
+        # Preserve the historical, safe response for an incomplete Guard
+        # result that contains neither a scalar route nor a typed blocker.
+        next_action = "restore frozen source Guard"
+    return {
+        "schema_version": SOURCE_GUARD_FEEDBACK_SCHEMA,
+        "passed": False,
+        "blocker": {
+            "kind": kind,
+            "code": code,
+            "guard_type": guard_type,
+            "message": message,
+        },
+        "metric_budget": metric_budget,
+        "next_action": next_action,
+        "progress_observation": _source_guard_progress_observation(
+            metric_budget,
+            structural_failure_count=(
+                regression_count if regression_count else 1
+            ),
+            blocker_codes=(regression_codes or [code]),
+        ),
+    }
+
+
+def _source_guard_scalar_next_action(
+    metric_budget: list[dict[str, Any]],
+) -> str:
+    routes: list[str] = []
+    for item in metric_budget:
+        boundary_key = (
+            "passing_max"
+            if "passing_max" in item
+            else "passing_exclusive_max"
+        )
+        routes.append(
+            f"metric={item['metric']}, current={item['current']}, "
+            f"{boundary_key}={item[boundary_key]}, "
+            f"required_reduction={item['required_reduction']}"
+        )
+    if not routes:
+        return "restore frozen source Guard"
+    return _source_guard_text(
+        "make one narrow production edit that crosses at least one frozen "
+        "scalar Guard route: " + "; ".join(routes)
+    )
+
+
+def _source_guard_progress_observation(
+    metric_budget: list[dict[str, Any]],
+    *,
+    structural_failure_count: int = 0,
+    blocker_codes: Iterable[str] = (),
+) -> dict[str, Any]:
+    metric_deficit = sum(
+        _source_guard_number(item.get("required_reduction")) or 0.0
+        for item in metric_budget
+    )
+    return {
+        "metric_deficit": _compact_number(metric_deficit),
+        "structural_failure_count": max(0, structural_failure_count),
+        "blocker_codes": _source_guard_code_preview(blocker_codes),
+    }
+
+
+def _source_guard_regression_summary(value: Any) -> tuple[int, list[str]]:
+    if not isinstance(value, (list, tuple)):
+        return 0, []
+    unique_codes: set[str] = set()
+    preview: list[str] = []
+    for item in value:
+        code = " ".join(str(item or "").split())
+        if not code or code in unique_codes:
+            continue
+        unique_codes.add(code)
+        if len(preview) >= _SOURCE_GUARD_BLOCKER_CODE_LIMIT:
+            continue
+        bounded = _source_guard_text(code, limit=128)
+        if bounded and bounded not in preview:
+            preview.append(bounded)
+    return len(unique_codes), preview
+
+
+def _source_guard_code_preview(values: Iterable[str]) -> list[str]:
+    preview: list[str] = []
+    for value in values:
+        code = _source_guard_text(value, limit=128)
+        if code and code not in preview:
+            preview.append(code)
+        if len(preview) >= _SOURCE_GUARD_BLOCKER_CODE_LIMIT:
+            break
+    return preview
+
+
+def _source_guard_contract_action(code: str) -> str:
+    base_code = code.split(":", 1)[0]
+    return _SOURCE_GUARD_CONTRACT_ACTIONS.get(base_code, "")
+
+
+def _source_guard_metric_budget(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        boundary_key = (
+            "passing_max"
+            if raw.get("passing_max") is not None
+            else "passing_exclusive_max"
+        )
+        metric = _source_guard_text(raw.get("metric"), limit=96)
+        unit = _source_guard_text(raw.get("unit"), limit=48)
+        current = _source_guard_number(raw.get("current"))
+        boundary = _source_guard_number(raw.get(boundary_key))
+        reduction = _source_guard_number(raw.get("required_reduction"))
+        if (
+            not metric
+            or not unit
+            or current is None
+            or boundary is None
+            or reduction is None
+        ):
+            continue
+        result.append({
+            "metric": metric,
+            "current": _compact_number(current),
+            boundary_key: _compact_number(boundary),
+            "required_reduction": _compact_number(reduction),
+            "unit": unit,
+        })
+        if len(result) >= 12:
+            break
+    return result
+
+
+def _source_guard_text(value: Any, *, limit: int = _SOURCE_GUARD_FEEDBACK_TEXT_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    head = max(1, int((limit - 5) * 0.7))
+    tail = max(1, limit - head - 5)
+    return f"{text[:head]} ... {text[-tail:]}"
+
+
+def _source_guard_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _objective_deficits(

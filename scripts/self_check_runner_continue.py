@@ -233,6 +233,52 @@ check_true(
     "runner_final_timeout_terminates_nested_process_groups",
     "_terminate_process_tree(proc)" in inspect.getsource(R._run),
 )
+check_true(
+    "runner_timeout_drain_is_bounded",
+    "proc.communicate()" not in inspect.getsource(R._run)
+    and "communicate(timeout=" in inspect.getsource(R._run),
+)
+
+
+class _NeverReapedProcess:
+    pid = 987654321
+    returncode = None
+
+    def __init__(self) -> None:
+        self.wait_timeouts: list[float | None] = []
+        self.killed = False
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        raise subprocess.TimeoutExpired("never-reaped", timeout)
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        self.killed = True
+
+
+never_reaped = _NeverReapedProcess()
+original_process_tree_groups = R._process_tree_groups
+R._process_tree_groups = lambda _pid: []
+try:
+    shutdown_started = time.monotonic()
+    shutdown_evidence = R._terminate_process_tree(
+        never_reaped,
+        term_timeout=0.01,
+        kill_timeout=0.01,
+    )
+finally:
+    R._process_tree_groups = original_process_tree_groups
+check_true("termination_waits_are_bounded", all(value is not None for value in never_reaped.wait_timeouts))
+check_true("termination_returns_promptly_when_unreapable", time.monotonic() - shutdown_started < 1)
+check("termination_evidence_is_bounded", shutdown_evidence["bounded"], True)
+check("termination_evidence_reports_unreaped", shutdown_evidence["process_reaped"], False)
+check_true("termination_evidence_has_phase_durations", "term_wait_ms" in shutdown_evidence and "kill_wait_ms" in shutdown_evidence)
 check("pass_is_accepted", R._is_accepted_status("PASS"), True)
 check("removed_timeout_pass_is_not_accepted", R._is_accepted_status("PASS_AFTER_OPENCODE_TIMEOUT"), False)
 check("opencode_failure_not_accepted", R._is_accepted_status("OPENCODE_FAILED"), False)
@@ -444,13 +490,17 @@ if readme_bridge.returncode == 0:
         "command",
     )
     initial_state = readme_bridge_payload["command_loop_state"]
-    check("readme_bridge_state_schema", initial_state["schema_version"], 4)
+    check("readme_bridge_state_schema", initial_state["schema_version"], 6)
     check(
         "readme_bridge_state_identity",
         initial_state["policy"]["identity"]["project_root"],
         "/abs/java-project",
     )
     check("readme_bridge_state_continuations", initial_state["continuation_count"], 0)
+    check("readme_bridge_state_target_context", initial_state["target_identity_context"], "")
+    check("readme_bridge_state_best_metric", initial_state["best_metric_deficit"], None)
+    check("readme_bridge_state_best_structural", initial_state["best_structural_failure_count"], None)
+    check("readme_bridge_state_terminal", initial_state["terminal_receipt"], None)
 multiline_identity = parse_command_task_identity(
     "\n".join(
         [
@@ -717,16 +767,548 @@ def verify_event(payload: dict, status: str = "completed", metadata: dict | None
         },
     })
 
+
+def command_state(
+    generation: int,
+    decision: str,
+    instruction: str,
+    termination_reason: str = "",
+    *,
+    terminal_receipt: dict | None = None,
+) -> dict:
+    candidate_identity = {
+        "baseline_revision": "base-revision",
+        "baseline_tree": "base-tree",
+        "production_diff": "production-diff",
+        "test_tree": "test-tree",
+        "verification_config_tree": "verification-config-tree",
+    }
+    if terminal_receipt is not None and "formalVerificationReceipt" not in terminal_receipt:
+        terminal_receipt = {
+            **terminal_receipt,
+            "formalVerificationReceipt": (
+                {
+                    "schema_version": "smell.formal-verification-receipt/v1",
+                    "terminal_stage": "formal_verify",
+                    "status": "PASS",
+                    "success": True,
+                    "accepted": True,
+                    "resolution": "resolved",
+                    "candidate_identity": candidate_identity,
+                    "outcome": "pass",
+                    "diagnostic_signature": "PASS",
+                    "guard": {"success": True, "failure_count": 0, "artifact_ref": "/tmp/guard.json"},
+                    "build_test": {
+                        "success": True,
+                        "reason": "",
+                        "project_full_executed": True,
+                        "build_status": "ok",
+                        "test_status": "ok",
+                        "sample_test_status": "",
+                    },
+                    "fresh_isolation": {
+                        "contract_version": "project-full-fresh-worktree/v1",
+                        "mode": "detached_git_worktree",
+                        "success": True,
+                        "stage": "completed",
+                        "cleanup_success": True,
+                    },
+                    "artifact_refs": {
+                        "guard_evidence": "/tmp/guard.json",
+                        "build_result": "/tmp/build.json",
+                        "test_result": "/tmp/test.json",
+                        "diff": "/tmp/diff.patch",
+                    },
+                }
+                if terminal_receipt.get("stage") == "formal_verify"
+                and terminal_receipt.get("status") == "PASS"
+                and terminal_receipt.get("accepted") is True
+                else None
+            ),
+        }
+    if terminal_receipt is not None and "ideaProtocolReceipt" not in terminal_receipt:
+        terminal_receipt = {**terminal_receipt, "ideaProtocolReceipt": None}
+    formal_receipt = (
+        terminal_receipt.get("formalVerificationReceipt")
+        if isinstance(terminal_receipt, dict)
+        else None
+    )
+    return {
+        "schema_version": 6,
+        "policy": {
+            "task": "Continue the current smell refactoring task.",
+            "verification_mode": "project_full",
+            "refactoring_backend": "direct",
+            "allow_test_changes": False,
+            "checkpoint_required": True,
+            "identity": {
+                "project_root": "/tmp/project",
+                "smell": "long_method",
+                "location": "sample.py:method=target|line=1",
+                "verification_mode": "project_full",
+                "project_override_root": "",
+                "language": "python",
+                "target_context_json": "",
+                "sample_test_location": "",
+                "sample_test_command": "",
+                "build_command": "",
+                "project_test_command": "",
+                "verification_cwd": "",
+                "verification_command_source": "",
+                "sample_test_source": "",
+            },
+            "loop": {
+                "mode": "verify-failure",
+                "max_continuations": 5,
+                "no_progress_limit": 1,
+                "allowed_failure_groups": ["smell", "compile", "test"],
+                "instruction": "repair narrowly",
+                "sample_deadline_seconds": 1800,
+            },
+        },
+        "target_identity_context": "",
+        "started_at": 1,
+        "control": {
+            "generation": generation,
+            "decision": decision,
+            "instruction": instruction,
+            "termination_reason": termination_reason,
+        },
+        "continuation_count": 0,
+        "cap_recovery_used": False,
+        "no_progress_count": 0,
+        "last_failure_fingerprint": "",
+        "best_metric_deficit": None,
+        "best_structural_failure_count": None,
+        "last_blocker_codes": [],
+        "seen_structural_states": [],
+        "formal_candidate_state": {
+            "candidate_identity": (
+                formal_receipt.get("candidate_identity")
+                if isinstance(formal_receipt, dict)
+                else None
+            ),
+            "outcome": (
+                formal_receipt.get("outcome")
+                if isinstance(formal_receipt, dict)
+                else ""
+            ),
+            "diagnostic_signature": (
+                formal_receipt.get("diagnostic_signature")
+                if isinstance(formal_receipt, dict)
+                else ""
+            ),
+            "confirmation_required": False,
+        },
+        "idea_protocol_state": {
+            "active_proposal": None,
+            "proposal_blocker": None,
+            "mutation_generation": 0,
+            "verified_generation": 0,
+            "mutation_route": "",
+            "mutation_proposal_id": "",
+            "revertible_apply_generation": None,
+        },
+        "terminal_receipt": terminal_receipt,
+    }
+
+
+def formal_pass_payload(loop: dict, state: dict) -> dict:
+    receipt = state["terminal_receipt"]["formalVerificationReceipt"]
+    artifacts = dict(receipt["artifact_refs"])
+    return {
+        "schema_version": "smell.verify.decision/v1",
+        "success": True,
+        "accepted": True,
+        "progress": True,
+        "status": "PASS",
+        "resolution": "resolved",
+        "project_full_executed": True,
+        "smell_guard": {"success": True, "failure_count": 0, "results": []},
+        "build_test_guard": {
+            "success": True,
+            "verification_mode": "project_full",
+            "project_full_executed": True,
+        },
+        "test_changes": {"success": True, "status": "TEST_SOURCE_UNCHANGED"},
+        "checkpoint": {
+            "accepted": True,
+            "resolution": "resolved",
+            "verify_status": "PASS",
+            "build_test_success": True,
+        },
+        "artifacts": artifacts,
+        "artifact_index": {
+            name: {"path": path, "bytes": 1}
+            for name, path in artifacts.items()
+        },
+        "formal_verification_receipt": receipt,
+        "termination_reason": "PASS",
+        "loop": loop,
+    }
+
+
+initial_control_state = command_state(
+    0,
+    "verify_required",
+    "Call smell_verify now using the frozen command identity.",
+)
+truncated_v6_state = {
+    "schema_version": 6,
+    "control": dict(initial_control_state["control"]),
+}
+check(
+    "truncated_v6_state_is_not_transportable",
+    R._runner_transport_plan(
+        R._verification_trace('{"type":"text","part":{"text":"done"}}'),
+        previous_state=truncated_v6_state,
+        transported_generations=set(),
+    )["action"],
+    "stop",
+)
+idea_terminal_state = command_state(
+    1,
+    "stop",
+    "",
+    "PASS",
+    terminal_receipt={
+        "stage": "formal_verify",
+        "status": "PASS",
+        "success": True,
+        "accepted": True,
+        "resolution": "resolved",
+        "terminationReason": "PASS",
+        "failureCategory": "",
+        "failureGroup": "",
+        "loop": {
+            "generation": 1,
+            "decision": "stop",
+            "instruction": "",
+            "termination_reason": "PASS",
+        },
+    },
+)
+idea_terminal_state["policy"]["refactoring_backend"] = "idea"
+idea_terminal_state["policy"]["identity"]["language"] = "java"
+idea_terminal_state["idea_protocol_state"].update(
+    {
+        "mutation_generation": 1,
+        "verified_generation": 1,
+        "mutation_route": "native_apply",
+        "mutation_proposal_id": "proposal-1",
+    }
+)
+idea_terminal_state["terminal_receipt"]["ideaProtocolReceipt"] = {
+    "schema_version": "smell.idea-protocol-receipt/v1",
+    "mutation_generation": 1,
+    "verified_generation": 1,
+    "mutation_route": "native_apply",
+    "proposal_id": "proposal-1",
+    "blocker_status": "",
+    "blocker_codes": [],
+    "complete": True,
+}
+check(
+    "idea_terminal_receipt_is_transferable",
+    R._typed_command_control(idea_terminal_state)["decision"],
+    "stop",
+)
+missing_idea_receipt = json.loads(json.dumps(idea_terminal_state))
+missing_idea_receipt["terminal_receipt"]["ideaProtocolReceipt"] = None
+check(
+    "idea_terminal_receipt_is_required",
+    R._typed_command_control(missing_idea_receipt),
+    None,
+)
+mismatched_idea_receipt = json.loads(json.dumps(idea_terminal_state))
+mismatched_idea_receipt["terminal_receipt"]["ideaProtocolReceipt"][
+    "verified_generation"
+] = 0
+check(
+    "idea_terminal_receipt_matches_state",
+    R._typed_command_control(mismatched_idea_receipt),
+    None,
+)
+zero_verify_plan = R._runner_transport_plan(
+    R._verification_trace('{"type":"text","part":{"text":"done"}}'),
+    previous_state=initial_control_state,
+    transported_generations=set(),
+)
+check("zero_verify_typed_control_transports_once", zero_verify_plan["action"], "verify_required")
+check("zero_verify_generation", zero_verify_plan["generation"], 0)
+check(
+    "zero_verify_same_generation_not_repeated",
+    R._runner_transport_plan(
+        R._verification_trace('{"type":"text","part":{"text":"done"}}'),
+        previous_state=initial_control_state,
+        transported_generations={0},
+    )["action"],
+    "stop",
+)
+
+continue_loop = {
+    "generation": 1,
+    "decision": "continue",
+    "instruction": "Repair the typed blocker and call smell_verify again.",
+    "termination_reason": "",
+}
+continue_state = command_state(1, "continue", continue_loop["instruction"])
+typed_continue_trace = R._verification_trace(
+    verify_event(
+        {"status": "SMELL_GUARD_FAILED", "loop": continue_loop},
+        metadata={"loop": continue_loop, "command_loop_state": continue_state},
+    )
+)
+typed_continue_plan = R._runner_transport_plan(
+    typed_continue_trace,
+    previous_state=initial_control_state,
+    transported_generations={0},
+)
+check("typed_continue_transports", typed_continue_plan["action"], "continue")
+check("typed_continue_generation_increments", typed_continue_plan["generation"], 1)
+check(
+    "typed_continue_uses_plugin_instruction",
+    R._runner_continuation_prompt(typed_continue_plan),
+    continue_loop["instruction"],
+)
+
+second_continue_loop = {
+    **continue_loop,
+    "generation": 2,
+    "instruction": "Apply the next typed repair and call smell_verify again.",
+}
+second_continue_state = command_state(2, "continue", second_continue_loop["instruction"])
+multi_verify_trace = R._verification_trace(
+    verify_event(
+        {"status": "SMELL_GUARD_FAILED", "loop": continue_loop},
+        metadata={"loop": continue_loop, "command_loop_state": continue_state},
+    )
+    + "\n"
+    + verify_event(
+        {"status": "SMELL_GUARD_FAILED", "loop": second_continue_loop},
+        metadata={"loop": second_continue_loop, "command_loop_state": second_continue_state},
+    )
+)
+multi_verify_plan = R._runner_transport_plan(
+    multi_verify_trace,
+    previous_state=initial_control_state,
+    transported_generations={0},
+)
+check("same_turn_control_chain_is_validated", multi_verify_plan["action"], "continue")
+check("same_turn_control_chain_reaches_latest_generation", multi_verify_plan["generation"], 2)
+
+duplicate_generation_trace = R._verification_trace(
+    verify_event(
+        {"status": "SMELL_GUARD_FAILED", "loop": continue_loop},
+        metadata={"loop": continue_loop, "command_loop_state": continue_state},
+    )
+    + "\n"
+    + verify_event(
+        {"status": "SMELL_GUARD_FAILED", "loop": continue_loop},
+        metadata={"loop": continue_loop, "command_loop_state": continue_state},
+    )
+)
+check(
+    "same_turn_duplicate_generation_fails_closed",
+    R._runner_transport_plan(
+        duplicate_generation_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    )["action"],
+    "stop",
+)
+
+missing_state_trace = R._verification_trace(
+    verify_event({"status": "SMELL_GUARD_FAILED", "loop": continue_loop})
+)
+check(
+    "continue_missing_state_fails_closed",
+    R._runner_transport_plan(
+        missing_state_trace,
+        previous_state=initial_control_state,
+        transported_generations={0},
+    )["action"],
+    "stop",
+)
+contradictory_state = command_state(1, "stop", "", "NO_PROGRESS")
+check(
+    "continue_state_payload_contradiction_fails_closed",
+    R._runner_transport_plan(
+        R._verification_trace(
+            verify_event(
+                {"status": "SMELL_GUARD_FAILED", "loop": continue_loop},
+                metadata={"loop": continue_loop, "command_loop_state": contradictory_state},
+            )
+        ),
+        previous_state=initial_control_state,
+        transported_generations={0},
+    )["action"],
+    "stop",
+)
+old_generation_loop = {**continue_loop, "generation": 0}
+old_generation_state = command_state(0, "continue", continue_loop["instruction"])
+check(
+    "continue_old_generation_fails_closed",
+    R._runner_transport_plan(
+        R._verification_trace(
+            verify_event(
+                {"status": "SMELL_GUARD_FAILED", "loop": old_generation_loop},
+                metadata={"loop": old_generation_loop, "command_loop_state": old_generation_state},
+            )
+        ),
+        previous_state=initial_control_state,
+        transported_generations={0},
+    )["action"],
+    "stop",
+)
+
+formal_pass_loop = {
+    "generation": 1,
+    "decision": "stop",
+    "instruction": "",
+    "termination_reason": "PASS",
+}
+formal_pass_receipt = {
+    "stage": "formal_verify",
+    "status": "PASS",
+    "success": True,
+    "accepted": True,
+    "resolution": "resolved",
+    "terminationReason": "PASS",
+    "failureCategory": "",
+    "failureGroup": "",
+    "loop": formal_pass_loop,
+}
+formal_pass_state = command_state(
+    1,
+    "stop",
+    "",
+    "PASS",
+    terminal_receipt=formal_pass_receipt,
+)
+formal_pass_trace = R._verification_trace(
+    verify_event(
+        formal_pass_payload(formal_pass_loop, formal_pass_state),
+        metadata={"loop": formal_pass_loop, "command_loop_state": formal_pass_state},
+    )
+)
+formal_pass_trace["runner_control_plan"] = R._runner_transport_plan(
+    formal_pass_trace,
+    previous_state=initial_control_state,
+    transported_generations=set(),
+)
+formal_authorization = R._runner_terminal_authorization(formal_pass_trace, 0)
+check("formal_pass_terminal_authorizes_confirmation", formal_authorization["authorized"], True)
+
+for authorization_name, state_mutation, returncode in (
+    (
+        "cheap_pass_does_not_authorize",
+        {**formal_pass_state, "terminal_receipt": {**formal_pass_receipt, "stage": "cheap_guard"}},
+        0,
+    ),
+    (
+        "protocol_pass_does_not_authorize",
+        {**formal_pass_state, "terminal_receipt": {**formal_pass_receipt, "stage": "protocol"}},
+        0,
+    ),
+    (
+        "formal_improved_does_not_authorize",
+        {
+            **formal_pass_state,
+            "terminal_receipt": {
+                **formal_pass_receipt,
+                "status": "IMPROVED",
+                "accepted": False,
+                "terminationReason": "IMPROVED",
+                "loop": {**formal_pass_loop, "termination_reason": "IMPROVED"},
+            },
+            "control": {**formal_pass_state["control"], "termination_reason": "IMPROVED"},
+        },
+        0,
+    ),
+    ("runtime_abort_does_not_authorize", formal_pass_state, 124),
+):
+    mutation_trace = R._verification_trace(
+        verify_event(
+            {
+                "success": True,
+                "accepted": True,
+                "status": "PASS",
+                "resolution": "resolved",
+                "loop": state_mutation["control"],
+            },
+            metadata={"loop": state_mutation["control"], "command_loop_state": state_mutation},
+        )
+    )
+    mutation_trace["runner_control_plan"] = R._runner_transport_plan(
+        mutation_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    )
+    check(
+        authorization_name,
+        R._runner_terminal_authorization(mutation_trace, returncode)["authorized"],
+        False,
+    )
+
+continue_not_closed_authorization = R._runner_terminal_authorization(typed_continue_trace, 0)
+check("continue_not_closed_does_not_authorize", continue_not_closed_authorization["authorized"], False)
+check(
+    "zero_verify_does_not_authorize",
+    R._runner_terminal_authorization(
+        R._verification_trace('{"type":"text","part":{"text":"done"}}'),
+        0,
+    )["authorized"],
+    False,
+)
+
+minimal_fresh_pass = {
+    "schema_version": "smell.verify.decision/v1",
+    "success": True,
+    "accepted": True,
+    "status": "PASS",
+    "resolution": "resolved",
+    "termination_reason": "PASS",
+}
+invalid_fresh_payload, invalid_fresh_audit = R._apply_runner_confirmation(
+    0,
+    minimal_fresh_pass,
+    formal_authorization,
+)
+check("minimal_fresh_pass_is_rejected", invalid_fresh_payload["accepted"], False)
+check(
+    "minimal_fresh_pass_protocol_reason",
+    invalid_fresh_audit["reason"],
+    "FRESH_VERIFY_PROTOCOL_INVALID",
+)
+fresh_pass = formal_pass_payload(formal_pass_loop, formal_pass_state)
+confirmed_payload, confirmed_audit = R._apply_runner_confirmation(
+    0,
+    fresh_pass,
+    formal_authorization,
+)
+check("authorized_fresh_pass_stays_pass", confirmed_payload["status"], "PASS")
+check("authorized_fresh_pass_is_accepted", confirmed_payload["accepted"], True)
+check("authorized_fresh_pass_audit", confirmed_audit["reason"], "FORMAL_PASS_CONFIRMED")
+
+blocked_payload, blocked_audit = R._apply_runner_confirmation(
+    0,
+    fresh_pass,
+    continue_not_closed_authorization,
+)
+check("fresh_pass_cannot_promote_unclosed_continue", blocked_payload["accepted"], False)
+check("fresh_pass_unclosed_status", blocked_payload["status"], "RUNNER_CONFIRMATION_NOT_AUTHORIZED")
+check("fresh_pass_raw_observation_is_audited", blocked_audit["raw_observation"]["status"], "PASS")
+
 empty_trace = R._verification_trace('{"type":"text","part":{"text":"done"}}')
 check("trace_empty_calls", empty_trace["smell_verify_calls"], 0)
 check(
-    "initial_missing_verify_reminder",
-    R._runner_closure_action(empty_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
-    "verify_required",
-)
-check(
-    "missing_verify_one_shot",
-    R._runner_closure_action(empty_trace, reminder_used=True, continuations_dispatched=0, max_continuations=2),
+    "missing_loop_decision_fails_closed",
+    R._runner_closure_action(
+        empty_trace,
+        previous_state=None,
+        transported_generations=set(),
+    ),
     "stop",
 )
 guard_progress_payload = {
@@ -757,16 +1339,25 @@ guard_progress_trace = R._verification_trace(verify_event(
         },
     },
 ))
-check("trace_guard_progress_required", guard_progress_trace["last_guard_progress_required"], True)
 check(
-    "guard_progress_resumes_without_loop_decision",
+    "guard_progress_without_loop_decision_fails_closed",
     R._runner_closure_action(
         guard_progress_trace,
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=0,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     ),
-    "guard_progress",
+    "stop",
+)
+guard_progress_continues = dict(guard_progress_payload)
+guard_progress_continues["loop"] = {"decision": "continue"}
+check(
+    "guard_progress_with_untyped_continue_fails_closed",
+    R._runner_closure_action(
+        R._verification_trace(verify_event(guard_progress_continues)),
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    ),
+    "stop",
 )
 guard_progress_stopped = dict(guard_progress_payload)
 guard_progress_stopped["loop"] = {
@@ -786,9 +1377,8 @@ check(
     "guard_progress_no_progress_stops_same_session",
     R._runner_closure_action(
         guard_progress_stopped_trace,
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=2,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     ),
     "stop",
 )
@@ -796,28 +1386,12 @@ continue_trace = R._verification_trace(verify_event({"status": "SMELL_GUARD_FAIL
 check("trace_verify_calls", continue_trace["smell_verify_calls"], 1)
 check("trace_decision", continue_trace["last_loop_decision"], "continue")
 check(
-    "continue_with_budget",
-    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=1, max_continuations=2),
-    "continue",
-)
-check(
-    "bare_continue_has_no_extra_transport",
-    R._runner_closure_action(continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
-    "stop",
-)
-cap_continue_trace = R._verification_trace(verify_event({
-    "status": "SMELL_GUARD_FAILED",
-    "loop": {"decision": "continue", "cap_recovery_used": True},
-}))
-check("trace_cap_recovery", cap_continue_trace["last_cap_recovery_used"], True)
-check(
-    "plugin_cap_recovery_transport",
-    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=2, max_continuations=2),
-    "continue",
-)
-check(
-    "transport_hard_cap",
-    R._runner_closure_action(cap_continue_trace, reminder_used=False, continuations_dispatched=3, max_continuations=2),
+    "untyped_continue_is_not_transportable",
+    R._runner_closure_action(
+        continue_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    ),
     "stop",
 )
 persisted_state = {
@@ -840,7 +1414,11 @@ pass_trace = R._verification_trace(verify_event({
 }))
 check(
     "pass_stops",
-    R._runner_closure_action(pass_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+    R._runner_closure_action(
+        pass_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    ),
     "stop",
 )
 check("trace_keeps_last_payload", pass_trace["last_payload"]["status"], "PASS")
@@ -862,11 +1440,7 @@ check(
     read_only_after_verify["completed_tools_after_last_verify"],
     ["todowrite"],
 )
-check(
-    "agent_project_full_receipt_path_exists",
-    hasattr(R, "_agent_project_full_receipt"),
-    True,
-)
+check("runner_has_guarded_agent_receipt_reuse_path", hasattr(R, "_agent_project_full_receipt"), True)
 post_verify_tool = json.dumps({
     "type": "tool_use",
     "part": {
@@ -952,6 +1526,16 @@ idea_bypass_contract = R._idea_protocol_contract([{**idea_bypass_trace, "last_pa
 check("idea_trace_detects_direct_cli", idea_bypass_trace["direct_idea_cli_calls"], 1)
 check("idea_bypass_contract_fails", idea_bypass_contract["success"], False)
 check_true("idea_bypass_contract_reason", "DIRECT_IDEA_CLI_USED" in idea_bypass_contract["violations"])
+run_sample_source = inspect.getsource(R._run_sample)
+check_true(
+    "idea_trace_contract_is_audit_only",
+    '"authority": "audit_only"' in run_sample_source,
+)
+check_true(
+    "idea_trace_contract_cannot_override_typed_status",
+    'final_status = "IDEA_PROTOCOL_FAILED"' not in run_sample_source
+    and 'idea_protocol["success"]' not in run_sample_source,
+)
 malformed = json.dumps({"type": "tool_use", "part": {"tool": "smell_verify", "state": {"status": "completed", "output": "truncated"}}})
 malformed_trace = R._verification_trace(malformed)
 check("malformed_still_counts_verify", malformed_trace["smell_verify_calls"], 1)
@@ -982,7 +1566,11 @@ cap_payload = {
 cap_trace = R._verification_trace(verify_event(cap_payload))
 check(
     "runner_does_not_reinterpret_plugin_stop",
-    R._runner_closure_action(cap_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+    R._runner_closure_action(
+        cap_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
+    ),
     "stop",
 )
 compile_cap_payload = {
@@ -997,9 +1585,8 @@ check(
     "runner_does_not_reinterpret_compile_stop",
     R._runner_closure_action(
         compile_cap_trace,
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=2,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     ),
     "stop",
 )
@@ -1011,9 +1598,8 @@ check(
     "compile_cap_empty_diff_stops",
     R._runner_closure_action(
         R._verification_trace(verify_event(compile_cap_no_diff)),
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=2,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     ),
     "stop",
 )
@@ -1026,46 +1612,41 @@ for name, mutation in (
     trace = R._verification_trace(verify_event(payload))
     check(
         name,
-        R._runner_closure_action(trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
+        R._runner_closure_action(
+            trace,
+            previous_state=initial_control_state,
+            transported_generations=set(),
+        ),
         "stop",
     )
-verify_resume_prompt = R._runner_continuation_prompt("verify_required", 0, 2)
-guard_progress_resume_prompt = R._runner_continuation_prompt(
-    "guard_progress",
-    0,
-    2,
-)
-continue_resume_prompt = R._runner_continuation_prompt(
-    "continue",
-    1,
-    2,
-)
-check_true("verify_prompt_marker", "[runner-resume verify-required]" in verify_resume_prompt)
-check_true(
-    "guard_progress_prompt_marker",
-    "[runner-resume guard-progress]" in guard_progress_resume_prompt,
-)
-check_true(
-    "guard_progress_prompt_uses_tool_result_as_source",
-    "latest smell_verify tool result" in guard_progress_resume_prompt,
-)
-check_true(
-    "guard_progress_prompt_keeps_budget_controller_owned",
-    "55" not in guard_progress_resume_prompt
-    and "SECRET" not in guard_progress_resume_prompt
-    and "GUARD_PROGRESS_REQUIRED" not in guard_progress_resume_prompt,
-)
-check_true("continue_prompt_marker", "[runner-resume continue 1/2]" in continue_resume_prompt)
-check_true(
-    "continue_prompt_uses_tool_result_as_source",
-    "latest smell_verify tool result" in continue_resume_prompt,
-)
+continue_resume_prompt = R._runner_continuation_prompt(typed_continue_plan)
+check("continue_prompt_is_exact_control_instruction", continue_resume_prompt, continue_loop["instruction"])
 check_true(
     "continue_prompt_does_not_duplicate_mutable_details",
     "SECRET" not in continue_resume_prompt
     and "BUILD_FAILED" not in continue_resume_prompt
-    and "test API migrations" not in continue_resume_prompt,
+    and "test API migrations" not in continue_resume_prompt
+    and "guard-progress" not in continue_resume_prompt
+    and "verify-required" not in continue_resume_prompt
+    and "narrow corrective edit" not in continue_resume_prompt,
 )
+
+control_reason, verification_reason, compatible_reason = R._termination_reasons(
+    {"termination_reason": "FINAL_BUILD_FAILED"},
+    {"last_loop_termination_reason": "GUARD_PROGRESS_NO_PROGRESS"},
+    "",
+)
+check("control_reason_is_preserved_separately", control_reason, "GUARD_PROGRESS_NO_PROGRESS")
+check("verification_reason_is_preserved_separately", verification_reason, "FINAL_BUILD_FAILED")
+check("verification_reason_wins_compatible_field", compatible_reason, "FINAL_BUILD_FAILED")
+control_only, verification_empty, compatible_control = R._termination_reasons(
+    {},
+    {"last_loop_termination_reason": "NO_PROGRESS"},
+    "",
+)
+check("control_only_reason", control_only, "NO_PROGRESS")
+check("empty_verification_reason", verification_empty, "")
+check("compatible_reason_falls_back_to_control", compatible_control, "NO_PROGRESS")
 check("buildenv_mutation_status_removed", hasattr(R, "_record_buildenv_mutation"), False)
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -1429,6 +2010,21 @@ with tempfile.TemporaryDirectory() as tmp:
         inactivity_verify["timeout"]["scope"],
         "model-event-inactivity",
     )
+    check(
+        "inactivity_control_reason_is_separate",
+        inactivity_result["control_termination_reason"],
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+    check(
+        "inactivity_verification_reason_is_separate",
+        inactivity_result["verification_termination_reason"],
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+    check(
+        "inactivity_csv_preserves_control_reason",
+        inactivity_csv["control_termination_reason"],
+        "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
 
 check(
     "baseline_not_found_status_is_exact",
@@ -1466,9 +2062,15 @@ check_true(
     run_sample_source.index("_initial_command_loop_state(")
     < run_sample_source.index("_run_opencode("),
 )
-check_true(
-    "idea_preflight_precedes_model",
-    run_sample_source.index("_prepare_idea_service(") < run_sample_source.index("_run_opencode("),
+check(
+    "idea_readiness_is_not_runner_authority",
+    "_prepare_idea_service(" in run_sample_source,
+    False,
+)
+check(
+    "idea_readiness_precheck_is_plugin_owned",
+    hasattr(R, "_prepare_idea_service"),
+    False,
 )
 check_true(
     "idea_close_follows_final_verify",
@@ -1476,8 +2078,11 @@ check_true(
     < run_sample_source.index("_close_idea_project("),
 )
 check_true(
-    "guard_progress_does_not_consume_continuation_counter",
-    'elif action == "continue":\n            continuations_dispatched += 1' in run_sample_source,
+    "typed_control_is_the_only_runner_transport",
+    "_runner_transport_plan(" in run_sample_source
+    and "transported_control_generations.add(generation)" in run_sample_source
+    and 'action == "guard_progress"' not in run_sample_source
+    and "max_continuations" not in inspect.getsource(R._runner_transport_plan),
 )
 check_true(
     "one_absolute_deadline_precedes_baseline",
@@ -1562,7 +2167,119 @@ prompt = sys.stdin.read()
 continued = "--session" in sys.argv
 decision = "stop" if continued else "continue"
 status = "PASS" if continued else "SMELL_GUARD_FAILED"
-payload = {"status": status, "loop": {"decision": decision}}
+generation = 2 if continued else 1
+instruction = "" if continued else "Repair the typed blocker and call smell_verify again."
+termination_reason = "PASS" if continued else ""
+loop = {
+    "generation": generation,
+    "decision": decision,
+    "instruction": instruction,
+    "termination_reason": termination_reason,
+}
+terminal = None
+if continued:
+    formal_receipt = {
+        "schema_version": "smell.formal-verification-receipt/v1",
+        "terminal_stage": "formal_verify",
+        "status": "PASS",
+        "success": True,
+        "accepted": True,
+        "resolution": "resolved",
+        "candidate_identity": {
+            "baseline_revision": "base",
+            "baseline_tree": "",
+            "production_diff": "diff",
+            "test_tree": "",
+            "verification_config_tree": "",
+        },
+        "outcome": "pass",
+        "diagnostic_signature": "PASS",
+        "guard": {"success": True, "failure_count": 0, "artifact_ref": "/tmp/guard"},
+        "build_test": {
+            "success": True,
+            "reason": "",
+            "project_full_executed": True,
+            "build_status": "ok",
+            "test_status": "ok",
+            "sample_test_status": "",
+        },
+        "fresh_isolation": {
+            "contract_version": "project-full-fresh-worktree/v1",
+            "mode": "detached_git_worktree",
+            "success": True,
+            "stage": "completed",
+            "cleanup_success": True,
+        },
+        "artifact_refs": {
+            "guard_evidence": "/tmp/guard",
+            "build_result": "/tmp/build",
+            "test_result": "/tmp/test",
+            "diff": "/tmp/diff",
+        },
+    }
+    terminal = {
+        "stage": "formal_verify",
+        "status": "PASS",
+        "success": True,
+        "accepted": True,
+        "resolution": "resolved",
+        "terminationReason": "PASS",
+        "failureCategory": "",
+        "failureGroup": "",
+        "formalVerificationReceipt": formal_receipt,
+        "ideaProtocolReceipt": None,
+        "loop": loop,
+    }
+state = {
+    "schema_version": 6,
+    "policy": {
+        "task": "Continue the current smell refactoring task.",
+        "verification_mode": "project_full",
+        "refactoring_backend": "direct",
+        "allow_test_changes": False,
+        "checkpoint_required": True,
+        "identity": {
+            "project_root": "/tmp/project", "smell": "long_method",
+            "location": "sample.py:1", "verification_mode": "project_full",
+            "project_override_root": "", "language": "python",
+            "target_context_json": "", "sample_test_location": "",
+            "sample_test_command": "", "build_command": "",
+            "project_test_command": "", "verification_cwd": "",
+            "verification_command_source": "", "sample_test_source": "",
+        },
+        "loop": {
+            "mode": "verify-failure", "max_continuations": 5,
+            "no_progress_limit": 1,
+            "allowed_failure_groups": ["smell", "compile", "test"],
+            "instruction": "repair narrowly", "sample_deadline_seconds": 1800,
+        },
+    },
+    "target_identity_context": "",
+    "started_at": 1,
+    "control": loop,
+    "continuation_count": 0,
+    "cap_recovery_used": False,
+    "no_progress_count": 0,
+    "last_failure_fingerprint": "",
+    "best_metric_deficit": None,
+    "best_structural_failure_count": None,
+    "last_blocker_codes": [],
+    "seen_structural_states": [],
+    "formal_candidate_state": {
+        "candidate_identity": formal_receipt["candidate_identity"] if continued else None,
+        "outcome": "pass" if continued else "",
+        "diagnostic_signature": "PASS" if continued else "",
+        "confirmation_required": False,
+    },
+    "idea_protocol_state": {
+        "active_proposal": None, "proposal_blocker": None,
+        "mutation_generation": 0, "verified_generation": 0,
+        "mutation_route": "", "mutation_proposal_id": "",
+        "revertible_apply_generation": None,
+    },
+    "terminal_receipt": terminal,
+}
+payload = {"success": continued, "accepted": continued, "status": status, "loop": loop}
 event = {
     "type": "tool_use",
     "sessionID": "ses_fake",
@@ -1571,7 +2288,11 @@ event = {
         "state": {
             "status": "completed",
             "output": json.dumps(payload),
-            "metadata": {"loop": payload["loop"], "auto_continuation": {"status": status}},
+            "metadata": {
+                "loop": loop,
+                "command_loop_state": state,
+                "auto_continuation": {"status": status},
+            },
         },
     },
 }
@@ -1590,38 +2311,39 @@ print(json.dumps(event))
     )
     first_sid = R._parse_session_id_from_json_events(first.stdout)
     first_trace = R._verification_trace(first.stdout)
-    first_action = R._runner_closure_action(
-        first_trace, reminder_used=False, continuations_dispatched=0, max_continuations=2
+    first_plan = R._runner_transport_plan(
+        first_trace,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     )
+    first_action = first_plan["action"]
     check("fake_initial_rc", first.returncode, 0)
     check("fake_initial_sid", first_sid, "ses_fake")
     check("fake_initial_action", first_action, "continue")
     second = subprocess.run(
         R._opencode_run_command(fake_args, "java-refactor-agent", first_sid),
-        input=R._runner_continuation_prompt("continue", 1, 2),
+        input=R._runner_continuation_prompt(first_plan),
         text=True,
         capture_output=True,
         check=False,
     )
     second_trace = R._verification_trace(second.stdout)
     second_action = R._runner_closure_action(
-        second_trace, reminder_used=False, continuations_dispatched=1, max_continuations=2
+        second_trace,
+        previous_state=first_plan["state"],
+        transported_generations={1},
     )
     check("fake_continuation_rc", second.returncode, 0)
     check("fake_continuation_status", second_trace["last_status"], "PASS")
     check("fake_continuation_action", second_action, "stop")
 
-print("== fake CLI guard-progress same-session integration ==")
+print("== fake CLI guard-progress missing-decision closure ==")
 with tempfile.TemporaryDirectory() as tmp:
     fake = Path(tmp) / "fake-opencode-guard-progress"
     fake.write_text(
         """#!/usr/bin/env python3
 import json, sys
-continued = "--session" in sys.argv
-payload = (
-    {"success": True, "status": "PASS", "loop": {"decision": "stop"}}
-    if continued
-    else {
+payload = {
         "schema_version": "smell.guard-progress/v1",
         "success": False,
         "status": "GUARD_PROGRESS_REQUIRED",
@@ -1632,8 +2354,7 @@ payload = (
         "project_full_executed": False,
         "metric_budget": {"current": 55, "passing_max": 50, "required_reduction": 5},
         "next_action": "Reduce the target method below the Guard threshold.",
-    }
-)
+}
 event = {
     "type": "tool_use",
     "sessionID": "ses_guard_progress",
@@ -1671,33 +2392,11 @@ print(json.dumps(event))
     first_trace = R._verification_trace(first.stdout)
     first_action = R._runner_closure_action(
         first_trace,
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=0,
+        previous_state=initial_control_state,
+        transported_generations=set(),
     )
     check("guard_progress_fake_initial_sid", first_sid, "ses_guard_progress")
-    check("guard_progress_fake_initial_action", first_action, "guard_progress")
-    second_command = R._opencode_run_command(fake_args, "smell-refactor-agent", first_sid)
-    check_true(
-        "guard_progress_fake_reuses_original_session",
-        "--session" in second_command and first_sid in second_command,
-    )
-    second = subprocess.run(
-        second_command,
-        input=R._runner_continuation_prompt("guard_progress", 0, 2),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    second_trace = R._verification_trace(second.stdout)
-    second_action = R._runner_closure_action(
-        second_trace,
-        reminder_used=False,
-        continuations_dispatched=0,
-        max_continuations=0,
-    )
-    check("guard_progress_fake_crossed_status", second_trace["last_status"], "PASS")
-    check("guard_progress_fake_crossed_action", second_action, "stop")
+    check("guard_progress_fake_missing_decision_stops", first_action, "stop")
 
 print("== _task_prompt ==")
 # Build a minimal fake sample/args to call _task_prompt
@@ -1722,6 +2421,12 @@ check("prompt_excludes_raw_dataset_evidence", "oracle_score=99" in prompt_plain,
 roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "project_full"))
 check("command_roundtrip_instruction", roundtrip.loop.instruction, args.loop_instruction)
 check_true("command_roundtrip_task", "Repair this one java smell" in roundtrip.task)
+check("command_roundtrip_direct_backend", roundtrip.refactoring_backend, "direct")
+idea_args = argparse.Namespace(**{**vars(args), "refactoring_backend": "idea"})
+idea_roundtrip = parse_command_policy(
+    R._command_arguments(prompt_plain, idea_args, "project_full")
+)
+check("command_roundtrip_idea_backend", idea_roundtrip.refactoring_backend, "idea")
 check_true(
     "prompt_excludes_controller_policy",
     all(
@@ -1748,8 +2453,9 @@ initial_controller_state = R._initial_command_loop_state(
     "project_full",
     started_at_ms=123456,
 )
-check("initial_controller_state_schema", initial_controller_state["schema_version"], 4)
+check("initial_controller_state_schema", initial_controller_state["schema_version"], 6)
 check("initial_controller_state_started_at", initial_controller_state["started_at"], 123456)
+check("initial_controller_state_target_context", initial_controller_state["target_identity_context"], "")
 check(
     "initial_controller_state_identity",
     initial_controller_state["policy"]["identity"]["location"],
@@ -1760,6 +2466,9 @@ check(
     initial_controller_state["policy"]["task"],
     "Continue the current smell refactoring task.",
 )
+check("initial_controller_state_best_metric", initial_controller_state["best_metric_deficit"], None)
+check("initial_controller_state_best_structural", initial_controller_state["best_structural_failure_count"], None)
+check("initial_controller_state_terminal", initial_controller_state["terminal_receipt"], None)
 
 print("== zero-verify state handoff integration ==")
 with tempfile.TemporaryDirectory() as tmp:
@@ -1774,7 +2483,15 @@ with tempfile.TemporaryDirectory() as tmp:
 import json, os, sys
 if os.environ.get("SMELL_BATCH_RUN") != "1":
     raise SystemExit(20)
-if os.environ.get("SMELL_REFACTORING_BACKEND") != "idea" or os.environ.get("SMELL_ENABLE_IDEA_TOOLS") != "1":
+if any(
+    name in os.environ
+    for name in (
+        "SMELL_REFACTORING_BACKEND",
+        "SMELL_ENABLE_IDEA_TOOLS",
+        "SMELL_IDEA_PREPARED",
+        "SMELL_IDEA_PROJECT_ROOT",
+    )
+):
     raise SystemExit(23)
 if os.environ.get("SMELL_BUILD_COMMAND") != "./gradlew classes":
     raise SystemExit(24)
@@ -1793,7 +2510,7 @@ if continued:
         raise SystemExit(21)
     state = json.loads(raw)
     identity = state.get("policy", {}).get("identity", {})
-    if state.get("schema_version") != 4 or identity.get("location") != "Foo.java:1":
+    if state.get("schema_version") != 6 or identity.get("location") != "Foo.java:1":
         raise SystemExit(22)
 print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
 """,
@@ -1888,6 +2605,14 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         (artifacts / "raw-user-input.txt").is_file()
         and bool(first_manifest["raw_user_input"]["sha256"]),
     )
+    zero_verify_transport = R._runner_transport_plan(
+        R._verification_trace(
+            (artifacts / "run.events.jsonl").read_text(encoding="utf-8")
+        ),
+        previous_state=handoff_state,
+        transported_generations=set(),
+    )
+    check("zero_verify_integration_transport", zero_verify_transport["action"], "verify_required")
     second_rc, second_session, second_termination_reason = R._run_opencode(
         handoff_sample,
         artifacts,
@@ -1895,9 +2620,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         "java-refactor-agent",
         "project_full",
         session_id=first_session,
-        continuation_prompt=R._runner_continuation_prompt(
-            "verify_required", 0, 2
-        ),
+        continuation_prompt=R._runner_continuation_prompt(zero_verify_transport),
         command_loop_state=handoff_state,
         attempt_suffix=".continue-1",
         hard_timeout_seconds=5,
@@ -1972,6 +2695,13 @@ time.sleep(3)
         "silent_model_termination_artifact",
         silent_termination["termination_reason"],
         "MODEL_EVENT_INACTIVITY_TIMEOUT",
+    )
+    check("silent_shutdown_is_bounded", silent_termination["shutdown"]["bounded"], True)
+    check_true(
+        "silent_shutdown_has_phase_timing",
+        "term_wait_ms" in silent_termination["shutdown"]
+        and "kill_wait_ms" in silent_termination["shutdown"]
+        and "stdout_drain_ms" in silent_termination["shutdown"],
     )
 
     periodic = temp / "fake-opencode-periodic"
