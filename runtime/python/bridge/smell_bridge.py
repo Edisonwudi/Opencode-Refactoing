@@ -2278,6 +2278,17 @@ _RRDTOOL_TRACKED_VERIFICATION_PRODUCTS = frozenset({
     "po/hu.po",
     "tests/graph2.output",
 })
+
+
+def _project_generated_output_root(root: Path, path: str) -> bool:
+    """Recognize a configured, project-owned build root in the candidate tree."""
+    normalized = path.replace("\\", "/").lstrip("/")
+    return bool(
+        normalized.startswith("build/")
+        and (root / "src/google/protobuf").is_dir()
+    )
+
+
 _AUTOTOOLS_GENERATED_NAMES = frozenset({
     "aclocal.m4",
     "ar-lib",
@@ -2784,11 +2795,16 @@ def _final_diff_generated_artifact_audit(
             and project_root.name.casefold() == "rrdtool"
             and path in _RRDTOOL_TRACKED_VERIFICATION_PRODUCTS
         )
+        project_build_product = bool(
+            project_root is not None
+            and _project_generated_output_root(project_root, path)
+        )
         if not any((
             controller_owned,
             cjson_root_product,
             tracked_autotools_product,
             rrdtool_verification_product,
+            project_build_product,
         )):
             continue
         artifacts.append({

@@ -410,6 +410,37 @@ def main() -> None:
         )
         assert manual_baseline["success"] is True, manual_baseline
         assert manual_baseline["paths"] == [], manual_baseline
+
+        protobuf_root = Path(raw) / "protobuf-29.3"
+        (protobuf_root / "src/google/protobuf").mkdir(parents=True)
+        protobuf_build_tree = smell_bridge._final_diff_generated_artifact_audit(
+            {
+                "success": True,
+                "changes": [
+                    {
+                        "path": "build/CMakeFiles/CMakeConfigureLog.yaml",
+                        "operation": "added",
+                    },
+                    {
+                        "path": "build/bin/protoc",
+                        "operation": "added",
+                    },
+                    {
+                        "path": "src/build/checked_in_helper.cc",
+                        "operation": "added",
+                    },
+                ],
+            },
+            project_root=protobuf_root,
+        )
+        assert protobuf_build_tree["success"] is False, protobuf_build_tree
+        assert protobuf_build_tree["status"] == (
+            "FINAL_DIFF_GENERATED_ARTIFACTS"
+        ), protobuf_build_tree
+        assert protobuf_build_tree["paths"] == [
+            "build/CMakeFiles/CMakeConfigureLog.yaml",
+            "build/bin/protoc",
+        ], protobuf_build_tree
         for legal_path in (
             "configure.ac",
             "Makefile.am",
