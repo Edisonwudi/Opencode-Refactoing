@@ -10,6 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ROOT / ".opencode" / "skills"
 IDEA = SKILLS / "idea-refactor-cli" / "references" / "refactor-paths"
+SHARED_OPERATION_REFERENCE = SKILLS / "_shared" / "operation-translations.md"
+SKILL_OPERATION_LINK = "../_shared/operation-translations.md"
+JAVA_OPERATION_LINK = "../../_shared/operation-translations.md"
 
 JAVA_SMELLS = (
     "code_clone_type1",
@@ -49,20 +52,20 @@ for language in ("python", "c", "cpp"):
         dataset_smells.add("dead_code")
     require(dataset_smells == set(GENERIC_SMELLS), f"per-smell skills do not cover {language} datasets")
 
+require(SHARED_OPERATION_REFERENCE.is_file(), "missing shared operation reference")
+
 route_total = 0
 for smell in JAVA_SMELLS:
     skill_name = f"smell-repair-{smell.replace('_', '-')}"
     skill_root = SKILLS / skill_name
     skill_file = skill_root / "SKILL.md"
     java_reference = skill_root / "references" / "java.md"
-    operation_reference = skill_root / "references" / "operation-translations.md"
     idea_reference = IDEA / f"{smell}.yaml"
 
     require(skill_file.is_file(), f"missing primary skill: {skill_name}")
     require(java_reference.is_file(), f"missing Java reference: {skill_name}")
-    require(operation_reference.is_file(), f"missing operation reference: {smell}")
     require(idea_reference.is_file(), f"missing IDEA route: {smell}")
-    if not all(path.is_file() for path in (skill_file, java_reference, operation_reference, idea_reference)):
+    if not all(path.is_file() for path in (skill_file, java_reference, idea_reference)):
         continue
 
     main_text = skill_file.read_text(encoding="utf-8")
@@ -73,14 +76,19 @@ for smell in JAVA_SMELLS:
     require("TODO" not in main_text, f"unfinished primary skill: {skill_name}")
     require("Read exactly one language route" in main_text or smell == "refused_bequest", f"missing one-route contract: {skill_name}")
     require("references/java.md" in main_text, f"Java route not linked: {skill_name}")
+    java_text = java_reference.read_text(encoding="utf-8")
+    require(SKILL_OPERATION_LINK in main_text, f"shared operation mechanics not linked: {skill_name}")
+    require(JAVA_OPERATION_LINK in java_text, f"Java routes do not link shared mechanics: {skill_name}")
     require(
-        "references/operation-translations.md" in main_text,
-        f"operation mechanics not linked: {skill_name}",
+        (skill_file.parent / SKILL_OPERATION_LINK).resolve() == SHARED_OPERATION_REFERENCE.resolve()
+        and (java_reference.parent / JAVA_OPERATION_LINK).resolve() == SHARED_OPERATION_REFERENCE.resolve(),
+        f"shared operation links do not resolve: {skill_name}",
     )
+    require("](operation-translations.md)" not in java_text, f"stale local mechanics link: {skill_name}")
     if smell != "refused_bequest":
         require("does not replace the Java semantic route" in main_text, f"IDEA route replaces Java semantics: {skill_name}")
 
-    expected_references = {"java.md", "operation-translations.md"}
+    expected_references = {"java.md"}
     if smell in GENERIC_SMELLS:
         expected_references.update({"python.md", "c.md", "cpp.md"})
         for language in ("Python", "C", "C++"):
@@ -92,7 +100,7 @@ for smell in JAVA_SMELLS:
     require(actual_references == expected_references, f"unexpected references for {skill_name}: {sorted(actual_references)}")
     require(not list((skill_root / "references").rglob("SKILL.md")), f"nested skill found in {skill_name}")
 
-    route_total += len(re.findall(r"^### `[^`]+`$", java_reference.read_text(encoding="utf-8"), re.MULTILINE))
+    route_total += len(re.findall(r"^### `[^`]+`$", java_text, re.MULTILINE))
 
 require(route_total == 47, f"expected 47 preserved Java direct routes, found {route_total}")
 
@@ -198,5 +206,5 @@ if failures:
 
 print(
     "PASS: 11 per-smell skills; 10 four-language routes; refused_bequest Java-only; "
-    "47 Java direct routes and 11 IDEA routes preserved"
+    "one shared operation reference; 47 Java direct routes and 11 IDEA routes preserved"
 )

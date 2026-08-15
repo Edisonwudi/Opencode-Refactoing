@@ -54,7 +54,7 @@ that state
 
 Direct edit target: Extract a field/state cluster and the methods that maintain it into a new class.
 
-Source operation shape: `extract:class`, `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:class`, `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -76,7 +76,7 @@ owner
 
 Direct edit target: Move several methods that mostly manipulate one existing collaborator to that collaborator.
 
-Source operation shape: `move:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `move:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -97,7 +97,7 @@ cannot migrate the needed fields and maintaining methods
 
 Direct edit target: Manually introduce an extracted state type when native class extraction is not available.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

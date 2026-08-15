@@ -39,7 +39,7 @@ signature so every caller updates together
 
 Direct edit target: Rename the short parameter through the method signature and body.
 
-Source operation shape: `change-signature:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `change-signature:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -58,7 +58,7 @@ hides that intent
 
 Direct edit target: Rename a generic method to describe its real operation.
 
-Source operation shape: `rename:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `rename:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -77,7 +77,7 @@ scope, so an in-place local rename is enough
 
 Direct edit target: Rename the vague local variable inside its lexical scope.
 
-Source operation shape: `rename:local-variable`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `rename:local-variable`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -96,7 +96,7 @@ rather than only renaming one member
 
 Direct edit target: Rename the opaque type and its Java file/references when required.
 
-Source operation shape: `rename:type`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `rename:type`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

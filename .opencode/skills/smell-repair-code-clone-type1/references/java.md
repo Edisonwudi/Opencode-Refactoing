@@ -98,7 +98,7 @@ replacement can collapse both at once
 Direct edit target: Extract the identical block once in the same file and replace every duplicate with the
 shared call.
 
-Source operation shape: `extract:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -117,7 +117,7 @@ normalization is pull-up rather than a new helper
 
 Direct edit target: Move the common behavior to the real shared parent and remove duplicate child overrides.
 
-Source operation shape: `pullUp:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `pullUp:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -155,7 +155,7 @@ helper to the closest shared parent or package helper, and replace only the
 duplicated block with a call.
 
 Source operation shape: `direct:edit`. See
-[`operation-translations.md`](operation-translations.md) for reusable mechanics.
+[`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Generic shape:
 
@@ -265,7 +265,7 @@ shared behavior should move to an external helper
 
 Direct edit target: Create an external helper because the clone sites have no good shared superclass owner.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -317,7 +317,7 @@ creating a new helper
 
 Direct edit target: Delegate to the existing semantic owner instead of creating a second helper.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -341,7 +341,7 @@ adapters
 
 Direct edit target: Keep public overloads and extract a private shared core for the common algorithm.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

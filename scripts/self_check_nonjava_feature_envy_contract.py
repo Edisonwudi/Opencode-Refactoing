@@ -17,7 +17,7 @@ CONFIG = RUNTIME_PYTHON / "smell_core" / "defaults" / "refactor.yaml"
 if str(RUNTIME_PYTHON) not in sys.path:
     sys.path.insert(0, str(RUNTIME_PYTHON))
 
-from smell_core.guards import _run_generic_feature_envy_guard  # noqa: E402
+from smell_core.guards import run_smell_guards  # noqa: E402
 from smell_core.guards.context import GuardRunContext  # noqa: E402
 from smell_core.feature_envy import feature_envy_metric_budget  # noqa: E402
 from smell_core.location import parse_locations  # noqa: E402
@@ -117,6 +117,86 @@ struct Order {
 
 static int total_price(Order *order) {
     return order->total_price();
+}
+"""
+
+PYTHON_ALIAS_GAMED = """\
+class Order:
+    def __init__(self):
+        self.unit_price = 10
+        self.quantity = 2
+        self.tax_rate = 5
+        self.shipping_fee = 3
+        self.discount = 1
+
+
+def total_price(order):
+    up = order.unit_price
+    q = order.quantity
+    tr = order.tax_rate
+    sf = order.shipping_fee
+    dc = order.discount
+    subtotal = up * q
+    tax = subtotal * tr
+    shipping = sf
+    discount = dc
+    total = subtotal + tax + shipping - discount
+    return total
+"""
+PYTHON_BARE_ALIAS_GAMED = """\
+class Order:
+    def __init__(self):
+        self.unit_price = 10
+        self.quantity = 2
+        self.tax_rate = 5
+        self.shipping_fee = 3
+        self.discount = 1
+        self.tracking_info = "T-1"
+
+
+def total_price(order):
+    ti = order.tracking_info
+    up, q = order.unit_price, order.quantity
+    tr = order.tax_rate
+    sf = order.shipping_fee
+    dc = order.discount
+    label = ti
+    subtotal = up * q
+    tax = subtotal + tr
+    total = subtotal + tax + sf - dc
+    return label, total
+"""
+C_ALIAS_GAMED = """\
+struct Order { int unit_price, quantity, tax_rate, shipping_fee, discount; };
+
+static int total_price(struct Order *order) {
+    int up = order->unit_price;
+    int q = order->quantity;
+    int tr = order->tax_rate;
+    int sf = order->shipping_fee;
+    int dc = order->discount;
+    int subtotal = up * q;
+    int tax = subtotal * tr;
+    int shipping = sf;
+    int discount = dc;
+    int total = subtotal + tax + shipping - discount;
+    return total;
+}
+"""
+C_BARE_ALIAS_GAMED = """\
+struct Order { int unit_price, quantity, tax_rate, shipping_fee, discount; };
+
+static int total_price(struct Order *order) {
+    int up = order->unit_price;
+    int q = order->quantity;
+    int tr = order->tax_rate;
+    int sf = order->shipping_fee;
+    int dc = order->discount;
+    int total = up * q;
+    total += tr;
+    total += sf;
+    total -= dc;
+    return total;
 }
 """
 
@@ -300,6 +380,81 @@ def _positive_case(
         return before_access, after_access, len(current.get("wrapper_reanchors") or [])
 
 
+def _alias_folding_anti_gaming_cases() -> dict[str, tuple[float, float]]:
+    cases = (
+        (
+            "python/feature_envy[gamed]",
+            "python",
+            "demo.py",
+            PYTHON_BEFORE,
+            PYTHON_ALIAS_GAMED,
+            "demo.py:method=total_price|line=10",
+        ),
+        (
+            "python/feature_envy[bare-gamed]",
+            "python",
+            "demo.py",
+            PYTHON_BEFORE,
+            PYTHON_BARE_ALIAS_GAMED,
+            "demo.py:method=total_price|line=10",
+        ),
+        (
+            "c/feature_envy[gamed]",
+            "c",
+            "demo.c",
+            C_BEFORE,
+            C_ALIAS_GAMED,
+            "demo.c:method=total_price|line=3",
+        ),
+        (
+            "c/feature_envy[bare-gamed]",
+            "c",
+            "demo.c",
+            C_BEFORE,
+            C_BARE_ALIAS_GAMED,
+            "demo.c:method=total_price|line=3",
+        ),
+    )
+    results: dict[str, tuple[float, float]] = {}
+    for label, language, filename, before, gamed_after, location in cases:
+        with tempfile.TemporaryDirectory(
+            prefix=f"feature-envy-alias-{language}-"
+        ) as temp:
+            project = Path(temp)
+            path = _commit(project, filename, before)
+            baseline = _bridge(
+                project,
+                "capture-baseline",
+                language=language,
+                location=location,
+                receiver="order",
+            )
+            assert baseline["success"] is True, (label, baseline)
+            before_value = float(
+                baseline["metrics"]["objectives"]["expected_receiver_access"]
+            )
+            assert before_value > 0, (label, baseline)
+
+            path.write_text(gamed_after, encoding="utf-8")
+            gamed = _bridge(
+                project,
+                "verify",
+                language=language,
+                location=location,
+                receiver="order",
+            )
+            assert gamed["success"] is False, (label, gamed)
+            delta = gamed["checkpoint"]["delta"]
+            assert delta["has_production_diff"] is True, (label, delta)
+            assert delta["metric_progress"] is False, (label, delta)
+            after_value = float(
+                delta["objectives"]["expected_receiver_access"]["after"]
+            )
+            assert after_value >= before_value, (label, delta)
+            results[label] = (before_value, after_value)
+    return results
+
+
 def _negative_case(
     label: str,
     *,
@@ -382,29 +537,45 @@ def _ordinary_guard_fail_closed() -> None:
         project = Path(temp)
         (project / "demo.py").write_text(PYTHON_BEFORE, encoding="utf-8")
         locations = parse_locations("demo.py:method=total_price|line=10", project)
-        config = SimpleNamespace(locations=locations, language="python")
-        missing_checkpoint = _run_generic_feature_envy_guard(config, {}, None)
-        assert missing_checkpoint["success"] is False, missing_checkpoint
+        config = SimpleNamespace(
+            locations=locations,
+            language="python",
+            smell="feature_envy",
+            profile=SimpleNamespace(guards=[{"type": "feature_envy"}]),
+        )
+        missing_checkpoint = run_smell_guards(config)
+        assert len(missing_checkpoint) == 1, missing_checkpoint
+        assert missing_checkpoint[0]["success"] is False, missing_checkpoint
         assert (
-            missing_checkpoint["details"]["error"]
-            == "feature_envy_checkpoint_contract_required"
+            missing_checkpoint[0]["details"]["reason"]
+            == "BASELINE_CHECKPOINT_MISSING"
         ), missing_checkpoint
-        missing_target = _run_generic_feature_envy_guard(
+        missing_target = run_smell_guards(
             config,
-            {},
             GuardRunContext(
                 checkpoint_required=True,
                 checkpoint_smell="feature_envy",
-                current_metrics={
-                    "ok": True,
-                    "finding_present": False,
-                    "target_missing": True,
-                    "target_identity_collision": False,
-                    "target_patch_identity_ok": False,
+                checkpoint={
+                    "required": True,
+                    "smell": "feature_envy",
+                    "current_metrics": {
+                        "ok": True,
+                        "candidate_count": 0,
+                        "finding_present": False,
+                        "target_missing": True,
+                        "target_identity_collision": False,
+                        "target_patch_identity_ok": False,
+                    },
+                    "delta": {
+                        "metric_progress": False,
+                        "reason": "TARGET_NOT_LOCATED",
+                    },
                 },
             ),
         )
-        assert missing_target["success"] is False, missing_target
+        assert len(missing_target) == 1, missing_target
+        assert missing_target[0]["success"] is False, missing_target
+        assert missing_target[0]["details"]["reason"] == "TARGET_NOT_LOCATED", missing_target
 
 
 def _exact_budget_and_denominator_contract() -> None:
@@ -646,6 +817,7 @@ struct OtherCheckout {
     _ordinary_guard_fail_closed()
     _exact_budget_and_denominator_contract()
     _explicit_receiver_must_own_baseline_finding()
+    alias_gaming = _alias_folding_anti_gaming_cases()
     rendered = " ".join(
         f"{language}={before}->{after}/reanchor{reanchors}"
         for language, (before, after, reanchors) in positives.items()
@@ -655,6 +827,14 @@ struct OtherCheckout {
         f"{rendered} negatives={len(negatives)} "
         "baseline_collision=1 current_collision=1 ordinary_fail_closed=2 "
         "exact_budget=3 denominator_gaming=1 selector_mismatch_rejected=1"
+    )
+    rendered_alias_gaming = " ".join(
+        f"{name}={before:g}->{after:g}"
+        for name, (before, after) in alias_gaming.items()
+    )
+    print(
+        "nonjava-envy-alias-folding PASS "
+        f"gamed_verify_failed={len(alias_gaming)} {rendered_alias_gaming}"
     )
     return 0
 

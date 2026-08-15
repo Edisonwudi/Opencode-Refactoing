@@ -9,7 +9,7 @@ Extract the smallest cohesive slices that remove the target's dominant executabl
 
 ## Load one language route
 
-- Java: read `references/java.md`; for the direct backend, read `references/operation-translations.md` only when needed. For the IDEA backend, also load `idea-refactor-cli` and read only its `long_method.yaml` route reference.
+- Java: read `references/java.md`; for the direct backend, read `../_shared/operation-translations.md` only when needed. For the IDEA backend, also load `idea-refactor-cli` and read only its `long_method.yaml` route reference.
 - Python: read `references/python.md`.
 - C: read `references/c.md`.
 - C++: read `references/cpp.md`.

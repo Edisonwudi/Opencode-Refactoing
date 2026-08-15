@@ -13,12 +13,42 @@ RUNTIME = ROOT / "runtime" / "python"
 sys.path.insert(0, str(RUNTIME))
 
 from smell_core.checkpoint_adapters import capture_metric_snapshot  # noqa: E402
+from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
 from smell_core.checkpoints import capture_baseline_finding_snapshot  # noqa: E402
 from smell_core.config import load_refactor_config, resolve_run_config  # noqa: E402
 from smell_core.guards import run_smell_guards  # noqa: E402
+from smell_core.guards.context import GuardRunContext  # noqa: E402
 
 
 GROUP = "int:start|int:end|int:retry"
+
+
+def _guard_context(config, baseline, current, *, has_production_diff: bool) -> GuardRunContext:
+    delta = evaluate_checkpoint_contract(
+        baseline,
+        current,
+        has_production_diff=has_production_diff,
+        smell=config.smell,
+    ).to_dict()
+    checkpoint = {
+        "required": True,
+        "smell": config.smell,
+        "checkpoint_id": "c-target-scope",
+        "verification_mode": config.verification_mode,
+        "production_diff": has_production_diff,
+        "baseline_metrics": baseline,
+        "current_metrics": current,
+        "delta": delta,
+    }
+    return GuardRunContext(
+        checkpoint_required=True,
+        checkpoint_smell=config.smell,
+        current_metrics=current,
+        metric_delta=delta,
+        has_production_diff=has_production_diff,
+        metric_progress=bool(delta.get("metric_progress")),
+        checkpoint=checkpoint,
+    )
 
 
 def _source(language: str, name: str, include_group: bool = True) -> str:
@@ -104,7 +134,15 @@ def _check_language(language: str) -> None:
             side_effect=AssertionError("runtime Guard attempted project-wide discovery"),
         ):
             baseline = capture_baseline_finding_snapshot(config)
-            ordinary_before = run_smell_guards(config)
+            ordinary_before = run_smell_guards(
+                config,
+                _guard_context(
+                    config,
+                    baseline,
+                    baseline,
+                    has_production_diff=False,
+                ),
+            )
         assert baseline["candidate_count"] == 1, baseline
         assert baseline["objectives"]["occurrence_count"] == 3, baseline
         assert baseline["scope_mode"] == "explicit_target_locations", baseline
@@ -122,7 +160,7 @@ def _check_language(language: str) -> None:
             "source_discovery": "forbidden",
         }, baseline
         assert len(ordinary_before) == 1 and ordinary_before[0]["success"] is False, ordinary_before
-        assert ordinary_before[0]["details"]["occurrence_count"] == 3, ordinary_before
+        assert ordinary_before[0]["details"]["current_metrics"]["objectives"]["occurrence_count"] == 3, ordinary_before
 
         # The fourth matching function is intentionally outside the frozen
         # locations. Removing one listed occurrence must reduce the target
@@ -136,12 +174,20 @@ def _check_language(language: str) -> None:
             side_effect=AssertionError("runtime Guard attempted project-wide discovery"),
         ):
             current = capture_metric_snapshot(config, "group=forged")
-            ordinary_after = run_smell_guards(config)
+            ordinary_after = run_smell_guards(
+                config,
+                _guard_context(
+                    config,
+                    baseline,
+                    current,
+                    has_production_diff=True,
+                ),
+            )
         assert current["ok"] is True, current
         assert current["objectives"]["occurrence_count"] == 2, current
         assert current["finding_present"] is False, current
         assert len(ordinary_after) == 1 and ordinary_after[0]["success"] is True, ordinary_after
-        assert ordinary_after[0]["details"]["occurrence_count"] == 2, ordinary_after
+        assert ordinary_after[0]["details"]["current_metrics"]["objectives"]["occurrence_count"] == 2, ordinary_after
 
         # Supplying only two locations cannot be rescued by matching functions
         # elsewhere in the project.
@@ -214,11 +260,19 @@ def _check_other_local_guards(language: str) -> None:
             side_effect=AssertionError("Dead Code attempted project-wide reference search"),
         ):
             dead_snapshot = capture_metric_snapshot(dead, "method=forged")
-            dead_guard = run_smell_guards(dead)
+            dead_guard = run_smell_guards(
+                dead,
+                _guard_context(
+                    dead,
+                    dead_snapshot,
+                    dead_snapshot,
+                    has_production_diff=False,
+                ),
+            )
         assert dead_snapshot["finding_present"] is True, dead_snapshot
         assert dead_snapshot["guard_scope"]["files"] == [f"target{extension}"], dead_snapshot
         assert len(dead_guard) == 1 and dead_guard[0]["success"] is False, dead_guard
-        assert dead_guard[0]["details"]["scope_mode"] == "explicit_target_locations", dead_guard
+        assert dead_guard[0]["details"]["current_metrics"]["guard_scope"]["mode"] == "explicit_target_locations", dead_guard
 
         switch_file = project / f"switch{extension}"
         switch_file.write_text(_switch_source(language), encoding="utf-8")

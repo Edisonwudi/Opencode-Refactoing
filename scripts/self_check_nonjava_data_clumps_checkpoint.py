@@ -21,6 +21,7 @@ from smell_core.checkpoints import (  # noqa: E402
 )
 from smell_core.config import load_refactor_config, resolve_run_config  # noqa: E402
 from smell_core.guards import run_smell_guards  # noqa: E402
+from smell_core.guards.context import GuardRunContext  # noqa: E402
 from smell_core.target_patch_identity import (  # noqa: E402
     ast_declaration_identity,
     evaluate_data_clump_target_patch_identity,
@@ -31,6 +32,45 @@ GROUP = "int:end|int:retry|int:start"
 CPP_CONSTRUCTOR_GROUP = (
     "statsconst&:_stats|bool:_printinfomessages|std::ostream&:_stream"
 )
+
+
+def _guard_context(config, checkpoint: dict[str, object]) -> GuardRunContext:
+    current = dict(checkpoint.get("current_metrics") or {})
+    delta = dict(checkpoint.get("delta") or {})
+    return GuardRunContext(
+        checkpoint_required=True,
+        checkpoint_smell=config.smell,
+        current_metrics=current,
+        metric_delta=delta,
+        has_production_diff=bool(checkpoint.get("production_diff")),
+        metric_progress=bool(delta.get("metric_progress")),
+        checkpoint=checkpoint,
+    )
+
+
+def _snapshot_checkpoint(
+    config,
+    baseline: dict[str, object],
+    current: dict[str, object],
+    *,
+    has_production_diff: bool,
+) -> dict[str, object]:
+    delta = evaluate_checkpoint_contract(
+        baseline,
+        current,
+        has_production_diff=has_production_diff,
+        smell=config.smell,
+    ).to_dict()
+    return {
+        "required": True,
+        "smell": config.smell,
+        "checkpoint_id": "c-data-clumps-self-check",
+        "verification_mode": config.verification_mode,
+        "production_diff": has_production_diff,
+        "baseline_metrics": baseline,
+        "current_metrics": current,
+        "delta": delta,
+    }
 
 
 def _legacy_function(name: str, factor: int) -> str:
@@ -558,9 +598,9 @@ def _check_unresolved_target_fails_closed() -> None:
         assert current["continuity_ok"] is False, current
         assert checkpoint["delta"]["metric_progress"] is False, checkpoint
         assert checkpoint["delta"]["reason"] == "TARGET_NOT_LOCATED", checkpoint
-        ordinary = run_smell_guards(config)
+        ordinary = run_smell_guards(config, _guard_context(config, checkpoint))
         assert len(ordinary) == 1 and ordinary[0]["success"] is False, ordinary
-        assert ordinary[0]["details"]["target_missing"] is True, ordinary
+        assert ordinary[0]["details"]["current_metrics"]["target_missing"] is True, ordinary
     finally:
         temporary.cleanup()
 
@@ -574,12 +614,18 @@ def _check_parse_failure_fails_closed() -> None:
             side_effect=RuntimeError("synthetic parse failure"),
         ):
             snapshot = capture_metric_snapshot(config, "", changed_patch="")
-            ordinary = run_smell_guards(config)
+            checkpoint = _snapshot_checkpoint(
+                config,
+                baseline["metrics"],
+                snapshot,
+                has_production_diff=False,
+            )
+            ordinary = run_smell_guards(config, _guard_context(config, checkpoint))
         assert snapshot["ok"] is False, snapshot
         assert snapshot["target_missing"] is True, snapshot
         assert snapshot["continuity_ok"] is False, snapshot
         assert len(ordinary) == 1 and ordinary[0]["success"] is False, ordinary
-        assert "evaluation unavailable" in ordinary[0]["message"], ordinary
+        assert ordinary[0]["details"]["reason"] == "CURRENT_DETECTOR_UNAVAILABLE", ordinary
     finally:
         temporary.cleanup()
 
@@ -1091,7 +1137,7 @@ def _check_same_name_decoys_do_not_replace_frozen_target() -> None:
                 label,
                 checkpoint,
             )
-            ordinary = run_smell_guards(config)
+            ordinary = run_smell_guards(config, _guard_context(config, checkpoint))
             assert len(ordinary) == 1 and ordinary[0]["success"] is False, (
                 label,
                 ordinary,
@@ -1168,7 +1214,7 @@ def _check_malformed_current_fails_closed(language: str) -> None:
         assert checkpoint["delta"]["reason"] == (
             "CURRENT_DETECTOR_UNAVAILABLE"
         ), checkpoint
-        ordinary = run_smell_guards(config)
+        ordinary = run_smell_guards(config, _guard_context(config, checkpoint))
         assert len(ordinary) == 1 and ordinary[0]["success"] is False, ordinary
 
 
@@ -1253,7 +1299,7 @@ def _check_ast_owner_change_fails_closed() -> None:
             for item in current["target_patch_identity_failures"]
         ), current
         assert checkpoint["delta"]["reason"] == "TARGET_NOT_LOCATED", checkpoint
-        ordinary = run_smell_guards(config)
+        ordinary = run_smell_guards(config, _guard_context(config, checkpoint))
         assert len(ordinary) == 1 and ordinary[0]["success"] is False, ordinary
 
 
@@ -1455,9 +1501,18 @@ def _check_overload_target_identity_collision() -> None:
         assert current["target_identity_collision"] is True, current
         assert current["error"] == "target_identity_collision", current
         assert current["target_identity_collisions"][0]["target_indexes"] == [0, 1], current
-        ordinary = run_smell_guards(config)
+        collision_checkpoint = _snapshot_checkpoint(
+            config,
+            baseline,
+            current,
+            has_production_diff=True,
+        )
+        ordinary = run_smell_guards(
+            config,
+            _guard_context(config, collision_checkpoint),
+        )
         assert len(ordinary) == 1 and ordinary[0]["success"] is False, ordinary
-        assert ordinary[0]["details"]["target_identity_collision"] is True, ordinary
+        assert ordinary[0]["details"]["current_metrics"]["target_identity_collision"] is True, ordinary
 
 
 def _check_cpp_constructor_signature_reanchor() -> None:

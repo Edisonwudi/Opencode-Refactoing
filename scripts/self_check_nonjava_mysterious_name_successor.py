@@ -2,15 +2,69 @@
 """Adversarial checks for the non-Java Mysterious Name successor contract."""
 from __future__ import annotations
 
+import json
+import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-from self_check_nonjava_envy_name import _bridge
-
 
 ROOT = Path(__file__).resolve().parents[1]
+BRIDGE = ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"
+CONFIG = ROOT / "runtime" / "python" / "smell_core" / "defaults" / "refactor.yaml"
 OBJECTIVE = "target_suspicious_name_present"
+
+
+def _bridge(
+    project: Path,
+    command: str,
+    language: str,
+    smell: str,
+    location: str,
+    evidence: str,
+) -> dict[str, object]:
+    kind = re.search(r"(?:^|;\s*)kind=([^;]+)", evidence)
+    name = re.search(r"(?:^|;\s*)name=([^;]+)", evidence)
+    assert smell == "mysterious_name" and kind and name, evidence
+    args = [
+        sys.executable,
+        str(BRIDGE),
+        command,
+        "--output-detail",
+        "audit",
+        "--config",
+        str(CONFIG),
+        "--project-root",
+        str(project),
+        "--language",
+        language,
+        "--smell",
+        smell,
+        "--location",
+        location,
+        "--smell-evidence",
+        evidence,
+        "--target-context-json",
+        json.dumps({
+            "symbol_kind": kind.group(1).strip(),
+            "symbol_name": name.group(1).strip(),
+        }, separators=(",", ":"), sort_keys=True),
+    ]
+    if command == "verify":
+        args.append("--skip-build-test")
+    result = subprocess.run(
+        args,
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        raise AssertionError(
+            f"{language}/{smell} {command}: {result.stderr}\n{result.stdout}"
+        )
+    return json.loads(result.stdout)
 
 
 def _init_project(project: Path, filename: str, source: str) -> Path:
@@ -87,9 +141,13 @@ def _assert_pass(result: dict[str, object], label: str) -> None:
     assert successor.get("status") == "accepted", (label, successor)
     assert successor.get("same_hunk", {}).get("ok") is True, (label, successor)
     guard_results = list(dict(result.get("smell_guard") or {}).get("results") or [])
-    assert len(guard_results) == 2 and all(
+    assert len(guard_results) == 1 and all(
         item.get("success") is True for item in guard_results
     ), (label, guard_results)
+    assert guard_results[0]["details"]["guard"] == "checkpoint_contract", (
+        label,
+        guard_results,
+    )
 
 
 def _assert_parser_recovery_pass(

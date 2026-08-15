@@ -9,7 +9,7 @@ Repair the rejected inheritance contract with real behavior or a justified hiera
 
 ## Load the Java route
 
-- Java: read `references/java.md`; for the direct backend, read `references/operation-translations.md` only when an operation shape is unclear. For the IDEA backend, also load `idea-refactor-cli` and read only its `refused_bequest.yaml` route reference.
+- Java: read `references/java.md`; for the direct backend, read `../_shared/operation-translations.md` only when an operation shape is unclear. For the IDEA backend, also load `idea-refactor-cli` and read only its `refused_bequest.yaml` route reference.
 - Reject Python, C, or C++ tasks as unsupported; do not invent a language route.
 
 ## Common workflow

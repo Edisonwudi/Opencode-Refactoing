@@ -9,7 +9,7 @@ Centralize the exact duplicated behavior behind one real implementation while pr
 
 ## Load one language route
 
-- Java: read `references/java.md`; for the direct backend, read `references/operation-translations.md` only when an operation shape is unclear. For the IDEA backend, also load `idea-refactor-cli` and read only its `code_clone_type1.yaml` route reference.
+- Java: read `references/java.md`; for the direct backend, read `../_shared/operation-translations.md` only when an operation shape is unclear. For the IDEA backend, also load `idea-refactor-cli` and read only its `code_clone_type1.yaml` route reference.
 - Python: read `references/python.md`.
 - C: read `references/c.md`.
 - C++: read `references/cpp.md`.

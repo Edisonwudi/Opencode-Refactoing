@@ -33,12 +33,28 @@ from smell_core.java_test_evidence import (  # noqa: E402
 )
 
 
-def _write_report(root: Path, class_name: str, tests: int, skipped: int = 0) -> None:
+def _write_report(
+    root: Path,
+    class_name: str,
+    tests: int,
+    skipped: int = 0,
+    failures: int = 0,
+    nested: bool = False,
+) -> None:
     report = root / "target" / "surefire-reports" / f"TEST-example.{class_name}.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(
+    failure = (
+        '<testcase name="fails"><failure message="boom"/></testcase>'
+        if failures
+        else ""
+    )
+    suite = (
         f'<testsuite name="example.{class_name}" tests="{tests}" '
-        f'failures="0" errors="0" skipped="{skipped}"></testsuite>\n',
+        f'failures="{failures}" errors="0" skipped="{skipped}">'
+        f"{failure}</testsuite>"
+    )
+    report.write_text(
+        f"<testsuites>{suite}</testsuites>\n" if nested else f"{suite}\n",
         encoding="utf-8",
     )
 
@@ -51,6 +67,62 @@ def _command_result(command: str, output: str) -> dict[str, object]:
         "returncode": 0,
         "success": True,
     }
+
+
+def _assert_evidence_fields(
+    case_name: str,
+    evidence: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    for field, expected_value in expected.items():
+        actual_value = evidence[field]
+        if callable(expected_value):
+            assert expected_value(actual_value), (
+                f"{case_name}: {field} predicate failed: {evidence}"
+            )
+        else:
+            matches = (
+                actual_value is expected_value
+                if isinstance(expected_value, bool)
+                else actual_value == expected_value
+            )
+            assert matches, (
+                f"{case_name}: expected {field}={expected_value!r}, "
+                f"got {actual_value!r}: {evidence}"
+            )
+
+
+def _check_sample_evidence_cases(root: Path, cases: tuple[tuple, ...]) -> None:
+    for case_name, started_ns, class_names, expected in cases:
+        location = ";".join(
+            f"src/test/java/example/{class_name}.java"
+            for class_name in class_names
+        )
+        evidence = _sample_test_execution_evidence(
+            SimpleNamespace(
+                project_root=root,
+                sample_test_location=location,
+            ),
+            started_ns,
+        )
+        _assert_evidence_fields(case_name, evidence, expected)
+        print(f"  ok   {case_name}")
+
+
+def _check_project_evidence_cases(root: Path, cases: tuple[tuple, ...]) -> None:
+    for case in cases:
+        case_name, language, command, output, expected, *report = case
+        case_root = root
+        started_ns = time.time_ns()
+        if report:
+            case_root = root / "project-evidence-cases" / case_name
+            _write_report(case_root, *report[0])
+        evidence = _project_test_execution_evidence(
+            SimpleNamespace(project_root=case_root, language=language),
+            started_ns,
+            _command_result(command, output),
+        )
+        _assert_evidence_fields(case_name, evidence, expected)
 
 
 def _check_delivery_dataset_contracts() -> None:
@@ -696,161 +768,105 @@ public final class Result {
         started_ns = time.time_ns()
         _write_report(root, "FirstBehaviorTest", 2)
         _write_report(root, "SecondBehaviorTest", 3, skipped=1)
-
-        config = SimpleNamespace(
-            project_root=root,
-            sample_test_location=(
-                "src/test/java/example/FirstBehaviorTest.java;"
-                "src/test/java/example/SecondBehaviorTest.java"
-            ),
-        )
-        evidence = _sample_test_execution_evidence(config, started_ns)
-        assert evidence["success"] is True, evidence
-        assert evidence["test_classes"] == [
-            "FirstBehaviorTest",
-            "SecondBehaviorTest",
-        ]
-        assert evidence["tests"] == 4
-        assert evidence["skipped"] == 1
-        assert all(item["success"] for item in evidence["classes"])
-        print("  ok   every declared test class has fresh evidence")
-
-        missing_config = SimpleNamespace(
-            project_root=root,
-            sample_test_location=(
-                "src/test/java/example/FirstBehaviorTest.java;"
-                "src/test/java/example/MissingBehaviorTest.java"
-            ),
-        )
-        missing = _sample_test_execution_evidence(missing_config, started_ns)
-        assert missing["success"] is False, missing
-        assert missing["missing_test_classes"] == ["MissingBehaviorTest"]
-        assert missing["executed_test_classes"] == ["FirstBehaviorTest"]
-        print("  ok   every declared test class requires fresh execution evidence")
-
-        all_missing_config = SimpleNamespace(
-            project_root=root,
-            sample_test_location=(
-                "src/test/java/example/MissingBehaviorTest.java;"
-                "src/test/java/example/OtherMissingBehaviorTest.java"
-            ),
-        )
-        all_missing = _sample_test_execution_evidence(all_missing_config, started_ns)
-        assert all_missing["success"] is False, all_missing
-        assert all_missing["executed_test_classes"] == []
-        assert all_missing["missing_test_classes"] == [
-            "MissingBehaviorTest",
-            "OtherMissingBehaviorTest",
-        ]
-        print("  ok   no declared class executed fails closed")
-
         skipped_started_ns = time.time_ns()
         _write_report(root, "SkippedBehaviorTest", 1, skipped=1)
-        skipped_config = SimpleNamespace(
-            project_root=root,
-            sample_test_location="src/test/java/example/SkippedBehaviorTest.java",
-        )
-        skipped = _sample_test_execution_evidence(skipped_config, skipped_started_ns)
-        assert skipped["success"] is False, skipped
-        assert skipped["missing_test_classes"] == ["SkippedBehaviorTest"]
-        print("  ok   skipped-only report fails closed")
-
         nested_started_ns = time.time_ns()
         _write_report(root, "NestedBehaviorTest$Case", 3)
-        nested_config = SimpleNamespace(
-            project_root=root,
-            sample_test_location="src/test/java/example/NestedBehaviorTest.java",
-        )
-        nested = _sample_test_execution_evidence(nested_config, nested_started_ns)
-        assert nested["success"] is True, nested
-        assert nested["tests"] == 3
-        assert nested["classes"][0]["evidence_mode"] == "xml"
-        print("  ok   nested test suites count as execution of the declared class")
+        empty_started_ns = time.time_ns()
 
-        console_config = SimpleNamespace(
-            project_root=root,
-            sample_test_location="src/test/java/example/ConsoleBehaviorTest.java",
-        )
-        console = _sample_test_execution_evidence(
-            console_config,
-            time.time_ns(),
-        )
-        assert console["success"] is False, console
-        assert console["tests"] == 0
-        print("  ok   JUnit console output without a fresh XML report fails closed")
-
-        runner_console = _sample_test_execution_evidence(
-            SimpleNamespace(
-                project_root=root,
-                sample_test_location="src/test/java/example/RunnerBehaviorTest.java",
+        _check_sample_evidence_cases(
+            root,
+            (
+                (
+                    "every declared test class has fresh evidence", started_ns,
+                    ("FirstBehaviorTest", "SecondBehaviorTest"),
+                    {
+                        "success": True,
+                        "test_classes": ["FirstBehaviorTest", "SecondBehaviorTest"],
+                        "tests": 4,
+                        "skipped": 1,
+                        "classes": lambda classes: all(
+                            item["success"] for item in classes
+                        ),
+                    },
+                ),
+                (
+                    "every declared test class requires fresh execution evidence", started_ns,
+                    ("FirstBehaviorTest", "MissingBehaviorTest"),
+                    {
+                        "success": False,
+                        "missing_test_classes": ["MissingBehaviorTest"],
+                        "executed_test_classes": ["FirstBehaviorTest"],
+                    },
+                ),
+                (
+                    "no declared class executed fails closed", started_ns,
+                    ("MissingBehaviorTest", "OtherMissingBehaviorTest"),
+                    {
+                        "success": False,
+                        "executed_test_classes": [],
+                        "missing_test_classes": ["MissingBehaviorTest", "OtherMissingBehaviorTest"],
+                    },
+                ),
+                (
+                    "skipped-only report fails closed", skipped_started_ns,
+                    ("SkippedBehaviorTest",),
+                    {"success": False, "missing_test_classes": ["SkippedBehaviorTest"]},
+                ),
+                (
+                    "nested test suites count as execution of the declared class", nested_started_ns,
+                    ("NestedBehaviorTest",),
+                    {
+                        "success": True,
+                        "tests": 3,
+                        "classes": lambda classes: classes[0]["evidence_mode"] == "xml",
+                    },
+                ),
+                (
+                    "JUnit console output without a fresh XML report fails closed", empty_started_ns,
+                    ("ConsoleBehaviorTest",),
+                    {"success": False, "tests": 0},
+                ),
+                (
+                    "Maven console output without a fresh XML report fails closed", empty_started_ns,
+                    ("RunnerBehaviorTest",),
+                    {"success": False, "tests": 0},
+                ),
+                (
+                    "direct Java exit zero without XML or attestation fails closed", empty_started_ns,
+                    ("MainBehaviorTest",),
+                    {"success": False, "tests": 0},
+                ),
+                (
+                    "unrelated successful tests still fail closed", empty_started_ns,
+                    ("ConsoleBehaviorTest",),
+                    {"success": False},
+                ),
             ),
-            time.time_ns(),
         )
-        assert runner_console["success"] is False, runner_console
-        assert runner_console["tests"] == 0
-        print("  ok   Maven console output without a fresh XML report fails closed")
 
-        main_class = _sample_test_execution_evidence(
-            SimpleNamespace(
-                project_root=root,
-                sample_test_location="src/test/java/example/MainBehaviorTest.java",
+        _check_project_evidence_cases(
+            root,
+            (
+                ("java_zero_tests", "java", "mvn test", "BUILD SUCCESS\n", {"success": False}),
             ),
-            time.time_ns(),
         )
-        assert main_class["success"] is False, main_class
-        assert main_class["tests"] == 0
-        print("  ok   direct Java exit zero without XML or attestation fails closed")
-
-        unrelated = _sample_test_execution_evidence(
-            console_config,
-            time.time_ns(),
-        )
-        assert unrelated["success"] is False, unrelated
-        print("  ok   unrelated successful tests still fail closed")
-
-        project_zero = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            time.time_ns(),
-            _command_result("mvn test", "BUILD SUCCESS\n"),
-        )
-        assert project_zero["success"] is False, project_zero
         print("  ok   project-full exit zero with no executed test fails closed")
 
-        printed_junit = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            time.time_ns(),
-            _command_result("printf", "OK (1 test)\n"),
-        )
-        assert printed_junit["success"] is False, printed_junit
-        real_junit_console = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            time.time_ns(),
-            _command_result(
-                "java org.junit.runner.JUnitCore ExampleTest",
-                "JUnit version 4.13.2\n.\nOK (1 test)\n",
+        _check_project_evidence_cases(
+            root,
+            (
+                ("forged_junit_summary", "java", "printf", "OK (1 test)\n", {"success": False}),
+                ("real_junit_summary", "java", "java org.junit.runner.JUnitCore ExampleTest",
+                 "JUnit version 4.13.2\n.\nOK (1 test)\n",
+                 {"success": True, "junit_console_tests": 1}),
+                ("forged_maven_summary", "java", "printf",
+                 "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n", {"success": False}),
+                ("real_maven_summary", "java", "mvn test",
+                 "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n",
+                 {"success": True, "maven_console_tests": 1}),
             ),
         )
-        assert real_junit_console["success"] is True, real_junit_console
-        assert real_junit_console["junit_console_tests"] == 1
-        printed_maven = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            time.time_ns(),
-            _command_result(
-                "printf",
-                "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n",
-            ),
-        )
-        assert printed_maven["success"] is False, printed_maven
-        real_maven_console = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            time.time_ns(),
-            _command_result(
-                "mvn test",
-                "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n",
-            ),
-        )
-        assert real_maven_console["success"] is True, real_maven_console
-        assert real_maven_console["maven_console_tests"] == 1
         print("  ok   console summaries are bound to their real test runners")
 
         masked_failure_marker = root / "masked-build-failure"
@@ -870,172 +886,97 @@ public final class Result {
         assert not masked_failure_marker.exists(), masked_failure
         print("  ok   project scripts stop at the first failed command")
 
-        project_started_ns = time.time_ns()
-        _write_report(root, "ProjectFullBehaviorTest", 2)
-        project_executed = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            project_started_ns,
-            _command_result("mvn test", "BUILD SUCCESS\n"),
+        _check_project_evidence_cases(
+            root,
+            (
+                ("java_fresh_report", "java", "mvn test", "BUILD SUCCESS\n",
+                 {"success": True, "tests": 2}, ("ProjectFullBehaviorTest", 2)),
+            ),
         )
-        assert project_executed["success"] is True, project_executed
-        assert project_executed["tests"] == 2, project_executed
         print("  ok   project-full requires fresh non-zero test execution")
 
-        failed_report_started_ns = time.time_ns()
-        failed_report = (
-            root
-            / "target"
-            / "surefire-reports"
-            / "TEST-example.ProjectFullFailureTest.xml"
+        _check_project_evidence_cases(
+            root,
+            (
+                (
+                    "java_failed_report", "java", "mvn test", "BUILD SUCCESS\n",
+                    {
+                        "success": False,
+                        "failed_reports": [
+                            "target/surefire-reports/"
+                            "TEST-example.ProjectFullFailureTest.xml"
+                        ],
+                    },
+                    ("ProjectFullFailureTest", 1, 0, 1),
+                ),
+                (
+                    "java_nested_failed_report", "java", "mvn test", "BUILD SUCCESS\n",
+                    {
+                        "success": False,
+                        "failed_reports": [
+                            "target/surefire-reports/"
+                            "TEST-example.NestedProjectFailureTest.xml"
+                        ],
+                    },
+                    ("NestedProjectFailureTest", 1, 0, 1, True),
+                ),
+            ),
         )
-        failed_report.write_text(
-            '<testsuite name="example.ProjectFullFailureTest" tests="1" '
-            'failures="1" errors="0" skipped="0">'
-            '<testcase name="fails"><failure message="boom"/></testcase>'
-            '</testsuite>\n',
-            encoding="utf-8",
-        )
-        project_failed_report = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            failed_report_started_ns,
-            _command_result("mvn test", "BUILD SUCCESS\n"),
-        )
-        assert project_failed_report["success"] is False, project_failed_report
-        assert project_failed_report["failed_reports"] == [
-            "target/surefire-reports/TEST-example.ProjectFullFailureTest.xml"
-        ], project_failed_report
-        nested_failure_started_ns = time.time_ns()
-        nested_failure_report = (
-            root
-            / "target"
-            / "surefire-reports"
-            / "TEST-example.NestedProjectFailureTest.xml"
-        )
-        nested_failure_report.write_text(
-            '<testsuites><testsuite name="nested" tests="1" failures="1" '
-            'errors="0" skipped="0"><testcase name="fails">'
-            '<failure message="boom"/></testcase></testsuite></testsuites>\n',
-            encoding="utf-8",
-        )
-        nested_failed_report = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="java"),
-            nested_failure_started_ns,
-            _command_result("mvn test", "BUILD SUCCESS\n"),
-        )
-        assert nested_failed_report["success"] is False, nested_failed_report
-        assert nested_failed_report["failed_reports"] == [
-            "target/surefire-reports/TEST-example.NestedProjectFailureTest.xml"
-        ], nested_failed_report
         print("  ok   fresh JUnit failures override a zero command return code")
 
-        python_executed = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="python"),
-            time.time_ns(),
-            _command_result(
-                "python -m pytest -q tests/unit",
-                ".................. [100%]\n"
-                "18 passed, 1 warning in 1.44s\n",
+        _check_project_evidence_cases(
+            root,
+            (
+                ("pytest_passed", "python", "python -m pytest -q tests/unit",
+                 ".................. [100%]\n18 passed, 1 warning in 1.44s\n",
+                 {"success": True, "tests": 18, "pytest_console_tests": 18}),
+                ("pytest_elapsed_suffix", "python", "python -m pytest -q tests/unit",
+                 "528 passed, 12 skipped, 10 warnings in 93.27s (0:01:33)\n",
+                 {"success": True, "tests": 528, "pytest_console_tests": 528}),
+                ("pytest_collection_only", "python", "python -m pytest --collect-only",
+                 "collected 18 items\n18 tests collected in 0.12s\n", {"success": False}),
+                (
+                    "unittest_passed", "python", "python -m unittest -v test_fixture.py",
+                    "test_one (test_fixture.Case.test_one) ... ok\n"
+                    "test_two (test_fixture.Case.test_two) ... ok\n\n"
+                    "----------------------------------------------------------------------\n"
+                    "Ran 2 tests in 0.001s\n\nOK\n",
+                    {"success": True, "unittest_console_tests": 2},
+                ),
+                ("unittest_all_skipped", "python", "python -m unittest -v test_fixture.py",
+                 "Ran 2 tests in 0.001s\n\nOK (skipped=2)\n", {"success": False}),
             ),
-        )
-        assert python_executed["success"] is True, python_executed
-        assert python_executed["tests"] == 18, python_executed
-        assert python_executed["pytest_console_tests"] == 18, python_executed
-        python_elapsed_suffix = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="python"),
-            time.time_ns(),
-            _command_result(
-                "python -m pytest -q tests/unit",
-                "528 passed, 12 skipped, 10 warnings in 93.27s (0:01:33)\n",
-            ),
-        )
-        assert python_elapsed_suffix["success"] is True, python_elapsed_suffix
-        assert python_elapsed_suffix["tests"] == 528, python_elapsed_suffix
-        assert python_elapsed_suffix["pytest_console_tests"] == 528, (
-            python_elapsed_suffix
-        )
-        python_collection_only = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="python"),
-            time.time_ns(),
-            _command_result(
-                "python -m pytest --collect-only",
-                "collected 18 items\n18 tests collected in 0.12s\n",
-            ),
-        )
-        assert python_collection_only["success"] is False, python_collection_only
-        python_unittest = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="python"),
-            time.time_ns(),
-            _command_result(
-                "python -m unittest -v test_fixture.py",
-                "test_one (test_fixture.Case.test_one) ... ok\n"
-                "test_two (test_fixture.Case.test_two) ... ok\n\n"
-                "----------------------------------------------------------------------\n"
-                "Ran 2 tests in 0.001s\n\nOK\n",
-            ),
-        )
-        assert python_unittest["success"] is True, python_unittest
-        assert python_unittest["unittest_console_tests"] == 2, python_unittest
-        python_unittest_all_skipped = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="python"),
-            time.time_ns(),
-            _command_result(
-                "python -m unittest -v test_fixture.py",
-                "Ran 2 tests in 0.001s\n\nOK (skipped=2)\n",
-            ),
-        )
-        assert python_unittest_all_skipped["success"] is False, (
-            python_unittest_all_skipped
         )
         print(
             "  ok   Python accepts completed pytest/unittest summaries, "
             "not collection or all-skipped output"
         )
 
-        ctest_output = (
-            "1/1 Test #1: cjson_test .................   Passed    0.01 sec\n"
-            "100% tests passed, 0 tests failed out of 1\n"
-        )
-        c_executed = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="c"),
-            time.time_ns(),
-            _command_result("ctest --output-on-failure", ctest_output),
-        )
-        assert c_executed["success"] is True, c_executed
-        assert c_executed["tests"] == 1, c_executed
-        assert c_executed["ctest_console_tests"] == 1, c_executed
-        c_no_tests = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="c"),
-            time.time_ns(),
-            _command_result(
-                "ctest --output-on-failure",
-                "No tests were found!!!\n",
+        _check_project_evidence_cases(
+            root,
+            (
+                ("ctest_c_passed", "c", "ctest --output-on-failure",
+                 "1/1 Test #1: cjson_test .................   Passed    0.01 sec\n"
+                 "100% tests passed, 0 tests failed out of 1\n",
+                 {"success": True, "tests": 1, "ctest_console_tests": 1}),
+                ("ctest_c_empty", "c", "ctest --output-on-failure",
+                 "No tests were found!!!\n", {"success": False}),
             ),
         )
-        assert c_no_tests["success"] is False, c_no_tests
         print("  ok   C accepts detailed ctest passes, not a zero-test exit")
 
-        cpp_ctest_output = (
-            "1/2 Test #1: parser_test ................   Passed    0.02 sec\n"
-            "2/2 Test #2: emitter_test ...............   Passed    0.03 sec\n"
-            "100% tests passed, 0 tests failed out of 2\n"
-        )
-        cpp_executed = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="cpp"),
-            time.time_ns(),
-            _command_result("ctest --output-on-failure", cpp_ctest_output),
-        )
-        assert cpp_executed["success"] is True, cpp_executed
-        assert cpp_executed["tests"] == 2, cpp_executed
-        assert cpp_executed["ctest_console_tests"] == 2, cpp_executed
-        cpp_summary_only = _project_test_execution_evidence(
-            SimpleNamespace(project_root=root, language="cpp"),
-            time.time_ns(),
-            _command_result(
-                "ctest --output-on-failure",
-                "100% tests passed, 0 tests failed out of 0\n",
+        _check_project_evidence_cases(
+            root,
+            (
+                ("ctest_cpp_passed", "cpp", "ctest --output-on-failure",
+                 "1/2 Test #1: parser_test ................   Passed    0.02 sec\n"
+                 "2/2 Test #2: emitter_test ...............   Passed    0.03 sec\n"
+                 "100% tests passed, 0 tests failed out of 2\n",
+                 {"success": True, "tests": 2, "ctest_console_tests": 2}),
+                ("ctest_cpp_empty", "cpp", "ctest --output-on-failure",
+                 "100% tests passed, 0 tests failed out of 0\n", {"success": False}),
             ),
         )
-        assert cpp_summary_only["success"] is False, cpp_summary_only
         print("  ok   C++ accepts ctest cases plus summary, not an empty summary")
 
     _check_delivery_dataset_contracts()

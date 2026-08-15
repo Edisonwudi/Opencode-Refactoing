@@ -78,7 +78,7 @@ whole method should move to that owner type
 
 Direct edit target: Place a stateless utility on the type that owns the data or domain vocabulary.
 
-Source operation shape: `move:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `move:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -99,7 +99,7 @@ storage rules, so the whole method can move intact
 
 Direct edit target: Move collaborator policy or storage behavior onto that collaborator.
 
-Source operation shape: `move:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `move:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -122,7 +122,7 @@ extract:method or leave the helper in the original source class
 
 Direct edit target: Move only the receiver-heavy slice from a larger source method to the receiver.
 
-Source operation shape: `extract:method`, `move:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`, `move:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -144,7 +144,7 @@ delegate to it
 
 Direct edit target: Keep the source entrypoint and move its receiver-heavy internals behind a receiver helper.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -167,7 +167,7 @@ Direct edit target: Extract the complete collaboration and effect sequence to an
 purpose-named workflow/adapter class; keep the existing receiver API and source entrypoint.
 
 Source operation shape: OpenCode read/search/edit tools only. See
-[`operation-translations.md`](operation-translations.md) for Java mechanics, but do not invoke
+[`operation-translations.md`](../../_shared/operation-translations.md) for Java mechanics, but do not invoke
 an unavailable external refactoring tool in the no-IDE agent.
 
 Route-specific edit steps:

@@ -9,7 +9,7 @@ Flatten the dominant nested control-flow hotspot while preserving branch orderin
 
 ## Load one language route
 
-- Java: read `references/java.md`; for the direct backend, read `references/operation-translations.md` only when needed. For the IDEA backend, also load `idea-refactor-cli` and read only its `nested_complexity.yaml` route reference.
+- Java: read `references/java.md`; for the direct backend, read `../_shared/operation-translations.md` only when needed. For the IDEA backend, also load `idea-refactor-cli` and read only its `nested_complexity.yaml` route reference.
 - Python: read `references/python.md`.
 - C: read `references/c.md`.
 - C++: read `references/cpp.md`.

@@ -62,22 +62,26 @@ type LoopPolicy = {
 
 type VerificationMode = "local" | "auto" | "sample_optimized" | "project_full"
 
-type CommandTaskIdentity = {
-  project_root: string
-  project_override_root: string
-  language: string
-  smell: string
-  location: string
-  target_context_json: string
-  verification_mode: VerificationMode
-  sample_test_location: string
-  sample_test_command: string
-  build_command: string
-  project_test_command: string
-  verification_cwd: string
-  verification_command_source: string
-  sample_test_source: string
-}
+// snake_case policy key, camelCase controller key, environment variable, CLI flag, CLI order.
+const COMMAND_IDENTITY_FIELDS = [
+  ["project_root", "projectRoot", "SMELL_PROJECT_ROOT", "--project-root", 0],
+  ["project_override_root", "projectOverrideRoot", "SMELL_CANONICAL_PROJECT_ROOT", "--project-override-root", 4],
+  ["language", "language", "SMELL_LANGUAGE", "--language", 3],
+  ["smell", "smell", "SMELL_SMELL", "--smell", 1],
+  ["location", "location", "SMELL_LOCATION", "--location", 2],
+  ["target_context_json", "targetContextJson", "SMELL_TARGET_CONTEXT_JSON", "--target-context-json", 5],
+  ["verification_mode", "verificationMode", "SMELL_VERIFICATION_MODE", "--verification-mode", 6],
+  ["sample_test_location", "sampleTestLocation", "SMELL_SAMPLE_TEST_LOCATION", "--sample-test-location", 7],
+  ["sample_test_command", "sampleTestCommand", "SMELL_SAMPLE_TEST_COMMAND", "--sample-test-command", 8],
+  ["build_command", "buildCommand", "SMELL_BUILD_COMMAND", "--build-command", 9],
+  ["project_test_command", "projectTestCommand", "SMELL_PROJECT_TEST_COMMAND", "--project-test-command", 10],
+  ["verification_cwd", "verificationCwd", "SMELL_VERIFICATION_CWD", "--verification-cwd", 11],
+  ["verification_command_source", "verificationCommandSource", "SMELL_VERIFICATION_COMMAND_SOURCE", "--verification-command-source", 12],
+  ["sample_test_source", "sampleTestSource", "SMELL_SAMPLE_TEST_SOURCE", "--sample-test-source", 13],
+] as const
+
+type CommandIdentityKey = (typeof COMMAND_IDENTITY_FIELDS)[number][0]
+type CommandTaskIdentity = Record<CommandIdentityKey, string> & { verification_mode: VerificationMode }
 
 type CommandPolicy = {
   task: string
@@ -106,22 +110,12 @@ type ControllerIdentity = {
   checkpointRequired: boolean
 }
 
-type CommandIdentityBinding = {
-  project_root: string
-  project_override_root: string
-  language: string
-  smell: string
-  location: string
-  target_context_json: string
-  verification_mode: string
-  sample_test_location: string
-  sample_test_command: string
-  build_command: string
-  project_test_command: string
-  verification_cwd: string
-  verification_command_source: string
-  sample_test_source: string
-}
+type CommandIdentityBinding = Record<CommandIdentityKey, string>
+type CommandIdentityEnvironment = Record<CommandIdentityKey, string | undefined>
+type BridgeIdentityArgs =
+  & Pick<ControllerIdentity, "projectRoot" | "smell" | "location">
+  & Omit<ControllerIdentity, "projectRoot" | "smell" | "location" | "verificationMode" | "checkpointRequired">
+  & { verificationMode?: string; baselineSeal?: string; allowTestChanges?: boolean }
 
 type CommandLoopState = {
   policy: CommandPolicy
@@ -155,6 +149,23 @@ function envDefault(name: string): string | undefined {
   return value && value.trim() ? value : undefined
 }
 
+const COMMAND_IDENTITY_CLI_FIELDS = [...COMMAND_IDENTITY_FIELDS]
+  .sort((left, right) => left[4] - right[4])
+
+function commandIdentityEnvironment(): CommandIdentityEnvironment {
+  return Object.fromEntries(
+    COMMAND_IDENTITY_FIELDS.map(([key, , env]) => [key, envDefault(env)]),
+  ) as CommandIdentityEnvironment
+}
+
+function controllerIdentityFields(
+  identity: Readonly<CommandIdentityEnvironment>,
+): Partial<Omit<ControllerIdentity, "checkpointRequired">> {
+  return Object.fromEntries(
+    COMMAND_IDENTITY_FIELDS.map(([key, controllerKey]) => [controllerKey, identity[key] || undefined]),
+  ) as Partial<Omit<ControllerIdentity, "checkpointRequired">>
+}
+
 function jsonObjectShape(description: string) {
   return tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional().describe(description)
 }
@@ -174,135 +185,60 @@ function ideaDecisionsShape(description: string) {
     .describe(description)
 }
 
-function withBatchDefaults(input: {
-  projectRoot?: string
-  language?: string
-  smell?: string
-  location?: string
-  targetContextJson?: string
-  verificationMode?: string
-  [key: string]: unknown
-}) {
-  const envProjectRoot = envDefault("SMELL_PROJECT_ROOT")
-  const envCanonicalProjectRoot = envDefault("SMELL_CANONICAL_PROJECT_ROOT")
-  const envLanguage = envDefault("SMELL_LANGUAGE")
-  const envSmell = envDefault("SMELL_SMELL")
-  const envLocation = envDefault("SMELL_LOCATION")
-  const envTargetContext = envDefault("SMELL_TARGET_CONTEXT_JSON")
-  const envVerificationMode = envDefault("SMELL_VERIFICATION_MODE")
-  const envSampleTestLocation = envDefault("SMELL_SAMPLE_TEST_LOCATION")
-  const envSampleTestCommand = envDefault("SMELL_SAMPLE_TEST_COMMAND")
-  const envBuildCommand = envDefault("SMELL_BUILD_COMMAND")
-  const envProjectTestCommand = envDefault("SMELL_PROJECT_TEST_COMMAND")
-  const envVerificationCwd = envDefault("SMELL_VERIFICATION_CWD")
-  const envVerificationCommandSource = envDefault("SMELL_VERIFICATION_COMMAND_SOURCE")
-  const envSampleTestSource = envDefault("SMELL_SAMPLE_TEST_SOURCE")
-  const hasBatchIdentity = Boolean(envProjectRoot && envSmell && envLocation)
+function withBatchDefaults(input: Partial<BridgeIdentityArgs> & { [key: string]: unknown }) {
+  const envIdentity = commandIdentityEnvironment()
+  const envController = controllerIdentityFields(envIdentity)
+  const hasBatchIdentity = Boolean(envIdentity.project_root && envIdentity.smell && envIdentity.location)
   return {
     ...input,
-    projectRoot: hasBatchIdentity ? envProjectRoot! : input.projectRoot,
-    projectOverrideRoot: envCanonicalProjectRoot,
-    language: hasBatchIdentity ? envLanguage : (input.language || envLanguage),
-    smell: hasBatchIdentity ? envSmell! : input.smell,
-    location: hasBatchIdentity ? envLocation! : input.location,
-    targetContextJson: hasBatchIdentity ? envTargetContext : (input.targetContextJson || envTargetContext),
-    verificationMode: hasBatchIdentity ? envVerificationMode : (input.verificationMode || envVerificationMode),
-    sampleTestLocation: envSampleTestLocation,
-    sampleTestCommand: envSampleTestCommand,
-    buildCommand: envBuildCommand,
-    projectTestCommand: envProjectTestCommand,
-    verificationCwd: envVerificationCwd,
-    verificationCommandSource: envVerificationCommandSource,
-    sampleTestSource: envSampleTestSource,
+    ...envController,
+    projectRoot: hasBatchIdentity ? envIdentity.project_root! : input.projectRoot,
+    language: hasBatchIdentity ? envIdentity.language : (input.language || envIdentity.language),
+    smell: hasBatchIdentity ? envIdentity.smell! : input.smell,
+    location: hasBatchIdentity ? envIdentity.location! : input.location,
+    targetContextJson: hasBatchIdentity
+      ? envIdentity.target_context_json
+      : (input.targetContextJson || envIdentity.target_context_json),
+    verificationMode: hasBatchIdentity
+      ? envIdentity.verification_mode
+      : (input.verificationMode || envIdentity.verification_mode),
     checkpointRequired: input.checkpointRequired === true,
   }
 }
 
-function commonArgs(input: {
-  projectRoot: string
-  projectOverrideRoot?: string
-  language?: string
-  smell: string
-  location: string
-  baselineSeal?: string
-  targetContextJson?: string
-  allowTestChanges?: boolean
-  verificationMode?: string
-  sampleTestLocation?: string
-  sampleTestCommand?: string
-  buildCommand?: string
-  projectTestCommand?: string
-  verificationCwd?: string
-  verificationCommandSource?: string
-  sampleTestSource?: string
-}): string[] {
-  const args = [
-    "--project-root",
-    input.projectRoot,
-    "--smell",
-    input.smell,
-    "--location",
-    input.location,
-  ]
-  addOptional(args, "--language", input.language)
-  addOptional(args, "--project-override-root", input.projectOverrideRoot)
-  addOptional(args, "--baseline-seal", input.baselineSeal)
-  addOptional(args, "--target-context-json", input.targetContextJson)
-  if (input.allowTestChanges) args.push("--allow-test-changes")
-  addOptional(args, "--verification-mode", input.verificationMode)
-  addOptional(args, "--sample-test-location", input.sampleTestLocation)
-  addOptional(args, "--sample-test-command", input.sampleTestCommand)
-  addOptional(args, "--build-command", input.buildCommand)
-  addOptional(args, "--project-test-command", input.projectTestCommand)
-  addOptional(args, "--verification-cwd", input.verificationCwd)
-  addOptional(args, "--verification-command-source", input.verificationCommandSource)
-  addOptional(args, "--sample-test-source", input.sampleTestSource)
+function commonArgs(input: BridgeIdentityArgs): string[] {
+  const args: string[] = []
+  for (const [key, controllerKey, , flag] of COMMAND_IDENTITY_CLI_FIELDS) {
+    if (key === "target_context_json") addOptional(args, "--baseline-seal", input.baselineSeal)
+    if (key === "verification_mode" && input.allowTestChanges) args.push("--allow-test-changes")
+    const value = input[controllerKey]
+    if (key === "project_root" || key === "smell" || key === "location") {
+      args.push(flag, value as string)
+    } else {
+      addOptional(args, flag, value)
+    }
+  }
   return args
 }
 
 function controllerIdentityFromPolicy(policy: CommandPolicy): ControllerIdentity {
   const identity = policy.identity
   return {
+    ...controllerIdentityFields(identity),
     projectRoot: identity.project_root,
-    projectOverrideRoot: identity.project_override_root || undefined,
-    language: identity.language || undefined,
     smell: identity.smell,
     location: identity.location,
-    targetContextJson: identity.target_context_json || undefined,
     verificationMode: identity.verification_mode,
-    sampleTestLocation: identity.sample_test_location || undefined,
-    sampleTestCommand: identity.sample_test_command || undefined,
-    buildCommand: identity.build_command || undefined,
-    projectTestCommand: identity.project_test_command || undefined,
-    verificationCwd: identity.verification_cwd || undefined,
-    verificationCommandSource: identity.verification_command_source || undefined,
-    sampleTestSource: identity.sample_test_source || undefined,
     checkpointRequired: policy.checkpoint_required,
   }
 }
 
 function batchCommandIdentityBinding(): CommandIdentityBinding | undefined {
-  const projectRoot = envDefault("SMELL_PROJECT_ROOT")
-  const smell = envDefault("SMELL_SMELL")
-  const location = envDefault("SMELL_LOCATION")
-  const verificationMode = envDefault("SMELL_VERIFICATION_MODE")
-  if (!projectRoot || !smell || !location || !verificationMode) return undefined
-  return {
-    project_root: projectRoot,
-    project_override_root: envDefault("SMELL_CANONICAL_PROJECT_ROOT") || "",
-    language: envDefault("SMELL_LANGUAGE") || "",
-    smell,
-    location,
-    target_context_json: envDefault("SMELL_TARGET_CONTEXT_JSON") || "",
-    verification_mode: verificationMode,
-    sample_test_location: envDefault("SMELL_SAMPLE_TEST_LOCATION") || "",
-    sample_test_command: envDefault("SMELL_SAMPLE_TEST_COMMAND") || "",
-    build_command: envDefault("SMELL_BUILD_COMMAND") || "",
-    project_test_command: envDefault("SMELL_PROJECT_TEST_COMMAND") || "",
-    verification_cwd: envDefault("SMELL_VERIFICATION_CWD") || "",
-    verification_command_source: envDefault("SMELL_VERIFICATION_COMMAND_SOURCE") || "",
-    sample_test_source: envDefault("SMELL_SAMPLE_TEST_SOURCE") || "",
-  }
+  const identity = commandIdentityEnvironment()
+  if (!identity.project_root || !identity.smell || !identity.location || !identity.verification_mode) return undefined
+  return Object.fromEntries(
+    COMMAND_IDENTITY_FIELDS.map(([key]) => [key, identity[key] || ""]),
+  ) as CommandIdentityBinding
 }
 
 function assertRestoredCommandIdentity(policy: CommandPolicy): void {
@@ -672,21 +608,12 @@ function shouldPluginHandleSessionIdle(
   return String(env.SMELL_BATCH_RUN || "").trim() !== "1"
 }
 
-type FailureClassification = {
-  category: string
-  verifyStatus: string
-  highlights: string[]
-  artifactPaths: string[]
-  nextAction: string
-}
-
 type ContinuationState = {
   taskKey: string
   generation: number
   dispatchedGeneration: number
   continuation: number
   maxContinuations: number
-  instruction: string
   pending: boolean
   dispatching: boolean
   awaitingVerify: boolean
@@ -695,23 +622,12 @@ type ContinuationState = {
   agent: string
   directory: string
   failureCategory: string
-  verifyStatus: string
-  failureHighlights: string[]
-  artifactPaths: string[]
-  nextAction: string
-  allowTestChanges: boolean
   updatedAt: number
 }
 
-// The bridge contract emits failure_pack.artifact_paths as name -> path.
-function artifactPathsFrom(value: unknown): string[] {
-  if (value && typeof value === "object") {
-    const entries = Object.values(value as Record<string, unknown>)
-    return entries
-      .map((item) => (typeof item === "string" ? item : ""))
-      .filter((item) => item.length > 0)
-  }
-  return []
+type PreparedLoopOutput = {
+  payload: Record<string, unknown>
+  failureCategory: string
 }
 
 function asStringArray(value: unknown): string[] {
@@ -719,32 +635,6 @@ function asStringArray(value: unknown): string[] {
   return value
     .map((item) => (typeof item === "string" ? item : ""))
     .filter((item) => item.length > 0)
-}
-
-function classifyFailureForContinue(failurePack: unknown): FailureClassification {
-  const empty: FailureClassification = {
-    category: "",
-    verifyStatus: "",
-    highlights: [],
-    artifactPaths: [],
-    nextAction: "",
-  }
-  if (!failurePack || typeof failurePack !== "object" || Array.isArray(failurePack)) {
-    return empty
-  }
-  const pack = failurePack as Record<string, unknown>
-  const category = typeof pack.failure_category === "string" ? pack.failure_category.trim() : ""
-  const verifyStatus = typeof pack.verify_status === "string" ? pack.verify_status.trim() : ""
-  const highlights = asStringArray(pack.highlights)
-  const artifactPaths = artifactPathsFrom(pack.artifact_paths)
-  const nextAction = typeof pack.next_action === "string" ? pack.next_action.trim() : ""
-  return {
-    category,
-    verifyStatus,
-    highlights,
-    artifactPaths,
-    nextAction,
-  }
 }
 
 function makeTaskKey(projectRoot: string, smell: string, location: string): string {
@@ -1921,8 +1811,6 @@ function createIdleContinueRuntime(options: {
     agent: string
     directory: string
     maxContinuations: number
-    instruction: string
-    allowTestChanges: boolean
   }) {
     if (!sessionIdleEnabled) return
     if (!input.sessionID) return
@@ -1932,7 +1820,6 @@ function createIdleContinueRuntime(options: {
       dispatchedGeneration: -1,
       continuation: 0,
       maxContinuations: input.maxContinuations,
-      instruction: input.instruction,
       pending: false,
       dispatching: false,
       awaitingVerify: true,
@@ -1941,11 +1828,6 @@ function createIdleContinueRuntime(options: {
       agent: input.agent,
       directory: input.directory,
       failureCategory: "",
-      verifyStatus: "",
-      failureHighlights: [],
-      artifactPaths: [],
-      nextAction: "",
-      allowTestChanges: input.allowTestChanges,
       updatedAt: Date.now(),
     })
   }
@@ -1958,7 +1840,7 @@ function createIdleContinueRuntime(options: {
     directory: string
     taskKey: string
     output: string
-    allowTestChanges: boolean
+    preparedOutput?: PreparedLoopOutput | null
   }): {
     enabled: boolean
     continuation: number
@@ -1969,23 +1851,27 @@ function createIdleContinueRuntime(options: {
     dispatched: boolean
   } {
     cleanupStale()
-    let status = ""
-    let category = ""
-    let jsonParsed = false
-    let failurePack: unknown = null
-    let loop: Record<string, unknown> | null = null
-    try {
-      const parsed = JSON.parse(input.output) as Record<string, unknown>
-      jsonParsed = true
-      status = typeof parsed.status === "string" ? parsed.status : ""
-      category = typeof parsed.failure_category === "string" ? parsed.failure_category : ""
-      failurePack = parsed.failure_pack
-      loop = parsed.loop && typeof parsed.loop === "object" && !Array.isArray(parsed.loop)
-        ? parsed.loop as Record<string, unknown>
-        : null
-    } catch {
-      // Non-JSON bridge output: never continue.
+    let preparedOutput = input.preparedOutput
+    if (preparedOutput === undefined) {
+      try {
+        const payload = JSON.parse(input.output) as Record<string, unknown>
+        const failurePack = payload.failure_pack && typeof payload.failure_pack === "object" && !Array.isArray(payload.failure_pack)
+          ? payload.failure_pack as Record<string, unknown>
+          : null
+        preparedOutput = {
+          payload,
+          failureCategory: typeof failurePack?.failure_category === "string"
+            ? failurePack.failure_category.trim()
+            : "",
+        }
+      } catch {
+        preparedOutput = null
+      }
     }
+    const parsed = preparedOutput?.payload
+    const loop = parsed?.loop && typeof parsed.loop === "object" && !Array.isArray(parsed.loop)
+      ? parsed.loop as Record<string, unknown>
+      : null
 
     const existing = states.get(input.sessionID)
     if (existing) {
@@ -1997,15 +1883,15 @@ function createIdleContinueRuntime(options: {
     const continuation = typeof loop?.continuation === "number" ? loop.continuation : 0
     const maxContinuations = typeof loop?.max_continuations === "number" ? loop.max_continuations : 0
     const decision = typeof loop?.decision === "string" ? loop.decision : "stop"
-    const instruction = typeof loop?.instruction === "string" ? loop.instruction : ""
 
     const base = {
       enabled: sessionIdleEnabled,
       continuation,
       maxContinuations,
       generation: existing ? existing.generation : 0,
-      status,
-      category: category || (existing ? existing.failureCategory : ""),
+      status: typeof parsed?.status === "string" ? parsed.status : "",
+      category: (typeof parsed?.failure_category === "string" ? parsed.failure_category : "")
+        || (existing ? existing.failureCategory : ""),
       dispatched: existing ? existing.dispatchedGeneration === existing.generation : false,
     }
 
@@ -2026,12 +1912,11 @@ function createIdleContinueRuntime(options: {
       }
     }
 
-    if (!jsonParsed || decision !== "continue" || continuation <= 0 || continuation > maxContinuations) {
+    if (!preparedOutput || decision !== "continue" || continuation <= 0 || continuation > maxContinuations) {
       revokePending()
       return { ...base, dispatched: false }
     }
 
-    const classification = classifyFailureForContinue(failurePack)
     // applyCommandLoopDecision already validated repairability and consumed one
     // unit from the shared command-policy budget.
     const nextGeneration = existing ? existing.generation + 1 : 1
@@ -2048,7 +1933,6 @@ function createIdleContinueRuntime(options: {
           dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
           continuation,
           maxContinuations,
-          instruction,
           pending: true,
           dispatching: false,
           awaitingVerify: false,
@@ -2056,12 +1940,7 @@ function createIdleContinueRuntime(options: {
           verifyReminderGeneration: -1,
           agent: input.agent,
           directory: input.directory,
-          failureCategory: classification.category,
-          verifyStatus: classification.verifyStatus || status,
-          failureHighlights: classification.highlights,
-          artifactPaths: classification.artifactPaths,
-          nextAction: classification.nextAction,
-          allowTestChanges: input.allowTestChanges,
+          failureCategory: preparedOutput.failureCategory,
           updatedAt: Date.now(),
         }
     // When mutating in place, update the fields that changed.
@@ -2070,19 +1949,13 @@ function createIdleContinueRuntime(options: {
       nextState.generation = nextGeneration
       nextState.continuation = continuation
       nextState.maxContinuations = maxContinuations
-      nextState.instruction = instruction
       nextState.pending = true
       nextState.awaitingVerify = false
       nextState.awaitingVerifyReason = "continuation"
       nextState.verifyReminderGeneration = -1
       nextState.agent = input.agent
       nextState.directory = input.directory
-      nextState.failureCategory = classification.category
-      nextState.verifyStatus = classification.verifyStatus || status
-      nextState.failureHighlights = classification.highlights
-      nextState.artifactPaths = classification.artifactPaths
-      nextState.nextAction = classification.nextAction
-      nextState.allowTestChanges = input.allowTestChanges
+      nextState.failureCategory = preparedOutput.failureCategory
       nextState.updatedAt = Date.now()
     }
     states.set(input.sessionID, nextState)
@@ -2367,22 +2240,9 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
     verification_mode: verificationMode as VerificationMode,
     allow_test_changes: payload.allow_test_changes,
     checkpoint_required: payload.checkpoint_required,
-    identity: {
-      project_root: identity.project_root as string,
-      project_override_root: identity.project_override_root as string,
-      language: identity.language as string,
-      smell: identity.smell as string,
-      location: identity.location as string,
-      target_context_json: identity.target_context_json as string,
-      verification_mode: identity.verification_mode as VerificationMode,
-      sample_test_location: identity.sample_test_location as string,
-      sample_test_command: identity.sample_test_command as string,
-      build_command: identity.build_command as string,
-      project_test_command: identity.project_test_command as string,
-      verification_cwd: identity.verification_cwd as string,
-      verification_command_source: identity.verification_command_source as string,
-      sample_test_source: identity.sample_test_source as string,
-    },
+    identity: Object.fromEntries(
+      COMMAND_IDENTITY_FIELDS.map(([key]) => [key, identity[key]]),
+    ) as CommandTaskIdentity,
     loop: {
       mode: loop.mode as LoopPolicy["mode"],
       max_continuations: Number(loop.max_continuations),
@@ -2679,12 +2539,15 @@ function failureFingerprint(payload: Record<string, unknown>): string {
   return createHash("sha256").update(JSON.stringify(source)).digest("hex")
 }
 
-function applyCommandLoopDecision(normalized: { output: string; metadata: Record<string, unknown> }, state: CommandLoopState) {
+function applyCommandLoopDecision(
+  normalized: { output: string; metadata: Record<string, unknown> },
+  state: CommandLoopState,
+): PreparedLoopOutput | null {
   let payload: Record<string, unknown>
   try {
     payload = JSON.parse(normalized.output) as Record<string, unknown>
   } catch {
-    return
+    return null
   }
   const resolution = typeof payload.resolution === "string" ? payload.resolution : ""
   const improvedOnly = payload.status === "IMPROVED" || resolution === "improved"
@@ -2702,19 +2565,15 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
   const bestPartial = checkpointObj?.best_partial && typeof checkpointObj.best_partial === "object" && !Array.isArray(checkpointObj.best_partial)
     ? checkpointObj.best_partial as Record<string, unknown>
     : undefined
-  const pack = payload.failure_pack
-  const category = pack && typeof pack === "object" && !Array.isArray(pack)
-    ? String((pack as Record<string, unknown>).failure_category || "")
-    : ""
-  const group = pack && typeof pack === "object" && !Array.isArray(pack)
-    ? String((pack as Record<string, unknown>).failure_group || "")
-    : ""
-  const bridgeRetryable = pack && typeof pack === "object" && !Array.isArray(pack)
-    ? (pack as Record<string, unknown>).retryable === true
-    : false
-  const nextAction = pack && typeof pack === "object" && !Array.isArray(pack)
-    && typeof (pack as Record<string, unknown>).next_action === "string"
-    ? String((pack as Record<string, unknown>).next_action).trim()
+  const pack = payload.failure_pack && typeof payload.failure_pack === "object" && !Array.isArray(payload.failure_pack)
+    ? payload.failure_pack as Record<string, unknown>
+    : null
+  const packCategory = pack?.failure_category
+  const category = pack ? String(packCategory || "") : ""
+  const group = pack ? String(pack.failure_group || "") : ""
+  const bridgeRetryable = pack?.retryable === true
+  const nextAction = typeof pack?.next_action === "string"
+    ? pack.next_action.trim()
     : ""
   const retryable = Boolean(bridgeRetryable && group && state.policy.loop.allowed_failure_groups.includes(group))
   const elapsedSeconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000))
@@ -2781,6 +2640,10 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
   payload.loop = loop
   normalized.output = safeJsonStringify(payload)
   normalized.metadata.loop = toJsonSafe(loop)
+  return {
+    payload,
+    failureCategory: typeof packCategory === "string" ? packCategory.trim() : "",
+  }
 }
 
 function applyGuardProgressDecision(
@@ -3109,8 +2972,9 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         const bridgeArgs = ["verify", ...commonArgs({ ...resolved, baselineSeal }), "--output-detail", "decision"]
         if (args.noSnapshot) bridgeArgs.push("--no-snapshot")
         const normalized = normalizeToolResult(name, await runBridge(worktree, bridgeArgs))
+        let preparedOutput: PreparedLoopOutput | null | undefined
         if (commandState) {
-          applyCommandLoopDecision(normalized, commandState)
+          preparedOutput = applyCommandLoopDecision(normalized, commandState)
           normalized.metadata.command_loop_state = toJsonSafe(commandLoopStateSnapshot(commandState))
         }
         // Every mode consumes the same authoritative loop decision. Interactive
@@ -3124,7 +2988,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             directory: context?.directory || "",
             taskKey: makeTaskKey(resolved.projectRoot || "", resolved.smell || "", resolved.location || ""),
             output: normalized.output,
-            allowTestChanges: commandState?.policy.allow_test_changes === true,
+            preparedOutput,
           })
           autoContinuation = {
             enabled: cont.enabled,
@@ -3455,8 +3319,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             : "java-refactor-agent",
         directory: worktree,
         maxContinuations: policy.loop.max_continuations,
-        instruction: policy.loop.instruction,
-        allowTestChanges: policy.allow_test_changes,
       })
     },
 
@@ -3568,7 +3430,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,
   // Idle continuation helpers exercised by the harness:
-  classifyFailureForContinue,
   makeTaskKey,
   buildContinuationMessage,
   buildVerifyRequiredMessage,

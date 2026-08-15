@@ -77,7 +77,7 @@ Direct edit target: Introduce one holder for the identified group and migrate en
 signature families that the target Guard no longer reports the frozen finding.
 
 Source operation shape: OpenCode read/search/edit tools only. See
-[`operation-translations.md`](operation-translations.md) for the Java mechanics, but do not
+[`operation-translations.md`](../../_shared/operation-translations.md) for the Java mechanics, but do not
 invoke an unavailable external refactoring tool in the no-IDE agent.
 
 Route-specific edit steps:

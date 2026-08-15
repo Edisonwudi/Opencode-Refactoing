@@ -18,11 +18,10 @@ from smell_core.data_clump_migration import (  # noqa: E402
     evaluate_data_clump_declaration_migration,
 )
 from smell_core.checkpoint_adapters import detector_profile_for  # noqa: E402
+from smell_core.checkpoint_contract import checkpoint_gate_result  # noqa: E402
 from smell_core.data_clumps import (  # noqa: E402
     evaluate_data_clump_checkpoint_contract,
 )
-from smell_core.guards import _run_data_clumps_guard  # noqa: E402
-from smell_core.guards.context import GuardRunContext  # noqa: E402
 from smell_core.target_patch_identity import ast_declaration_identity  # noqa: E402
 
 
@@ -516,6 +515,7 @@ def _check_migration_requires_project_full_mode() -> None:
 
     metrics = {
         "ok": True,
+        "candidate_count": 0,
         "target_patch_identity_ok": True,
         "target_missing": False,
         "finding_present": False,
@@ -523,30 +523,26 @@ def _check_migration_requires_project_full_mode() -> None:
         "declaration_migration_mode": "api_abi_migration",
         "objectives": {"occurrence_count": 2},
     }
-    context = GuardRunContext(
-        checkpoint_required=True,
-        checkpoint_smell="data_clumps",
-        current_metrics=metrics,
+    checkpoint = {
+        "required": True,
+        "smell": "data_clumps",
+        "checkpoint_id": "c-data-clump-migration",
+        "current_metrics": metrics,
+        "delta": {"metric_progress": True, "reason": "METRIC_PROGRESS"},
+    }
+    sample_optimized = checkpoint_gate_result(
+        "data_clumps",
+        {**checkpoint, "verification_mode": "sample_optimized"},
     )
-    sample_optimized = _run_data_clumps_guard(
-        SimpleNamespace(
-            target_context={"group": GROUP},
-            verification_mode="sample_optimized",
-        ),
-        {},
-        context,
-    )
+    assert sample_optimized is not None, sample_optimized
     assert sample_optimized["success"] is False, sample_optimized
-    assert sample_optimized["details"]["project_full_required"] is True
-    project_full = _run_data_clumps_guard(
-        SimpleNamespace(
-            target_context={"group": GROUP},
-            verification_mode="project_full",
-        ),
-        {},
-        context,
-    )
-    assert project_full["success"] is True, project_full
+    assert sample_optimized["details"]["reason"] == (
+        "DATA_CLUMPS_PROJECT_FULL_REQUIRED"
+    ), sample_optimized
+    assert checkpoint_gate_result(
+        "data_clumps",
+        {**checkpoint, "verification_mode": "project_full"},
+    ) is None
 
 
 def main() -> int:

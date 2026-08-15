@@ -39,7 +39,7 @@ but be collapsed into a lookup table instead of staying as many terminal cases
 
 Direct edit target: Replace key-to-result cases with a map from key to supplier/function.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -59,7 +59,7 @@ dedicated handler strategies
 
 Direct edit target: Move each packet branch workflow into a dedicated handler strategy.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -79,7 +79,7 @@ registry
 
 Direct edit target: Replace stable wire/file type-code cases with an explicit reader registry.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -99,7 +99,7 @@ semantics
 
 Direct edit target: Replace parser-character branching with a classifier table or predicate set.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -118,7 +118,7 @@ should delegate to the state object instead of repeating the per-state branches
 
 Direct edit target: Move state-specific behavior onto the state object/type.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

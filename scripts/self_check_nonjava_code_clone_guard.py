@@ -18,10 +18,11 @@ from smell_core.checkpoint_adapters import (  # noqa: E402
     _code_clone,
     capture_metric_snapshot,
 )
-from smell_core.checkpoint_contract import evaluate_checkpoint_contract  # noqa: E402
+from smell_core.checkpoint_contract import (  # noqa: E402
+    checkpoint_gate_result,
+    evaluate_checkpoint_contract,
+)
 from smell_core.checkpoints import _diff_patch, _finding_contract  # noqa: E402
-from smell_core.guards import _run_code_clone_guard  # noqa: E402
-from smell_core.guards.context import GuardRunContext  # noqa: E402
 from smell_core.location import parse_location_descriptor  # noqa: E402
 from smell_core.target_patch_identity import (  # noqa: E402
     AST_DECLARATION_IDENTITY_CONTRACT,
@@ -63,7 +64,24 @@ def _source(language: str, first_body: str, second_body: str) -> tuple[str, int]
     raise AssertionError(f"unsupported test language: {language}")
 
 
-def _evaluate(language: str, body: str) -> tuple[dict[str, object], dict[str, object]]:
+def _checkpoint_gate(
+    current: dict[str, object],
+    delta: dict[str, object],
+) -> dict[str, object] | None:
+    return checkpoint_gate_result(
+        "code_clone_type1",
+        {
+            "required": True,
+            "smell": "code_clone_type1",
+            "checkpoint_id": "c-code-clone-self-check",
+            "production_diff": True,
+            "current_metrics": current,
+            "delta": delta,
+        },
+    )
+
+
+def _evaluate(language: str, body: str) -> dict[str, object]:
     suffix = {"c": ".c", "cpp": ".cpp", "python": ".py"}[language]
     with tempfile.TemporaryDirectory(prefix=f"nonjava-clone-{language}-") as raw:
         project = Path(raw)
@@ -86,17 +104,11 @@ def _evaluate(language: str, body: str) -> tuple[dict[str, object], dict[str, ob
                 ),
             ],
         )
-        ordinary = _run_code_clone_guard(config, {"type": "code_clone_type1"})
-        checkpoint = _code_clone(config, "")
-        return ordinary, checkpoint
+        return _code_clone(config, "")
 
 
 def _assert_case(language: str, body: str, expected_score: int, expected_success: bool) -> None:
-    ordinary, checkpoint = _evaluate(language, body)
-    assert ordinary["success"] is expected_success, ordinary
-    details = ordinary["details"]
-    assert isinstance(details, dict), ordinary
-    assert details["clone_token_count"] == expected_score, ordinary
+    checkpoint = _evaluate(language, body)
     assert checkpoint["objectives"]["clone_token_count"] == expected_score, checkpoint
     assert checkpoint["finding_present"] is (not expected_success), checkpoint
     assert checkpoint["declaration_identity_valid"] is True, checkpoint
@@ -123,16 +135,27 @@ def _assert_target_resolution_contract() -> None:
             "sample.py:method=second|line=1",
             project,
         )
-        partial = _run_code_clone_guard(
-            SimpleNamespace(language="python", locations=[first, missing_second]),
-            {"type": "code_clone_type1"},
-        )
-        assert partial["success"] is False, partial
-        assert partial["details"]["target_resolution"] == "partial", partial
-
-        missing_both = _run_code_clone_guard(
+        partial = _code_clone(
             SimpleNamespace(
                 language="python",
+                smell="code_clone_type1",
+                project_root=project,
+                finding_contract={},
+                locations=[first, missing_second],
+            ),
+            "",
+        )
+        assert partial["ok"] is False, partial
+        assert partial["error"] == "TARGET_DECLARATION_IDENTITY_UNAVAILABLE", partial
+        assert partial["target_missing"] is True, partial
+        assert partial["unresolved_targets"] == [1], partial
+
+        missing_both = _code_clone(
+            SimpleNamespace(
+                language="python",
+                smell="code_clone_type1",
+                project_root=project,
+                finding_contract={},
                 locations=[
                     parse_location_descriptor(
                         "sample.py:method=third|line=1",
@@ -144,14 +167,19 @@ def _assert_target_resolution_contract() -> None:
                     ),
                 ],
             ),
-            {"type": "code_clone_type1"},
+            "",
         )
-        assert missing_both["success"] is False, missing_both
-        assert missing_both["details"]["target_resolution"] == "none", missing_both
+        assert missing_both["ok"] is False, missing_both
+        assert missing_both["error"] == "TARGET_DECLARATION_IDENTITY_UNAVAILABLE", missing_both
+        assert missing_both["target_missing"] is True, missing_both
+        assert missing_both["unresolved_targets"] == [0, 1], missing_both
 
-        missing_file = _run_code_clone_guard(
+        missing_file = _code_clone(
             SimpleNamespace(
                 language="python",
+                smell="code_clone_type1",
+                project_root=project,
+                finding_contract={},
                 locations=[
                     first,
                     parse_location_descriptor(
@@ -160,19 +188,24 @@ def _assert_target_resolution_contract() -> None:
                     ),
                 ],
             ),
-            {"type": "code_clone_type1"},
+            "",
         )
-        assert missing_file["success"] is False, missing_file
-        assert missing_file["details"]["target_resolution"] == (
-            "source_not_parseable"
-        ), missing_file
+        assert missing_file["ok"] is False, missing_file
+        assert missing_file["error"] == "TARGET_SOURCE_NOT_PARSEABLE", missing_file
+        assert missing_file["target_missing"] is True, missing_file
 
-        invalid = _run_code_clone_guard(
-            SimpleNamespace(language="python", locations=[first]),
-            {"type": "code_clone_type1"},
+        invalid = _code_clone(
+            SimpleNamespace(
+                language="python",
+                smell="code_clone_type1",
+                project_root=project,
+                finding_contract={},
+                locations=[first],
+            ),
+            "",
         )
-        assert invalid["success"] is False, invalid
-        assert invalid["details"]["target_resolution"] == "invalid_location", invalid
+        assert invalid["ok"] is False, invalid
+        assert invalid["error"] == "clone pair requires two locations", invalid
 
 
 def _patch(before: str, after: str, file_name: str) -> str:
@@ -415,17 +448,9 @@ def _assert_same_name_decoy_rejected() -> None:
         assert delta["metric_progress"] is False, delta
         assert delta["reason"] == "SEMANTIC_CONTRACT_REGRESSION", delta
 
-        ordinary = _run_code_clone_guard(
-            config,
-            {"type": "code_clone_type1"},
-            GuardRunContext(
-                checkpoint_required=True,
-                checkpoint_smell="code_clone_type1",
-                current_metrics=current,
-            ),
-        )
-        assert ordinary["success"] is False, ordinary
-        assert ordinary["details"]["detector"] == "checkpoint_current_metrics", ordinary
+        gate = _checkpoint_gate(current, delta)
+        assert gate is not None, gate
+        assert gate["details"]["reason"] == "SEMANTIC_CONTRACT_REGRESSION", gate
 
 
 def _assert_frozen_patch_anchor_beats_nearest_same_name() -> None:
@@ -655,17 +680,7 @@ def _assert_checkpoint_context_reused() -> None:
         ).to_dict()
         assert delta["metric_progress"] is True, delta
 
-        ordinary = _run_code_clone_guard(
-            config,
-            {"type": "code_clone_type1"},
-            GuardRunContext(
-                checkpoint_required=True,
-                checkpoint_smell="code_clone_type1",
-                current_metrics=current,
-            ),
-        )
-        assert ordinary["success"] is True, ordinary
-        assert ordinary["details"]["detector"] == "checkpoint_current_metrics", ordinary
+        assert _checkpoint_gate(current, delta) is None
 
 
 def _assert_owner_decoy_rejected() -> None:
@@ -890,15 +905,7 @@ def _assert_unfrozen_third_override_deletion_rejected() -> None:
                 has_production_diff=True,
                 smell="code_clone_type1",
             ).to_dict()
-            ordinary = _run_code_clone_guard(
-                config,
-                {"type": "code_clone_type1"},
-                GuardRunContext(
-                    checkpoint_required=True,
-                    checkpoint_smell="code_clone_type1",
-                    current_metrics=current,
-                ),
-            )
+            gate = _checkpoint_gate(current, delta)
             if scenario == "deleted_third":
                 assert current["target_patch_identity_ok"] is True, current
                 assert closure.get("ok") is False, current
@@ -923,14 +930,17 @@ def _assert_unfrozen_third_override_deletion_rejected() -> None:
                 assert delta["reason"] == (
                     "SEMANTIC_CONTRACT_REGRESSION"
                 ), delta
-                assert ordinary["success"] is False, ordinary
+                assert gate is not None, gate
+                assert gate["details"]["reason"] == (
+                    "SEMANTIC_CONTRACT_REGRESSION"
+                ), gate
             elif scenario == "untouched_third":
                 assert current["target_patch_identity_ok"] is True, current
                 assert closure.get("ok") is True, current
                 assert closure.get("unfrozen_removed_occurrence_count") == 0
                 assert not current.get("guard_violations"), current
                 assert delta["metric_progress"] is True, delta
-                assert ordinary["success"] is True, ordinary
+                assert gate is None, gate
             else:
                 assert current["target_patch_identity_ok"] is False, current
                 assert closure.get("ok") is False, current
@@ -943,7 +953,10 @@ def _assert_unfrozen_third_override_deletion_rejected() -> None:
                     for item in current.get("guard_violations") or []
                 ), current
                 assert delta["metric_progress"] is False, delta
-                assert ordinary["success"] is False, ordinary
+                assert gate is not None, gate
+                assert gate["details"]["reason"] == (
+                    "SEMANTIC_CONTRACT_REGRESSION"
+                ), gate
 
 
 def _assert_parse_failure_closed() -> None:
@@ -998,14 +1011,15 @@ def _assert_parse_failure_closed() -> None:
             assert parse_files[0]["parseable"] is True, snapshot
             assert parse_files[1]["parseable"] is False, snapshot
 
-            ordinary = _run_code_clone_guard(
-                config,
-                {"type": "code_clone_type1"},
+            gate = _checkpoint_gate(
+                snapshot,
+                {
+                    "metric_progress": False,
+                    "reason": "CURRENT_DETECTOR_UNAVAILABLE",
+                },
             )
-            assert ordinary["success"] is False, ordinary
-            assert ordinary["details"]["target_resolution"] == (
-                "source_not_parseable"
-            ), ordinary
+            assert gate is not None, gate
+            assert gate["details"]["reason"] == "CURRENT_DETECTOR_UNAVAILABLE", gate
 
 
 def _assert_exact_shared_declaration_consolidation() -> None:
@@ -1078,17 +1092,9 @@ def _assert_exact_shared_declaration_consolidation() -> None:
                 has_production_diff=True,
                 smell="code_clone_type1",
             ).to_dict()
-            ordinary = _run_code_clone_guard(
-                config,
-                {"type": "code_clone_type1"},
-                GuardRunContext(
-                    checkpoint_required=True,
-                    checkpoint_smell="code_clone_type1",
-                    current_metrics=current,
-                ),
-            )
+            gate = _checkpoint_gate(current, delta)
             assert delta["metric_progress"] is expected, delta
-            assert ordinary["success"] is expected, ordinary
+            assert (gate is None) is expected, gate
             if expected:
                 assert consolidation["implementation_count"] == 1, current
                 assert len(consolidation["relocated_declarations"]) == 1, current

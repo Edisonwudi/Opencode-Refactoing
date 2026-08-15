@@ -101,7 +101,7 @@ override entirely rather than keep an empty hook or pure delegation layer
 
 Direct edit target: Delete an override that only repeats parent behavior.
 
-Source operation shape: `inline:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `inline:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -122,7 +122,7 @@ specifically
 Direct edit target: Fill an empty required override with behavior derived from the contract and nearby
 invariants.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -141,7 +141,7 @@ same class already implements the same operation with a richer or normalized arg
 
 Direct edit target: Delegate a required simple override to an existing richer overload.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -160,7 +160,7 @@ already owns the operation so the override should delegate to that helper
 
 Direct edit target: Delegate a required override to a helper or service that already owns the operation.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -179,7 +179,7 @@ implementations show the request/transport/handler pattern needed to complete it
 
 Direct edit target: Implement the required override by copying the established sibling protocol shape.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -199,7 +199,7 @@ operations
 
 Direct edit target: Separate collection-wrapper behavior from unsupported property-wrapper behavior.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -221,7 +221,7 @@ them, and a narrower closed-state guard or sentinel object can express the behav
 Direct edit target: Represent closed/sentinel behavior with a guard or sentinel object instead of inheriting
 runtime operations only to reject them.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -246,7 +246,7 @@ and wrapping should be modeled as a separate setup capability
 
 Direct edit target: Split setup/wrapping capability from executor runtime operations.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -265,7 +265,7 @@ nearby setter or update methods
 
 Direct edit target: Implement a refused getter from state already maintained by setters or update methods.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -284,7 +284,7 @@ interface, and packet direction can be represented by narrower inbound/outbound 
 
 Direct edit target: Split inbound parsing from outbound packet behavior.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -305,7 +305,7 @@ behavior
 Direct edit target: Replace incompatible formatter inheritance with composition or a narrower immutable
 formatting API.
 
-Source operation shape: `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -324,7 +324,7 @@ ownership should move downward instead of leaving the hook on the parent
 
 Direct edit target: Move a real hook from a parent to the subclass that actually supports it.
 
-Source operation shape: `pushDown:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `pushDown:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

@@ -1821,7 +1821,6 @@ function flush() {
 async function runIdleContinueSelfCheck(pluginModule) {
   const hooks = pluginModule.SmellPlugin?.__selfTest || pluginModule.default?.__selfTest
   for (const key of [
-    "classifyFailureForContinue",
     "makeTaskKey",
     "buildContinuationMessage",
     "buildVerifyRequiredMessage",
@@ -1839,15 +1838,6 @@ async function runIdleContinueSelfCheck(pluginModule) {
   ]) {
     assertCond(`unified_loop_removed:${removed}`, !(removed in hooks), `${removed} must be removed`)
   }
-
-  const removedStructuralFailure = hooks.classifyFailureForContinue({
-    failure_category: "STRUCTURAL_ROUTE_MISMATCH",
-    verify_status: "SMELL_GUARD_FAILED",
-    highlights: ["CAPABILITY_SPLIT_REQUIRED target=ReadOnlyPacket method=toBytes parent=Packet"],
-    artifact_paths: {},
-  })
-  assertEqual("structural_route_category_preserved", removedStructuralFailure.category, "STRUCTURAL_ROUTE_MISMATCH", "category")
-  assertEqual("unused_repairable_flag_removed", typeof removedStructuralFailure.ok, "undefined", "ok")
 
   function outputWithLoop({ decision = "continue", continuation = 1, max = 2, status = "SMELL_GUARD_FAILED", nextAction = "" } = {}) {
     const payload = JSON.parse(makeFailureOutput(status, status, { next_action: nextAction }))

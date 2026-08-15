@@ -147,10 +147,18 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         )
         is True
     )
+    data_clumps_project_full_required = bool(
+        smell == "data_clumps"
+        and isinstance(current_metrics, Mapping)
+        and current_metrics.get("project_full_required") is True
+        and str(checkpoint.get("verification_mode") or "").strip()
+        != "project_full"
+    )
     if (
         not current_detector_failure
         and delta.get("metric_progress") is True
         and not finding_remains
+        and not data_clumps_project_full_required
     ):
         return None
     checkpoint_reason = str(checkpoint.get("reason") or "").strip()
@@ -160,6 +168,8 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         reason = current_detector_failure
     elif finding_remains and delta.get("metric_progress") is True:
         reason = "FINDING_REMAINS"
+    elif data_clumps_project_full_required and delta.get("metric_progress") is True:
+        reason = "DATA_CLUMPS_PROJECT_FULL_REQUIRED"
     else:
         reason = str(delta.get("reason") or "NO_STRUCTURAL_PROGRESS")
     messages = {
@@ -206,6 +216,9 @@ def checkpoint_gate_result(smell: str, checkpoint: Mapping[str, Any]) -> dict[st
         "NO_STRUCTURAL_PROGRESS": "production source changed, but no checkpoint objective decreased",
         "TARGET_NOT_LOCATED": "the target entity could not be located after the edits; re-anchor it or restore the target signature instead of making it unreachable",
         "SEMANTIC_CONTRACT_REGRESSION": "the refactoring violated a smell-specific structural contract",
+        "DATA_CLUMPS_PROJECT_FULL_REQUIRED": (
+            "the controlled declaration migration requires verification_mode=project_full"
+        ),
     }
     return {
         "type": smell,

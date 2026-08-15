@@ -39,7 +39,7 @@ if the outer control flow shape stays the same
 
 Direct edit target: Extract the deepest meaningful branch so the target method has less nested detail.
 
-Source operation shape: `extract:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -59,7 +59,7 @@ remaining outer condition into a guard clause
 
 Direct edit target: Extract a valid branch, then invert the remaining outer condition into a guard clause.
 
-Source operation shape: `extract:method`, `direct:edit`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`, `direct:edit`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

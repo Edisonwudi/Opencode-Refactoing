@@ -40,7 +40,7 @@ extracted while the caller keeps orchestration
 
 Direct edit target: Extract the bulky loop body or control block that dominates the long method.
 
-Source operation shape: `extract:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -60,7 +60,7 @@ single derived result, so a plain helper extraction is clean
 
 Direct edit target: Extract a straight-line calculation slice with one clear result.
 
-Source operation shape: `extract:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -79,7 +79,7 @@ plain extract:method stalls and the path must switch to method object
 
 Direct edit target: Use a small helper object when a cohesive slice writes several locals needed later.
 
-Source operation shape: `extract:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `extract:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

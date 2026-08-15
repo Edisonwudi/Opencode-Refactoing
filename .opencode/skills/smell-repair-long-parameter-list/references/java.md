@@ -53,7 +53,7 @@ complete caller set can migrate to a request object
 Direct edit target: Replace a static utility signature with one request object.
 
 Source operation shape: `introduce:parameter-object`. See
-[`operation-translations.md`](operation-translations.md) for reusable mechanics.
+[`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -75,7 +75,7 @@ Direct edit target: Replace the cohesive constructor parameters with one immutab
 configuration object.
 
 Source operation shape: `introduce:parameter-object`. See
-[`operation-translations.md`](operation-translations.md) for reusable mechanics.
+[`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -101,7 +101,7 @@ Direct edit target: Replace the traveling method parameters with a request objec
 moving the method away from its owner.
 
 Source operation shape: `introduce:parameter-object`. See
-[`operation-translations.md`](operation-translations.md) for reusable mechanics.
+[`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 
@@ -123,7 +123,7 @@ family whose declarations and callers can be migrated as one API change
 Direct edit target: Change the contract and every implementation to one typed request object.
 
 Source operation shape: OpenCode read/search/edit tools only. See
-[`operation-translations.md`](operation-translations.md) for Java mechanics, but do not invoke
+[`operation-translations.md`](../../_shared/operation-translations.md) for Java mechanics, but do not invoke
 an unavailable external refactoring tool in the no-IDE agent.
 
 Route-specific edit steps:

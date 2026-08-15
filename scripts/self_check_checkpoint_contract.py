@@ -698,6 +698,92 @@ def main() -> int:
     )
     assert improved.reason == "METRIC_PROGRESS" and improved.metric_progress
 
+    data_clumps_requires_full = {
+        "required": True,
+        "smell": "data_clumps",
+        "checkpoint_id": "c-data-clumps-mode",
+        "production_diff": True,
+        "current_metrics": {
+            "ok": True,
+            "candidate_count": 0,
+            "finding_present": False,
+            "project_full_required": True,
+        },
+        "delta": {"metric_progress": True, "reason": "METRIC_PROGRESS"},
+    }
+    sample_optimized_gate = checkpoint_gate_result(
+        "data_clumps",
+        {**data_clumps_requires_full, "verification_mode": "sample_optimized"},
+    )
+    assert sample_optimized_gate is not None, sample_optimized_gate
+    assert (
+        sample_optimized_gate["details"]["reason"]
+        == "DATA_CLUMPS_PROJECT_FULL_REQUIRED"
+    ), sample_optimized_gate
+    assert checkpoint_gate_result(
+        "data_clumps",
+        {**data_clumps_requires_full, "verification_mode": "project_full"},
+    ) is None
+
+    missing_gate = checkpoint_gate_result(
+        "long_method",
+        {"required": False, "reason": "baseline_checkpoint_missing"},
+    )
+    assert missing_gate is not None, missing_gate
+    assert missing_gate["details"]["reason"] == "BASELINE_CHECKPOINT_MISSING", missing_gate
+
+    finding_remains_gate = checkpoint_gate_result(
+        "long_method",
+        {
+            "required": True,
+            "current_metrics": {
+                "ok": True,
+                "candidate_count": 1,
+                "finding_present": True,
+            },
+            "delta": {"metric_progress": True, "reason": "METRIC_PROGRESS"},
+        },
+    )
+    assert finding_remains_gate is not None, finding_remains_gate
+    assert finding_remains_gate["details"]["reason"] == "FINDING_REMAINS", finding_remains_gate
+
+    resolved_current = {
+        "ok": True,
+        "candidate_count": 0,
+        "finding_present": False,
+    }
+    assert checkpoint_gate_result(
+        "long_method",
+        {
+            "required": True,
+            "current_metrics": resolved_current,
+            "delta": {"metric_progress": True, "reason": "METRIC_PROGRESS"},
+        },
+    ) is None
+
+    violation_current = {
+        **resolved_current,
+        "objectives": {"primary": 9},
+        "guard_violations": [{"code": "SYNTHETIC_CONTRACT_VIOLATION"}],
+    }
+    violation_delta = evaluate_checkpoint_contract(
+        {"ok": True, "objectives": {"primary": 10}},
+        violation_current,
+        has_production_diff=True,
+        smell="code_clone_type1",
+    ).to_dict()
+    assert violation_delta["reason"] == "SEMANTIC_CONTRACT_REGRESSION", violation_delta
+    violation_gate = checkpoint_gate_result(
+        "code_clone_type1",
+        {
+            "required": True,
+            "current_metrics": violation_current,
+            "delta": violation_delta,
+        },
+    )
+    assert violation_gate is not None, violation_gate
+    assert violation_gate["details"]["reason"] == "SEMANTIC_CONTRACT_REGRESSION", violation_gate
+
     detector_unavailable_current = {
         "ok": False,
         "candidate_count": 0,

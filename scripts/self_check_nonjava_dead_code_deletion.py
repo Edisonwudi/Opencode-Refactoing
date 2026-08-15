@@ -276,7 +276,9 @@ def _check_exact_deletion(workspace: Path, fixture: Fixture) -> None:
         outcome.get("success") is True for outcome in proven_guard
     ), proven_guard
     assert any(
-        (outcome.get("details") or {}).get("target_absence_allowed") is True
+        ((outcome.get("details") or {}).get("current_metrics") or {}).get(
+            "target_absence_allowed"
+        ) is True
         for outcome in proven_guard
     ), proven_guard
 

@@ -39,7 +39,7 @@ references
 
 Direct edit target: Delete the unused private method after reference search proves it is local dead code.
 
-Source operation shape: `delete:method`. See [`operation-translations.md`](operation-translations.md) for reusable mechanics.
+Source operation shape: `delete:method`. See [`operation-translations.md`](../../_shared/operation-translations.md) for reusable mechanics.
 
 Route-specific edit steps:
 

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Verify Java checkpoint-only dispatch and the retained non-Java path."""
+"""Verify checkpoint-only smell dispatch for every supported language."""
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +17,6 @@ from smell_core.guards import (  # noqa: E402
     validate_java_strict_verification_contract,
 )
 from smell_core.guards.context import GuardRunContext  # noqa: E402
-from smell_core.location import parse_location_descriptor  # noqa: E402
 
 
 def _profile(smell: str, **thresholds: object) -> SimpleNamespace:
@@ -93,6 +91,7 @@ def main() -> int:
 
     checkpoint = {
         "required": True,
+        "smell": "long_method",
         "checkpoint_id": "c000-self-check",
         "finding_contract": {"detector_id": "java-product/long_method/v4"},
         "current_metrics": {
@@ -155,43 +154,81 @@ def main() -> int:
         sample_optimized_without_test
     ), sample_optimized_without_test
 
-    with tempfile.TemporaryDirectory(prefix="nonjava-guard-dispatch-") as temp_dir:
-        project = Path(temp_dir)
-        source = project / "sample.py"
-        source.write_text("def target(a, b):\n    return a + b\n", encoding="utf-8")
-        target = parse_location_descriptor("sample.py:method=target|line=1", project)
-        nonjava = SimpleNamespace(
-            language="python",
-            smell="long_parameter_list",
-            project_root=project,
-            profile=_profile("long_parameter_list", max_params=5),
-            locations=[target],
-            defaults=DefaultsConfig(run_build=False, run_tests=False),
-            build=CommandConfig(),
-            test=CommandConfig(),
-            sample_test=CommandConfig(),
-            dataset_root=project,
-            cwd=project,
-            verification_cwd=project,
-            env={},
-            verification_mode="local",
-            verification_command_source="",
-            build_source="",
-            test_source="",
-            sample_test_source="",
-            sample_test_location="",
-            sample_test_command="",
-        )
-        assert validate_java_strict_verification_contract(nonjava) == []
-        generic = run_smell_guards(nonjava)
-        assert len(generic) == 1 and generic[0]["success"] is True, generic
-        assert generic[0]["details"]["param_count"] == 2, generic
-        nonjava_build = run_build_test_guard(nonjava)
-        assert nonjava_build["success"] is True, nonjava_build
+    project = Path.cwd().resolve()
+    nonjava = SimpleNamespace(
+        language="python",
+        smell="long_parameter_list",
+        project_root=project,
+        profile=_profile("long_parameter_list", max_params=5),
+        locations=[],
+        defaults=DefaultsConfig(run_build=False, run_tests=False),
+        build=CommandConfig(),
+        test=CommandConfig(),
+        sample_test=CommandConfig(),
+        dataset_root=project,
+        cwd=project,
+        verification_cwd=project,
+        env={},
+        verification_mode="sample_optimized",
+        verification_command_source="",
+        build_source="",
+        test_source="",
+        sample_test_source="",
+        sample_test_location="",
+        sample_test_command="",
+    )
+    assert validate_java_strict_verification_contract(nonjava) == []
+
+    nonjava_missing = run_smell_guards(nonjava)
+    assert len(nonjava_missing) == 1 and nonjava_missing[0]["success"] is False, nonjava_missing
+    assert nonjava_missing[0]["details"]["reason"] == "BASELINE_CHECKPOINT_MISSING", nonjava_missing
+
+    nonjava_mismatch = run_smell_guards(
+        nonjava,
+        GuardRunContext(
+            checkpoint_required=True,
+            checkpoint_smell="nested_complexity",
+            checkpoint={"required": True, "smell": "nested_complexity"},
+        ),
+    )
+    assert len(nonjava_mismatch) == 1 and nonjava_mismatch[0]["success"] is False, nonjava_mismatch
+    assert nonjava_mismatch[0]["details"]["reason"] == "BASELINE_CHECKPOINT_MISSING", nonjava_mismatch
+
+    nonjava_checkpoint = {
+        "required": True,
+        "smell": "long_parameter_list",
+        "checkpoint_id": "c000-nonjava-self-check",
+        "current_metrics": {
+            "ok": True,
+            "candidate_count": 0,
+            "finding_present": False,
+        },
+        "delta": {"metric_progress": True},
+    }
+    nonjava_resolved = run_smell_guards(
+        nonjava,
+        GuardRunContext(
+            checkpoint_required=True,
+            checkpoint_smell="long_parameter_list",
+            checkpoint=nonjava_checkpoint,
+        ),
+    )
+    # PASS is represented once: no second legacy dispatcher may append another
+    # success result after the authoritative checkpoint gate.
+    assert len(nonjava_resolved) == 1 and nonjava_resolved[0]["success"] is True, nonjava_resolved
+    assert nonjava_resolved[0]["details"]["guard"] == "checkpoint_contract", nonjava_resolved
+
+    unknown = SimpleNamespace(**{**vars(nonjava), "smell": "future_smell", "profile": _profile("future_smell")})
+    unknown_result = run_smell_guards(unknown)
+    assert len(unknown_result) == 1 and unknown_result[0]["success"] is False, unknown_result
+    assert "Unknown guard type" in str(unknown_result[0]["message"]), unknown_result
+
+    nonjava_build = run_build_test_guard(nonjava)
+    assert nonjava_build["success"] is True, nonjava_build
 
     print(
         "guard-dispatch self-check: PASS java_fallback=0 "
-        "java_invalid_config_pass=0 nonjava_generic=PASS"
+        "java_invalid_config_pass=0 nonjava_checkpoint_only=PASS"
     )
     return 0
 
