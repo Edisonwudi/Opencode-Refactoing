@@ -634,7 +634,15 @@ def main() -> None:
             smell_bridge.run_build_test_guard = original_run_build_test_guard
         assert java_verify["status"] == "PASS", java_verify
         assert java_roots == [root], java_roots
-        assert java_verify["build_test_guard"]["verification_isolation"] is None
+        java_lifecycle = java_verify["build_test_guard"]["verification_isolation"]
+        assert java_lifecycle["contract_version"] == (
+            "project-full-direct-output-cleanup/v1"
+        ), java_lifecycle
+        assert java_lifecycle["mode"] == (
+            "runner_checkout_with_output_cleanup"
+        ), java_lifecycle
+        assert java_lifecycle["success"] is True, java_lifecycle
+        assert java_lifecycle["cleanup_success"] is True, java_lifecycle
 
     print(
         "fresh project_full worktree self-check passed: consecutive isolated "

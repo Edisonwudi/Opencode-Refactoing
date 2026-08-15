@@ -56,18 +56,23 @@ Workflow:
    `required_reduction` scalars to size the first coherent edit. Those scalars
    are planning input, not a caller or dependency closure.
 4. Execute the smallest set of coherent production slices projected to cross a
-   source-derived passing route. After each slice, run the language reference's
-   focused compile or test. If the source projection is still outside the
-   numeric budget, continue the same repair without calling `smell_verify`.
-   Avoid unrelated cleanup and never delete or weaken behavior checks. Only
-   migrate test references when the controller explicitly allows test changes,
-   preserving their original assertions and intent.
-5. Once the source projection reaches a passing route—or, when no numeric
-   budget exists, after the first coherent repair—call `smell_verify` as the
-   acceptance gate using the controller-owned verification mode. Do not run
-   Maven, Gradle, or their wrappers directly during this command;
-   `smell_verify` owns the pinned build/test invocation and loop decision. Do
-   not substitute syntax-only checks for configured project tests.
+   source-derived passing route. In a controller-managed, checkpoint-required
+   `project_full` Python/C/C++ command, use read/grep/glob/list for inspection and
+   edit/write/patch for source changes; do not use bash. Avoid unrelated cleanup
+   and never delete or weaken behavior checks. Only migrate test references when
+   the controller explicitly allows test changes, preserving their original
+   assertions and intent.
+5. In a controller-managed, checkpoint-required `project_full` Python/C/C++
+   command, call `smell_verify` after each coherent slice. It owns the isolated
+   focused compile/test while the source Guard is outside a passing route, and
+   advances to final verification only after the Guard passes. Do not invoke
+   compilers, build systems, or test runners manually in that protected
+   session. If the source projection is still outside the numeric budget, the
+   call at that stage is only its isolated focused preflight. Once the source
+   projection reaches a passing route, the next call may advance to final
+   verification under the frozen controller policy. Outside a
+   controller-managed `project_full` Python/C/C++ command, follow the selected
+   language route's focused-check policy and the frozen verification mode.
 6. If `smell_verify` returns `success: false`, read `failure_pack` before
    editing again. Repair only the reported smell, compile, or test regression.
 

@@ -156,9 +156,15 @@ require(
     "generic agent does not treat the baseline metric budget as bounded scalar planning input",
 )
 require(
-    "If the source projection is still outside the numeric budget, continue the same repair without calling `smell_verify`" in generic_agent_flat
+    "If the source projection is still outside the numeric budget, the call at that stage is only its isolated focused preflight" in generic_agent_flat
     and "Once the source projection reaches a passing route" in generic_agent_flat,
     "generic agent does not defer project_full verification until the projected edit reaches a passing route",
+)
+require(
+    "In a controller-managed, checkpoint-required `project_full` Python/C/C++ command" in generic_agent_flat
+    and
+    "Outside a controller-managed `project_full` Python/C/C++ command" in generic_agent_flat,
+    "generic agent applies the protected shell and focused-verification policy outside its controller scope",
 )
 require("load exactly the\n   matching `smell-repair-<smell>` semantic skill" in java_agent, "Java agent lacks exact-smell loading")
 require("and read its Java reference" in java_agent, "Java route is not reference-scoped")
@@ -198,6 +204,15 @@ for smell in GENERIC_SMELLS:
         "call `smell_verify`; it owns the configured full project suite" in cpp_reference,
         f"C++ route duplicates controller-owned full verification: {smell}",
     )
+
+for smell in GENERIC_SMELLS:
+    skill_root = SKILLS / f"smell-repair-{smell.replace('_', '-')}" / "references"
+    for language in ("python", "c", "cpp"):
+        reference = (skill_root / f"{language}.md").read_text(encoding="utf-8")
+        require(
+            "owns the isolated focused" not in reference,
+            f"{language} route globally overrides non-project_full focused-check semantics: {smell}",
+        )
 
 plugin_text = (ROOT / ".opencode" / "plugins" / "smell.ts").read_text(encoding="utf-8")
 require("smell-repair-<task-smell-with-hyphens> semantic skill and idea-refactor-cli backend skill" in plugin_text, "controller still advertises the old IDEA-only route")

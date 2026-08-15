@@ -313,6 +313,9 @@ async function makeFixtureProject() {
       "    var report = Path.of(\".smell-test-reports\", \"TEST-SelfCheckSampleBehaviorTest.xml\");",
       "    Files.createDirectories(report.getParent());",
       "    Files.writeString(report, \"<testsuite name='SelfCheckSampleBehaviorTest' tests='1' failures='0' errors='0' skipped='0'><testcase name='publicAdd'/></testsuite>\\n\");",
+      "    var ignoredOutput = Path.of(\"ignored-build\", \"controller.tmp\");",
+      "    Files.createDirectories(ignoredOutput.getParent());",
+      "    Files.writeString(ignoredOutput, \"controller verification output\\n\");",
       "    System.out.println(\"OK (1 test)\");",
       "  }",
       "}",
@@ -320,6 +323,7 @@ async function makeFixtureProject() {
     ].join("\n"),
     "utf8",
   )
+  await writeFile(path.join(fixtureRoot, ".gitignore"), "ignored-build/\n", "utf8")
   await writeFile(
     path.join(fixtureRoot, "projects.yaml"),
     [
@@ -336,7 +340,7 @@ async function makeFixtureProject() {
   )
   for (const args of [
     ["init", "-q"],
-    ["add", "src/main/java/SelfCheckSample.java", "src/test/java/SelfCheckSampleBehaviorTest.java", "projects.yaml"],
+    ["add", ".gitignore", "src/main/java/SelfCheckSample.java", "src/test/java/SelfCheckSampleBehaviorTest.java", "projects.yaml"],
     ["-c", "user.name=smell-self-check", "-c", "user.email=self-check@example.invalid", "commit", "-qm", "baseline"],
   ]) {
     const result = await run("git", args, { cwd: fixtureRoot })
@@ -350,6 +354,7 @@ async function makeFixtureProject() {
 async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
   const env = cleanSmellIdentityEnv(process.env)
   env.SMELL_ARTIFACT_ROOT = artifactRoot
+  env.SMELL_CHECKPOINT_ROOT = path.join(artifactRoot, "checkpoints")
   const sourceFile = path.join(fixtureRoot, "src", "main", "java", "SelfCheckSample.java")
   const originalSource = await readFile(sourceFile, "utf8")
   const identityArgs = [
@@ -433,6 +438,14 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
     "passing_max",
   )
   await writeFile(
+    path.join(fixtureRoot, "candidate-note.txt"),
+    "authored before controller verification\n",
+    "utf8",
+  )
+  await mkdir(path.join(fixtureRoot, "ignored-build"), { recursive: true })
+  const authoredIgnoredPath = path.join(fixtureRoot, "ignored-build", "authored.seed")
+  await writeFile(authoredIgnoredPath, "pre-existing candidate input\n", "utf8")
+  await writeFile(
     sourceFile,
     [
       "public class SelfCheckSample {",
@@ -442,34 +455,99 @@ async function runBridgeSelfCheck(fixtureRoot, artifactRoot) {
     ].join("\n"),
     "utf8",
   )
-  const result = await run(
-    "python3",
-    [
-      bridgeFile,
-      "verify",
-      ...identityArgs,
-      "--baseline-seal",
-      baselineSeal,
-      "--no-snapshot",
-    ],
-    { cwd: fixtureRoot, env },
-  )
-  await writeFile(sourceFile, originalSource, "utf8")
-  if (result.exitCode !== 0) {
-    throw new SelfCheckError("bridge_verify", "smell_bridge.py verify exited non-zero.", result)
-  }
-  const payload = parseJson("bridge_verify_json", result.stdout)
-  if (payload.status !== "PASS" || payload.success !== true) {
-    throw new SelfCheckError("bridge_verify_status", "Bridge verification did not return PASS.", {
-      status: payload.status,
-      success: payload.success,
-      payload,
-    })
+  let result
+  let payload
+  let repeatedResult
+  let repeatedPayload
+  try {
+    result = await run(
+      "python3",
+      [
+        bridgeFile,
+        "verify",
+        ...identityArgs,
+        "--baseline-seal",
+        baselineSeal,
+        "--no-snapshot",
+      ],
+      { cwd: fixtureRoot, env },
+    )
+    if (result.exitCode !== 0) {
+      throw new SelfCheckError("bridge_verify", "smell_bridge.py verify exited non-zero.", result)
+    }
+    payload = parseJson("bridge_verify_json", result.stdout)
+    if (payload.status !== "PASS" || payload.success !== true) {
+      throw new SelfCheckError("bridge_verify_status", "Bridge verification did not return PASS.", {
+        status: payload.status,
+        success: payload.success,
+        payload,
+      })
+    }
+
+    const postVerifyStatus = await run(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { cwd: fixtureRoot },
+    )
+    assertEqual("bridge_verify_preserves_candidate_tree_rc", postVerifyStatus.exitCode, 0, "exitCode")
+    assertEqual(
+      "bridge_verify_preserves_candidate_tree",
+      postVerifyStatus.stdout,
+      " M src/main/java/SelfCheckSample.java\n?? candidate-note.txt\n",
+      "gitStatus",
+    )
+    assertEqual(
+      "bridge_verify_preserves_preexisting_ignored_input",
+      await readFile(authoredIgnoredPath, "utf8"),
+      "pre-existing candidate input\n",
+      "content",
+    )
+    assertCond(
+      "bridge_verify_removes_new_ignored_output",
+      !existsSync(path.join(fixtureRoot, "ignored-build", "controller.tmp")),
+      "controller-created ignored output remained in the candidate tree",
+    )
+
+    repeatedResult = await run(
+      "python3",
+      [
+        bridgeFile,
+        "verify",
+        ...identityArgs,
+        "--baseline-seal",
+        baselineSeal,
+        "--no-snapshot",
+      ],
+      { cwd: fixtureRoot, env },
+    )
+    if (repeatedResult.exitCode !== 0) {
+      throw new SelfCheckError(
+        "bridge_repeated_verify",
+        "Repeated smell_bridge.py verify exited non-zero.",
+        repeatedResult,
+      )
+    }
+    repeatedPayload = parseJson("bridge_repeated_verify_json", repeatedResult.stdout)
+    if (repeatedPayload.status !== "PASS" || repeatedPayload.success !== true) {
+      throw new SelfCheckError(
+        "bridge_repeated_verify_status",
+        "Repeated bridge verification did not return PASS.",
+        {
+          status: repeatedPayload.status,
+          success: repeatedPayload.success,
+          payload: repeatedPayload,
+        },
+      )
+    }
+  } finally {
+    await writeFile(sourceFile, originalSource, "utf8")
   }
   return {
     exitCode: result.exitCode,
     status: payload.status,
     success: payload.success,
+    repeatedStatus: repeatedPayload.status,
+    repeatedSuccess: repeatedPayload.success,
     artifactKeys: Object.keys(payload.artifacts || {}).sort(),
     baselineResolutionPlanKeys: Object.keys(baselinePlan).sort(),
     metricBudgetSurface: compactBudgetPlan.metric_budget,
@@ -2126,6 +2204,27 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && !sampleOptimizedPrompt.includes("smell_verify(project_full)"),
     "controller prompt hardcoded project_full instead of the frozen verification mode",
   )
+  const protectedCandidatePrompt = hooks.commandControllerSystemContext({
+    ...state.policy,
+    identity: { ...state.policy.identity, language: "cpp" },
+  })
+  assertCond(
+    "command_prompt_protects_project_full_nonjava_candidate_tree",
+    protectedCandidatePrompt.includes("Bash is disabled for this controller-managed project_full Python/C/C++ session")
+      && protectedCandidatePrompt.includes("Call smell_verify for every compile or test"),
+    "controller prompt omitted the protected candidate source-tree contract",
+  )
+  const javaCandidatePrompt = hooks.commandControllerSystemContext(state.policy)
+  assertCond(
+    "command_prompt_keeps_java_shell_policy",
+    !javaCandidatePrompt.includes("Bash is disabled for this controller-managed project_full Python/C/C++ session"),
+    "controller prompt applied the non-Java candidate-shell policy to Java",
+  )
+  assertCond(
+    "command_prompt_keeps_non_project_full_shell_policy",
+    !sampleOptimizedPrompt.includes("Bash is disabled for this controller-managed project_full Python/C/C++ session"),
+    "controller prompt applied the candidate-shell policy outside project_full",
+  )
   assertCond(
     "checkpoint_target_identity_prompt_hook",
     typeof hooks?.checkpointTargetIdentityPrompt === "function",
@@ -2792,9 +2891,10 @@ with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({"case": case.get("name"), "command": logged_command, "argv": sys.argv[2:]}) + "\\n")
 
 if command == "resolve-command":
+    verification_mode = case.get("verification_mode", "project_full")
     payload = {
         "task": "Continue the current smell refactoring task.",
-        "verification_mode": "project_full",
+        "verification_mode": verification_mode,
         "allow_test_changes": False,
         "checkpoint_required": bool(case.get("checkpoint_required")),
         "identity": {
@@ -2804,7 +2904,7 @@ if command == "resolve-command":
             "smell": case["smell"],
             "location": case["location"],
             "target_context_json": "",
-            "verification_mode": "project_full",
+            "verification_mode": verification_mode,
             "sample_test_location": "",
             "sample_test_command": "",
         },
@@ -2922,6 +3022,184 @@ print(json.dumps(payload))
       "Java location did not enter the source-only Guard progress gate",
     )
     process.env.SMELL_BUILD_JOBS = "1"
+    const candidateShellGateResults = []
+    for (const language of ["python", "c", "cpp"]) {
+      const projectRoot = path.join(tempRoot, `candidate-shell-gate-${language}`)
+      await mkdir(projectRoot, { recursive: true })
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        name: `candidate-shell-gate-${language}`,
+        project_root: projectRoot,
+        language,
+        smell: "long_method",
+        location: `sample.${language === "python" ? "py" : "cc"}:method=target|line=1`,
+        checkpoint_required: true,
+        budget: {},
+      })
+      const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot })
+      const sessionID = `candidate-shell-gate-${language}`
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID,
+          arguments: `--verification-mode=project_full -- Project root: ${projectRoot}; Language: ${language}; Smell type: long_method; Target location: sample.cc:method=target|line=1`,
+        },
+        { parts: [] },
+      )
+      for (const command of [
+        "git status --short",
+        "python -m pytest -q",
+        "touch arbitrary-output",
+      ]) {
+        let message = ""
+        try {
+          await plugin["tool.execute.before"](
+            { tool: "bash", sessionID },
+            { args: { command } },
+          )
+        } catch (error) {
+          message = String(error?.message || error)
+        }
+        assertCond(
+          `candidate_shell_${language}_blocks_${command}`,
+          message.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+          `controller-owned project_full bash was not rejected: ${command}`,
+        )
+      }
+      const childSessionID = `${sessionID}-child`
+      await plugin.event({
+        event: {
+          type: "session.created",
+          properties: {
+            sessionID: childSessionID,
+            info: { parentID: sessionID },
+          },
+        },
+      })
+      let childMessage = ""
+      try {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID: childSessionID },
+          { args: { command: "cmake --build build" } },
+        )
+      } catch (error) {
+        childMessage = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_${language}_blocks_child_session`,
+        childMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        "fresh child session escaped the controller-owned candidate shell policy",
+      )
+      const grandchildSessionID = `${childSessionID}-child`
+      await plugin.event({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: grandchildSessionID, parentID: childSessionID },
+          },
+        },
+      })
+      let grandchildMessage = ""
+      try {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID: grandchildSessionID },
+          { args: { command: "python -m pytest" } },
+        )
+      } catch (error) {
+        grandchildMessage = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_${language}_blocks_nested_child_session`,
+        grandchildMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        "nested child session escaped the controller-owned candidate shell policy",
+      )
+      const intermediateSessionID = `${sessionID}-unprotected-intermediate`
+      await plugin.event({
+        event: {
+          type: "session.created",
+          properties: {
+            sessionID: intermediateSessionID,
+            info: { parentID: sessionID },
+          },
+        },
+      })
+      process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+        name: `candidate-shell-unprotected-intermediate-${language}`,
+        project_root: projectRoot,
+        language,
+        smell: "long_method",
+        location: `sample.${language === "python" ? "py" : "cc"}:method=target|line=1`,
+        checkpoint_required: true,
+        verification_mode: "sample_optimized",
+        budget: {},
+      })
+      await plugin["command.execute.before"](
+        {
+          command: "smell-refactor-run",
+          sessionID: intermediateSessionID,
+          arguments: `--verification-mode=sample_optimized -- Project root: ${projectRoot}; Language: ${language}; Smell type: long_method; Target location: sample.cc:method=target|line=1`,
+        },
+        { parts: [] },
+      )
+      let intermediateMessage = ""
+      try {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID: intermediateSessionID },
+          { args: { command: "cmake --build build" } },
+        )
+      } catch (error) {
+        intermediateMessage = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_${language}_blocks_child_with_unprotected_state`,
+        intermediateMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        "a child-owned unprotected command state masked its protected parent",
+      )
+      const nestedThroughUnprotectedID = `${intermediateSessionID}-child`
+      await plugin.event({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: nestedThroughUnprotectedID, parentID: intermediateSessionID },
+          },
+        },
+      })
+      let nestedThroughUnprotectedMessage = ""
+      try {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID: nestedThroughUnprotectedID },
+          { args: { command: "cmake --build build" } },
+        )
+      } catch (error) {
+        nestedThroughUnprotectedMessage = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_${language}_blocks_nested_child_through_unprotected_state`,
+        nestedThroughUnprotectedMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        "an unprotected intermediate command state masked its protected ancestor",
+      )
+      await plugin.event({
+        event: {
+          type: "session.deleted",
+          properties: { info: { id: sessionID } },
+        },
+      })
+      let orphanedChildMessage = ""
+      try {
+        await plugin["tool.execute.before"](
+          { tool: "bash", sessionID: childSessionID },
+          { args: { command: "ninja --jobs=8" } },
+        )
+      } catch (error) {
+        orphanedChildMessage = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_${language}_survives_parent_deletion`,
+        orphanedChildMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        "a live child lost inherited shell protection when its parent was deleted",
+      )
+      await plugin.dispose?.()
+      candidateShellGateResults.push({ language, blocked: 8 })
+    }
     const buildGateResults = []
     const buildGateCases = [
       {
@@ -3067,22 +3345,31 @@ print(json.dumps(payload))
           message = String(error?.message || error)
         }
         assertCond(
-          `manual_build_parallel_${buildCase.name}_blocks_${command}`,
-          message.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
+          `candidate_shell_${buildCase.name}_blocks_${command}`,
+          message.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
           `command was not rejected: ${command}`,
         )
       }
       for (const command of buildCase.allowed) {
-        await plugin["tool.execute.before"](
-          { tool: "bash", sessionID },
-          { args: { command } },
+        let message = ""
+        try {
+          await plugin["tool.execute.before"](
+            { tool: "bash", sessionID },
+            { args: { command } },
+          )
+        } catch (error) {
+          message = String(error?.message || error)
+        }
+        assertCond(
+          `candidate_shell_${buildCase.name}_blocks_formerly_allowed_${command}`,
+          message.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+          `controller-owned project_full bash was not rejected: ${command}`,
         )
       }
       await plugin.dispose?.()
       buildGateResults.push({
         language: buildCase.language,
-        blocked: buildCase.blocked.length,
-        allowed: buildCase.allowed.length,
+        blocked: buildCase.blocked.length + buildCase.allowed.length,
       })
     }
 
@@ -3116,9 +3403,19 @@ print(json.dumps(payload))
       "MAKEFLAGS=-j2 make",
       "env SMELL_BUILD_JOBS=2 bash -lc 'make -j${SMELL_BUILD_JOBS:-1}'",
     ]) {
-      await capTwoPlugin["tool.execute.before"](
-        { tool: "bash", sessionID: "build-gate-cap-two" },
-        { args: { command } },
+      let message = ""
+      try {
+        await capTwoPlugin["tool.execute.before"](
+          { tool: "bash", sessionID: "build-gate-cap-two" },
+          { args: { command } },
+        )
+      } catch (error) {
+        message = String(error?.message || error)
+      }
+      assertCond(
+        `candidate_shell_cap_two_blocks_${command}`,
+        message.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        `controller-owned project_full bash was not rejected: ${command}`,
       )
     }
     for (const command of [
@@ -3140,12 +3437,54 @@ print(json.dumps(payload))
         capTwoMessage = String(error?.message || error)
       }
       assertCond(
-        `manual_build_parallel_cap_two_blocks_${command}`,
-        capTwoMessage.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
-        `${command} was not rejected under a two-job cap`,
+        `candidate_shell_cap_two_blocks_high_parallel_${command}`,
+        capTwoMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+        `controller-owned project_full bash was not rejected: ${command}`,
       )
     }
     await capTwoPlugin.dispose?.()
+
+    process.env.SMELL_BUILD_JOBS = "1"
+    const nonProjectFullRoot = path.join(tempRoot, "candidate-shell-non-project-full")
+    await mkdir(nonProjectFullRoot, { recursive: true })
+    process.env.SMELL_PREFLIGHT_CASE = JSON.stringify({
+      name: "candidate-shell-non-project-full",
+      project_root: nonProjectFullRoot,
+      language: "cpp",
+      smell: "long_method",
+      location: "sample.cc:method=target|line=1",
+      checkpoint_required: true,
+      verification_mode: "sample_optimized",
+      budget: {},
+    })
+    const nonProjectFullPlugin = await pluginModule.SmellPlugin({ worktree: nonProjectFullRoot })
+    await nonProjectFullPlugin["command.execute.before"](
+      {
+        command: "smell-refactor-run",
+        sessionID: "candidate-shell-non-project-full",
+        arguments: `--verification-mode=sample_optimized -- Project root: ${nonProjectFullRoot}; Language: cpp; Smell type: long_method; Target location: sample.cc:method=target|line=1`,
+      },
+      { parts: [] },
+    )
+    await nonProjectFullPlugin["tool.execute.before"](
+      { tool: "bash", sessionID: "candidate-shell-non-project-full" },
+      { args: { command: "cmake --build out --parallel 1" } },
+    )
+    let nonProjectFullMessage = ""
+    try {
+      await nonProjectFullPlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "candidate-shell-non-project-full" },
+        { args: { command: "cmake --build out --parallel 2" } },
+      )
+    } catch (error) {
+      nonProjectFullMessage = String(error?.message || error)
+    }
+    assertCond(
+      "candidate_shell_non_project_full_keeps_existing_build_cap",
+      nonProjectFullMessage.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
+      "non-project_full checkpoint session did not preserve its existing bash policy",
+    )
+    await nonProjectFullPlugin.dispose?.()
 
     process.env.SMELL_BUILD_JOBS = "1"
     const resumeRoot = path.join(tempRoot, "build-gate-resume")
@@ -3186,7 +3525,7 @@ print(json.dumps(payload))
     )
     const resumeState = initialResumeResult.metadata?.command_loop_state
     assertCond(
-      "manual_build_parallel_resume_state_exported",
+      "candidate_shell_resume_state_exported",
       Boolean(resumeState && typeof resumeState === "object"),
       "initial checkpoint session did not export command state",
     )
@@ -3210,9 +3549,9 @@ print(json.dumps(payload))
       resumedMessage = String(error?.message || error)
     }
     assertCond(
-      "manual_build_parallel_resumed_state_blocks_four",
-      resumedMessage.includes("SMELL_BUILD_PARALLELISM_EXCEEDED"),
-      "restored batch command state did not enforce the build cap",
+      "candidate_shell_resumed_state_blocks_bash",
+      resumedMessage.includes("SMELL_CANDIDATE_SHELL_FORBIDDEN"),
+      "restored batch command state did not enforce candidate shell isolation",
     )
     await resumedPlugin.dispose?.()
 
@@ -3228,7 +3567,7 @@ print(json.dumps(payload))
       mismatchMessage = String(error?.message || error)
     }
     assertCond(
-      "manual_build_parallel_resume_identity_mismatch_fails_closed",
+      "candidate_shell_resume_identity_mismatch_fails_closed",
       mismatchMessage.includes("COMMAND_POLICY_STATE_IDENTITY_MISMATCH"),
       "batch identity mismatch did not fail closed",
     )
@@ -3247,7 +3586,7 @@ print(json.dumps(payload))
       malformedResumeMessage = String(error?.message || error)
     }
     assertCond(
-      "manual_build_parallel_resume_malformed_state_fails_closed",
+      "candidate_shell_resume_malformed_state_fails_closed",
       malformedResumeMessage.includes("COMMAND_POLICY_STATE_INVALID"),
       "malformed resumed command state did not fail closed",
     )
@@ -3311,7 +3650,7 @@ print(json.dumps(payload))
             message = String(error?.message || error)
           }
           assertCond(
-            `manual_build_parallel_java_keeps_${command}`,
+            `candidate_shell_java_keeps_${command}`,
             message.includes("Do not run Maven or Gradle directly"),
             `existing Java build rule did not reject: ${command}`,
           )
@@ -3320,6 +3659,15 @@ print(json.dumps(payload))
       await plugin.dispose?.()
     }
     const unownedPlugin = await pluginModule.SmellPlugin({ worktree: tempRoot })
+    await unownedPlugin.event({
+      event: {
+        type: "session.created",
+        properties: {
+          sessionID: "unowned-build-gate-child",
+          info: { id: "unowned-build-gate-child", parentID: "unowned-build-gate" },
+        },
+      },
+    })
     for (const command of [
       "make -j8",
       "make --jobs=8",
@@ -3330,6 +3678,10 @@ print(json.dumps(payload))
     ]) {
       await unownedPlugin["tool.execute.before"](
         { tool: "bash", sessionID: "unowned-build-gate" },
+        { args: { command } },
+      )
+      await unownedPlugin["tool.execute.before"](
+        { tool: "bash", sessionID: "unowned-build-gate-child" },
         { args: { command } },
       )
     }
@@ -3705,11 +4057,12 @@ print(json.dumps(payload))
     }
     return {
       replayCases: results,
-      manualBuildParallelism: {
-        caps: [1, 2],
-        checkpointLanguages: buildGateResults,
-        javaBuildRulePreserved: true,
-        quotedControllerExpressionAllowed: true,
+      candidateShellProtection: {
+        projectFullLanguages: candidateShellGateResults,
+        commandVariants: buildGateResults,
+        compileJobCapsCovered: [1, 2],
+        nonProjectFullPolicyPreserved: true,
+        javaPolicyPreserved: true,
         resumedStateEnforced: true,
         resumedStateMismatchFailsClosed: true,
         malformedResumedStateFailsClosed: true,

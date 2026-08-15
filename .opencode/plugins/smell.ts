@@ -352,6 +352,22 @@ function isCappedCheckpointBuildSession(state: CommandLoopState | undefined): bo
   return ["python", "c", "cpp", "c++"].includes(language)
 }
 
+function isProtectedProjectFullCandidateShellPolicy(
+  policy: CommandPolicy | undefined,
+): boolean {
+  return policy?.checkpoint_required === true
+    && policy.verification_mode === "project_full"
+    && ["python", "c", "cpp", "c++"].includes(
+      String(policy.identity.language || "").trim().toLowerCase(),
+    )
+}
+
+function isProtectedProjectFullCandidateShellSession(
+  state: CommandLoopState | undefined,
+): boolean {
+  return isProtectedProjectFullCandidateShellPolicy(state?.policy)
+}
+
 function isControllerBuildJobsExpression(value: string): boolean {
   return value === CONTROLLER_BUILD_JOBS_EXPRESSION
     || value === `"${CONTROLLER_BUILD_JOBS_EXPRESSION}"`
@@ -2442,6 +2458,15 @@ function commandControllerSystemContext(
       "- A decreased metric is IMPROVED only. PASS requires the frozen target smell to disappear plus structural and build/test preservation.",
     )
   }
+  if (isProtectedProjectFullCandidateShellPolicy(policy)) {
+    lines.push(
+      "",
+      "Candidate source-tree tool contract:",
+      "- Bash is disabled for this controller-managed project_full Python/C/C++ session.",
+      "- Use read, grep, glob, or list for inspection and edit, write, patch, or apply_patch for source changes.",
+      "- Call smell_verify for every compile or test; it owns the configured isolated focused preflight and final project_full verification.",
+    )
+  }
   if (backend === "idea") {
     lines.push(
       "",
@@ -2783,7 +2808,21 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   const refactoringBackend = String(process.env.SMELL_REFACTORING_BACKEND || "direct").trim().toLowerCase()
   const ideaToolsEnabled = refactoringBackend === "idea" && process.env.SMELL_ENABLE_IDEA_TOOLS === "1"
   const commandLoopStates = new Map<string, CommandLoopState>()
+  const commandSessionParents = new Map<string, string>()
+  const protectedShellLineage = new Set<string>()
   const commandBaselineSeals = new Map<string, string>()
+  const markProtectedShellLineage = (sessionID: string): void => {
+    if (!sessionID) return
+    const pending = [sessionID]
+    while (pending.length > 0) {
+      const current = pending.pop() || ""
+      if (!current || protectedShellLineage.has(current)) continue
+      protectedShellLineage.add(current)
+      for (const [childID, parentID] of commandSessionParents.entries()) {
+        if (parentID === current) pending.push(childID)
+      }
+    }
+  }
   const restoreBatchCommandState = (sessionID: string): CommandLoopState | undefined => {
     if (!sessionID) return undefined
     const existing = commandLoopStates.get(sessionID)
@@ -2802,7 +2841,24 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       )
     }
     commandLoopStates.set(sessionID, restored)
+    if (isProtectedProjectFullCandidateShellSession(restored)) {
+      markProtectedShellLineage(sessionID)
+    }
     return restored
+  }
+  const hasProtectedShellAncestor = (sessionID: string): boolean => {
+    const visited = new Set<string>()
+    let current = commandSessionParents.get(sessionID) || ""
+    while (current && !visited.has(current)) {
+      visited.add(current)
+      const state = commandLoopStates.get(current)
+      if (
+        protectedShellLineage.has(current)
+        || isProtectedProjectFullCandidateShellSession(state)
+      ) return true
+      current = commandSessionParents.get(current) || ""
+    }
+    return false
   }
   const commonShape = {
     projectRoot: tool.schema.string().describe("Absolute path to the source project root."),
@@ -3262,6 +3318,26 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       const commandState = sessionID
         ? (commandLoopStates.get(sessionID) || restoreBatchCommandState(sessionID))
         : undefined
+      const inheritedShellProtection = Boolean(
+        sessionID
+        && (
+          protectedShellLineage.has(sessionID)
+          || hasProtectedShellAncestor(sessionID)
+        )
+      )
+      if (inheritedShellProtection) markProtectedShellLineage(sessionID)
+      if (
+        isProtectedProjectFullCandidateShellSession(commandState)
+        || inheritedShellProtection
+      ) {
+        throw new Error(
+          "SMELL_CANDIDATE_SHELL_FORBIDDEN: controller-managed project_full "
+          + "Python/C/C++ sessions do not execute bash in the candidate source tree. "
+          + "Use read, grep, glob, or list for inspection; use edit, write, patch, or "
+          + "apply_patch for source changes; call smell_verify for every compile or test. "
+          + "smell_verify runs configured focused and full verification in a disposable worktree.",
+        )
+      }
       const buildJobLimit = controllerBuildJobLimit()
       if (buildJobLimit && isCappedCheckpointBuildSession(commandState)) {
         const violation = explicitBuildParallelismViolation(command, buildJobLimit)
@@ -3327,7 +3403,11 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
         commandBaselineSeals.set(input.sessionID, baselineSeal)
         targetIdentityPrompt = checkpointTargetIdentityPrompt(identity.smell, baselinePayload)
       }
-      commandLoopStates.set(input.sessionID, newCommandLoopState(policy, targetIdentityPrompt))
+      const commandState = newCommandLoopState(policy, targetIdentityPrompt)
+      commandLoopStates.set(input.sessionID, commandState)
+      if (isProtectedProjectFullCandidateShellSession(commandState)) {
+        markProtectedShellLineage(input.sessionID)
+      }
       idleRuntime.clearSession(input.sessionID)
       idleRuntime.armInitialVerification({
         sessionID: input.sessionID,
@@ -3359,6 +3439,29 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     event: async ({ event }) => {
       try {
         if (!event || typeof event.type !== "string") return
+        if (event.type === "session.created") {
+          const properties = (event as {
+            properties?: {
+              sessionID?: string
+              info?: { id?: string; parentID?: string }
+            }
+          }).properties
+          const sessionID = properties?.sessionID || properties?.info?.id || ""
+          const parentID = properties?.info?.parentID || ""
+          if (sessionID && parentID) {
+            commandSessionParents.set(sessionID, parentID)
+            if (
+              protectedShellLineage.has(parentID)
+              || isProtectedProjectFullCandidateShellSession(
+                commandLoopStates.get(parentID),
+              )
+              || hasProtectedShellAncestor(parentID)
+            ) {
+              markProtectedShellLineage(sessionID)
+            }
+          }
+          return
+        }
         if (event.type === "session.idle") {
           const sessionID = (event as { properties?: { sessionID?: string } }).properties?.sessionID
           if (typeof sessionID === "string" && sessionID) {
@@ -3372,6 +3475,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             idleRuntime.handleSessionDeleted(sessionID)
             commandLoopStates.delete(sessionID)
             commandBaselineSeals.delete(sessionID)
+            commandSessionParents.delete(sessionID)
+            protectedShellLineage.delete(sessionID)
           }
           return
         }
@@ -3396,6 +3501,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
     dispose: async () => {
       idleRuntime.dispose()
       commandLoopStates.clear()
+      commandSessionParents.clear()
+      protectedShellLineage.clear()
     },
   }
 }

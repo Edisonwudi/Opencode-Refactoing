@@ -34,9 +34,15 @@ def _write(root: Path, relative: str, value: str) -> None:
     path.write_text(value, encoding="utf-8")
 
 
+def _write_bytes(root: Path, relative: str, value: bytes) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(value)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="snapshot-diff-hygiene-") as raw:
-        root = Path(raw) / "rrdtool"
+        root = Path(raw) / "fixture-project"
         root.mkdir()
         _run(root, "git", "init", "-q")
         _run(root, "git", "config", "user.email", "guard@example.invalid")
@@ -177,6 +183,12 @@ def main() -> None:
             "build-refactoragent/generated.cc",
             "int generated(void) { return 2; }\n",
         )
+        _write(root, ".opencode/controller.json", '{"owned": true}\n')
+        _write(root, ".smell-artifacts/verify/evidence.json", "{}\n")
+        _write(root, ".idea-refactoring/session.json", "{}\n")
+        _write(root, ".idea/workspace.xml", "<project/>\n")
+        _write(root, "opencode.json", '{"controller": true}\n')
+        _write(root, "docs/.opencode/note.md", "project-owned nested path\n")
         _write(
             root,
             "CMakeCache.txt",
@@ -208,23 +220,29 @@ def main() -> None:
             "manual-tree/Testing/baseline.output",
             "project-owned test baseline\n",
         )
-        # Root-level products left by cJSON's Makefile must remain visible in
-        # the exported diff, but they are never an acceptable deliverable.
-        generated_files = (
-            "cJSON.o",
-            "cJSON_Utils.o",
-            "cJSON_test",
-            "libcjson.a",
-            "libcjson.so.1.7.18",
-        )
+        # Root-level compiled products must remain visible in the exported
+        # diff, but they are never an acceptable deliverable.
+        generated_files = ("combined.o", "support.o", "fixture_test")
         for generated_path in generated_files:
-            _write(root, generated_path, "generated build product\n")
-        (root / "libcjson.so.1").symlink_to("libcjson.so.1.7.18")
-        (root / "libcjson.so").symlink_to("libcjson.so.1")
+            _write_bytes(
+                root,
+                generated_path,
+                b"\x7fELF\x02\x01\x01\x00generated-build-product",
+            )
+        _write_bytes(root, "libfixture.a", b"!<arch>\ngenerated-archive")
+        _write_bytes(
+            root,
+            "libfixture.so.1.0.0",
+            b"\x7fELF\x02\x01\x01\x00generated-shared-library",
+        )
+        (root / "libfixture.so.1").symlink_to("libfixture.so.1.0.0")
+        (root / "libfixture.so").symlink_to("libfixture.so.1")
         generated_root_products = (
             *generated_files,
-            "libcjson.so.1",
-            "libcjson.so",
+            "libfixture.a",
+            "libfixture.so.1.0.0",
+            "libfixture.so.1",
+            "libfixture.so",
         )
 
         # Staged edits must not disappear from the exported patch.
@@ -239,16 +257,37 @@ def main() -> None:
         _run(root, "git", "config", "diff.mnemonicPrefix", "true")
         _run(root, "git", "config", "diff.algorithm", "histogram")
         _run(root, "git", "config", "diff.indentHeuristic", "true")
-        snapshot = smell_bridge._snapshot_project(
-            root,
-            declared_test_paths=["qa/oracle.py"],
-            base_commit=baseline_commit,
-        )
+        original_git_diff_with_untracked = smell_bridge._git_diff_with_untracked
+        replay_diff_calls: list[bool] = []
+
+        def _unexpected_replay_diff(*_args, **_kwargs):
+            replay_diff_calls.append(True)
+            raise AssertionError(
+                "artifact-polluted snapshots must not serialize replay diffs"
+            )
+
+        try:
+            smell_bridge._git_diff_with_untracked = _unexpected_replay_diff
+            snapshot = smell_bridge._snapshot_project(
+                root,
+                declared_test_paths=["qa/oracle.py"],
+                base_commit=baseline_commit,
+            )
+        finally:
+            smell_bridge._git_diff_with_untracked = original_git_diff_with_untracked
+        assert replay_diff_calls == [], replay_diff_calls
         patch = snapshot["diff"]["stdout"]
         stat = snapshot["diff_stat"]["stdout"]
         status = snapshot["status"]["stdout"]
         assert snapshot["scope"] == "full_worktree_pre_verification"
-        for rendered in (patch, stat, status):
+        assert patch == "" and stat == "", snapshot
+        for skipped in (snapshot["diff"], snapshot["diff_stat"]):
+            assert skipped["returncode"] != 0, skipped
+            assert skipped["skipped"] is True, skipped
+            assert skipped["skipped_reason"] == (
+                "FINAL_DIFF_GENERATED_ARTIFACTS"
+            ), skipped
+        for rendered in (status,):
             assert "src/target.c" in rendered, rendered
             assert "build-refactoragent/tracked-generated.cc" in rendered, rendered
             assert "build-refactoragent/removed-generated.o" in rendered, rendered
@@ -256,10 +295,16 @@ def main() -> None:
             assert ".smell-test-reports/TEST-tracked.xml" in rendered, rendered
             assert ".smell-test-reports/TEST-removed.xml" in rendered, rendered
             assert ".smell-test-reports/TEST-added.xml" in rendered, rendered
-            assert "build-refactoragent/generated.cc" not in rendered, rendered
-            assert ".smell-test-reports/TEST-focused.xml" not in rendered, rendered
-            assert "autom4te.cache" not in rendered, rendered
-            assert "config.status" not in rendered, rendered
+            assert "build-refactoragent/generated.cc" in rendered, rendered
+            assert ".smell-test-reports/TEST-focused.xml" in rendered, rendered
+            assert "autom4te.cache" in rendered, rendered
+            assert "config.status" in rendered, rendered
+            assert ".opencode/controller.json" not in rendered, rendered
+            assert ".smell-artifacts/verify/evidence.json" not in rendered, rendered
+            assert ".idea-refactoring/session.json" not in rendered, rendered
+            assert ".idea/workspace.xml" not in rendered, rendered
+            assert "opencode.json" not in rendered, rendered
+            assert "docs/.opencode/note.md" in rendered, rendered
             assert "po/fr.po" in rendered, rendered
             assert "po/hu.po" in rendered, rendered
             assert "tests/graph2.output" in rendered, rendered
@@ -272,24 +317,24 @@ def main() -> None:
             assert "manual/CMakeCache.txt" in rendered, rendered
             assert "manual-tree/CMakeFiles/project.cmake" in rendered, rendered
             assert "manual-tree/Testing/baseline.output" in rendered, rendered
-            assert "generated/CTestTestfile.cmake" not in rendered, rendered
-            assert "CMakeCache.txt" not in rendered.replace(
+            assert "generated/CTestTestfile.cmake" in rendered, rendered
+            assert "CMakeCache.txt" in rendered.replace(
                 "manual/CMakeCache.txt", ""
             ), rendered
-            assert "build.ninja" not in rendered, rendered
+            assert "build.ninja" in rendered, rendered
             for generated_path in generated_root_products:
                 assert generated_path in rendered, (generated_path, rendered)
-        assert "src/new.h" in patch, patch
-        assert "build/real_source.c" in patch, patch
-        assert "tests/target_test.c" in patch, patch
-        assert "qa/oracle.py" in patch, patch
-        assert "Makefile" in patch, patch
-        assert "configure.ac" in patch, patch
-        assert "Makefile.am" in patch, patch
-        assert "CMakeLists.txt" in patch, patch
-        assert "tools/configure" in patch, patch
-        assert "build-aux/custom-check.sh" in patch, patch
-        assert "docs/note.md" in patch, patch
+        assert "src/new.h" in status, status
+        assert "build/real_source.c" in status, status
+        assert "tests/target_test.c" in status, status
+        assert "qa/oracle.py" in status, status
+        assert "Makefile" in status, status
+        assert "configure.ac" in status, status
+        assert "Makefile.am" in status, status
+        assert "CMakeLists.txt" in status, status
+        assert "tools/configure" in status, status
+        assert "build-aux/custom-check.sh" in status, status
+        assert "docs/note.md" in status, status
         for tracked_generated in (
             "configure",
             "aclocal.m4",
@@ -308,13 +353,10 @@ def main() -> None:
             "generated/CTestTestfile.cmake",
             "build.ninja",
         ):
-            assert not any(
+            assert any(
                 item["path"] == untracked_generated
                 for item in snapshot["change_audit"]["changes"]
             ), (untracked_generated, snapshot["change_audit"])
-        assert "--- a/src/target.c" in patch, patch
-        assert "+++ b/src/target.c" in patch, patch
-
         audit = snapshot["change_audit"]
         assert audit["success"] is True, audit
         final_artifacts = audit["final_diff_generated_artifact_audit"]
@@ -326,9 +368,11 @@ def main() -> None:
             "build-refactoragent/tracked-generated.cc",
             "build-refactoragent/removed-generated.o",
             "build-refactoragent/added-generated.ninja",
+            "build-refactoragent/generated.cc",
             ".smell-test-reports/TEST-tracked.xml",
             ".smell-test-reports/TEST-removed.xml",
             ".smell-test-reports/TEST-added.xml",
+            ".smell-test-reports/TEST-focused.xml",
         )
         tracked_autotools_products = (
             "configure",
@@ -336,17 +380,21 @@ def main() -> None:
             "config.h.in",
             "sub/Makefile.in",
         )
-        rrdtool_verification_products = (
-            "po/fr.po",
-            "po/hu.po",
-            "tests/graph2.output",
+        untracked_generated_products = (
+            "CMakeCache.txt",
+            "autom4te.cache/traces.0",
+            "build-aux/compile",
+            "build.ninja",
+            "config.status",
+            "generated/CTestTestfile.cmake",
+            "sub/Makefile",
         )
         assert final_artifacts["paths"] == sorted(
             (
                 *generated_root_products,
                 *controller_owned_products,
                 *tracked_autotools_products,
-                *rrdtool_verification_products,
+                *untracked_generated_products,
             )
         ), final_artifacts
         assert {
@@ -357,9 +405,11 @@ def main() -> None:
             "build-refactoragent/tracked-generated.cc": "changed",
             "build-refactoragent/removed-generated.o": "deleted",
             "build-refactoragent/added-generated.ninja": "added",
+            "build-refactoragent/generated.cc": "added",
             ".smell-test-reports/TEST-tracked.xml": "changed",
             ".smell-test-reports/TEST-removed.xml": "deleted",
             ".smell-test-reports/TEST-added.xml": "added",
+            ".smell-test-reports/TEST-focused.xml": "added",
         }, final_artifacts
         assert "src/new.h" not in final_artifacts["paths"], final_artifacts
         assert "docs/note.md" not in final_artifacts["paths"], final_artifacts
@@ -368,10 +418,10 @@ def main() -> None:
             "changes": [
                 {"path": "src/new.h", "operation": "added"},
                 {"path": "docs/note.md", "operation": "added"},
-                {"path": "src/libcjson.so", "operation": "added"},
+                {"path": "src/libfixture.so", "operation": "added"},
                 {"path": "libwidget.so", "operation": "added"},
                 {"path": "unrelated.o", "operation": "added"},
-                {"path": ".cJSON.o", "operation": "added"},
+                {"path": ".fixture.o", "operation": "added"},
                 {
                     "path": "src/build-refactoragent/generated.cc",
                     "operation": "added",
@@ -406,54 +456,248 @@ def main() -> None:
                     },
                 ],
             },
-            project_root=root.parent / "handwritten-project",
+            project_root=root,
         )
         assert manual_baseline["success"] is True, manual_baseline
         assert manual_baseline["paths"] == [], manual_baseline
 
-        protobuf_root = Path(raw) / "protobuf-29.3"
-        (protobuf_root / "src/google/protobuf").mkdir(parents=True)
-        protobuf_build_tree = smell_bridge._final_diff_generated_artifact_audit(
+        # Build-tree detection is based on generator provenance and content,
+        # never on a project's name or a conventional build-directory name.
+        generic_root = Path(raw) / "generic-project"
+        generic_root.mkdir()
+        _run(generic_root, "git", "init", "-q")
+        _run(generic_root, "git", "config", "user.email", "guard@example.invalid")
+        _run(generic_root, "git", "config", "user.name", "Guard Check")
+        _write(generic_root, "src/existing.c", "int existing(void) { return 1; }\n")
+        _write(generic_root, "CMakeLists.txt", "project(generic C)\n")
+        _write(generic_root, "Makefile", "all:\n\t@true\n")
+        _write(
+            generic_root,
+            ".gitignore",
+            "ignored-arbitrary-output/\nnode_modules/\nignored-root-tool\n",
+        )
+        _run(generic_root, "git", "add", ".")
+        _run(generic_root, "git", "commit", "-qm", "baseline")
+        generic_baseline = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=generic_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+
+        _write(generic_root, "src/new.c", "int added(void) { return 2; }\n")
+        _write(
+            generic_root,
+            "CMakeLists.txt",
+            "project(generic C)\nadd_library(generic src/new.c)\n",
+        )
+        _write(generic_root, "Makefile", "all:\n\t@echo authored\n")
+        _write(
+            generic_root,
+            "manual/CMakeCache.txt",
+            "# hand-authored cache example\nPROJECT_MODE=1\n",
+        )
+        _write(
+            generic_root,
+            "manual-tree/CMakeFiles/project.cmake",
+            "# hand-authored module\n",
+        )
+        _write(
+            generic_root,
+            "ci/project.ninja",
+            "rule authored\n  command = true\n",
+        )
+        _write(generic_root, "unrelated.o", "hand-authored fixture\n")
+        _write(
+            generic_root,
+            "src/marker_comment.c",
+            "/* Documentation quotes: # This file is generated by cmake */\n"
+            "int marker_comment(void) { return 1; }\n",
+        )
+        _write(
+            generic_root,
+            "src/marker_sibling.c",
+            "int marker_sibling(void) { return 1; }\n",
+        )
+
+        _write(
+            generic_root,
+            "build-test/CMakeCache.txt",
+            "# This is the CMakeCache file.\nCMAKE_GENERATOR:INTERNAL=Ninja\n",
+        )
+        _write(
+            generic_root,
+            "build-test/CMakeFiles/generic.dir/link.txt",
+            "/usr/bin/cc generic.o -o generic\n",
+        )
+        _write_bytes(
+            generic_root,
+            "build-test/CMakeFiles/generic.dir/generic.o",
+            b"\x7fELF\x02\x01\x01\x00generated-object",
+        )
+        _write(
+            generic_root,
+            "build_test/build.ninja",
+            "# CMAKE generated file: DO NOT EDIT!\n"
+            "# Generated by \"Ninja\" Generator, CMake Version 3.31\n",
+        )
+        _write(generic_root, "build_test/generated.cc", "int generated;\n")
+        _write(
+            generic_root,
+            "out-uuid/rules.ninja",
+            "# CMAKE generated file: DO NOT EDIT!\n",
+        )
+        _write_bytes(
+            generic_root,
+            "out-uuid/bin/generic-tool",
+            b"\x7fELF\x02\x01\x01\x00generated-executable",
+        )
+        _write_bytes(
+            generic_root,
+            "combined.o",
+            b"\x7fELF\x02\x01\x01\x00root-object",
+        )
+        _write_bytes(
+            generic_root,
+            "standalone-tool",
+            b"\x7fELF\x02\x01\x01\x00root-executable",
+        )
+        _write(
+            generic_root,
+            "ignored-arbitrary-output/CMakeCache.txt",
+            "# This is the CMakeCache file.\nCMAKE_GENERATOR:INTERNAL=Ninja\n",
+        )
+        _write(
+            generic_root,
+            "ignored-arbitrary-output/generated.cc",
+            "int ignored_generated;\n",
+        )
+        _write_bytes(
+            generic_root,
+            "ignored-root-tool",
+            b"\x7fELF\x02\x01\x01\x00ignored-root-executable",
+        )
+        _write(
+            generic_root,
+            "node_modules/package/cache.js",
+            "module.exports = 'ordinary ignored dependency cache';\n",
+        )
+
+        generic_snapshot = smell_bridge._snapshot_project(
+            generic_root,
+            base_commit=generic_baseline,
+        )
+        generic_audit = generic_snapshot["change_audit"]
+        generic_artifacts = generic_audit[
+            "final_diff_generated_artifact_audit"
+        ]
+        expected_generic_artifacts = sorted((
+            "build-test/CMakeCache.txt",
+            "build-test/CMakeFiles/generic.dir/generic.o",
+            "build-test/CMakeFiles/generic.dir/link.txt",
+            "build_test/build.ninja",
+            "build_test/generated.cc",
+            "out-uuid/bin/generic-tool",
+            "out-uuid/rules.ninja",
+            "combined.o",
+            "standalone-tool",
+            "ignored-arbitrary-output/CMakeCache.txt",
+            "ignored-root-tool",
+        ))
+        assert generic_artifacts["status"] == (
+            "FINAL_DIFF_GENERATED_ARTIFACTS"
+        ), generic_artifacts
+        assert generic_artifacts["paths"] == expected_generic_artifacts, (
+            generic_artifacts
+        )
+        assert generic_artifacts["derived_build_roots"] == [
             {
-                "success": True,
-                "changes": [
-                    {
-                        "path": "build/CMakeFiles/CMakeConfigureLog.yaml",
-                        "operation": "added",
-                    },
-                    {
-                        "path": "build/bin/protoc",
-                        "operation": "added",
-                    },
-                    {
-                        "path": "src/build/checked_in_helper.cc",
-                        "operation": "added",
-                    },
+                "path": "build-test",
+                "evidence_paths": ["build-test/CMakeCache.txt"],
+            },
+            {
+                "path": "build_test",
+                "evidence_paths": ["build_test/build.ninja"],
+            },
+            {
+                "path": "ignored-arbitrary-output",
+                "evidence_paths": [
+                    "ignored-arbitrary-output/CMakeCache.txt"
                 ],
             },
-            project_root=protobuf_root,
+            {
+                "path": "out-uuid",
+                "evidence_paths": ["out-uuid/rules.ninja"],
+            },
+        ], generic_artifacts
+        generic_evidence = {
+            item["path"]: item["evidence"]
+            for item in generic_artifacts["artifacts"]
+        }
+        assert generic_evidence["combined.o"] == "compiled-content:elf", (
+            generic_evidence
         )
-        assert protobuf_build_tree["success"] is False, protobuf_build_tree
-        assert protobuf_build_tree["status"] == (
-            "FINAL_DIFF_GENERATED_ARTIFACTS"
-        ), protobuf_build_tree
-        assert protobuf_build_tree["paths"] == [
-            "build/CMakeFiles/CMakeConfigureLog.yaml",
-            "build/bin/protoc",
-        ], protobuf_build_tree
+        assert generic_evidence["standalone-tool"] == "compiled-content:elf", (
+            generic_evidence
+        )
+        assert generic_evidence["ignored-root-tool"] == (
+            "compiled-content:elf"
+        ), generic_evidence
+        assert generic_evidence["build_test/generated.cc"] == (
+            "generated-build-root"
+        ), generic_evidence
+        inventoried_paths = {
+            item["path"] for item in generic_audit["changes"]
+        }
+        assert set(expected_generic_artifacts) <= inventoried_paths, generic_audit
+        assert not any(
+            path.startswith("node_modules/") for path in inventoried_paths
+        ), generic_audit
+        assert "ignored-arbitrary-output/generated.cc" not in inventoried_paths, (
+            generic_audit
+        )
+        for rendered in (generic_snapshot["status"]["stdout"],):
+            for artifact_path in expected_generic_artifacts:
+                assert artifact_path in rendered, (artifact_path, rendered)
+        for skipped in (
+            generic_snapshot["diff_stat"],
+            generic_snapshot["diff"],
+        ):
+            assert skipped["skipped_reason"] == (
+                "FINAL_DIFF_GENERATED_ARTIFACTS"
+            ), skipped
+        for legal_path in (
+            "src/new.c",
+            "CMakeLists.txt",
+            "Makefile",
+            "manual/CMakeCache.txt",
+            "manual-tree/CMakeFiles/project.cmake",
+            "ci/project.ninja",
+            "unrelated.o",
+            "src/marker_comment.c",
+            "src/marker_sibling.c",
+        ):
+            assert legal_path in inventoried_paths, (legal_path, generic_audit)
+            assert legal_path not in generic_artifacts["paths"], (
+                legal_path,
+                generic_artifacts,
+            )
+
         for legal_path in (
             "configure.ac",
             "Makefile.am",
             "CMakeLists.txt",
             "tools/configure",
+            "docs/.opencode/note.md",
             "manual-tree/Testing/baseline.output",
         ):
             assert legal_path not in final_artifacts["paths"], final_artifacts
         assert audit["category_counts"] == {
-            "production": 5,
+            "production": 6,
             "test": 4,
-            "build_metadata": 20,
-            "other": 15,
+            "build_metadata": 26,
+            "other": 18,
         }, audit
         assert audit["ignored_tracked_count"] == 0, audit
         assert any(
@@ -466,10 +710,10 @@ def main() -> None:
             for item in audit["changes"]
         ), audit
         assert audit["ignored_tracked_count"] == 0, audit
-        assert audit["ignored_untracked_count"] == 9, audit
-        assert audit["ignored_generated_count"] == 9, audit
+        assert audit["ignored_untracked_count"] == 5, audit
+        assert audit["ignored_generated_count"] == 5, audit
         assert snapshot["status"]["ignored_tracked_count"] == 0, snapshot["status"]
-        assert snapshot["status"]["ignored_untracked_count"] == 9, snapshot["status"]
+        assert snapshot["status"]["ignored_untracked_count"] == 5, snapshot["status"]
 
         immutable = smell_bridge._worktree_test_change_audit(
             audit,
@@ -558,7 +802,7 @@ def main() -> None:
                 *generated_root_products,
                 *controller_owned_products,
                 *tracked_autotools_products,
-                *rrdtool_verification_products,
+                *untracked_generated_products,
             )
         ), verify_audit
         assert verify["failure_pack"]["failure_category"] == (
@@ -583,12 +827,12 @@ def main() -> None:
             for item in recommendations
             if item.startswith("Remove untracked generated paths")
         )
-        assert "configure" in restore and "cJSON.o" not in restore, restore
-        assert "cJSON.o" in remove and "configure" not in remove, remove
+        assert "configure" in restore and "combined.o" not in restore, restore
+        assert "combined.o" in remove and "configure" not in remove, remove
 
         # A candidate-created commit must not erase the c000-relative delivery
         # patch or hide its test edits. Commit only the deliverable paths; the
-        # generated build tree remains an ignored untracked artifact.
+        # generated build tree remains visible and independently fail-closed.
         _run(
             root,
             "git", "add",
@@ -603,12 +847,15 @@ def main() -> None:
             declared_test_paths=["qa/oracle.py"],
             base_commit=baseline_commit,
         )
-        committed_patch = committed_snapshot["diff"]["stdout"]
+        committed_status = committed_snapshot["status"]["stdout"]
         committed_audit = committed_snapshot["change_audit"]
         assert committed_snapshot["base_commit"] == baseline_commit
-        assert "src/target.c" in committed_patch, committed_patch
-        assert "tests/target_test.c" in committed_patch, committed_patch
-        assert "Makefile" in committed_patch, committed_patch
+        assert committed_snapshot["diff"]["skipped_reason"] == (
+            "FINAL_DIFF_GENERATED_ARTIFACTS"
+        ), committed_snapshot["diff"]
+        assert "src/target.c" in committed_status, committed_status
+        assert "tests/target_test.c" in committed_status, committed_status
+        assert "Makefile" in committed_status, committed_status
         assert committed_audit["category_counts"] == audit["category_counts"], (
             committed_audit,
             audit,
@@ -624,7 +871,8 @@ def main() -> None:
     print(
         "snapshot diff hygiene self-check passed: "
         "c000-relative committed/staged/unstaged patch; "
-        "provenance-marked untracked verification products excluded; "
+        "generated build products retained in the visible inventory; "
+        "exact controller-injected paths excluded; "
         "tracked and source-owned build/test metadata retained; "
         "tracked generated build/test products fail closed; "
         "production/test/build metadata classified; "

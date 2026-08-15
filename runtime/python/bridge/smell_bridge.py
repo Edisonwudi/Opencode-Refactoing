@@ -53,6 +53,10 @@ from smell_core.loop_policy import (  # noqa: E402
     resolve_command_payload,
 )
 from smell_core.target_context import parse_target_context_json  # noqa: E402
+from smell_core.verification_slots import (  # noqa: E402
+    VerificationSlotError,
+    acquire_verification_slot,
+)
 
 
 VERIFY_DECISION_SCHEMA = "smell.verify.decision/v1"
@@ -1120,6 +1124,14 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
                 snapshot,
                 require_test_execution=require_test_execution,
             )
+        elif (
+            resolved.verification_mode == "project_full"
+            and resolved.language == "java"
+        ):
+            build_test_result = _run_project_full_in_candidate_with_cleanup(
+                resolved,
+                require_test_execution=require_test_execution,
+            )
         else:
             build_test_result = run_build_test_guard(
                 resolved,
@@ -1556,7 +1568,214 @@ def _git_failure_message(result: dict[str, Any], fallback: str) -> str:
     return _bounded_text(detail or fallback, limit=1024)
 
 
+def _untracked_project_paths(root: Path) -> dict[str, Any]:
+    """Inventory controller-visible and ignored untracked files byte-exactly.
+
+    Java verification still executes in the runner-prepared checkout because
+    that checkout may contain ignored wrapper bootstraps and declared sibling
+    checkouts. Capture both ordinary and ignored untracked paths so the build
+    leaves no new Git-visible files without guessing a project or build folder.
+    Exact controller-owned state is retained across verify calls.
+    """
+    paths: set[str] = set()
+    for args in (
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        [
+            "ls-files", "--others", "--ignored", "--exclude-standard",
+            "-z", "--",
+        ],
+    ):
+        result = _run_git(args, root)
+        stdout = result.get("stdout")
+        if result.get("returncode") != 0 or not isinstance(stdout, str):
+            return {
+                "success": False,
+                "paths": [],
+                "message": _git_failure_message(
+                    result,
+                    "Git could not inventory untracked verification outputs.",
+                ),
+            }
+        for raw_path in stdout.split("\0"):
+            normalized = raw_path.replace("\\", "/").strip("/")
+            if normalized and not _is_controller_injected_untracked_path(normalized):
+                paths.add(normalized)
+    return {"success": True, "paths": sorted(paths), "message": ""}
+
+
+def _cleanup_new_verification_paths(
+    root: Path,
+    before: set[str],
+) -> dict[str, Any]:
+    """Remove only files Git proves were created by this verification run."""
+    after = _untracked_project_paths(root)
+    if after.get("success") is not True:
+        return {
+            "contract_version": "project-full-direct-output-cleanup/v1",
+            "success": False,
+            "stage": "inventory_after_verification",
+            "message": str(after.get("message") or ""),
+            "removed_count": 0,
+            "removed_paths": [],
+        }
+    created = sorted(set(after.get("paths") or []) - before)
+    removed: list[str] = []
+    failures: list[dict[str, str]] = []
+    for relative in created:
+        pure = Path(relative)
+        if pure.is_absolute() or ".." in pure.parts:
+            failures.append({"path": relative, "error": "unsafe relative path"})
+            continue
+        candidate = root.joinpath(*pure.parts)
+        if not candidate.is_symlink() and not candidate.is_file():
+            failures.append({"path": relative, "error": "not a regular file"})
+            continue
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            failures.append({"path": relative, "error": str(exc)})
+        else:
+            removed.append(relative)
+
+    final = _untracked_project_paths(root)
+    remaining = (
+        sorted(set(final.get("paths") or []) - before)
+        if final.get("success") is True
+        else created
+    )
+    success = bool(final.get("success") is True and not failures and not remaining)
+    return {
+        "contract_version": "project-full-direct-output-cleanup/v1",
+        "success": success,
+        "stage": "completed" if success else "cleanup_verification_outputs",
+        "message": (
+            ""
+            if success
+            else str(final.get("message") or "New verification outputs remain.")
+        ),
+        "before_count": len(before),
+        "created_count": len(created),
+        "removed_count": len(removed),
+        "removed_paths": _bounded_strings(removed, count=64, limit=512),
+        "removed_paths_truncated": len(removed) > 64,
+        "remaining_count": len(remaining),
+        "remaining_paths": _bounded_strings(remaining, count=64, limit=512),
+        "remaining_paths_truncated": len(remaining) > 64,
+        "failure_count": len(failures),
+        "failures": failures[:64],
+        "failures_truncated": len(failures) > 64,
+    }
+
+
+def _run_project_full_in_candidate_with_cleanup(
+    resolved: Any,
+    *,
+    require_test_execution: bool = False,
+) -> dict[str, Any]:
+    """Run Java project_full and remove files created by that verification."""
+    root = Path(resolved.project_root).expanduser().resolve()
+    inventory = _untracked_project_paths(root)
+    if inventory.get("success") is not True:
+        failure = _final_verify_infra_failure_result(
+            resolved,
+            stage="inventory_candidate_before_verification",
+            message=str(inventory.get("message") or ""),
+        )
+        failure["verification_isolation"] = {
+            "contract_version": "project-full-direct-output-cleanup/v1",
+            "mode": "runner_checkout_with_output_cleanup",
+            "success": False,
+            "stage": "inventory_candidate_before_verification",
+            "cleanup_success": None,
+        }
+        return failure
+
+    before = set(inventory.get("paths") or [])
+    try:
+        result = run_build_test_guard(
+            resolved,
+            require_test_execution=require_test_execution,
+        )
+    except Exception:
+        cleanup = _cleanup_new_verification_paths(root, before)
+        failure = _final_verify_infra_failure_result(
+            resolved,
+            stage="run_build_test_guard",
+            message="The Java build/test Guard raised an exception.",
+            cleanup_success=bool(cleanup.get("success")),
+        )
+        failure["verification_isolation"] = {
+            "contract_version": "project-full-direct-output-cleanup/v1",
+            "mode": "runner_checkout_with_output_cleanup",
+            "success": False,
+            "stage": "run_build_test_guard",
+            "cleanup_success": bool(cleanup.get("success")),
+        }
+        failure["verification_cleanup"] = cleanup
+        return failure
+
+    cleanup = _cleanup_new_verification_paths(root, before)
+    if cleanup.get("success") is not True:
+        failure = _final_verify_infra_failure_result(
+            resolved,
+            stage="cleanup_candidate_tree",
+            message=str(cleanup.get("message") or "New verification outputs remain."),
+            cleanup_success=False,
+        )
+        failure["verification_isolation"] = {
+            "contract_version": "project-full-direct-output-cleanup/v1",
+            "mode": "runner_checkout_with_output_cleanup",
+            "success": False,
+            "stage": "cleanup_candidate_tree",
+            "cleanup_success": False,
+        }
+        failure["verification_cleanup"] = cleanup
+        return failure
+
+    result["verification_isolation"] = {
+        "contract_version": "project-full-direct-output-cleanup/v1",
+        "mode": "runner_checkout_with_output_cleanup",
+        "success": True,
+        "stage": "completed",
+        "cleanup_success": True,
+    }
+    result["verification_cleanup"] = cleanup
+    return result
+
+
 def _run_project_full_in_fresh_worktree(
+    resolved: Any,
+    snapshot: Optional[dict[str, Any]],
+    *,
+    require_test_execution: bool = False,
+    focused_only: bool = False,
+) -> dict[str, Any]:
+    """Admit one isolated verification through the controller-owned slots."""
+    try:
+        with acquire_verification_slot() as lease:
+            result = _run_project_full_in_fresh_worktree_impl(
+                resolved,
+                snapshot,
+                require_test_execution=require_test_execution,
+                focused_only=focused_only,
+            )
+    except VerificationSlotError as exc:
+        return _final_verify_infra_failure_result(
+            resolved,
+            stage="acquire_project_full_slot",
+            message=_bounded_text(str(exc), limit=1024),
+        )
+    if lease.enabled:
+        result["verification_admission"] = {
+            "contract_version": "project-full-slots/v1",
+            "success": True,
+            "slot_index": lease.slot_index,
+            "waited_seconds": round(lease.waited_seconds, 3),
+        }
+    return result
+
+
+def _run_project_full_in_fresh_worktree_impl(
     resolved: Any,
     snapshot: Optional[dict[str, Any]],
     *,
@@ -1940,6 +2159,7 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
     details = result.get("details") or {}
     final_artifact_audit = result.get("final_diff_generated_artifact_audit")
     isolation = result.get("verification_isolation")
+    admission = result.get("verification_admission")
     focused_preflight = result.get("focused_preflight")
     return {
         "type": result.get("type"),
@@ -1999,6 +2219,17 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
             "cleanup_success": isolation.get("cleanup_success"),
         }
         if isinstance(isolation, dict)
+        else None,
+        "verification_admission": {
+            "contract_version": _bounded_text(
+                admission.get("contract_version"),
+                limit=128,
+            ),
+            "success": admission.get("success") is True,
+            "slot_index": admission.get("slot_index"),
+            "waited_seconds": admission.get("waited_seconds"),
+        }
+        if isinstance(admission, dict)
         else None,
         "details": {
             "build": _summarize_command_result(details.get("build")),
@@ -2254,10 +2485,12 @@ def _git_untracked_files(root: Path, pathspecs: list[str] | None = None) -> list
     stdout = result.get("stdout")
     if not isinstance(stdout, str):
         return []
+    # Keep build output visible. Only exact controller-injected roots stay out
+    # of the candidate deliverable.
     return [
         path
         for path in stdout.split("\0")
-        if path and not _is_verification_generated_path(root, path, tracked=False)
+        if path and not _is_controller_injected_untracked_path(path)
     ]
 
 
@@ -2265,28 +2498,21 @@ _CONTROLLER_OUTPUT_DIRECTORIES = frozenset({
     ".smell-test-reports",
     "build-refactoragent",
 })
-_CJSON_ROOT_BUILD_PRODUCTS = frozenset({
-    "cJSON.o",
-    "cJSON_Utils.o",
-    "cJSON_test",
-})
-_CJSON_ROOT_LIBRARY_PRODUCT = re.compile(
-    r"libcjson[^/]*\.(?:a|so(?:\.\d+)*)\Z"
-)
-_RRDTOOL_TRACKED_VERIFICATION_PRODUCTS = frozenset({
-    "po/fr.po",
-    "po/hu.po",
-    "tests/graph2.output",
+_CONTROLLER_INJECTED_ROOTS = frozenset({
+    ".idea",
+    ".idea-refactoring",
+    ".opencode",
+    ".smell-artifacts",
 })
 
 
-def _project_generated_output_root(root: Path, path: str) -> bool:
-    """Recognize a configured, project-owned build root in the candidate tree."""
-    normalized = path.replace("\\", "/").lstrip("/")
-    return bool(
-        normalized.startswith("build/")
-        and (root / "src/google/protobuf").is_dir()
-    )
+def _is_controller_injected_untracked_path(path: str) -> bool:
+    """Exclude only controller-owned inputs/evidence, never build output."""
+    normalized = path.replace("\\", "/").strip("/")
+    if normalized == "opencode.json":
+        return True
+    first = normalized.partition("/")[0]
+    return first in _CONTROLLER_INJECTED_ROOTS
 
 
 _AUTOTOOLS_GENERATED_NAMES = frozenset({
@@ -2366,7 +2592,11 @@ def _generated_file_header(path: Path) -> str:
 
 def _looks_like_cmake_generated_file(path: Path) -> bool:
     """Recognize an untracked CMake product from its own provenance marker."""
-    header = _generated_file_header(path)
+    return _looks_like_cmake_generated_header(_generated_file_header(path))
+
+
+def _looks_like_cmake_generated_header(header: str) -> bool:
+    """Recognize CMake/Ninja output from a bounded provenance header."""
     return bool(
         header
         and any(
@@ -2669,7 +2899,7 @@ def _git_change_records(
     declared_test_paths: list[str] | None = None,
     base_commit: str = "HEAD",
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """Classify every path changed since the controller-frozen c000 commit."""
+    """Inventory every visible path changed since the frozen c000 commit."""
     result = _run_git(
         [
             "diff",
@@ -2687,17 +2917,13 @@ def _git_change_records(
     if result.get("returncode") != 0 or not isinstance(stdout, str):
         return result, []
     records: list[dict[str, str]] = []
-    ignored_tracked: list[str] = []
-    ignored_untracked: list[str] = []
+    ignored_controller: list[str] = []
     declared = _normalized_declared_test_paths(root, declared_test_paths)
     fields = stdout.split("\0")
     for index in range(0, len(fields) - 1, 2):
         status = fields[index]
         path = fields[index + 1].replace("\\", "/")
         if not status or not path:
-            continue
-        if _is_verification_generated_path(root, path, tracked=True):
-            ignored_tracked.append(path)
             continue
         if status.startswith("D"):
             operation = "deleted"
@@ -2727,8 +2953,8 @@ def _git_change_records(
         path = raw_path.replace("\\", "/")
         if not path:
             continue
-        if _is_verification_generated_path(root, path, tracked=False):
-            ignored_untracked.append(path)
+        if _is_controller_injected_untracked_path(path):
+            ignored_controller.append(path)
             continue
         records.append({
             "path": path,
@@ -2736,13 +2962,309 @@ def _git_change_records(
             "status": "??",
             "category": _change_category(path, declared),
         })
-    result["ignored_tracked_count"] = len(ignored_tracked)
-    result["ignored_untracked_count"] = len(ignored_untracked)
-    result["ignored_generated_count"] = len(ignored_tracked) + len(ignored_untracked)
-    result["ignored_generated_paths"] = sorted(
-        {*ignored_tracked, *ignored_untracked}
+    ignored, ignored_output_records = _ignored_output_evidence_records(root)
+    if ignored.get("returncode") != 0:
+        return {
+            **result,
+            "returncode": ignored.get("returncode"),
+            "stderr": ignored.get("stderr"),
+        }, []
+    for item in ignored_output_records:
+        item["category"] = _change_category(str(item["path"]), declared)
+        records.append(item)
+    # Retained for payload compatibility. Only exact controller-injected
+    # paths are excluded; generated products are ordinary inventory records.
+    result["ignored_tracked_count"] = 0
+    result["ignored_untracked_count"] = len(ignored_controller)
+    result["ignored_generated_count"] = len(ignored_controller)
+    result["ignored_generated_paths"] = sorted(ignored_controller)
+    result["ignored_collapsed_count"] = int(
+        ignored.get("ignored_collapsed_count") or 0
+    )
+    result["ignored_output_evidence_count"] = len(ignored_output_records)
+    result["ignored_direct_binary_probe_count"] = int(
+        ignored.get("ignored_direct_binary_probe_count") or 0
+    )
+    result["ignored_direct_binary_probe_truncated"] = bool(
+        ignored.get("ignored_direct_binary_probe_truncated")
     )
     return result, sorted(records, key=lambda item: (item["path"], item["operation"]))
+
+
+def _change_header(
+    root: Path,
+    path: str,
+    *,
+    operation: str,
+    base_commit: str,
+) -> str:
+    """Read bounded current-or-baseline text used only for provenance."""
+    current = ""
+    if operation != "deleted":
+        current = _generated_file_header(root / path)
+        if _looks_like_cmake_generated_header(current) or operation == "added":
+            return current
+    pure = Path(path)
+    if (
+        pure.name not in {
+            "CMakeCache.txt", "CTestTestfile.cmake", "DartConfiguration.tcl",
+            "Makefile", "build.ninja", "cmake_install.cmake",
+            "cmake_uninstall.cmake", "rules.ninja",
+        }
+        and "CMakeFiles" not in pure.parts
+    ):
+        return current
+    baseline = _run_git(["show", f"{base_commit}:{path}"], root)
+    stdout = baseline.get("stdout")
+    if baseline.get("returncode") != 0 or not isinstance(stdout, str):
+        return current
+    return f"{current}\n{stdout[:16384]}"
+
+
+def _cmake_output_root(path: str) -> str:
+    """Return the lexical CMake/Ninja output root for a proven marker."""
+    pure = Path(path)
+    parts = pure.parts
+    if "CMakeFiles" in parts:
+        index = parts.index("CMakeFiles")
+        return Path(*parts[:index]).as_posix() if index else "."
+    parent = pure.parent.as_posix()
+    return parent if parent else "."
+
+
+_CMAKE_OUTPUT_EVIDENCE_NAMES = frozenset({
+    "CMakeCache.txt",
+    "CTestTestfile.cmake",
+    "DartConfiguration.tcl",
+    "Makefile",
+    "build.ninja",
+    "cmake_install.cmake",
+    "cmake_uninstall.cmake",
+    "rules.ninja",
+})
+_IGNORED_CMAKE_MARKER_PATHS = tuple(sorted({
+    *_CMAKE_OUTPUT_EVIDENCE_NAMES,
+    ".ninja_deps",
+    ".ninja_log",
+    "CMakeFiles/Makefile.cmake",
+    "CMakeFiles/cmake.check_cache",
+}))
+_IGNORED_DIRECT_BINARY_PROBE_LIMIT = 128
+
+
+def _is_cmake_output_evidence_path(path: Path) -> bool:
+    """Limit build-root evidence to structural generator-owned paths."""
+    return bool(
+        path.name in _CMAKE_OUTPUT_EVIDENCE_NAMES
+        or "CMakeFiles" in path.parts
+    )
+
+
+def _proven_ignored_generator_marker(path: Path) -> bool:
+    """Recognize one direct, bounded CMake/Ninja structural marker."""
+    header = _generated_file_header(path)
+    if path.name == ".ninja_log":
+        return header.startswith("# ninja log v")
+    if path.name == ".ninja_deps":
+        return header.startswith("# ninjadeps")
+    return _looks_like_cmake_generated_header(header)
+
+
+def _ignored_output_evidence_records(
+    root: Path,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Inspect collapsed ignored roots without walking dependency caches.
+
+    Each ignored directory receives only a fixed set of direct structural-marker
+    probes. Collapsed ignored files are content-probed under a small global cap,
+    with root-level files first. Ordinary ignored trees never enter the replay
+    inventory; one proven marker or compiled file is enough to fail closed.
+    """
+    result = _run_git(
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+            "--",
+        ],
+        root,
+    )
+    stdout = result.get("stdout")
+    if result.get("returncode") != 0 or not isinstance(stdout, str):
+        return result, []
+
+    entries = sorted({
+        raw.replace("\\", "/")
+        for raw in stdout.split("\0")
+        if raw
+    })
+    evidence_paths: set[str] = set()
+    direct_files: list[str] = []
+    for raw in entries:
+        normalized = raw.strip("/")
+        pure = Path(normalized)
+        if (
+            not normalized
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or _is_controller_injected_untracked_path(normalized)
+        ):
+            continue
+        if raw.endswith("/"):
+            for marker in _IGNORED_CMAKE_MARKER_PATHS:
+                candidate = root / pure / marker
+                if _proven_ignored_generator_marker(candidate):
+                    evidence_paths.add((pure / marker).as_posix())
+                    break
+            continue
+        direct_files.append(normalized)
+
+    direct_files.sort(
+        key=lambda item: (
+            len(Path(item).parts) != 1,
+            not os.access(root / item, os.X_OK),
+            item,
+        )
+    )
+    binary_probe_count = 0
+    for path in direct_files[:_IGNORED_DIRECT_BINARY_PROBE_LIMIT]:
+        candidate = root / path
+        pure = Path(path)
+        if (
+            pure.name in _CMAKE_OUTPUT_EVIDENCE_NAMES
+            or pure.name in {".ninja_deps", ".ninja_log"}
+            or "CMakeFiles" in pure.parts
+        ) and _proven_ignored_generator_marker(candidate):
+            evidence_paths.add(path)
+            continue
+        binary_probe_count += 1
+        if _compiled_binary_kind(root, path, "added"):
+            evidence_paths.add(path)
+
+    records = [
+        {
+            "path": path,
+            "operation": "added",
+            "status": "!!",
+        }
+        for path in sorted(evidence_paths)
+    ]
+    result.update({
+        "ignored_collapsed_count": len(entries),
+        "ignored_direct_binary_probe_count": binary_probe_count,
+        "ignored_direct_binary_probe_truncated": (
+            len(direct_files) > _IGNORED_DIRECT_BINARY_PROBE_LIMIT
+        ),
+    })
+    return result, records
+
+
+def _derive_generated_output_roots(
+    changes: list[dict[str, Any]],
+    *,
+    project_root: Path | None,
+    base_commit: str,
+) -> list[dict[str, Any]]:
+    """Pass two: derive build roots only from generator-owned evidence."""
+    if project_root is None:
+        return []
+    evidence_by_root: dict[str, set[str]] = {}
+    for item in changes:
+        operation = str(item.get("operation") or "")
+        path = str(item.get("path") or "").replace("\\", "/").strip("/")
+        if operation not in {"added", "changed", "deleted"} or not path:
+            continue
+        pure = Path(path)
+        cmake_evidence_path = _is_cmake_output_evidence_path(pure)
+        ninja_state_path = pure.name in {".ninja_log", ".ninja_deps"}
+        if not cmake_evidence_path and not ninja_state_path:
+            continue
+        header = _change_header(
+            project_root,
+            path,
+            operation=operation,
+            base_commit=base_commit,
+        )
+        proven_cmake = bool(
+            cmake_evidence_path and _looks_like_cmake_generated_header(header)
+        )
+        proven_ninja_state = bool(
+            ninja_state_path
+            and (
+                pure.name == ".ninja_log" and header.startswith("# ninja log v")
+                or pure.name == ".ninja_deps" and header.startswith("# ninjadeps")
+            )
+        )
+        if not proven_cmake and not proven_ninja_state:
+            continue
+        output_root = _cmake_output_root(path)
+        evidence_by_root.setdefault(output_root, set()).add(path)
+    return [
+        {"path": path, "evidence_paths": sorted(evidence)}
+        for path, evidence in sorted(evidence_by_root.items())
+    ]
+
+
+def _path_within_output_root(path: str, output_root: str) -> bool:
+    if output_root == ".":
+        return False
+    return path == output_root or path.startswith(f"{output_root}/")
+
+
+def _compiled_binary_kind(root: Path, path: str, operation: str) -> str:
+    """Identify compiled output by bytes, independent of its filename."""
+    if operation not in {"added", "changed"}:
+        return ""
+    candidate = root / path
+    if candidate.is_symlink():
+        target = os.readlink(candidate).casefold()
+        if re.search(r"(?:^|/)lib[^/]+\.(?:a|so(?:\.\d+)*|dylib)\Z", target):
+            return "compiled-library-symlink"
+        return ""
+    if not candidate.is_file():
+        return ""
+    try:
+        with candidate.open("rb") as handle:
+            data = handle.read(65536)
+    except OSError:
+        return ""
+    if data.startswith(b"\x7fELF"):
+        return "elf"
+    if data.startswith(b"!<arch>\n"):
+        return "archive"
+    if data[:4] in {
+        b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+    }:
+        return "mach-o-or-class"
+    if data.startswith(b"BC\xc0\xde"):
+        return "llvm-bitcode"
+    if len(data) >= 64 and data.startswith(b"MZ"):
+        pe_offset = int.from_bytes(data[60:64], byteorder="little")
+        if 0 <= pe_offset <= len(data) - 4 and data[pe_offset:pe_offset + 4] == b"PE\0\0":
+            return "portable-executable"
+    return ""
+
+
+def _root_cmake_product(path: str) -> bool:
+    """Limit an in-source CMake root to unambiguous generated subpaths."""
+    pure = Path(path)
+    return bool(
+        pure.parts
+        and (
+            pure.parts[0] == "CMakeFiles"
+            or len(pure.parts) == 1 and pure.name in {
+                ".ninja_deps", ".ninja_log", "CMakeCache.txt",
+                "CTestTestfile.cmake", "DartConfiguration.tcl",
+                "build.ninja", "cmake_install.cmake", "rules.ninja",
+            }
+        )
+    )
 
 
 def _final_diff_generated_artifact_audit(
@@ -2750,38 +3272,55 @@ def _final_diff_generated_artifact_audit(
     *,
     project_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Reject visible generated build/test products from the final delivery.
+    """Reject generated output using inventory, provenance and file content.
 
-    This is deliberately not a suffix ignore.  The paths remain ordinary
-    visible changes. Controller-owned root trees, provenance-marked tracked
-    Autotools products, known RRDtool verification products, and the narrow
-    cJSON root-level product family block final acceptance. New source, tests,
-    documentation and authored build metadata keep their existing delivery.
+    The audit is intentionally two-pass. The complete Git-visible inventory is
+    frozen first; generator provenance then derives arbitrary build roots; only
+    afterwards are paths classified. Nothing is deleted or hidden, and authored
+    source/build metadata remains deliverable when no provenance proves a build
+    tree.
     """
-    artifacts: list[dict[str, str]] = []
+    raw_changes = list(change_audit.get("changes") or [])
+    changes = [item for item in raw_changes if isinstance(item, dict)]
     base_commit = str(change_audit.get("base_commit") or "HEAD")
-    for raw_item in list(change_audit.get("changes") or []):
-        if not isinstance(raw_item, dict):
-            continue
+    output_roots = _derive_generated_output_roots(
+        changes,
+        project_root=project_root,
+        base_commit=base_commit,
+    )
+    root_paths = [str(item["path"]) for item in output_roots]
+    root_evidence_paths = {
+        str(path)
+        for item in output_roots
+        if item.get("path") == "."
+        for path in item.get("evidence_paths") or []
+    }
+    artifacts: list[dict[str, str]] = []
+    for raw_item in changes:
         operation = str(raw_item.get("operation") or "")
         if operation not in {"added", "changed", "deleted"}:
             continue
-        path = str(raw_item.get("path") or "").replace("\\", "/")
+        path = str(raw_item.get("path") or "").replace("\\", "/").strip("/")
         if not path:
             continue
-        controller_owned = any(
+        evidence = ""
+        build_root = next(
+            (root for root in root_paths if _path_within_output_root(path, root)),
+            "",
+        )
+        if build_root:
+            evidence = "generated-build-root"
+        elif "." in root_paths and (
+            path in root_evidence_paths or _root_cmake_product(path)
+        ):
+            evidence = "in-source-generator-product"
+            build_root = "."
+        elif any(
             path.startswith(f"{directory}/")
             for directory in _CONTROLLER_OUTPUT_DIRECTORIES
-        )
-        cjson_root_product = bool(
-            operation in {"added", "changed"}
-            and "/" not in path
-            and (
-                path in _CJSON_ROOT_BUILD_PRODUCTS
-                or _CJSON_ROOT_LIBRARY_PRODUCT.fullmatch(path) is not None
-            )
-        )
-        tracked_autotools_product = bool(
+        ):
+            evidence = "controller-output"
+        elif (
             project_root is not None
             and _tracked_autotools_generated_artifact(
                 project_root,
@@ -2789,33 +3328,33 @@ def _final_diff_generated_artifact_audit(
                 operation=operation,
                 base_commit=base_commit,
             )
-        )
-        rrdtool_verification_product = bool(
+        ):
+            evidence = "autotools-provenance"
+        elif (
             project_root is not None
-            and project_root.name.casefold() == "rrdtool"
-            and path in _RRDTOOL_TRACKED_VERIFICATION_PRODUCTS
-        )
-        project_build_product = bool(
-            project_root is not None
-            and _project_generated_output_root(project_root, path)
-        )
-        if not any((
-            controller_owned,
-            cjson_root_product,
-            tracked_autotools_product,
-            rrdtool_verification_product,
-            project_build_product,
-        )):
+            and operation == "added"
+            and _is_verification_generated_path(project_root, path, tracked=False)
+        ):
+            evidence = "generator-provenance"
+        elif project_root is not None:
+            binary_kind = _compiled_binary_kind(project_root, path, operation)
+            if binary_kind:
+                evidence = f"compiled-content:{binary_kind}"
+        if not evidence:
             continue
-        artifacts.append({
+        artifact = {
             "path": path,
             "operation": operation,
             "status": str(raw_item.get("status") or ""),
-        })
+            "evidence": evidence,
+        }
+        if build_root:
+            artifact["build_root"] = build_root
+        artifacts.append(artifact)
     artifacts.sort(key=lambda item: item["path"])
     audit_ok = change_audit.get("success") is True
     return {
-        "contract_version": "final-diff-generated-artifacts/v1",
+        "contract_version": "final-diff-generated-artifacts/v2",
         "success": bool(audit_ok and not artifacts),
         "status": (
             "WORKTREE_CHANGE_AUDIT_FAILED"
@@ -2831,6 +3370,8 @@ def _final_diff_generated_artifact_audit(
             if artifacts
             else ""
         ),
+        "inventory_count": len(changes),
+        "derived_build_roots": output_roots,
         "paths": [item["path"] for item in artifacts],
         "artifacts": artifacts,
     }
@@ -3018,6 +3559,59 @@ def _snapshot_project(
         for item in change_audit.get("changes") or []
         if isinstance(item, dict) and item.get("path")
     ]
+    generated_audit = change_audit.get("final_diff_generated_artifact_audit")
+    if (
+        isinstance(generated_audit, dict)
+        and generated_audit.get("status") == "FINAL_DIFF_GENERATED_ARTIFACTS"
+    ):
+        status_lines = [
+            f"{str(item.get('status') or '')}\t{str(item.get('path') or '')}"
+            for item in change_audit.get("changes") or []
+            if isinstance(item, dict) and item.get("path")
+        ]
+        status = {
+            "returncode": 0,
+            "stdout": ("\n".join(status_lines) + "\n") if status_lines else "",
+            "stderr": "",
+            "ignored_tracked_count": int(
+                change_audit.get("ignored_tracked_count") or 0
+            ),
+            "ignored_untracked_count": int(
+                change_audit.get("ignored_untracked_count") or 0
+            ),
+            "ignored_generated_count": int(
+                change_audit.get("ignored_generated_count") or 0
+            ),
+            "path_count": len(deliverable_paths),
+            "source": "change_audit",
+        }
+        skipped_diff = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": (
+                "Replay diff skipped because generated build/test artifacts "
+                "are present in the candidate deliverable."
+            ),
+            "untracked_files": [
+                str(item.get("path") or "")
+                for item in change_audit.get("changes") or []
+                if isinstance(item, dict)
+                and item.get("status") == "??"
+                and item.get("path")
+            ],
+            "skipped": True,
+            "skipped_reason": "FINAL_DIFF_GENERATED_ARTIFACTS",
+            "path_count": len(deliverable_paths),
+        }
+        return {
+            "project_root": str(root),
+            "scope": "full_worktree_pre_verification",
+            "base_commit": base_commit,
+            "change_audit": change_audit,
+            "status": status,
+            "diff_stat": dict(skipped_diff),
+            "diff": dict(skipped_diff),
+        }
     status = _git_status_snapshot(
         root,
         base_commit=base_commit,

@@ -16,7 +16,7 @@
     "audit:offline-dependency-integrity": "python3 scripts/audit_offline_dependency_integrity.py",
     "dataset:build-envy-name": "python3 scripts/build_envy_name_dataset.py",
     "check:bridge": "python3 -m py_compile runtime/python/bridge/smell_bridge.py && python3 scripts/self_check_bridge_surface.py && python3 scripts/self_check_snapshot_diff_hygiene.py && python3 scripts/self_check_fresh_project_full_worktree.py && python3 scripts/self_check_guard_progress_preflight.py",
-    "check:config": "python3 scripts/self_check_config.py && python3 scripts/self_check_focused_preflight.py && python3 scripts/self_check_docker_ccache_mount.py",
+    "check:config": "python3 scripts/self_check_config.py && python3 scripts/self_check_focused_preflight.py && python3 scripts/self_check_docker_ccache_mount.py && python3 scripts/self_check_verification_slots.py",
     "check:plugin": "tsc --noEmit --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node --noUnusedLocals --noUnusedParameters .opencode/plugins/smell.ts",
     "check:maven-offline-repo": "python3 scripts/self_check_maven_offline_repo.py",
     "check:image-dependencies": "python3 scripts/self_check_java_image_dependencies.py",
