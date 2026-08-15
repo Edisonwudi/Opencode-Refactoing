@@ -17,6 +17,13 @@ from .location import LocationTarget, parse_locations
 SUPPORTED_LANGUAGES = {"java", "python", "c", "cpp"}
 VERIFICATION_MODES = {"local", "auto", "sample_optimized", "project_full"}
 JAVA_VERIFICATION_MODES = {"sample_optimized", "project_full"}
+VERIFICATION_COMMAND_SOURCES = {
+    "command",
+    "cli",
+    "dataset",
+    "project_manifest",
+    "language_default",
+}
 
 
 @dataclass
@@ -174,8 +181,10 @@ class ResolvedRunConfig:
     focused_preflight: CommandConfig = field(default_factory=CommandConfig)
     project_override: Optional[ProjectOverride] = None
     verification_mode: str = "project_full"
-    build_source: str = "projects.yaml"
-    test_source: str = "projects.yaml"
+    verification_command_source: str = ""
+    build_source: str = ""
+    test_source: str = ""
+    sample_test_source: str = ""
     sample_test_location: str = ""
     sample_test_command: str = ""
     target_context: Dict[str, Any] = field(default_factory=dict)
@@ -184,6 +193,12 @@ class ResolvedRunConfig:
     # ``finding_contract`` remains only for non-Java checkpoint compatibility.
     guard_contract: Dict[str, Any] = field(default_factory=dict)
     guard_scope: Any = None
+
+    @property
+    def verification_cwd(self) -> Path:
+        """Controller-facing name for the resolved verification directory."""
+
+        return self.cwd
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -213,12 +228,15 @@ class ResolvedRunConfig:
             "sample_test": self.sample_test.to_dict(),
             "env": dict(self.env),
             "cwd": str(self.cwd),
+            "verification_cwd": str(self.cwd),
             "profile": asdict(self.profile),
             "focused_preflight": self.focused_preflight.to_dict(),
             "project_override_root": str(self.project_override.root) if self.project_override else None,
             "verification_mode": self.verification_mode,
+            "verification_command_source": self.verification_command_source,
             "build_source": self.build_source,
             "test_source": self.test_source,
+            "sample_test_source": self.sample_test_source,
             "sample_test_location": self.sample_test_location,
             "sample_test_command": self.sample_test_command,
             "target_context": copy.deepcopy(self.target_context),
@@ -352,6 +370,11 @@ def resolve_run_config(
     verification_mode: str = "",
     sample_test_location: str = "",
     sample_test_command: str = "",
+    build_command: str = "",
+    project_test_command: str = "",
+    verification_cwd: str = "",
+    verification_command_source: str = "",
+    sample_test_source: str = "",
     target_context: Optional[Dict[str, Any]] = None,
 ) -> ResolvedRunConfig:
     from .target_context import validate_target_context
@@ -382,8 +405,18 @@ def resolve_run_config(
     profile = language_config.smells[smell]
     smell_override = override.smells.get(smell) if override else None
     merged_profile = profile.merged_with(smell_override)
-    build = _merge_command_config(language_config.build, override.build if override else None)
-    project_test = _merge_command_config(language_config.test, override.test if override else None)
+    build_override = override.build if override else None
+    project_test_override = override.test if override else None
+    build = _merge_command_config(language_config.build, build_override)
+    project_test = _merge_command_config(language_config.test, project_test_override)
+    build_source = _resolved_command_source(
+        build,
+        override=build_override,
+    )
+    project_test_source = _resolved_command_source(
+        project_test,
+        override=project_test_override,
+    )
     focused_preflight = (
         copy.deepcopy(override.focused_preflight)
         if override
@@ -397,34 +430,103 @@ def resolve_run_config(
         )
         build = _rebase_command_config(build, override.root.resolve(), project_root_path)
         project_test = _rebase_command_config(project_test, override.root.resolve(), project_root_path)
+    explicit_build_command = _clean_optional_string(build_command)
+    explicit_project_test_command = _clean_optional_string(project_test_command)
+    explicit_verification_cwd = _clean_optional_string(verification_cwd)
+    explicit_verification_source = _clean_optional_string(
+        verification_command_source
+    )
+    explicit_spec_present = bool(
+        explicit_build_command
+        or explicit_project_test_command
+        or explicit_verification_cwd
+        or explicit_verification_source
+    )
+    if explicit_spec_present and not (
+        explicit_build_command and explicit_project_test_command
+    ):
+        raise ValueError(
+            "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED: explicit verification "
+            "input requires both --build-command and --project-test-command"
+        )
+    explicit_verification_commands = bool(explicit_build_command)
+    normalized_verification_source = _normalize_command_source(
+        verification_command_source,
+        default="cli" if explicit_verification_commands else "",
+        field_name="verification_command_source",
+    )
+    if explicit_verification_commands:
+        build = CommandConfig(command=explicit_build_command)
+        project_test = CommandConfig(command=explicit_project_test_command)
+        build_source = normalized_verification_source
+        project_test_source = normalized_verification_source
+    elif not normalized_verification_source:
+        phase_sources = {source for source in (build_source, project_test_source) if source}
+        if "project_manifest" in phase_sources:
+            normalized_verification_source = "project_manifest"
+        elif "language_default" in phase_sources:
+            normalized_verification_source = "language_default"
     normalized_verification_mode = _resolve_verification_mode(
         verification_mode,
         language=language,
         sample_test_command=sample_test_command,
     )
-    sample_test = CommandConfig(
-        command=_clean_optional_string(sample_test_command),
+    cleaned_sample_test_command = _clean_optional_string(sample_test_command)
+    explicit_sample_test_source = _clean_optional_string(sample_test_source)
+    if explicit_sample_test_source and not cleaned_sample_test_command:
+        raise ValueError(
+            "SAMPLE_TEST_SOURCE_WITHOUT_COMMAND: --sample-test-source requires "
+            "--sample-test-command"
+        )
+    normalized_sample_test_source = (
+        _normalize_command_source(
+            sample_test_source,
+            default="cli",
+            field_name="sample_test_source",
+        )
+        if cleaned_sample_test_command
+        else ""
     )
+    sample_test = CommandConfig(command=cleaned_sample_test_command)
     if normalized_verification_mode == "sample_optimized" and sample_test.command:
         test = sample_test
     else:
         test = project_test
     test_source = (
-        "dataset"
+        normalized_sample_test_source
         if normalized_verification_mode == "sample_optimized"
-        else ("projects.yaml" if normalized_verification_mode != "local" else "")
+        else (project_test_source if normalized_verification_mode != "local" else "")
     )
-    cwd = build_root
+    resolved_verification_cwd = build_root
     if override and override.cwd:
         cwd_path = Path(override.cwd)
         if cwd_path.is_absolute():
             try:
-                cwd = project_root_path / cwd_path.resolve().relative_to(override.root.resolve())
+                resolved_verification_cwd = (
+                    project_root_path
+                    / cwd_path.resolve().relative_to(override.root.resolve())
+                )
             except ValueError:
-                cwd = cwd_path
+                resolved_verification_cwd = cwd_path
         else:
-            cwd = project_root_path / cwd_path
-        cwd = cwd.resolve()
+            resolved_verification_cwd = project_root_path / cwd_path
+    if explicit_verification_commands:
+        requested_cwd = Path(explicit_verification_cwd or ".").expanduser()
+        resolved_verification_cwd = (
+            requested_cwd
+            if requested_cwd.is_absolute()
+            else project_root_path / requested_cwd
+        )
+        resolved_verification_cwd = resolved_verification_cwd.resolve()
+        try:
+            resolved_verification_cwd.relative_to(project_root_path)
+        except ValueError as exc:
+            raise ValueError(
+                "VERIFICATION_CWD_OUTSIDE_PROJECT: verification_cwd must resolve "
+                f"inside project_root ({project_root_path})"
+            ) from exc
+    else:
+        resolved_verification_cwd = resolved_verification_cwd.resolve()
     resolved_env = dict(override.env) if override else {}
     if override and override.root.resolve() != project_root_path:
         canonical = str(override.root.resolve())
@@ -451,13 +553,15 @@ def resolve_run_config(
         test=test,
         sample_test=sample_test,
         env=resolved_env,
-        cwd=cwd,
+        cwd=resolved_verification_cwd,
         profile=merged_profile,
         focused_preflight=focused_preflight,
         project_override=override,
         verification_mode=normalized_verification_mode,
-        build_source="projects.yaml",
+        verification_command_source=normalized_verification_source,
+        build_source=build_source,
         test_source=test_source,
+        sample_test_source=normalized_sample_test_source,
         sample_test_location=str(sample_test_location or ""),
         sample_test_command=str(sample_test_command or ""),
         target_context=copy.deepcopy(validate_target_context(target_context)),
@@ -660,6 +764,41 @@ def _merge_command_config(base: CommandConfig, override: Optional[CommandConfig]
         command=base.command,
         script=base.script,
     )
+
+
+def _has_command_config(config: Optional[CommandConfig]) -> bool:
+    return bool(
+        config
+        and (
+            _clean_optional_string(config.command)
+            or _clean_optional_string(config.script)
+        )
+    )
+
+
+def _resolved_command_source(
+    resolved: CommandConfig,
+    *,
+    override: Optional[CommandConfig],
+) -> str:
+    if not _has_command_config(resolved):
+        return ""
+    return "project_manifest" if _has_command_config(override) else "language_default"
+
+
+def _normalize_command_source(
+    value: Any,
+    *,
+    default: str,
+    field_name: str,
+) -> str:
+    source = str(value or default).strip()
+    if source and source not in VERIFICATION_COMMAND_SOURCES:
+        raise ValueError(
+            f"Unsupported {field_name} '{source}'. Expected one of: "
+            + ", ".join(sorted(VERIFICATION_COMMAND_SOURCES))
+        )
+    return source
 
 
 def _rebase_command_config(config: CommandConfig, canonical_root: Path, execution_root: Path) -> CommandConfig:

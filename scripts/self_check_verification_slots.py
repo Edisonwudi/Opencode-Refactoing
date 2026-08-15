@@ -25,7 +25,12 @@ from smell_core.verification_slots import (  # noqa: E402
 )
 
 
-def _worker(env: dict[str, str], queue: multiprocessing.Queue) -> None:
+def _worker(
+    env: dict[str, str],
+    queue: multiprocessing.Queue,
+    ready: multiprocessing.Event,
+) -> None:
+    ready.set()
     with acquire_verification_slot(env) as lease:
         queue.put((lease.slot_index, lease.waited_seconds))
 
@@ -49,10 +54,15 @@ def main() -> int:
             SAMPLE_DEADLINE_EPOCH_MS_ENV: str(int((time.time() + 5) * 1000)),
         }
         result_queue: multiprocessing.Queue = multiprocessing.Queue()
+        worker_ready = multiprocessing.Event()
         with acquire_verification_slot(env) as outer:
             assert outer.enabled is True and outer.slot_index == 0
-            child = multiprocessing.Process(target=_worker, args=(env, result_queue))
+            child = multiprocessing.Process(
+                target=_worker,
+                args=(env, result_queue, worker_ready),
+            )
             child.start()
+            assert worker_ready.wait(timeout=3), "slot worker did not start"
             try:
                 result_queue.get(timeout=0.25)
                 raise AssertionError("a second worker bypassed the single slot")

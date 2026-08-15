@@ -41,7 +41,7 @@ CHECKPOINT_SCHEMA_VERSION = 5
 BASELINE_SEAL_VERSION = 1
 BASELINE_SEAL_ALGORITHM = "sha256"
 BASELINE_SEAL_FIELD = "baseline_seal"
-VERIFICATION_CONTRACT_VERSION = 4
+VERIFICATION_CONTRACT_VERSION = 5
 
 
 def _require_current_checkpoint_versions(payload: dict[str, Any]) -> None:
@@ -171,9 +171,21 @@ def capture_verification_contract(config: Any) -> dict[str, Any]:
     verification_mode = str(getattr(config, "verification_mode", "") or "").strip()
     build_source = str(getattr(config, "build_source", "") or "").strip()
     test_source = str(getattr(config, "test_source", "") or "").strip()
-    resolved_cwd = Path(config.cwd).expanduser().resolve()
+    resolved_cwd = Path(
+        getattr(config, "verification_cwd", getattr(config, "cwd", project_root))
+    ).expanduser().resolve()
     dataset_root = Path(config.dataset_root).expanduser().resolve()
-    test_cwd = dataset_root if test_source == "dataset" else resolved_cwd
+    sample_test_source = str(
+        getattr(config, "sample_test_source", "") or ""
+    ).strip()
+    sample_test_cwd = (
+        dataset_root if sample_test_source == "dataset" else resolved_cwd
+    )
+    test_cwd = (
+        sample_test_cwd
+        if verification_mode == "sample_optimized"
+        else resolved_cwd
+    )
     defaults = getattr(config, "defaults", None)
     resolved_env = {
         str(key): str(value)
@@ -190,6 +202,10 @@ def capture_verification_contract(config: Any) -> dict[str, Any]:
     return {
         "contract_version": VERIFICATION_CONTRACT_VERSION,
         "verification_mode": verification_mode,
+        "verification_command_source": str(
+            getattr(config, "verification_command_source", "") or ""
+        ).strip(),
+        "verification_cwd": str(resolved_cwd),
         "build": {
             **_command_contract(getattr(config, "build", None), project_root),
             "source": build_source,
@@ -202,8 +218,8 @@ def capture_verification_contract(config: Any) -> dict[str, Any]:
         },
         "sample_test": {
             **_command_contract(getattr(config, "sample_test", None), project_root),
-            "source": "dataset",
-            "cwd": str(dataset_root),
+            "source": sample_test_source if sample_test_command else "",
+            "cwd": str(sample_test_cwd),
             "locations": sample_test_locations,
             "command_sha256": hashlib.sha256(
                 sample_test_command.encode("utf-8")

@@ -44,6 +44,52 @@ def main() -> int:
     ])
     assert focused_args.func is smell_bridge.cmd_verify, focused_args
     assert focused_args.focused_preflight_only is True, focused_args
+    explicit_verification_args = parser.parse_args([
+        "verify",
+        "--project-root", "/tmp/project",
+        "--language", "java",
+        "--smell", "long_method",
+        "--location", "Sample.java:1",
+        "--build-command", "./gradlew classes",
+        "--project-test-command", "./gradlew test",
+        "--verification-cwd", ".",
+        "--verification-command-source", "command",
+        "--sample-test-command", "./gradlew focusedTest",
+        "--sample-test-source", "command",
+    ])
+    assert explicit_verification_args.build_command == "./gradlew classes"
+    assert explicit_verification_args.project_test_command == "./gradlew test"
+    assert explicit_verification_args.verification_cwd == "."
+    assert explicit_verification_args.verification_command_source == "command"
+    assert explicit_verification_args.sample_test_source == "command"
+    mixed_cli_inputs = smell_bridge._resolved_command_inputs(
+        SimpleNamespace(
+            build_command="cli-build",
+            project_test_command=None,
+            verification_cwd=None,
+            verification_command_source=None,
+            sample_test_location=None,
+            sample_test_command="cli-sample",
+            sample_test_source=None,
+        ),
+        {
+            "SMELL_PROJECT_ROOT": "/tmp/project",
+            "SMELL_SMELL": "long_method",
+            "SMELL_LOCATION": "Sample.java:1",
+            "SMELL_BUILD_COMMAND": "env-build",
+            "SMELL_PROJECT_TEST_COMMAND": "env-test",
+            "SMELL_VERIFICATION_CWD": "env-cwd",
+            "SMELL_VERIFICATION_COMMAND_SOURCE": "dataset",
+            "SMELL_SAMPLE_TEST_COMMAND": "env-sample",
+            "SMELL_SAMPLE_TEST_SOURCE": "dataset",
+        },
+    )
+    assert mixed_cli_inputs["build_command"] == "cli-build"
+    assert mixed_cli_inputs["project_test_command"] == ""
+    assert mixed_cli_inputs["verification_cwd"] == ""
+    assert mixed_cli_inputs["verification_command_source"] == ""
+    assert mixed_cli_inputs["sample_test_command"] == "cli-sample"
+    assert mixed_cli_inputs["sample_test_source"] == ""
 
     build_timeout = {
         "status": "BUILD_FAILED",

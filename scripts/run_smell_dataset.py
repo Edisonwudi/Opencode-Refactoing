@@ -92,6 +92,10 @@ class Sample:
     target_context: dict[str, Any] = field(default_factory=dict)
     test_location: str = ""
     test_command: str = ""
+    build_command: str = ""
+    project_test_command: str = ""
+    verification_cwd: str = ""
+    verification_command_source: str = ""
     verification_mode: str = ""
     canonical_project_root: Path | None = None
     sibling_revision_audit: tuple[dict[str, str], ...] = ()
@@ -387,6 +391,19 @@ def _load_samples(dataset: Path) -> list[Sample]:
                         "non-Java mysterious_name rows require target_context_json.symbol_name"
                     )
             verification_mode = str(row.get("verification_mode") or "").strip()
+            build_command = str(row.get("build_command") or "").strip()
+            project_test_command = str(
+                row.get("project_test_command") or ""
+            ).strip()
+            verification_cwd = str(row.get("verification_cwd") or "").strip()
+            if bool(build_command) != bool(project_test_command) or (
+                verification_cwd and not build_command
+            ):
+                raise ValueError(
+                    "DATASET_VERIFICATION_COMMAND_PAIR_REQUIRED: "
+                    f"sample {row['sample_id']} must declare both build_command and "
+                    "project_test_command when any project verification override is present"
+                )
             samples.append(
                 Sample(
                     sample_id=str(row["sample_id"]),
@@ -400,6 +417,14 @@ def _load_samples(dataset: Path) -> list[Sample]:
                     target_context=target_context,
                     test_location=str(row.get("test_file") or "").strip(),
                     test_command=str(row.get("test_command") or "").strip(),
+                    build_command=build_command,
+                    project_test_command=project_test_command,
+                    verification_cwd=verification_cwd,
+                    verification_command_source=(
+                        "dataset"
+                        if build_command or project_test_command or verification_cwd
+                        else ""
+                    ),
                     verification_mode=verification_mode,
                 )
             )
@@ -426,14 +451,14 @@ def _filter_samples(samples: list[Sample], args: argparse.Namespace) -> list[Sam
 
 
 def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> str:
-    cli_mode = str(args.verification_mode or "project_full").strip() or "project_full"
-    if cli_mode not in FINAL_VERIFICATION_MODES:
+    cli_mode = str(getattr(args, "verification_mode", None) or "").strip()
+    if cli_mode and cli_mode not in FINAL_VERIFICATION_MODES:
         raise ValueError(
             f"Unsupported verification mode '{cli_mode}'. Expected one of: "
             f"{', '.join(sorted(FINAL_VERIFICATION_MODES))}."
         )
     sample_mode = str(sample.verification_mode or "").strip()
-    requested = sample_mode or cli_mode
+    requested = cli_mode or sample_mode or "project_full"
     # Once tests may change, a sample-only command can be edited together with
     # the implementation and is no longer an independent behavior oracle.
     # Use the project's complete frozen test command for every such task,
@@ -456,6 +481,122 @@ def _effective_verification_mode(sample: Sample, args: argparse.Namespace) -> st
             f"{', '.join(sorted(FINAL_VERIFICATION_MODES))}."
         )
     return requested
+
+
+def _normalized_verification_cwd(value: str, project_root: Path) -> str:
+    raw = str(value or "").strip()
+    path = Path(raw or ".").expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    return str(path.resolve())
+
+
+def _project_verification_identity(sample: Sample) -> tuple[str, str]:
+    # The checkout revision is selected exclusively by project_name in the
+    # authoritative revisions manifest. Dataset project_commit/test_commit
+    # fields are provenance only and must not split this consistency group.
+    return str(sample.project_root.resolve()), str(sample.project_name).strip()
+
+
+def _resolve_verification_command_specs(
+    samples: list[Sample], args: argparse.Namespace
+) -> list[Sample]:
+    """Resolve trusted project commands before any model process can start."""
+
+    cli_build = str(getattr(args, "build_command", None) or "").strip()
+    cli_test = str(getattr(args, "project_test_command", None) or "").strip()
+    cli_cwd = str(getattr(args, "verification_cwd", None) or "").strip()
+    if bool(cli_build) != bool(cli_test) or (cli_cwd and not cli_build):
+        raise ValueError(
+            "CLI_VERIFICATION_COMMAND_PAIR_REQUIRED: --build-command and "
+            "--project-test-command must be provided together when any project "
+            "verification override is present"
+        )
+
+    resolved: list[Sample] = []
+    grouped_specs: dict[
+        tuple[str, str],
+        tuple[tuple[str, str, str], list[str]],
+    ] = {}
+    for sample in samples:
+        row_build = str(sample.build_command or "").strip()
+        row_test = str(sample.project_test_command or "").strip()
+        row_cwd = str(sample.verification_cwd or "").strip()
+        cli_spec_present = bool(cli_build)
+        row_spec_present = bool(row_build)
+        cli_spec = (
+            cli_build,
+            cli_test,
+            _normalized_verification_cwd(cli_cwd, sample.project_root),
+        )
+        row_spec = (
+            row_build,
+            row_test,
+            _normalized_verification_cwd(row_cwd, sample.project_root),
+        )
+        if cli_spec_present and row_spec_present and cli_spec != row_spec:
+            raise ValueError(
+                "VERIFICATION_COMMAND_SOURCE_CONFLICT: "
+                f"sample {sample.sample_id} has a dataset build/project-test/cwd "
+                "spec that differs from the explicit runner CLI spec"
+            )
+
+        effective_build = cli_build if cli_spec_present else row_build
+        effective_test = cli_test if cli_spec_present else row_test
+        effective_cwd = (
+            (cli_cwd or ".")
+            if cli_spec_present
+            else (row_cwd or ".")
+            if row_spec_present
+            else ""
+        )
+        source = "cli" if cli_spec_present else sample.verification_command_source
+        effective = replace(
+            sample,
+            build_command=effective_build,
+            project_test_command=effective_test,
+            verification_cwd=effective_cwd,
+            verification_command_source=source,
+        )
+        resolved.append(effective)
+
+        identity = _project_verification_identity(effective)
+        spec = (
+            effective_build,
+            effective_test,
+            _normalized_verification_cwd(effective_cwd, effective.project_root),
+        )
+        previous = grouped_specs.get(identity)
+        if previous is None:
+            grouped_specs[identity] = (spec, [effective.sample_id])
+            continue
+        previous_spec, sample_ids = previous
+        if previous_spec != spec:
+            raise ValueError(
+                "PROJECT_VERIFICATION_SPEC_CONFLICT: project/revision "
+                f"{identity[0]}@{identity[1]} has inconsistent build, project-test, "
+                f"or cwd values across samples {', '.join([*sample_ids, effective.sample_id])}"
+            )
+        sample_ids.append(effective.sample_id)
+    return resolved
+
+
+def _append_verification_command_args(cmd: list[str], sample: Sample) -> None:
+    if sample.build_command:
+        cmd.extend(["--build-command", sample.build_command])
+    if sample.project_test_command:
+        cmd.extend(["--project-test-command", sample.project_test_command])
+    if sample.verification_cwd:
+        cmd.extend(["--verification-cwd", sample.verification_cwd])
+    if sample.verification_command_source:
+        cmd.extend(
+            [
+                "--verification-command-source",
+                sample.verification_command_source,
+            ]
+        )
+    if sample.test_command:
+        cmd.extend(["--sample-test-source", "dataset"])
 
 
 def _sanitize(value: str) -> str:
@@ -627,6 +768,15 @@ def _prepare_worktree(
         evidence=_remap_text(sample.evidence, canonical_root, worktree.resolve()),
         test_location=_remap_text(sample.test_location, canonical_root, worktree.resolve()),
         test_command=_remap_text(sample.test_command, canonical_root, worktree.resolve()),
+        build_command=_remap_text(
+            sample.build_command, canonical_root, worktree.resolve()
+        ),
+        project_test_command=_remap_text(
+            sample.project_test_command, canonical_root, worktree.resolve()
+        ),
+        verification_cwd=_remap_text(
+            sample.verification_cwd, canonical_root, worktree.resolve()
+        ),
     )
 
 
@@ -1520,7 +1670,14 @@ def _controller_context_manifest(
         "source": "controller_command_state",
         "identity": {
             key: identity.get(key)
-            for key in ("project_root", "language", "smell", "location")
+            for key in (
+                "project_root",
+                "language",
+                "smell",
+                "location",
+                "verification_command_source",
+                "sample_test_source",
+            )
         },
         "policy": {
             "verification_mode": policy.get("verification_mode"),
@@ -1598,7 +1755,7 @@ def _initial_command_loop_state(
     *,
     started_at_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Freeze trusted v3 state before the first OpenCode process starts.
+    """Freeze trusted v4 state before the first OpenCode process starts.
 
     A verify-required reminder runs in a new OpenCode process.  The first
     model turn may have made no ``smell_verify`` call, so there may be no tool
@@ -1630,6 +1787,11 @@ def _initial_command_loop_state(
             ),
             "sample_test_location": sample.test_location,
             "sample_test_command": sample.test_command,
+            "sample_test_source": "dataset" if sample.test_command else "",
+            "build_command": sample.build_command,
+            "project_test_command": sample.project_test_command,
+            "verification_cwd": sample.verification_cwd,
+            "verification_command_source": sample.verification_command_source,
         },
         started_at_ms=started_at_ms,
     )
@@ -1729,6 +1891,7 @@ def _run_capture_baseline(
         cmd.extend(["--sample-test-location", sample.test_location])
     if sample.test_command:
         cmd.extend(["--sample-test-command", sample.test_command])
+    _append_verification_command_args(cmd, sample)
     if getattr(args, "allow_test_changes", False):
         cmd.append("--allow-test-changes")
 
@@ -1928,6 +2091,7 @@ def _run_verify(
         cmd.extend(["--sample-test-location", sample.test_location])
     if sample.test_command:
         cmd.extend(["--sample-test-command", sample.test_command])
+    _append_verification_command_args(cmd, sample)
     if baseline_seal:
         cmd.extend(["--baseline-seal", baseline_seal])
 
@@ -2849,6 +3013,13 @@ def _run_opencode(
     env["SMELL_VERIFICATION_MODE"] = verification_mode
     env["SMELL_SAMPLE_TEST_LOCATION"] = sample.test_location
     env["SMELL_SAMPLE_TEST_COMMAND"] = sample.test_command
+    env["SMELL_SAMPLE_TEST_SOURCE"] = "dataset" if sample.test_command else ""
+    env["SMELL_BUILD_COMMAND"] = sample.build_command
+    env["SMELL_PROJECT_TEST_COMMAND"] = sample.project_test_command
+    env["SMELL_VERIFICATION_CWD"] = sample.verification_cwd
+    env["SMELL_VERIFICATION_COMMAND_SOURCE"] = (
+        sample.verification_command_source
+    )
     env["SMELL_ALLOW_TEST_CHANGES"] = "1" if getattr(args, "allow_test_changes", False) else "0"
     refactoring_backend = getattr(args, "refactoring_backend", "direct")
     env["SMELL_REFACTORING_BACKEND"] = refactoring_backend
@@ -2900,6 +3071,13 @@ def _run_opencode(
         "agent": agent,
         "auth": {**auth_meta, "api_key_source": "configured" if auth_meta.get("api_key_configured") else ""},
         "verification_mode": verification_mode,
+        "verification_commands": {
+            "build_command": sample.build_command,
+            "project_test_command": sample.project_test_command,
+            "verification_cwd": sample.verification_cwd,
+            "source": sample.verification_command_source,
+            "sample_test_source": "dataset" if sample.test_command else "",
+        },
         "loop_policy": parse_command_policy(command_arguments).loop.to_dict(),
         "time_budget": {
             "source": "sample-deadline",
@@ -3089,6 +3267,7 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         "execution_project_root",
         "location",
         "verification_mode",
+        "verification_command_source",
         "agent",
         "status",
         "resolution",
@@ -3190,6 +3369,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     dataset_audit = {
         "evidence": sample.evidence,
         "target_context": sample.target_context,
+        "sample_test_source": "dataset" if sample.test_command else "",
+        "verification_command_source": sample.verification_command_source,
     }
     sample_dir = run_dir / "samples" / f"sample-{_sanitize(sample.sample_id)}-{_sanitize(sample.project_name)}"
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -3262,6 +3443,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             "execution_project_root": "",
             "location": sample.location,
             "verification_mode": verification_mode,
+            "verification_command_source": sample.verification_command_source,
             "agent": agent,
             "status": exc.status,
             "opencode_returncode": -1,
@@ -3281,7 +3463,24 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         )
         return row
     (sample_dir / "sample.json").write_text(
-        json.dumps({**sample.raw, "execution_project_root": str(execution_sample.project_root)}, indent=2, ensure_ascii=True) + "\n",
+        json.dumps(
+            {
+                **sample.raw,
+                "execution_project_root": str(execution_sample.project_root),
+                "effective_verification_commands": {
+                    "build_command": execution_sample.build_command,
+                    "project_test_command": execution_sample.project_test_command,
+                    "verification_cwd": execution_sample.verification_cwd,
+                    "source": execution_sample.verification_command_source,
+                    "sample_test_source": (
+                        "dataset" if execution_sample.test_command else ""
+                    ),
+                },
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     sample_deadline_started_at_ms = int(time.time() * 1000)
@@ -3336,6 +3535,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "execution_project_root": str(execution_sample.project_root),
                 "location": execution_sample.location,
                 "verification_mode": verification_mode,
+                "verification_command_source": sample.verification_command_source,
                 "allow_test_changes": bool(getattr(args, "allow_test_changes", False)),
                 "refactoring_backend": getattr(args, "refactoring_backend", "direct"),
                 "agent": agent,
@@ -3384,6 +3584,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "execution_project_root": str(execution_sample.project_root),
                 "location": execution_sample.location,
                 "verification_mode": verification_mode,
+                "verification_command_source": sample.verification_command_source,
                 "agent": agent,
                 "status": baseline_status,
                 "opencode_returncode": -1,
@@ -3419,6 +3620,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "execution_project_root": str(execution_sample.project_root),
                 "location": execution_sample.location,
                 "verification_mode": verification_mode,
+                "verification_command_source": sample.verification_command_source,
                 "agent": agent,
                 "status": "BASELINE_SEAL_MISSING",
                 "opencode_returncode": -1,
@@ -3445,6 +3647,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "execution_project_root": str(execution_sample.project_root),
                 "location": execution_sample.location,
                 "verification_mode": verification_mode,
+                "verification_command_source": sample.verification_command_source,
                 "refactoring_backend": "idea",
                 "agent": agent,
                 "status": "IDEA_PRECHECK_FAILED",
@@ -3712,6 +3915,12 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         if isinstance(loop_payload, dict)
         else str(verify_payload.get("termination_reason") or "")
     )
+    build_test_guard = verify_payload.get("build_test_guard")
+    verification_command_source = (
+        str(build_test_guard.get("verification_command_source") or "")
+        if isinstance(build_test_guard, dict)
+        else ""
+    ) or sample.verification_command_source
     last = {
         **_compact_verify_attempt(
             verify_payload,
@@ -3766,6 +3975,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         "execution_project_root": str(execution_sample.project_root),
         "location": execution_sample.location,
         "verification_mode": verification_mode,
+        "verification_command_source": verification_command_source,
         "allow_test_changes": bool(getattr(args, "allow_test_changes", False)),
         "refactoring_backend": getattr(args, "refactoring_backend", "direct"),
         "agent": agent,
@@ -3824,6 +4034,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs-root", default=str(ROOT / "runs"))
     parser.add_argument("--run-name", default="")
     parser.add_argument("--projects", default=os.environ.get("SMELL_PROJECTS", ""))
+    parser.add_argument(
+        "--build-command",
+        default=None,
+        help="Trusted build command for every selected project revision; requires --project-test-command.",
+    )
+    parser.add_argument(
+        "--project-test-command",
+        default=None,
+        help="Trusted project-level test command for every selected project revision; requires --build-command.",
+    )
+    parser.add_argument(
+        "--verification-cwd",
+        default=None,
+        help="Working directory for the explicit build/project-test pair; relative paths resolve from project_path.",
+    )
     parser.add_argument("--smell", default="")
     parser.add_argument("--sample-id", action="append")
     parser.add_argument("--project", action="append")
@@ -3852,7 +4077,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verification-mode",
         choices=sorted(FINAL_VERIFICATION_MODES),
-        default="project_full",
+        default=None,
+        help="Explicit run-wide override. Otherwise each CSV row is used, then project_full.",
     )
     parser.add_argument(
         "--allow-test-changes",
@@ -3895,17 +4121,31 @@ def main(argv: list[str] | None = None) -> int:
     # The runner owns normalization of dataset/CLI optimization hints. Once
     # test migration is enabled, only the complete project verification
     # contract is an independent behavior gate.
-    if args.allow_test_changes:
-        args.verification_mode = "project_full"
     if args.refactoring_backend == "idea" and args.agent == "smell-refactor-agent":
         parser.error("--refactoring-backend=idea requires the Java refactor agent")
     if args.model_event_inactivity_timeout <= 0:
         parser.error("--model-event-inactivity-timeout must be positive")
     # Validate the runner flags through the same parser used by the OpenCode
     # command hook, so batch and direct command invocations cannot drift.
-    parse_command_policy(_command_arguments("validation task", args, args.verification_mode))
+    policy_validation_mode = (
+        "project_full"
+        if args.allow_test_changes
+        else args.verification_mode or "project_full"
+    )
+    parse_command_policy(
+        _command_arguments("validation task", args, policy_validation_mode)
+    )
     dataset = Path(args.dataset).expanduser().resolve()
-    samples = _filter_samples(_load_samples(dataset), args)
+    try:
+        samples = _resolve_verification_command_specs(
+            _filter_samples(_load_samples(dataset), args),
+            args,
+        )
+        effective_verification_modes = sorted(
+            {_effective_verification_mode(sample, args) for sample in samples}
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.refactoring_backend == "idea" and any(sample.language != "java" for sample in samples):
         parser.error("--refactoring-backend=idea supports Java samples only")
     try:
@@ -3922,10 +4162,28 @@ def main(argv: list[str] | None = None) -> int:
         "selected_count": len(samples),
         "run_dir": str(run_dir),
         "execution_checkout_root": str(_execution_checkout_run_dir(run_dir)),
-        "verification_mode": args.verification_mode,
+        "verification_mode": (
+            effective_verification_modes[0]
+            if len(effective_verification_modes) == 1
+            else "per_sample"
+        ),
+        "verification_modes": effective_verification_modes,
+        "verification_mode_override": args.verification_mode,
+        "verification_mode_forced_by_test_changes": bool(args.allow_test_changes),
+        "verification_mode_default": "project_full",
+        "verification_command_cli": {
+            "build_command": str(args.build_command or ""),
+            "project_test_command": str(args.project_test_command or ""),
+            "verification_cwd": str(args.verification_cwd or ""),
+            "source": (
+                "cli"
+                if args.build_command or args.project_test_command or args.verification_cwd
+                else ""
+            ),
+        },
         "refactoring_backend": args.refactoring_backend,
         "loop_policy": parse_command_policy(
-            _command_arguments("validation task", args, args.verification_mode)
+            _command_arguments("validation task", args, policy_validation_mode)
         ).loop.to_dict(),
         "time_budget": {
             "source": "sample-deadline",
@@ -3980,7 +4238,8 @@ def main(argv: list[str] | None = None) -> int:
                 "project_root": str(sample.project_root),
                 "execution_project_root": "",
                 "location": sample.location,
-                "verification_mode": args.verification_mode,
+                "verification_mode": _effective_verification_mode(sample, args),
+                "verification_command_source": sample.verification_command_source,
                 "agent": _select_agent(sample, args),
                 "status": "RUNNER_FAILED",
                 "opencode_returncode": "",

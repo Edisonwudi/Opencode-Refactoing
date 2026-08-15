@@ -176,12 +176,16 @@ def validate_java_strict_verification_contract(
     sample_test = getattr(config, "sample_test", None)
     sample_command = str(getattr(sample_test, "command", "") or "").strip()
     sample_script = str(getattr(sample_test, "script", "") or "").strip()
-    if not sample_command and not sample_script:
+    if (
+        str(getattr(config, "verification_mode", "") or "").strip()
+        == "sample_optimized"
+        and not sample_command
+        and not sample_script
+    ):
         violations.append({
             "code": "JAVA_SAMPLE_TEST_COMMAND_MISSING",
             "message": (
-                "Java strict verification requires the dataset sample test command; "
-                "project_full executes it after the projects.yaml test command."
+                "Java sample_optimized verification requires a sample test command."
             ),
         })
     return violations
@@ -368,6 +372,28 @@ def god_class_relative_reduction(context: Optional[GuardRunContext]) -> float:
     return max((0.0, *reductions))
 
 
+def _has_command_config(config: CommandConfig) -> bool:
+    return bool(
+        str(getattr(config, "command", "") or "").strip()
+        or str(getattr(config, "script", "") or "").strip()
+    )
+
+
+def _resolved_verification_cwd(config: ResolvedRunConfig) -> Path:
+    value = getattr(config, "verification_cwd", None) or getattr(
+        config, "cwd", None
+    )
+    if value is None:
+        raise ValueError("Resolved verification configuration is missing verification_cwd")
+    return Path(value)
+
+
+def _sample_test_cwd(config: ResolvedRunConfig) -> Path:
+    if str(getattr(config, "sample_test_source", "") or "") == "dataset":
+        return Path(config.dataset_root)
+    return _resolved_verification_cwd(config)
+
+
 def run_build_test_guard(
     config: ResolvedRunConfig,
     *,
@@ -390,7 +416,7 @@ def run_build_test_guard(
     if config.defaults.run_build:
         build_result = _run_command_config(
             config.build,
-            cwd=config.cwd,
+            cwd=_resolved_verification_cwd(config),
             env=config.env,
             label="build",
             project_root=config.project_root,
@@ -417,7 +443,7 @@ def run_build_test_guard(
             "returncode": None,
             "command": "",
             "script": "",
-            "cwd": str(config.cwd),
+            "cwd": str(_resolved_verification_cwd(config)),
             "source": config.test_source,
             "summary": [],
             "failure_highlights": [
@@ -443,7 +469,11 @@ def run_build_test_guard(
             },
         }
     if config.defaults.run_tests:
-        test_cwd = config.dataset_root if config.test_source == "dataset" else config.cwd
+        test_cwd = (
+            _sample_test_cwd(config)
+            if config.verification_mode == "sample_optimized"
+            else _resolved_verification_cwd(config)
+        )
         test_started_ns = time.time_ns()
         fresh_execution_required = bool(
             config.verification_mode == "sample_optimized"
@@ -515,6 +545,7 @@ def run_build_test_guard(
         if (
             str(getattr(config, "language", "")).strip().lower() == "java"
             and config.verification_mode == "project_full"
+            and _has_command_config(config.sample_test)
         ):
             reset_java_sample_test_evidence(config.project_root)
             sample_test_started_ns = time.time_ns()
@@ -523,11 +554,11 @@ def run_build_test_guard(
             )
             sample_test_result = _run_command_config(
                 sample_test_command,
-                cwd=config.dataset_root,
+                cwd=_sample_test_cwd(config),
                 env=config.env,
                 label="sample_test",
                 project_root=config.project_root,
-                source="dataset",
+                source=str(getattr(config, "sample_test_source", "") or ""),
                 force_fresh_test_execution=True,
                 timeout_seconds=config.defaults.shell_timeout,
             )
@@ -628,11 +659,11 @@ def run_focused_preflight(config: ResolvedRunConfig) -> Dict[str, object]:
         }
     execution = _run_command_config(
         command,
-        cwd=config.cwd,
+        cwd=_resolved_verification_cwd(config),
         env=config.env,
         label="focused_preflight",
         project_root=config.project_root,
-        source="projects.yaml",
+        source="project_manifest",
         timeout_seconds=config.defaults.shell_timeout,
     )
     ready = bool(execution["success"])
@@ -653,12 +684,18 @@ def run_focused_preflight(config: ResolvedRunConfig) -> Dict[str, object]:
 def _verification_metadata(config: ResolvedRunConfig) -> Dict[str, object]:
     return {
         "verification_mode": config.verification_mode,
+        "verification_command_source": str(
+            getattr(config, "verification_command_source", "") or ""
+        ),
+        "verification_cwd": str(_resolved_verification_cwd(config)),
         "build_source": config.build_source,
         "test_source": config.test_source,
         "test_location": config.sample_test_location,
         "test_command_hash": _command_hash(config.sample_test_command),
         "sample_test_source": (
-            "dataset" if str(config.sample_test_command or "").strip() else ""
+            str(getattr(config, "sample_test_source", "") or "")
+            if str(config.sample_test_command or "").strip()
+            else ""
         ),
     }
 

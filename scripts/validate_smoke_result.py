@@ -118,6 +118,7 @@ def _require_build_test_contract(
     build_test: Any,
     *,
     expected_mode: str,
+    sample_test_required: bool,
 ) -> None:
     require(
         isinstance(build_test, Mapping) and build_test.get("success") is True,
@@ -130,7 +131,9 @@ def _require_build_test_contract(
     details = build_test.get("details")
     require(isinstance(details, Mapping), "build/test stage details missing")
     required_stages = ["build", "test"]
-    if expected_mode == "project_full":
+    if expected_mode == "project_full" and (
+        sample_test_required or details.get("sample_test") is not None
+    ):
         required_stages.append("sample_test")
     for stage in required_stages:
         item = details.get(stage)
@@ -190,12 +193,17 @@ def validate_result(
         "baseline verification policy missing",
     )
     require(
-        verification_policy.get("contract_version") == 4,
+        verification_policy.get("contract_version") == 5,
         "baseline verification contract version mismatch",
     )
     require(
         verification_policy.get("verification_mode") == expected_mode,
         "baseline verification mode mismatch",
+    )
+    sample_test_required = verification_policy.get("sample_test_command_present")
+    require(
+        isinstance(sample_test_required, bool),
+        "baseline sample test declaration missing",
     )
     baseline_failures = sorted(_top_level_baseline_failure_codes(baseline))
     require(
@@ -283,7 +291,11 @@ def validate_result(
             "PASS flags invalid",
         )
         require(verify.get("success") is True, "PASS verify success false")
-        _require_build_test_contract(build_test, expected_mode=expected_mode)
+        _require_build_test_contract(
+            build_test,
+            expected_mode=expected_mode,
+            sample_test_required=sample_test_required,
+        )
         require(
             isinstance(checkpoint, Mapping) and checkpoint.get("accepted") is True,
             "PASS checkpoint rejected",
@@ -306,7 +318,11 @@ def validate_result(
             "IMPROVED flags invalid",
         )
         require(verify.get("success") is False, "IMPROVED verify success true")
-        _require_build_test_contract(build_test, expected_mode=expected_mode)
+        _require_build_test_contract(
+            build_test,
+            expected_mode=expected_mode,
+            sample_test_required=sample_test_required,
+        )
         require(
             isinstance(checkpoint, Mapping) and checkpoint.get("accepted") is False,
             "IMPROVED accepted",

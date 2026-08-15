@@ -453,7 +453,12 @@ checkpoint 只保留作诊断证据，`restorable=false`。
 由 command 前缀显式声明（与批量 runner 同一入口）：
 
 ```text
-/java-refactor-run --verification-mode=sample_optimized --loop-max=2 -- Project root: /abs/java-project; Smell type: long_method; Target location: src/main/java/Foo.java:42
+/java-refactor-run --verification-mode=project_full --loop-max=2 -- Project root: /abs/java-project
+Smell type: long_method
+Target location: src/main/java/Foo.java:42
+Build command: ./gradlew --offline classes
+Project test command: ./gradlew --offline test
+Verification cwd: .
 ```
 
 command 展开后的用户消息会原样保留；plugin 不再重写 `output.parts`。解析出的
@@ -480,10 +485,11 @@ Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_ful
 Java 与非 Java 都会在正式 build/test 前先执行 source-only Guard；未越线时只返回
 数值缺口，不启动完整项目验证。两种正式验证模式都会执行严格 build/test；
 `sample_optimized` 在 build 后只执行数据行
-中已物化的聚焦测试命令。`project_full` 是固定的两段测试合同：先执行
-`projects.yaml` 的项目级测试，再执行数据行的 `sample_test_command`，并要求每个
-声明测试类都有新鲜、非零的 JUnit 执行证据。build、项目测试和样本测试三段任一
-失败都不通过；两个测试命令及其工作目录均冻结进 c000，不能互相替代。
+中已物化的聚焦测试命令。`project_full` 必须执行解析后的项目级测试；当 controller
+还提供了样本测试（benchmark CSV 的 `test_command`）时，再追加执行该命令，并要求
+每个声明测试类都有新鲜、非零的 JUnit 执行证据。真实用户只声明 build 和项目测试
+即可，不必虚构样本测试。build、项目测试及已声明的样本测试任一失败都不通过；所有
+实际命令及其工作目录均冻结进 c000，不能互相替代。
 允许测试迁移时 runner 会无条件切到 `project_full`。
 此时 c000 将测试策略冻结为 `api_migration`（默认是 `immutable`）：只允许测试
 源码的 API 同步迁移，已有测试文件不得删除，测试方法/断言不得减少，不得新增
@@ -507,13 +513,42 @@ python3 scripts/run_smell_dataset.py \
   --agent java-refactor-agent
 ```
 
+真实用户可直接指定该项目的构建、项目级测试及其工作目录，无需先编写项目
+manifest：
+
+```bash
+python3 scripts/run_smell_dataset.py \
+  --dataset /abs/samples.csv \
+  --build-command './gradlew --offline classes' \
+  --project-test-command './gradlew --offline test' \
+  --verification-cwd .
+```
+
+验证命令分三层，且不会静默互相覆盖：
+
+1. runner 的 `--build-command`、`--project-test-command`、
+   `--verification-cwd` 是本次选择范围的用户显式项目合同，来源记为 `cli`；build 与
+   project-test 必须成对，未给 cwd 时按项目根目录 `.` 处理。
+2. CSV 可选列 `build_command`、`project_test_command`、`verification_cwd` 用于需要
+   单文件复现实验的项目合同，来源记为 `dataset`；同一 `project_path` 和 project
+   revision 的所有选中行必须完全一致。若 CLI 与 CSV 都声明合同，三项必须一致，否则
+   runner 在模型启动前报 conflict。
+3. 两者都未声明时，沿用 `--projects <yaml>` 中匹配项目的 manifest；复杂的环境变量、
+   多行脚本和项目子根仍推荐放在 manifest，而不是逐行复制到 CSV。
+
+CSV 已有的 `test_file`、`test_command` 仍只表示样本级测试，来源为 `dataset`，不等同于
+项目级完整测试。验证模式按“显式 `--verification-mode` > CSV
+`verification_mode` > `project_full`”解析；`--allow-test-changes` 仍无条件强制
+`project_full`。解析后的命令、cwd 和来源会进入 controller 环境并冻结在 c000，后续
+agent 调用不能改写。
+
 要点：
 
 - 每个样本独立 git checkout、独立容器，requested commit/tree 与 actual
   必须一致，禁止 HEAD fallback。
 - 测试默认以 `immutable` 冻结；只有 controller 显式传 `--allow-test-changes`
   才切到 `api_migration`。启用后统一执行 `project_full`；完整 test SHA 与测试强度
-  审计、c000 冻结的 build/项目测试/样本测试合同仍必须通过，基线测试文件身份不得删除，
+  审计、c000 冻结的 build/项目测试及已声明样本测试合同仍必须通过，基线测试文件身份不得删除，
   测试方法/断言不得减少，不能新增跳过信号，声明测试必须实际执行；构建描述符、
   测试资源与验证脚本始终不可改。
 - 离线约束：Maven/Gradle 全部走镜像内离线仓库；模型 API 是唯一外联。

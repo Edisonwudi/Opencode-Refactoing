@@ -252,7 +252,15 @@ check(
     getattr(parsed, "model_event_inactivity_timeout", None),
     300,
 )
-check("project_full_is_default", parsed.verification_mode, "project_full")
+check("verification_mode_cli_default_is_unset", parsed.verification_mode, None)
+check(
+    "project_full_is_effective_default",
+    R._effective_verification_mode(
+        loaded[0],
+        argparse.Namespace(verification_mode=None, allow_test_changes=False),
+    ),
+    "project_full",
+)
 check("test_changes_default_forbidden", parsed.allow_test_changes, False)
 check("direct_backend_is_default", parsed.refactoring_backend, "direct")
 check(
@@ -401,7 +409,9 @@ readme_bridge = subprocess.run(
         (
             "--verification-mode=sample_optimized --loop-max=2 -- "
             "Project root: /abs/java-project; Smell type: long_method; "
-            "Target location: src/main/java/Foo.java:42"
+            "Target location: src/main/java/Foo.java:42; "
+            "Build command: ./mvnw -q package; "
+            "Project test command: ./mvnw -q test; Verification cwd: module-a"
         ),
     ],
     cwd=ROOT,
@@ -418,8 +428,23 @@ if readme_bridge.returncode == 0:
         "src/main/java/Foo.java:42",
     )
     check("readme_bridge_checkpoint_required", readme_bridge_payload["checkpoint_required"], True)
+    check(
+        "readme_bridge_build_command",
+        readme_bridge_payload["identity"]["build_command"],
+        "./mvnw -q package",
+    )
+    check(
+        "readme_bridge_project_test_command",
+        readme_bridge_payload["identity"]["project_test_command"],
+        "./mvnw -q test",
+    )
+    check(
+        "readme_bridge_verification_source",
+        readme_bridge_payload["identity"]["verification_command_source"],
+        "command",
+    )
     initial_state = readme_bridge_payload["command_loop_state"]
-    check("readme_bridge_state_schema", initial_state["schema_version"], 3)
+    check("readme_bridge_state_schema", initial_state["schema_version"], 4)
     check(
         "readme_bridge_state_identity",
         initial_state["policy"]["identity"]["project_root"],
@@ -443,6 +468,139 @@ multiline_identity = parse_command_task_identity(
 )
 check("multiline_identity_language", multiline_identity.language, "java")
 check("multiline_identity_mode", multiline_identity.verification_mode, "project_full")
+structured_verification_identity = parse_command_task_identity(
+    "\n".join(
+        [
+            "Project root: /tmp/p",
+            "Language: java",
+            "Smell type: feature_envy",
+            "Target location: src/Foo.java:10",
+            "Build command: ./mvnw -q -DskipTests package && echo built",
+            "Project test command: ./mvnw -q test; echo tested",
+            "Verification cwd: module-a",
+            "Sample test command: ./mvnw -q -Dtest=FocusedTest test",
+        ]
+    ),
+    verification_mode="project_full",
+)
+check(
+    "structured_verification_build_command",
+    structured_verification_identity.build_command,
+    "./mvnw -q -DskipTests package && echo built",
+)
+check(
+    "structured_verification_project_test_command",
+    structured_verification_identity.project_test_command,
+    "./mvnw -q test; echo tested",
+)
+check("structured_verification_cwd", structured_verification_identity.verification_cwd, "module-a")
+check(
+    "structured_verification_source",
+    structured_verification_identity.verification_command_source,
+    "command",
+)
+check(
+    "structured_sample_test_source",
+    structured_verification_identity.sample_test_source,
+    "command",
+)
+interactive_defaults_identity = parse_command_task_identity(
+    "\n".join(
+        [
+            "Project root: /tmp/p",
+            "Smell type: feature_envy",
+            "Target location: src/Foo.java:10",
+            "Build command: ./mvnw package",
+            "Project test command: ./mvnw test",
+            "Verification cwd: module-a",
+            "Sample test command: ./mvnw focusedTest",
+        ]
+    ),
+    verification_mode="project_full",
+    defaults={
+        "build_command": "false",
+        "project_test_command": "false",
+        "verification_cwd": "forged",
+        "verification_command_source": "dataset",
+        "sample_test_command": "false",
+        "sample_test_source": "cli",
+    },
+)
+check(
+    "interactive_task_build_overrides_incomplete_env",
+    interactive_defaults_identity.build_command,
+    "./mvnw package",
+)
+check(
+    "interactive_task_test_overrides_incomplete_env",
+    interactive_defaults_identity.project_test_command,
+    "./mvnw test",
+)
+check(
+    "interactive_task_cwd_overrides_incomplete_env",
+    interactive_defaults_identity.verification_cwd,
+    "module-a",
+)
+check(
+    "interactive_task_verification_source_is_command",
+    interactive_defaults_identity.verification_command_source,
+    "command",
+)
+check(
+    "interactive_task_sample_overrides_incomplete_env",
+    interactive_defaults_identity.sample_test_command,
+    "./mvnw focusedTest",
+)
+check(
+    "interactive_task_sample_source_is_command",
+    interactive_defaults_identity.sample_test_source,
+    "command",
+)
+controller_owned_identity = parse_command_task_identity(
+    (
+        "Project root: /tmp/model; Smell type: long_method; Target location: Model.java:1; "
+        "Build command: false; Project test command: false; Verification cwd: forged"
+    ),
+    verification_mode="project_full",
+    defaults={
+        "project_root": "/tmp/controller",
+        "smell": "long_method",
+        "location": "Controller.java:1",
+        "build_command": "./gradlew assemble",
+        "project_test_command": "./gradlew test",
+        "verification_cwd": "module-b",
+        "verification_command_source": "dataset",
+        "sample_test_command": "./gradlew focusedTest",
+        "sample_test_source": "dataset",
+    },
+)
+check("controller_owned_build_command", controller_owned_identity.build_command, "./gradlew assemble")
+check("controller_owned_project_test_command", controller_owned_identity.project_test_command, "./gradlew test")
+check("controller_owned_verification_cwd", controller_owned_identity.verification_cwd, "module-b")
+check("controller_owned_verification_source", controller_owned_identity.verification_command_source, "dataset")
+empty_controller_identity = parse_command_task_identity(
+    (
+        "Project root: /tmp/model; Smell type: long_method; Target location: Model.java:1; "
+        "Build command: false; Project test command: false; Verification cwd: forged; "
+        "Sample test command: false"
+    ),
+    verification_mode="project_full",
+    defaults={
+        "project_root": "/tmp/controller",
+        "smell": "long_method",
+        "location": "Controller.java:1",
+        "build_command": "",
+        "project_test_command": "",
+        "verification_cwd": "",
+        "verification_command_source": "",
+        "sample_test_command": "",
+        "sample_test_source": "",
+    },
+)
+check("controller_empty_build_blocks_task_fallback", empty_controller_identity.build_command, "")
+check("controller_empty_test_blocks_task_fallback", empty_controller_identity.project_test_command, "")
+check("controller_empty_cwd_blocks_task_fallback", empty_controller_identity.verification_cwd, "")
+check("controller_empty_sample_test_blocks_task_fallback", empty_controller_identity.sample_test_command, "")
 for name, task, expected_prefix in [
     (
         "identity_missing_required",
@@ -470,6 +628,37 @@ for name, task, expected_prefix in [
         parse_command_task_identity(
             task,
             verification_mode="project_full",
+        )
+        failures.append(f"{name}: expected ValueError")
+    except ValueError as exc:
+        check_true(name, str(exc).startswith(expected_prefix))
+for name, defaults, expected_prefix in [
+    (
+        "identity_build_requires_project_test",
+        {"build_command": "./mvnw package"},
+        "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED:",
+    ),
+    (
+        "identity_verification_cwd_requires_pair",
+        {"verification_cwd": "module-a"},
+        "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED:",
+    ),
+    (
+        "identity_verification_source_requires_pair",
+        {"verification_command_source": "dataset"},
+        "VERIFICATION_COMMAND_SOURCE_WITHOUT_COMMANDS:",
+    ),
+    (
+        "identity_sample_source_requires_command",
+        {"sample_test_source": "dataset"},
+        "SAMPLE_TEST_SOURCE_WITHOUT_COMMAND:",
+    ),
+]:
+    try:
+        parse_command_task_identity(
+            "Project root: /tmp/p; Smell type: long_method; Target location: Foo.java:1",
+            verification_mode="project_full",
+            defaults=defaults,
         )
         failures.append(f"{name}: expected ValueError")
     except ValueError as exc:
@@ -917,6 +1106,10 @@ with tempfile.TemporaryDirectory() as tmp:
             target_context={"group": "int:a|int:b|int:c"},
             test_location="src/test/FooTest.java",
             test_command="mvn -Dtest=FooTest test",
+            build_command="mvn -DskipTests package",
+            project_test_command="mvn test",
+            verification_cwd=".",
+            verification_command_source="dataset",
         )
         R._run_capture_baseline(
             sample,
@@ -936,6 +1129,17 @@ with tempfile.TemporaryDirectory() as tmp:
         check_true("baseline_keeps_target_context", "--target-context-json" in baseline_cmd)
         check_true("baseline_keeps_test_location", "--sample-test-location" in baseline_cmd)
         check_true("baseline_keeps_test_command", "--sample-test-command" in baseline_cmd)
+        check_true("baseline_keeps_build_command", "--build-command" in baseline_cmd)
+        check_true(
+            "baseline_keeps_project_test_command",
+            "--project-test-command" in baseline_cmd,
+        )
+        check_true("baseline_keeps_verification_cwd", "--verification-cwd" in baseline_cmd)
+        check_true(
+            "baseline_keeps_verification_source",
+            "--verification-command-source" in baseline_cmd,
+        )
+        check_true("baseline_keeps_sample_test_source", "--sample-test-source" in baseline_cmd)
         check("baseline_disallows_test_changes_cli", "--allow-test-changes" in baseline_cmd, False)
         check("baseline_disallows_test_changes_env", baseline_env.get("SMELL_ALLOW_TEST_CHANGES"), "0")
         R._run_verify(
@@ -1016,6 +1220,17 @@ with tempfile.TemporaryDirectory() as tmp:
     final_cmd = captured["cmd"]
     final_env = captured["env"]
     check("final_verify_excludes_smell_evidence", "--smell-evidence" in final_cmd, False)
+    check_true("final_verify_keeps_build_command", "--build-command" in final_cmd)
+    check_true(
+        "final_verify_keeps_project_test_command",
+        "--project-test-command" in final_cmd,
+    )
+    check_true("final_verify_keeps_verification_cwd", "--verification-cwd" in final_cmd)
+    check_true(
+        "final_verify_keeps_verification_source",
+        "--verification-command-source" in final_cmd,
+    )
+    check_true("final_verify_keeps_sample_test_source", "--sample-test-source" in final_cmd)
     check_true(
         "final_verify_requests_compact_decision",
         "--output-detail" in final_cmd
@@ -1533,7 +1748,7 @@ initial_controller_state = R._initial_command_loop_state(
     "project_full",
     started_at_ms=123456,
 )
-check("initial_controller_state_schema", initial_controller_state["schema_version"], 3)
+check("initial_controller_state_schema", initial_controller_state["schema_version"], 4)
 check("initial_controller_state_started_at", initial_controller_state["started_at"], 123456)
 check(
     "initial_controller_state_identity",
@@ -1561,6 +1776,16 @@ if os.environ.get("SMELL_BATCH_RUN") != "1":
     raise SystemExit(20)
 if os.environ.get("SMELL_REFACTORING_BACKEND") != "idea" or os.environ.get("SMELL_ENABLE_IDEA_TOOLS") != "1":
     raise SystemExit(23)
+if os.environ.get("SMELL_BUILD_COMMAND") != "./gradlew classes":
+    raise SystemExit(24)
+if os.environ.get("SMELL_PROJECT_TEST_COMMAND") != "./gradlew test":
+    raise SystemExit(25)
+if os.environ.get("SMELL_VERIFICATION_CWD") != ".":
+    raise SystemExit(26)
+if os.environ.get("SMELL_VERIFICATION_COMMAND_SOURCE") != "cli":
+    raise SystemExit(27)
+if os.environ.get("SMELL_SAMPLE_TEST_SOURCE") != "dataset":
+    raise SystemExit(28)
 continued = "--session" in sys.argv
 if continued:
     raw = os.environ.get("SMELL_COMMAND_LOOP_STATE_JSON", "")
@@ -1568,7 +1793,7 @@ if continued:
         raise SystemExit(21)
     state = json.loads(raw)
     identity = state.get("policy", {}).get("identity", {})
-    if state.get("schema_version") != 3 or identity.get("location") != "Foo.java:1":
+    if state.get("schema_version") != 4 or identity.get("location") != "Foo.java:1":
         raise SystemExit(22)
 print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
 """,
@@ -1584,6 +1809,11 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         location="Foo.java:1",
         evidence="",
         raw={},
+        test_command="./gradlew focusedTest",
+        build_command="./gradlew classes",
+        project_test_command="./gradlew test",
+        verification_cwd=".",
+        verification_command_source="cli",
     )
     handoff_args = argparse.Namespace(
         opencode_bin=str(fake),
@@ -1637,6 +1867,16 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         "remaining-sample-budget",
     )
     check("command_audits_event_watchdog", first_command["time_budget"]["idle_watchdog_enabled"], True)
+    check(
+        "command_audits_verification_source",
+        first_command["verification_commands"]["source"],
+        "cli",
+    )
+    check(
+        "command_audits_sample_test_source",
+        first_command["verification_commands"]["sample_test_source"],
+        "dataset",
+    )
     check("initial_message_provenance", first_manifest["provenance"], "user_command")
     check(
         "initial_user_parts_not_mutated",

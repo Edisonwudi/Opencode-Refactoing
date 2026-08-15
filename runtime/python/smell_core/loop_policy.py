@@ -7,10 +7,12 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from .config import VERIFICATION_COMMAND_SOURCES
+
 
 LOOP_MODES = {"off", "verify-failure"}
 FAILURE_GROUPS = {"smell", "compile", "test"}
-COMMAND_LOOP_STATE_VERSION = 3
+COMMAND_LOOP_STATE_VERSION = 4
 CHECKPOINT_SMELLS = frozenset({
     "long_method",
     "nested_complexity",
@@ -85,6 +87,11 @@ class CommandTaskIdentity:
     target_context_json: str = ""
     sample_test_location: str = ""
     sample_test_command: str = ""
+    build_command: str = ""
+    project_test_command: str = ""
+    verification_cwd: str = ""
+    verification_command_source: str = ""
+    sample_test_source: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -116,6 +123,9 @@ _COMMAND_TASK_FIELDS = {
     "verification mode": "verification_mode",
     "sample test location": "sample_test_location",
     "sample test command": "sample_test_command",
+    "build command": "build_command",
+    "project test command": "project_test_command",
+    "verification cwd": "verification_cwd",
 }
 _COMMAND_TASK_FIELD_RE = re.compile(
     r"(?:^\s*|;\s*)(?P<label>"
@@ -204,8 +214,53 @@ def parse_command_task_identity(
         )
 
     def optional_value(key: str) -> str:
+        if has_batch_identity and key in defaults:
+            return str(defaults.get(key) or "").strip()
+        field_value = str(fields.get(key) or "").strip()
         default_value = str(defaults.get(key) or "").strip()
-        return default_value or str(fields.get(key) or "").strip()
+        return field_value or default_value
+
+    build_command = optional_value("build_command")
+    project_test_command = optional_value("project_test_command")
+    verification_cwd = optional_value("verification_cwd")
+    sample_test_command = optional_value("sample_test_command")
+    verification_command_source = optional_value("verification_command_source")
+    if not has_batch_identity and any(
+        str(fields.get(key) or "").strip()
+        for key in ("build_command", "project_test_command", "verification_cwd")
+    ):
+        verification_command_source = "command"
+    sample_test_source = optional_value("sample_test_source")
+    if (
+        not has_batch_identity
+        and str(fields.get("sample_test_command") or "").strip()
+    ):
+        sample_test_source = "command"
+    if bool(build_command) != bool(project_test_command) or (
+        verification_cwd and not build_command
+    ):
+        raise ValueError(
+            "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED: build_command and "
+            "project_test_command must be provided together before verification_cwd"
+        )
+    if verification_command_source and not build_command:
+        raise ValueError(
+            "VERIFICATION_COMMAND_SOURCE_WITHOUT_COMMANDS: "
+            "verification_command_source requires the complete build/project-test pair"
+        )
+    if sample_test_source and not sample_test_command:
+        raise ValueError(
+            "SAMPLE_TEST_SOURCE_WITHOUT_COMMAND: sample_test_source requires "
+            "sample_test_command"
+        )
+    for field_name, source in (
+        ("verification_command_source", verification_command_source),
+        ("sample_test_source", sample_test_source),
+    ):
+        if source and source not in VERIFICATION_COMMAND_SOURCES:
+            raise ValueError(
+                f"INVALID_COMMAND_TASK_IDENTITY: unsupported {field_name} '{source}'"
+            )
 
     return CommandTaskIdentity(
         project_root=str(fields["project_root"]).strip(),
@@ -216,7 +271,12 @@ def parse_command_task_identity(
         target_context_json=str(fields.get("target_context_json") or "").strip(),
         verification_mode=verification_mode,
         sample_test_location=optional_value("sample_test_location"),
-        sample_test_command=optional_value("sample_test_command"),
+        sample_test_command=sample_test_command,
+        build_command=build_command,
+        project_test_command=project_test_command,
+        verification_cwd=verification_cwd,
+        verification_command_source=verification_command_source,
+        sample_test_source=sample_test_source,
     )
 
 

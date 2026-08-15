@@ -298,7 +298,7 @@ def resolve(
 ):
     verification_mode = _effective_verification_mode(
         as_runner_sample(sample),
-        argparse.Namespace(verification_mode="project_full"),
+        argparse.Namespace(verification_mode=None),
     )
     resolved = resolve_run_config(
         refactor_config=refactor_config,

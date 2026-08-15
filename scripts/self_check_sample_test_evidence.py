@@ -190,11 +190,14 @@ echo ":demo:test"
                     run_tests=True,
                 ),
                 build=CommandConfig(),
+                sample_test=CommandConfig(),
+                verification_command_source="project_manifest",
                 test=CommandConfig(
                     command="./gradlew :demo:test --no-build-cache"
                 ),
                 build_source="",
-                test_source="projects.yaml",
+                test_source="project_manifest",
+                sample_test_source="",
                 verification_mode="project_full",
                 sample_test_location="",
                 sample_test_command="",
@@ -244,8 +247,10 @@ fi
             build=CommandConfig(command="true"),
             test=CommandConfig(command="./two-stage-test.sh project"),
             sample_test=CommandConfig(command="./two-stage-test.sh sample"),
-            build_source="projects.yaml",
-            test_source="projects.yaml",
+            verification_command_source="project_manifest",
+            build_source="project_manifest",
+            test_source="project_manifest",
+            sample_test_source="dataset",
             verification_mode="project_full",
             sample_test_location=(
                 "src/test/java/example/DeclaredBehaviorTest.java"
@@ -263,7 +268,11 @@ fi
             "DeclaredBehaviorTest"
         ]
         verification_contract = capture_verification_contract(two_stage_config)
-        assert verification_contract["contract_version"] == 4, verification_contract
+        assert verification_contract["contract_version"] == 5, verification_contract
+        assert verification_contract["verification_command_source"] == (
+            "project_manifest"
+        )
+        assert verification_contract["verification_cwd"] == str(root.resolve())
         assert verification_contract["test"]["configured_command"] == (
             "./two-stage-test.sh project"
         )
@@ -272,6 +281,45 @@ fi
         )
         assert verification_contract["sample_test"]["source"] == "dataset"
         assert verification_contract["sample_test"]["cwd"] == str(root.resolve())
+        alternate_dataset_root = root / "dataset-root"
+        alternate_dataset_root.mkdir()
+        alternate_dataset_config = SimpleNamespace(
+            **{
+                **vars(two_stage_config),
+                "dataset_root": alternate_dataset_root,
+            }
+        )
+        alternate_contract = capture_verification_contract(
+            alternate_dataset_config
+        )
+        assert alternate_contract["test"]["cwd"] == str(root.resolve())
+        assert alternate_contract["sample_test"]["cwd"] == str(
+            alternate_dataset_root.resolve()
+        )
+        optimized_contract = capture_verification_contract(
+            SimpleNamespace(
+                **{
+                    **vars(alternate_dataset_config),
+                    "verification_mode": "sample_optimized",
+                    "test": alternate_dataset_config.sample_test,
+                    "test_source": "dataset",
+                }
+            )
+        )
+        assert optimized_contract["test"]["cwd"] == str(
+            alternate_dataset_root.resolve()
+        )
+        command_sample_contract = capture_verification_contract(
+            SimpleNamespace(
+                **{
+                    **vars(alternate_dataset_config),
+                    "sample_test_source": "command",
+                }
+            )
+        )
+        assert command_sample_contract["sample_test"]["cwd"] == str(
+            root.resolve()
+        )
         (root / "target/surefire-reports/TEST-example.DeclaredBehaviorTest.xml").unlink()
         print("  ok   project_full freezes and executes project plus sample tests")
 
@@ -310,8 +358,10 @@ public final class LegacyMainBehaviorTest {
             build=CommandConfig(command="true"),
             test=CommandConfig(command="true"),
             sample_test=CommandConfig(command=legacy_command),
-            build_source="projects.yaml",
-            test_source="projects.yaml",
+            verification_command_source="project_manifest",
+            build_source="project_manifest",
+            test_source="project_manifest",
+            sample_test_source="dataset",
             verification_mode="project_full",
             sample_test_location=(
                 "src/test/java/example/LegacyMainBehaviorTest.java"
@@ -357,7 +407,7 @@ public final class LegacyMainBehaviorTest {
         ).hexdigest(), attestation
         legacy_contract = capture_verification_contract(legacy_config)
         assert legacy_contract["sample_test"]["evidence_adapter"]["selected"] is True
-        assert legacy_contract["contract_version"] == 4, legacy_contract
+        assert legacy_contract["contract_version"] == 5, legacy_contract
         print("  ok   direct Java main keeps its JVM boundary and emits an attestation")
 
         system_exit_source = (

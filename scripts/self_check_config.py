@@ -91,6 +91,146 @@ def main() -> int:
             "run_build": True,
             "run_tests": True,
         }
+        assert payload["verification_cwd"] == str(project.resolve())
+        assert payload["verification_command_source"] == ""
+        assert payload["build_source"] == ""
+        assert payload["test_source"] == ""
+        assert payload["sample_test_source"] == ""
+
+        module = project / "module"
+        module.mkdir()
+        explicit = resolve_run_config(
+            refactor_config=config,
+            project_overrides=[],
+            project_root=str(project),
+            smell="long_method",
+            location="sample.py:method=target|line=1",
+            cli_language="python",
+            verification_mode="project_full",
+            build_command="python -m compileall .",
+            project_test_command="python -m unittest",
+            verification_cwd="module",
+            verification_command_source="command",
+            sample_test_command="python focused_test.py",
+            sample_test_source="command",
+        )
+        assert explicit.build.command == "python -m compileall ."
+        assert explicit.test.command == "python -m unittest"
+        assert explicit.verification_cwd == module.resolve()
+        assert explicit.verification_command_source == "command"
+        assert explicit.build_source == "command"
+        assert explicit.test_source == "command"
+        assert explicit.sample_test_source == "command"
+
+        explicit_default_cwd = resolve_run_config(
+            refactor_config=config,
+            project_overrides=[],
+            project_root=str(project),
+            smell="long_method",
+            location="sample.py:method=target|line=1",
+            cli_language="python",
+            verification_mode="project_full",
+            build_command="python -m compileall .",
+            project_test_command="python -m unittest",
+        )
+        assert explicit_default_cwd.verification_cwd == project.resolve()
+        assert explicit_default_cwd.verification_command_source == "cli"
+
+        for partial in (
+            {"build_command": "python -m compileall ."},
+            {"project_test_command": "python -m unittest"},
+            {"verification_cwd": "module"},
+            {"verification_command_source": "command"},
+        ):
+            try:
+                resolve_run_config(
+                    refactor_config=config,
+                    project_overrides=[],
+                    project_root=str(project),
+                    smell="long_method",
+                    location="sample.py:method=target|line=1",
+                    cli_language="python",
+                    verification_mode="project_full",
+                    **partial,
+                )
+            except ValueError as exc:
+                assert "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED" in str(exc)
+            else:
+                raise AssertionError(f"partial verification spec must fail: {partial}")
+
+        try:
+            resolve_run_config(
+                refactor_config=config,
+                project_overrides=[],
+                project_root=str(project),
+                smell="long_method",
+                location="sample.py:method=target|line=1",
+                cli_language="python",
+                verification_mode="project_full",
+                build_command="python -m compileall .",
+                project_test_command="python -m unittest",
+                verification_cwd="../outside",
+            )
+        except ValueError as exc:
+            assert "VERIFICATION_CWD_OUTSIDE_PROJECT" in str(exc)
+        else:
+            raise AssertionError("outside verification cwd must fail closed")
+
+        try:
+            resolve_run_config(
+                refactor_config=config,
+                project_overrides=[],
+                project_root=str(project),
+                smell="long_method",
+                location="sample.py:method=target|line=1",
+                cli_language="python",
+                verification_mode="project_full",
+                sample_test_source="dataset",
+            )
+        except ValueError as exc:
+            assert "SAMPLE_TEST_SOURCE_WITHOUT_COMMAND" in str(exc)
+        else:
+            raise AssertionError("sample source without a command must fail closed")
+
+        manifest_project = ProjectOverride(
+            root=project,
+            language="python",
+            cwd="module",
+            build=CommandConfig(command="python -m compileall ."),
+            test=CommandConfig(command="python -m unittest"),
+        )
+        manifest_resolved = resolve_run_config(
+            refactor_config=config,
+            project_overrides=[manifest_project],
+            project_root=str(project),
+            smell="long_method",
+            location="sample.py:method=target|line=1",
+            cli_language="python",
+            verification_mode="project_full",
+        )
+        assert manifest_resolved.verification_cwd == module.resolve()
+        assert manifest_resolved.verification_command_source == "project_manifest"
+        assert manifest_resolved.build_source == "project_manifest"
+        assert manifest_resolved.test_source == "project_manifest"
+
+        java_project = temp / "java-project"
+        java_project.mkdir()
+        (java_project / "Sample.java").write_text(
+            "class Sample { void target() {} }\n",
+            encoding="utf-8",
+        )
+        language_default = resolve_run_config(
+            refactor_config=config,
+            project_overrides=[],
+            project_root=str(java_project),
+            smell="long_method",
+            location="Sample.java:method=target|line=1",
+            cli_language="java",
+            verification_mode="project_full",
+        )
+        assert language_default.verification_command_source == "language_default"
+        assert language_default.build_source == "language_default"
+        assert language_default.test_source == "language_default"
 
         slow_project = ProjectOverride(
             root=project,

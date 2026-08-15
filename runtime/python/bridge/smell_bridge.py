@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from smell_core.config import (  # noqa: E402
+    VERIFICATION_COMMAND_SOURCES,
     bundled_projects_config_path,
     bundled_refactor_config_path,
     load_project_overrides,
@@ -329,6 +331,11 @@ def _compact_contract_summary(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict):
         return None
     output = _compact_scalar_mapping(value, count=24)
+    sample_test = value.get("sample_test")
+    if isinstance(sample_test, dict) and isinstance(
+        sample_test.get("command_present"), bool
+    ):
+        output["sample_test_command_present"] = sample_test["command_present"]
     for key, item in value.items():
         if isinstance(item, list):
             output[f"{key}_count"] = len(item)
@@ -385,6 +392,43 @@ def _assert_decision_size(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _resolved_command_inputs(
+    args: argparse.Namespace,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve CLI or batch command groups without mixing individual fields."""
+
+    env = os.environ if environ is None else environ
+    has_batch_identity = all(
+        str(env.get(name) or "").strip()
+        for name in ("SMELL_PROJECT_ROOT", "SMELL_SMELL", "SMELL_LOCATION")
+    )
+    output: dict[str, str] = {}
+    for group in (
+        (
+            ("build_command", "SMELL_BUILD_COMMAND"),
+            ("project_test_command", "SMELL_PROJECT_TEST_COMMAND"),
+            ("verification_cwd", "SMELL_VERIFICATION_CWD"),
+            ("verification_command_source", "SMELL_VERIFICATION_COMMAND_SOURCE"),
+        ),
+        (
+            ("sample_test_location", "SMELL_SAMPLE_TEST_LOCATION"),
+            ("sample_test_command", "SMELL_SAMPLE_TEST_COMMAND"),
+            ("sample_test_source", "SMELL_SAMPLE_TEST_SOURCE"),
+        ),
+    ):
+        use_cli = any(getattr(args, field, None) is not None for field, _ in group)
+        for field, env_name in group:
+            output[field] = str(
+                (getattr(args, field, None) or "")
+                if use_cli
+                else (env.get(env_name) or "")
+                if has_batch_identity
+                else ""
+            )
+    return output
+
+
 def _resolve(args: argparse.Namespace):
     refactor_config = load_refactor_config(_refactor_config_path(args.config))
     project_overrides = load_project_overrides(_projects_path(args.projects))
@@ -393,6 +437,7 @@ def _resolve(args: argparse.Namespace):
         getattr(args, "target_context_json", None)
         or os.environ.get("SMELL_TARGET_CONTEXT_JSON", "")
     )
+    command_inputs = _resolved_command_inputs(args)
     resolved = resolve_run_config(
         refactor_config=refactor_config,
         project_overrides=project_overrides,
@@ -404,10 +449,15 @@ def _resolve(args: argparse.Namespace):
         verification_mode=getattr(args, "verification_mode", None)
         or os.environ.get("SMELL_VERIFICATION_MODE", "")
         or "",
-        sample_test_location=getattr(args, "sample_test_location", None)
-        or os.environ.get("SMELL_SAMPLE_TEST_LOCATION", ""),
-        sample_test_command=getattr(args, "sample_test_command", None)
-        or os.environ.get("SMELL_SAMPLE_TEST_COMMAND", ""),
+        sample_test_location=command_inputs["sample_test_location"],
+        sample_test_command=command_inputs["sample_test_command"],
+        build_command=command_inputs["build_command"],
+        project_test_command=command_inputs["project_test_command"],
+        verification_cwd=command_inputs["verification_cwd"],
+        verification_command_source=command_inputs[
+            "verification_command_source"
+        ],
+        sample_test_source=command_inputs["sample_test_source"],
         target_context=explicit_target_context,
     )
     if smell_evidence and resolved.language != "java":
@@ -1248,6 +1298,37 @@ def _requires_fresh_test_execution(
     )
 
 
+def _verification_provenance(resolved: Any) -> dict[str, Any]:
+    sample_command = str(
+        getattr(resolved, "sample_test_command", "") or ""
+    ).strip()
+    verification_cwd = getattr(
+        resolved,
+        "verification_cwd",
+        getattr(resolved, "cwd", ""),
+    )
+    return {
+        "verification_mode": getattr(resolved, "verification_mode", ""),
+        "verification_command_source": getattr(
+            resolved, "verification_command_source", ""
+        ),
+        "verification_cwd": str(verification_cwd or ""),
+        "build_source": getattr(resolved, "build_source", ""),
+        "test_source": getattr(resolved, "test_source", ""),
+        "sample_test_source": (
+            str(getattr(resolved, "sample_test_source", "") or "")
+            if sample_command
+            else ""
+        ),
+        "test_location": getattr(resolved, "sample_test_location", ""),
+        "test_command_hash": (
+            hashlib.sha256(sample_command.encode("utf-8")).hexdigest()
+            if sample_command
+            else ""
+        ),
+    }
+
+
 def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[str, Any]:
     changed_paths = [
         str(item.get("path") or "")
@@ -1303,11 +1384,7 @@ def _test_source_modified_result(resolved: Any, audit: dict[str, Any]) -> dict[s
         "success": False,
         "message": message,
         "reason": reason,
-        "verification_mode": resolved.verification_mode,
-        "build_source": resolved.build_source,
-        "test_source": resolved.test_source,
-        "sample_test_source": "dataset",
-        "test_location": resolved.sample_test_location,
+        **_verification_provenance(resolved),
         "test_changes": audit,
         "details": {
             "build": {"success": True, "status": "skipped_by_test_change_contract"},
@@ -1358,11 +1435,7 @@ def _final_diff_generated_artifacts_result(
         "success": False,
         "message": message,
         "reason": "FINAL_DIFF_GENERATED_ARTIFACTS",
-        "verification_mode": resolved.verification_mode,
-        "build_source": resolved.build_source,
-        "test_source": resolved.test_source,
-        "sample_test_source": "dataset",
-        "test_location": resolved.sample_test_location,
+        **_verification_provenance(resolved),
         "final_diff_generated_artifact_audit": dict(audit),
         "details": {
             "build": {
@@ -1399,22 +1472,12 @@ def _final_verify_infra_failure_result(
         "snapshot_change_count": int(snapshot_change_count),
         "cleanup_success": cleanup_success,
     }
-    sample_command = str(getattr(resolved, "sample_test_command", "") or "").strip()
     return {
         "type": "build_test",
         "success": False,
         "message": rendered,
         "reason": "FINAL_VERIFY_INFRA_FAILED",
-        "verification_mode": resolved.verification_mode,
-        "build_source": resolved.build_source,
-        "test_source": resolved.test_source,
-        "sample_test_source": "dataset" if sample_command else "",
-        "test_location": resolved.sample_test_location,
-        "test_command_hash": (
-            hashlib.sha256(sample_command.encode("utf-8")).hexdigest()
-            if sample_command
-            else ""
-        ),
+        **_verification_provenance(resolved),
         "verification_isolation": isolation,
         "details": {
             "build": None,
@@ -1509,7 +1572,7 @@ def _rebase_build_test_config(
             fresh_root,
         ),
         cwd=_rebase_path_to_fresh_root(
-            resolved.cwd,
+            resolved.verification_cwd,
             source_root,
             fresh_root,
         ),
@@ -2028,19 +2091,9 @@ def _run_project_full_in_fresh_worktree_impl(
             cleanup_success=cleanup_success,
         )
 
-    sample_command = str(resolved.sample_test_command or "").strip()
     build_test_result.update({
         "focused_preflight": focused_preflight_result,
-        "verification_mode": resolved.verification_mode,
-        "build_source": resolved.build_source,
-        "test_source": resolved.test_source,
-        "sample_test_source": "dataset" if sample_command else "",
-        "test_location": resolved.sample_test_location,
-        "test_command_hash": (
-            hashlib.sha256(sample_command.encode("utf-8")).hexdigest()
-            if sample_command
-            else ""
-        ),
+        **_verification_provenance(resolved),
         "verification_isolation": {
             "contract_version": "project-full-fresh-worktree/v1",
             "mode": "detached_git_worktree",
@@ -2066,6 +2119,13 @@ def cmd_resolve_command(args: argparse.Namespace) -> dict[str, Any]:
             "target_context_json": os.environ.get("SMELL_TARGET_CONTEXT_JSON"),
             "sample_test_location": os.environ.get("SMELL_SAMPLE_TEST_LOCATION"),
             "sample_test_command": os.environ.get("SMELL_SAMPLE_TEST_COMMAND"),
+            "build_command": os.environ.get("SMELL_BUILD_COMMAND"),
+            "project_test_command": os.environ.get("SMELL_PROJECT_TEST_COMMAND"),
+            "verification_cwd": os.environ.get("SMELL_VERIFICATION_CWD"),
+            "verification_command_source": os.environ.get(
+                "SMELL_VERIFICATION_COMMAND_SOURCE"
+            ),
+            "sample_test_source": os.environ.get("SMELL_SAMPLE_TEST_SOURCE"),
         },
     )
 
@@ -2162,6 +2222,10 @@ def _summarize_build_test_guard(result: Optional[dict[str, Any]]) -> Optional[di
         "message": _bounded_text(result.get("message")),
         "reason": _bounded_text(result.get("reason", ""), limit=256),
         "verification_mode": result.get("verification_mode", ""),
+        "verification_command_source": result.get(
+            "verification_command_source", ""
+        ),
+        "verification_cwd": _bounded_text(result.get("verification_cwd", "")),
         "build_source": result.get("build_source", ""),
         "test_source": result.get("test_source", ""),
         "sample_test_source": result.get("sample_test_source", ""),
@@ -4160,8 +4224,21 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         choices=("local", "auto", "sample_optimized", "project_full"),
         default="",
     )
-    parser.add_argument("--sample-test-location", default="")
-    parser.add_argument("--sample-test-command", default="")
+    parser.add_argument("--sample-test-location", default=None)
+    parser.add_argument("--sample-test-command", default=None)
+    parser.add_argument("--build-command", default=None)
+    parser.add_argument("--project-test-command", default=None)
+    parser.add_argument("--verification-cwd", default=None)
+    parser.add_argument(
+        "--verification-command-source",
+        choices=sorted(VERIFICATION_COMMAND_SOURCES),
+        default=None,
+    )
+    parser.add_argument(
+        "--sample-test-source",
+        choices=sorted(VERIFICATION_COMMAND_SOURCES),
+        default=None,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

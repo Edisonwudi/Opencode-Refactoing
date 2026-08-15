@@ -33,7 +33,9 @@ def _java_config(
     build_command: str = "true",
     test_command: str = "true",
     sample_test_command: str = "true",
+    verification_mode: str = "project_full",
 ) -> SimpleNamespace:
+    root = Path.cwd().resolve()
     return SimpleNamespace(
         language="java",
         smell="long_method",
@@ -44,9 +46,16 @@ def _java_config(
         build=CommandConfig(command=build_command or None),
         test=CommandConfig(command=test_command or None),
         sample_test=CommandConfig(command=sample_test_command or None),
-        verification_mode="project_full",
-        build_source="self_check",
-        test_source="self_check",
+        project_root=root,
+        dataset_root=root,
+        verification_cwd=root,
+        cwd=root,
+        env={},
+        verification_mode=verification_mode,
+        verification_command_source="command",
+        build_source="command",
+        test_source="command",
+        sample_test_source="command" if sample_test_command else "",
         sample_test_location="",
         sample_test_command=sample_test_command,
     )
@@ -131,10 +140,20 @@ def main() -> int:
     assert "JAVA_TEST_COMMAND_MISSING" in _violation_codes(empty_test), empty_test
 
     empty_sample_test = run_build_test_guard(_java_config(sample_test_command=""))
-    assert empty_sample_test["success"] is False, empty_sample_test
+    assert empty_sample_test["success"] is True, empty_sample_test
+    assert empty_sample_test["details"]["sample_test"] is None, empty_sample_test
+
+    sample_optimized_without_test = run_build_test_guard(
+        _java_config(
+            test_command="",
+            sample_test_command="",
+            verification_mode="sample_optimized",
+        )
+    )
+    assert sample_optimized_without_test["success"] is False
     assert "JAVA_SAMPLE_TEST_COMMAND_MISSING" in _violation_codes(
-        empty_sample_test
-    ), empty_sample_test
+        sample_optimized_without_test
+    ), sample_optimized_without_test
 
     with tempfile.TemporaryDirectory(prefix="nonjava-guard-dispatch-") as temp_dir:
         project = Path(temp_dir)
@@ -150,9 +169,16 @@ def main() -> int:
             defaults=DefaultsConfig(run_build=False, run_tests=False),
             build=CommandConfig(),
             test=CommandConfig(),
+            sample_test=CommandConfig(),
+            dataset_root=project,
+            cwd=project,
+            verification_cwd=project,
+            env={},
             verification_mode="local",
+            verification_command_source="",
             build_source="",
             test_source="",
+            sample_test_source="",
             sample_test_location="",
             sample_test_command="",
         )

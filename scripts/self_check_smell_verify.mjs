@@ -116,6 +116,11 @@ function cleanSmellIdentityEnv(env) {
     "SMELL_VERIFICATION_MODE",
     "SMELL_SAMPLE_TEST_LOCATION",
     "SMELL_SAMPLE_TEST_COMMAND",
+    "SMELL_BUILD_COMMAND",
+    "SMELL_PROJECT_TEST_COMMAND",
+    "SMELL_VERIFICATION_CWD",
+    "SMELL_VERIFICATION_COMMAND_SOURCE",
+    "SMELL_SAMPLE_TEST_SOURCE",
     "SMELL_COMMAND_LOOP_STATE_JSON",
     "SMELL_BASELINE_SEAL",
   ]) {
@@ -2117,6 +2122,11 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
         verification_mode: "project_full",
         sample_test_location: "",
         sample_test_command: "",
+        build_command: "",
+        project_test_command: "",
+        verification_cwd: "",
+        verification_command_source: "",
+        sample_test_source: "",
       },
       loop: {
         mode: "verify-failure",
@@ -2630,6 +2640,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
           "--projects", path.join(fixtureRoot, "projects.yaml"),
           "--verification-mode", "project_full",
           "--sample-test-command", sampleTestCommand,
+          "--sample-test-source", "command",
         ],
         { cwd: fixtureRoot, env: process.env },
       )
@@ -2744,6 +2755,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         SMELL_LOCATION: "src/main/java/SelfCheckSample.java:2",
         SMELL_VERIFICATION_MODE: "project_full",
         SMELL_SAMPLE_TEST_COMMAND: sampleTestCommand,
+        SMELL_SAMPLE_TEST_SOURCE: "command",
         SMELL_BASELINE_CONTEXT_FILE: baselineContextFile,
       })
       delete process.env.SMELL_BASELINE_SEAL
@@ -2785,6 +2797,28 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         )
       }
       process.env.SMELL_LOCATION = "src/main/java/SelfCheckSample.java:2"
+      process.env.SMELL_SAMPLE_TEST_SOURCE = "dataset"
+      const reloadedWithWrongCommandSource = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
+      try {
+        await reloadedWithWrongCommandSource.tool.smell_verify.execute(verifyArgs, {
+          sessionID: "batch-reload-wrong-command-source",
+          agent: "java-refactor-agent",
+          directory: fixtureRoot,
+        })
+        throw new SelfCheckError(
+          "batch_reload_wrong_command_source",
+          "Stale command state was accepted with another sample-test source.",
+          {},
+        )
+      } catch (error) {
+        assertCond(
+          "batch_reload_command_source_mismatch_fails_closed",
+          String(error?.message || error).includes("COMMAND_POLICY_STATE_IDENTITY_MISMATCH")
+            && String(error?.message || error).includes("sample_test_source"),
+          String(error?.message || error),
+        )
+      }
+      process.env.SMELL_SAMPLE_TEST_SOURCE = "command"
       const reloadedWithoutSeal = await pluginModule.SmellPlugin({ worktree: fixtureRoot })
       try {
         await reloadedWithoutSeal.tool.smell_verify.execute(verifyArgs, {
@@ -2828,6 +2862,8 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         "SMELL_SMELL",
         "SMELL_LOCATION",
         "SMELL_VERIFICATION_MODE",
+        "SMELL_SAMPLE_TEST_COMMAND",
+        "SMELL_SAMPLE_TEST_SOURCE",
         "SMELL_COMMAND_LOOP_STATE_JSON",
         "SMELL_BASELINE_SEAL",
         "SMELL_BASELINE_CONTEXT_FILE",
@@ -2900,7 +2936,12 @@ if command == "resolve-command":
             "target_context_json": "",
             "verification_mode": verification_mode,
             "sample_test_location": "",
-            "sample_test_command": "",
+            "sample_test_command": case.get("sample_test_command", ""),
+            "build_command": case.get("build_command", ""),
+            "project_test_command": case.get("project_test_command", ""),
+            "verification_cwd": case.get("verification_cwd", ""),
+            "verification_command_source": case.get("verification_command_source", ""),
+            "sample_test_source": case.get("sample_test_source", ""),
         },
         "loop": {
             "mode": "verify-failure",
@@ -3568,7 +3609,7 @@ print(json.dumps(payload))
     await mismatchedResumePlugin.dispose?.()
 
     process.env.SMELL_LOCATION = resumeLocation
-    process.env.SMELL_COMMAND_LOOP_STATE_JSON = '{"schema_version":3}'
+    process.env.SMELL_COMMAND_LOOP_STATE_JSON = '{"schema_version":4}'
     const malformedResumePlugin = await pluginModule.SmellPlugin({ worktree: resumeRoot })
     let malformedResumeMessage = ""
     try {
@@ -3715,6 +3756,16 @@ print(json.dumps(payload))
     const results = []
     for (const replay of replayCases) {
       const replayRoot = path.join(tempRoot, `replay-${replay.name}`)
+      const controllerVerification = replay.language === "java"
+        ? {
+            build_command: "./mvnw -q -DskipTests package",
+            project_test_command: "./mvnw -q test",
+            verification_cwd: path.join(replayRoot, "module-a"),
+            verification_command_source: "dataset",
+            sample_test_command: "./mvnw -q -Dtest=FocusedTest test",
+            sample_test_source: "dataset",
+          }
+        : {}
       await mkdir(replayRoot, { recursive: true })
       await writeFile(stateFile, "0", "utf8")
       await writeFile(logFile, "", "utf8")
@@ -3724,6 +3775,7 @@ print(json.dumps(payload))
         checkpoint_required: true,
         early_calls: 2,
         progress_each_call: true,
+        ...controllerVerification,
       })
       const plugin = await pluginModule.SmellPlugin({ worktree: replayRoot })
       const sessionID = `guard-progress-${replay.name}`
@@ -3740,6 +3792,12 @@ print(json.dumps(payload))
         smell: replay.smell,
         location: replay.location,
         verificationMode: "project_full",
+        buildCommand: "false",
+        projectTestCommand: "false",
+        verificationCwd: "/tmp/model-controlled-cwd",
+        verificationCommandSource: "cli",
+        sampleTestCommand: "false",
+        sampleTestSource: "command",
       }
       const toolContext = { sessionID, agent: "smell-refactor-agent", directory: replayRoot }
       const earlyStates = []
@@ -3815,12 +3873,49 @@ print(json.dumps(payload))
       assertEqual(`guard_progress_${replay.name}_focused_count`, commands.filter((item) => item.command === "focused-preflight").length, 2, "focused-preflight count")
       assertEqual(`guard_progress_${replay.name}_full_count`, commands.filter((item) => item.command === "verify").length, 1, "verify count")
       if (replay.language === "java") {
-        for (const command of commands.filter((item) => item.command === "guard-progress")) {
+        for (const command of commands.filter((item) => item.command !== "resolve-command")) {
           const argv = command.argv || []
-          assertEqual(`guard_progress_${replay.name}_seal`, argv[argv.indexOf("--baseline-seal") + 1], "controller-seal", "baseline seal")
+          if (command.command !== "capture-baseline") {
+            assertEqual(`guard_progress_${replay.name}_seal`, argv[argv.indexOf("--baseline-seal") + 1], "controller-seal", "baseline seal")
+          }
           assertEqual(`guard_progress_${replay.name}_language`, argv[argv.indexOf("--language") + 1], "java", "language")
           assertEqual(`guard_progress_${replay.name}_smell`, argv[argv.indexOf("--smell") + 1], replay.smell, "smell")
           assertEqual(`guard_progress_${replay.name}_location`, argv[argv.indexOf("--location") + 1], replay.location, "location")
+          assertEqual(
+            `guard_progress_${replay.name}_build_command`,
+            argv[argv.indexOf("--build-command") + 1],
+            controllerVerification.build_command,
+            "build command",
+          )
+          assertEqual(
+            `guard_progress_${replay.name}_project_test_command`,
+            argv[argv.indexOf("--project-test-command") + 1],
+            controllerVerification.project_test_command,
+            "project test command",
+          )
+          assertEqual(
+            `guard_progress_${replay.name}_verification_cwd`,
+            argv[argv.indexOf("--verification-cwd") + 1],
+            controllerVerification.verification_cwd,
+            "verification cwd",
+          )
+          assertEqual(
+            `guard_progress_${replay.name}_verification_source`,
+            argv[argv.indexOf("--verification-command-source") + 1],
+            "dataset",
+            "verification source",
+          )
+          assertEqual(
+            `guard_progress_${replay.name}_sample_test_source`,
+            argv[argv.indexOf("--sample-test-source") + 1],
+            "dataset",
+            "sample test source",
+          )
+          assertCond(
+            `guard_progress_${replay.name}_model_commands_rejected`,
+            !argv.includes("false") && !argv.includes("/tmp/model-controlled-cwd"),
+            "model-controlled command fields reached the bridge",
+          )
         }
       }
       results.push({ replay: replay.name, prematureFull: 0, finalFull: 1, continuation: 0 })

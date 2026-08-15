@@ -69,8 +69,9 @@ def _base_result(evidence_path: Path) -> dict[str, object]:
             "success": True,
             "status": "BASELINE_CAPTURED",
             "verification_policy": {
-                "contract_version": 4,
+                "contract_version": 5,
                 "verification_mode": "project_full",
+                "sample_test_command_present": True,
             },
         },
         "revision_audit": {},
@@ -155,7 +156,7 @@ def main() -> int:
             root,
             "baseline verification contract version mismatch",
         )
-        print("  ok   smoke requires c000 verification contract v4")
+        print("  ok   smoke requires c000 verification contract v5")
 
         profile_mismatch = copy.deepcopy(ordinary_guard_failure)
         profile_verify = profile_mismatch["attempts"][0]["verify_payload"]
@@ -217,7 +218,28 @@ def main() -> int:
             root,
             "sample test stage",
         )
-        print("  ok   PASS requires build, project test, and sample test stages")
+        optional_sample_stage = copy.deepcopy(missing_sample_stage)
+        optional_sample_stage["baseline_capture"]["verification_policy"][
+            "sample_test_command_present"
+        ] = False
+        _validate(
+            optional_sample_stage,
+            root / "pass-optional-sample-stage" / "result.json",
+            root,
+        )
+        failed_optional_sample_stage = copy.deepcopy(optional_sample_stage)
+        failed_optional_sample_stage["attempts"][0]["verify_payload"][
+            "build_test_guard"
+        ]["details"]["sample_test"] = {"success": False, "status": "failed"}
+        _expect_failure(
+            failed_optional_sample_stage,
+            root / "pass-failed-optional-sample-stage" / "result.json",
+            root,
+            "sample test stage failed",
+        )
+        print(
+            "  ok   PASS requires build/project test and only a declared sample test"
+        )
 
     print("smoke result validator self-check: PASS")
     return 0

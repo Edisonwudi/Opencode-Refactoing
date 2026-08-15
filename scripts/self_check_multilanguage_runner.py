@@ -120,6 +120,9 @@ def main() -> int:
                     "test_file",
                     "test_command",
                     "verification_mode",
+                    "build_command",
+                    "project_test_command",
+                    "verification_cwd",
                 ],
             )
             writer.writeheader()
@@ -134,13 +137,128 @@ def main() -> int:
                     "test_file": "FocusedTest.java",
                     "test_command": "mvn -Dtest=FocusedTest test",
                     "verification_mode": "sample_optimized",
+                    "build_command": "./mvnw -q -DskipTests package",
+                    "project_test_command": "./mvnw -q test",
+                    "verification_cwd": ".",
                 }
             )
         focused_sample = runner._load_samples(focused_dataset)[0]
         assert focused_sample.test_command == "mvn -Dtest=FocusedTest test"
         assert focused_sample.test_location == "FocusedTest.java"
         assert focused_sample.raw["test_command"] == "mvn -Dtest=FocusedTest test"
+        assert focused_sample.build_command == "./mvnw -q -DskipTests package"
+        assert focused_sample.project_test_command == "./mvnw -q test"
+        assert focused_sample.verification_cwd == "."
+        assert focused_sample.verification_command_source == "dataset"
         print("  ok   sample_optimized uses materialized test_command and test_file")
+
+        no_cli_spec = argparse.Namespace(
+            build_command=None,
+            project_test_command=None,
+            verification_cwd=None,
+        )
+        resolved_dataset_spec = runner._resolve_verification_command_specs(
+            [focused_sample], no_cli_spec
+        )[0]
+        assert resolved_dataset_spec.verification_command_source == "dataset"
+        matching_cli_spec = argparse.Namespace(
+            build_command=focused_sample.build_command,
+            project_test_command=focused_sample.project_test_command,
+            verification_cwd="",
+        )
+        resolved_cli_spec = runner._resolve_verification_command_specs(
+            [focused_sample], matching_cli_spec
+        )[0]
+        assert resolved_cli_spec.verification_command_source == "cli"
+        assert resolved_cli_spec.verification_cwd == "."
+        bridge_args: list[str] = []
+        runner._append_verification_command_args(bridge_args, resolved_cli_spec)
+        assert bridge_args[bridge_args.index("--build-command") + 1] == (
+            focused_sample.build_command
+        )
+        assert bridge_args[bridge_args.index("--project-test-command") + 1] == (
+            focused_sample.project_test_command
+        )
+        assert bridge_args[bridge_args.index("--verification-cwd") + 1] == "."
+        assert bridge_args[
+            bridge_args.index("--verification-command-source") + 1
+        ] == "cli"
+        assert bridge_args[bridge_args.index("--sample-test-source") + 1] == (
+            "dataset"
+        )
+        try:
+            runner._resolve_verification_command_specs(
+                [focused_sample],
+                argparse.Namespace(
+                    build_command="false",
+                    project_test_command="false",
+                    verification_cwd=".",
+                ),
+            )
+        except ValueError as exc:
+            assert "VERIFICATION_COMMAND_SOURCE_CONFLICT" in str(exc), exc
+        else:
+            raise AssertionError("CLI and dataset project specs must not silently override")
+        try:
+            runner._resolve_verification_command_specs(
+                [focused_sample],
+                argparse.Namespace(
+                    build_command="true",
+                    project_test_command=None,
+                    verification_cwd=None,
+                ),
+            )
+        except ValueError as exc:
+            assert "CLI_VERIFICATION_COMMAND_PAIR_REQUIRED" in str(exc), exc
+        else:
+            raise AssertionError("partial CLI project verification spec must fail")
+        conflicting_row = replace(
+            focused_sample,
+            sample_id="3",
+            project_test_command="./mvnw -q verify",
+            raw={**focused_sample.raw, "test_commit": "different-test-provenance"},
+        )
+        try:
+            runner._resolve_verification_command_specs(
+                [focused_sample, conflicting_row], no_cli_spec
+            )
+        except ValueError as exc:
+            assert "PROJECT_VERIFICATION_SPEC_CONFLICT" in str(exc), exc
+        else:
+            raise AssertionError("one project revision must have one project spec")
+
+        partial_dataset = root / "partial-verification.csv"
+        with partial_dataset.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "sample_id",
+                    "language",
+                    "smell_type",
+                    "project_name",
+                    "project_path",
+                    "location",
+                    "verification_cwd",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "sample_id": "partial",
+                    "language": "python",
+                    "smell_type": "long_method",
+                    "project_name": "demo",
+                    "project_path": str(project),
+                    "location": f"{source}:method=f|line=1",
+                    "verification_cwd": ".",
+                }
+            )
+        try:
+            runner._load_samples(partial_dataset)
+        except ValueError as exc:
+            assert "DATASET_VERIFICATION_COMMAND_PAIR_REQUIRED" in str(exc), exc
+        else:
+            raise AssertionError("dataset cwd without a command pair must fail")
         auth_args = SimpleNamespace(
             dry_run=False,
             checkout_only=False,
@@ -172,7 +290,7 @@ def main() -> int:
                 strict_oracle,
                 argparse.Namespace(verification_mode="project_full"),
             )
-            == "sample_optimized"
+            == "project_full"
         )
         project_full_command = replace(
             sample,
@@ -193,7 +311,7 @@ def main() -> int:
         try:
             runner._effective_verification_mode(
                 invalid_sample_oracle,
-                argparse.Namespace(verification_mode="project_full"),
+                argparse.Namespace(verification_mode=None),
             )
         except ValueError as exc:
             assert "SAMPLE_ORACLE_TEST_FILE_MISSING" in str(exc)
@@ -203,7 +321,7 @@ def main() -> int:
         try:
             runner._effective_verification_mode(
                 missing_strict_test,
-                argparse.Namespace(verification_mode="project_full"),
+                argparse.Namespace(verification_mode=None),
             )
         except ValueError as exc:
             assert "SAMPLE_ORACLE_TEST_FILE_MISSING" in str(exc)
@@ -218,6 +336,9 @@ def main() -> int:
             assert "Unsupported verification mode" in str(exc)
         else:
             raise AssertionError("legacy local mode must be rejected")
+        assert runner.build_parser().parse_args(
+            ["--dataset", str(dataset)]
+        ).verification_mode is None
         prompt = runner._task_prompt(sample)
         assert "Repair this one python smell" in prompt
         assert "Repair this one Java smell" not in prompt
@@ -266,6 +387,65 @@ def main() -> int:
         )
         assert direct.returncode == 0, direct.stderr
         assert "python" in direct.stdout
+        assert '"verification_mode": "project_full"' in direct.stdout
+        assert '"verification_modes": [' in direct.stdout
+
+        forced_project_full = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "run_smell_dataset.py"),
+                "--dataset",
+                str(dataset),
+                "--allow-test-changes",
+                "--dry-run",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert forced_project_full.returncode == 0, forced_project_full.stderr
+        assert '"verification_mode_override": null' in forced_project_full.stdout
+        assert (
+            '"verification_mode_forced_by_test_changes": true'
+            in forced_project_full.stdout
+        )
+
+        direct_cli_spec = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "run_smell_dataset.py"),
+                "--dataset",
+                str(dataset),
+                "--build-command",
+                "python -m compileall .",
+                "--project-test-command",
+                "python -m unittest",
+                "--verification-cwd",
+                ".",
+                "--dry-run",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert direct_cli_spec.returncode == 0, direct_cli_spec.stderr
+        assert '"source": "cli"' in direct_cli_spec.stdout
+        partial_cli_spec = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "run_smell_dataset.py"),
+                "--dataset",
+                str(dataset),
+                "--build-command",
+                "true",
+                "--dry-run",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert partial_cli_spec.returncode == 2, partial_cli_spec
+        assert "CLI_VERIFICATION_COMMAND_PAIR_REQUIRED" in partial_cli_spec.stderr
 
         report_dir = project / "build" / "test-results" / "test"
         report_dir.mkdir(parents=True)

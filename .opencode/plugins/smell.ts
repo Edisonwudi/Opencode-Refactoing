@@ -72,6 +72,11 @@ type CommandTaskIdentity = {
   verification_mode: VerificationMode
   sample_test_location: string
   sample_test_command: string
+  build_command: string
+  project_test_command: string
+  verification_cwd: string
+  verification_command_source: string
+  sample_test_source: string
 }
 
 type CommandPolicy = {
@@ -93,6 +98,11 @@ type ControllerIdentity = {
   verificationMode: VerificationMode
   sampleTestLocation?: string
   sampleTestCommand?: string
+  buildCommand?: string
+  projectTestCommand?: string
+  verificationCwd?: string
+  verificationCommandSource?: string
+  sampleTestSource?: string
   checkpointRequired: boolean
 }
 
@@ -106,6 +116,11 @@ type CommandIdentityBinding = {
   verification_mode: string
   sample_test_location: string
   sample_test_command: string
+  build_command: string
+  project_test_command: string
+  verification_cwd: string
+  verification_command_source: string
+  sample_test_source: string
 }
 
 type CommandLoopState = {
@@ -118,7 +133,7 @@ type CommandLoopState = {
   lastFailureFingerprint: string
 }
 
-const COMMAND_LOOP_STATE_VERSION = 3
+const COMMAND_LOOP_STATE_VERSION = 4
 const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
 const BASELINE_CONTEXT_FILE_ENV = "SMELL_BASELINE_CONTEXT_FILE"
 const CONTROLLER_CONTEXT_AUDIT_FILE_ENV = "SMELL_CONTROLLER_CONTEXT_AUDIT_FILE"
@@ -177,6 +192,11 @@ function withBatchDefaults(input: {
   const envVerificationMode = envDefault("SMELL_VERIFICATION_MODE")
   const envSampleTestLocation = envDefault("SMELL_SAMPLE_TEST_LOCATION")
   const envSampleTestCommand = envDefault("SMELL_SAMPLE_TEST_COMMAND")
+  const envBuildCommand = envDefault("SMELL_BUILD_COMMAND")
+  const envProjectTestCommand = envDefault("SMELL_PROJECT_TEST_COMMAND")
+  const envVerificationCwd = envDefault("SMELL_VERIFICATION_CWD")
+  const envVerificationCommandSource = envDefault("SMELL_VERIFICATION_COMMAND_SOURCE")
+  const envSampleTestSource = envDefault("SMELL_SAMPLE_TEST_SOURCE")
   const hasBatchIdentity = Boolean(envProjectRoot && envSmell && envLocation)
   return {
     ...input,
@@ -189,6 +209,11 @@ function withBatchDefaults(input: {
     verificationMode: hasBatchIdentity ? envVerificationMode : (input.verificationMode || envVerificationMode),
     sampleTestLocation: envSampleTestLocation,
     sampleTestCommand: envSampleTestCommand,
+    buildCommand: envBuildCommand,
+    projectTestCommand: envProjectTestCommand,
+    verificationCwd: envVerificationCwd,
+    verificationCommandSource: envVerificationCommandSource,
+    sampleTestSource: envSampleTestSource,
     checkpointRequired: input.checkpointRequired === true,
   }
 }
@@ -205,6 +230,11 @@ function commonArgs(input: {
   verificationMode?: string
   sampleTestLocation?: string
   sampleTestCommand?: string
+  buildCommand?: string
+  projectTestCommand?: string
+  verificationCwd?: string
+  verificationCommandSource?: string
+  sampleTestSource?: string
 }): string[] {
   const args = [
     "--project-root",
@@ -222,6 +252,11 @@ function commonArgs(input: {
   addOptional(args, "--verification-mode", input.verificationMode)
   addOptional(args, "--sample-test-location", input.sampleTestLocation)
   addOptional(args, "--sample-test-command", input.sampleTestCommand)
+  addOptional(args, "--build-command", input.buildCommand)
+  addOptional(args, "--project-test-command", input.projectTestCommand)
+  addOptional(args, "--verification-cwd", input.verificationCwd)
+  addOptional(args, "--verification-command-source", input.verificationCommandSource)
+  addOptional(args, "--sample-test-source", input.sampleTestSource)
   return args
 }
 
@@ -237,6 +272,11 @@ function controllerIdentityFromPolicy(policy: CommandPolicy): ControllerIdentity
     verificationMode: identity.verification_mode,
     sampleTestLocation: identity.sample_test_location || undefined,
     sampleTestCommand: identity.sample_test_command || undefined,
+    buildCommand: identity.build_command || undefined,
+    projectTestCommand: identity.project_test_command || undefined,
+    verificationCwd: identity.verification_cwd || undefined,
+    verificationCommandSource: identity.verification_command_source || undefined,
+    sampleTestSource: identity.sample_test_source || undefined,
     checkpointRequired: policy.checkpoint_required,
   }
 }
@@ -257,6 +297,11 @@ function batchCommandIdentityBinding(): CommandIdentityBinding | undefined {
     verification_mode: verificationMode,
     sample_test_location: envDefault("SMELL_SAMPLE_TEST_LOCATION") || "",
     sample_test_command: envDefault("SMELL_SAMPLE_TEST_COMMAND") || "",
+    build_command: envDefault("SMELL_BUILD_COMMAND") || "",
+    project_test_command: envDefault("SMELL_PROJECT_TEST_COMMAND") || "",
+    verification_cwd: envDefault("SMELL_VERIFICATION_CWD") || "",
+    verification_command_source: envDefault("SMELL_VERIFICATION_COMMAND_SOURCE") || "",
+    sample_test_source: envDefault("SMELL_SAMPLE_TEST_SOURCE") || "",
   }
 }
 
@@ -2209,6 +2254,13 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
   const verificationMode = payload?.verification_mode
   const allowedModes: VerificationMode[] = ["local", "auto", "sample_optimized", "project_full"]
   const allowedFailureGroups = new Set(["smell", "compile", "test"])
+  const allowedCommandSources = new Set([
+    "command",
+    "cli",
+    "dataset",
+    "project_manifest",
+    "language_default",
+  ])
   const requiredIdentityStrings = ["project_root", "smell", "location"] as const
   const optionalIdentityStrings = [
     "project_override_root",
@@ -2216,6 +2268,11 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
     "target_context_json",
     "sample_test_location",
     "sample_test_command",
+    "build_command",
+    "project_test_command",
+    "verification_cwd",
+    "verification_command_source",
+    "sample_test_source",
   ] as const
   if (!payload || typeof payload.task !== "string" || !payload.task.trim()) {
     throw new Error("INVALID_LOOP_POLICY: resolver returned no task text")
@@ -2240,6 +2297,37 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
   for (const key of optionalIdentityStrings) {
     if (typeof identity[key] !== "string") {
       throw new Error(`INVALID_COMMAND_TASK_IDENTITY: resolver returned invalid ${key}`)
+    }
+  }
+  const buildCommand = String(identity.build_command || "").trim()
+  const projectTestCommand = String(identity.project_test_command || "").trim()
+  const verificationCwd = String(identity.verification_cwd || "").trim()
+  const verificationCommandSource = String(identity.verification_command_source || "").trim()
+  const sampleTestCommand = String(identity.sample_test_command || "").trim()
+  const sampleTestSource = String(identity.sample_test_source || "").trim()
+  if (Boolean(buildCommand) !== Boolean(projectTestCommand) || (verificationCwd && !buildCommand)) {
+    throw new Error(
+      "EXPLICIT_VERIFICATION_COMMAND_PAIR_REQUIRED: build_command and "
+      + "project_test_command must be provided together before verification_cwd",
+    )
+  }
+  if (verificationCommandSource && !buildCommand) {
+    throw new Error(
+      "VERIFICATION_COMMAND_SOURCE_WITHOUT_COMMANDS: "
+      + "verification_command_source requires the complete build/project-test pair",
+    )
+  }
+  if (sampleTestSource && !sampleTestCommand) {
+    throw new Error(
+      "SAMPLE_TEST_SOURCE_WITHOUT_COMMAND: sample_test_source requires sample_test_command",
+    )
+  }
+  for (const [field, source] of [
+    ["verification_command_source", verificationCommandSource],
+    ["sample_test_source", sampleTestSource],
+  ] as const) {
+    if (source && !allowedCommandSources.has(source)) {
+      throw new Error(`INVALID_COMMAND_TASK_IDENTITY: unsupported ${field} '${source}'`)
     }
   }
   if (identity.verification_mode !== verificationMode) {
@@ -2289,6 +2377,11 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
       verification_mode: identity.verification_mode as VerificationMode,
       sample_test_location: identity.sample_test_location as string,
       sample_test_command: identity.sample_test_command as string,
+      build_command: identity.build_command as string,
+      project_test_command: identity.project_test_command as string,
+      verification_cwd: identity.verification_cwd as string,
+      verification_command_source: identity.verification_command_source as string,
+      sample_test_source: identity.sample_test_source as string,
     },
     loop: {
       mode: loop.mode as LoopPolicy["mode"],
@@ -2875,6 +2968,11 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           resolved.verificationMode = controllerIdentity.verificationMode
           resolved.sampleTestLocation = controllerIdentity.sampleTestLocation
           resolved.sampleTestCommand = controllerIdentity.sampleTestCommand
+          resolved.buildCommand = controllerIdentity.buildCommand
+          resolved.projectTestCommand = controllerIdentity.projectTestCommand
+          resolved.verificationCwd = controllerIdentity.verificationCwd
+          resolved.verificationCommandSource = controllerIdentity.verificationCommandSource
+          resolved.sampleTestSource = controllerIdentity.sampleTestSource
           resolved.checkpointRequired = controllerIdentity.checkpointRequired
         }
         const javaCheckpoint = isJavaCheckpointIdentity(resolved)
@@ -3321,6 +3419,11 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             verificationMode: policy.verification_mode,
             sampleTestLocation: identity.sampleTestLocation,
             sampleTestCommand: identity.sampleTestCommand,
+            buildCommand: identity.buildCommand,
+            projectTestCommand: identity.projectTestCommand,
+            verificationCwd: identity.verificationCwd,
+            verificationCommandSource: identity.verificationCommandSource,
+            sampleTestSource: identity.sampleTestSource,
           }),
           "--output-detail",
           "decision",
