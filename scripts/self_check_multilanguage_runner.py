@@ -218,11 +218,7 @@ def main() -> int:
             assert "Unsupported verification mode" in str(exc)
         else:
             raise AssertionError("legacy local mode must be rejected")
-        prompt = runner._task_prompt(
-            sample,
-            argparse.Namespace(allow_test_changes=False),
-            "project_full",
-        )
+        prompt = runner._task_prompt(sample)
         assert "Repair this one python smell" in prompt
         assert "Repair this one Java smell" not in prompt
         assert "IDEA preference" not in prompt

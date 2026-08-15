@@ -55,7 +55,7 @@ docker image inspect \
 npm ci && (cd .opencode && npm ci && cd ..)
 python3 -m pip install pyyaml tree_sitter tree_sitter_language_pack
 # Ubuntu 24.04(PEP 668)请改用 venv,或加 --break-system-packages
-npm run check && npm run check:self
+npm run check
 ```
 
 要求：Node.js ≥ 18（推荐 22)、Python ≥ 3.10、Docker 24+。
@@ -104,7 +104,7 @@ docker run --rm \
   --mount type=bind,src="$PWD/runs",dst=/runs \
   -e SMELL_OPENCODE_API_KEY \
   opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
-  --dataset /opt/dataset/java/delivery_schema/mysterious_name.csv \
+  --dataset /agent-src/dataset/java/delivery_schema/mysterious_name.csv \
   --sample-id 8 \
   --model minimax/MiniMax-M2.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \
@@ -148,7 +148,7 @@ worklist、测试清单或源码 diff 复制进模型上下文。模型需要进
 ### 1.9 日常更新
 
 ```bash
-git pull    # agent 源码即最新版;镜像无需任何操作
+git pull    # 更新 agent 源码及仓库内权威 dataset
 ```
 
 Java 环境镜像的唯一构建入口是
@@ -158,12 +158,10 @@ Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在
 从 `/agent-src` 只读装配。`npm run check:mounted-source` 会阻断重新复制这些源码
 或绕过挂载入口的 Dockerfile 改动。
 
-只有以下环境契约变化才重建镜像：Java 工具链、项目快照、dataset、离线依赖，
-或 `package-lock.json` / `.opencode/package-lock.json`。其余 Agent 逻辑更新只
-同步仓库；实验结果同时记录 Git commit 与环境镜像 ID，避免把两种版本混为一谈。
-
-只有环境本身（Java 工具链、项目快照、依赖缓存、dataset）变化才需要重新
-交付镜像（回到 1.2）。
+Java 工具链、项目快照、离线依赖或两个 lockfile 变化时必须重建镜像。仓库
+dataset 更新后，运行时应使用 `/agent-src/dataset/...` 的权威 CSV；只有需要同步
+更新镜像内 `/opt/dataset/...` 快照时才重建镜像。实验结果同时记录 Git commit、
+dataset 路径与环境镜像 ID，避免把三种版本混为一谈。
 
 ### 1.10 非 Java 语言（python / c / cpp）
 
@@ -176,7 +174,8 @@ Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在
 30 样本；**已是容器路径格式**——`/opt/projects/<lang>/<name>`，与快照 payload
 逐字节一致，容器内可直接通过 `/agent-src` 挂载使用）。
 Java 数据集的权威源同样在本仓库 `dataset/java/delivery_schema/<smell>.csv`
-（对应镜像内 `/opt/dataset/java/delivery_schema/`，同为容器路径格式）。
+（容器内使用 `/agent-src/dataset/java/delivery_schema/`；镜像内 `/opt/dataset/`
+只代表该镜像验收时冻结的历史快照）。
 8 种基础异味：long_method、long_parameter_list、nested_complexity、
 switch_statements、data_clumps、code_clone_type1、god_class、dead_code。
 检测层面非 Java 现已
@@ -499,7 +498,7 @@ disabled/ignored/assumption-skip，测试资源和验证配置仍不可改；声
 
 ```bash
 python3 scripts/run_smell_dataset.py \
-  --dataset /opt/dataset/java/delivery_schema/<smell>.csv \
+  --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
   --sample-id <id> \
   --model minimax/MiniMax-M2.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \
@@ -565,13 +564,14 @@ delivery/                    交付镜像清单(tag / sha256 / 使用说明)
 docker/                      mounted-source 与 delivery entrypoint
 ```
 
-自检：`npm run check`、`npm run check:self`，以及 `scripts/self_check_*.py`
-（契约、各 adapter、guard、runner 续跑、统一结构闭包等回归用例）。
+日常全量自检运行 `npm run check`（已包含 `check:self` 及根目录
+`package.json` 列出的 Python 自检）；仅在定位问题时单独运行
+`npm run check:self` 或对应的 `scripts/self_check_*.py`。
 
 异味 skill 采用“主流程 + 语言 reference”组织：10 个通用异味支持
-Java/Python/C/C++，Java 特有的 `refused_bequest` 只暴露 Java reference。旧
-`java-smell-edit-patterns` 内容作为兼容归档保留，新 Java reference 与其逐字节一致；
-IDEA 后端仍按异味加载 `idea-refactor-cli` 的单个 YAML，不与语言语义规则混写。
+Java/Python/C/C++，Java 特有的 `refused_bequest` 只暴露 Java reference。每个
+`smell-repair-*` 是该异味语义规则的唯一来源；IDEA 后端仍按异味加载
+`idea-refactor-cli` 的单个 YAML，不与语言语义规则混写。
 
 约定：实验结果、worktree、`runs/`、`node_modules/`、`images/` 都不进 Git;
 key 不进任何文件。

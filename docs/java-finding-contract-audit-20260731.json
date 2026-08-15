@@ -1,4 +1,9 @@
 {
+  "snapshot": {
+    "generated_at": "2026-07-31",
+    "source_commit": "022ed70",
+    "historical": true
+  },
   "summary": {
     "rows": 751,
     "baseline_hit": 751,

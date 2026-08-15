@@ -274,8 +274,6 @@ def evaluate_mysterious_name(
                 methods,
                 int(syntax.DEFAULT_THRESHOLDS["mysterious_name_min_len"]),
                 syntax.DEFAULT_LOW_INFO_NAMES,
-                profile="strict",
-                exclude_tests=True,
             )
         )
         findings.extend(
@@ -286,7 +284,6 @@ def evaluate_mysterious_name(
                 methods,
                 int(syntax.DEFAULT_THRESHOLDS["mysterious_name_min_len"]),
                 syntax.DEFAULT_LOW_INFO_NAMES,
-                profile="strict",
             )
         )
     except (OSError, RuntimeError, UnicodeError, ValueError) as exc:

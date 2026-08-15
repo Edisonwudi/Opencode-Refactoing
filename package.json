@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "private": true,
   "type": "module",
-  "description": "Minimal OpenCode Java smell refactor plugin delivery package.",
+  "description": "OpenCode smell refactor delivery package for Java, Python, C, and C++.",
   "dependencies": {
     "@opencode-ai/plugin": "1.15.10"
   },
@@ -28,6 +28,7 @@
     "check:improvement-gate": "python3 scripts/self_check_improvement_gate.py",
     "check:checkpoint-nonutf8": "python3 scripts/self_check_checkpoint_nonutf8_patch.py",
     "check:nonjava-filters": "python3 scripts/self_check_nonjava_production_filter.py && python3 scripts/self_check_nonjava_semantic_probes.py",
+    "check:nonjava-contracts": "python3 scripts/self_check_nonjava_data_clump_migration.py && python3 scripts/self_check_nonjava_god_class_contract.py",
     "check:runner-closure": "python3 scripts/self_check_runner_continue.py",
     "check:runner-verification-lifecycle": "python3 scripts/self_check_runner_verification_lifecycle.py && python3 scripts/self_check_runner_final_receipt.py",
     "check:smoke-result-validator": "python3 scripts/self_check_smoke_result_validator.py",
@@ -41,6 +42,6 @@
     "check:target-guard-v5": "python3 scripts/self_check_guard_dispatch.py && python3 scripts/self_check_guard_scope.py && python3 scripts/self_check_scoped_java_model.py && python3 scripts/self_check_target_guard_predicates.py && python3 scripts/self_check_target_relational_guards.py && python3 scripts/self_check_target_clone_guard.py && python3 scripts/self_check_target_relation_scope.py && python3 scripts/self_check_target_feature_envy_scope.py && python3 scripts/self_check_target_semantic_guards.py && python3 scripts/self_check_dead_code_reference_resolution.py && python3 scripts/self_check_java_target_guard_v5.py",
     "check:target-baseline-audit": "python3 scripts/self_check_java_target_guard_baseline_audit.py",
     "check:self": "node scripts/self_check_smell_verify.mjs",
-    "check": "npm run check:bridge && npm run check:config && npm run check:plugin && npm run check:maven-offline-repo && npm run check:image-dependencies && npm run check:guard-profile && npm run check:smell-skill-organization && npm run check:target-guard-v5 && npm run check:target-baseline-audit && npm run check:audit-provenance && npm run check:checkpoint-contract && npm run check:test-change-contract && npm run check:improvement-gate && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:runner-closure && npm run check:runner-verification-lifecycle && npm run check:smoke-result-validator && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner && npm run check:focused-guards && npm run check:self"
+    "check": "npm run check:bridge && npm run check:config && npm run check:plugin && npm run check:maven-offline-repo && npm run check:image-dependencies && npm run check:guard-profile && npm run check:smell-skill-organization && npm run check:target-guard-v5 && npm run check:target-baseline-audit && npm run check:audit-provenance && npm run check:checkpoint-contract && npm run check:test-change-contract && npm run check:improvement-gate && npm run check:checkpoint-nonutf8 && npm run check:nonjava-filters && npm run check:nonjava-contracts && npm run check:runner-closure && npm run check:runner-verification-lifecycle && npm run check:smoke-result-validator && npm run check:project-revision && npm run check:clone-contract && npm run check:mounted-source && npm run check:multilanguage-runner && npm run check:focused-guards && npm run check:self"
   }
 }

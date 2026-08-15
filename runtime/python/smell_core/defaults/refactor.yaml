@@ -4,101 +4,48 @@ defaults:
   run_tests: true
 generic_smells: &generic_smells
   long_method:
-    instruction: Extract cohesive helpers or introduce guard clauses to reduce the target function while preserving behavior.
-    constraints:
-    - Keep changes focused on the labeled function and production source.
-    verification:
-    - Reduce the target function's meaningful line count and pass configured project tests.
     guards:
     - type: long_method
       max_lines: 60
     retry_hint_template: Reduce the labeled function further without weakening tests.
   long_parameter_list:
-    instruction: Reduce the target function's parameter burden with a cohesive parameter object or narrower API.
-    constraints:
-    - Update production callers and preserve the public contract where required.
-    verification:
-    - Reduce the labeled declaration's parameter count and pass configured project tests.
     guards:
     - type: long_parameter_list
       max_params: 5
     retry_hint_template: Reduce the labeled declaration's parameter count before retrying.
   nested_complexity:
-    instruction: Flatten the target function with guard clauses and cohesive helpers while preserving behavior.
-    constraints:
-    - Change the labeled control flow rather than unrelated code.
-    verification:
-    - Reduce the target function's measured complexity and pass configured project tests.
     guards:
     - type: nested_complexity
       max_complexity: 20
     retry_hint_template: Reduce the labeled function's nesting or branching further.
   switch_statements:
-    instruction: Replace switch-heavy branching with clearer dispatch or focused helpers while preserving behavior.
-    constraints:
-    - Keep every existing branch behavior covered.
-    verification:
-    - Remove every switch from the target function and pass configured project tests.
     guards:
     - type: switch_statements
     retry_hint_template: The target function still contains a switch; remove it without changing branch behavior.
   code_clone_type1:
-    instruction: Centralize the exact duplicated behavior shared by the two labeled functions.
-    constraints:
-    - Preserve both call paths and avoid unrelated cleanup.
-    - Centralize the clone in one shared owner; do not perturb tokens or copy it into parallel helpers.
-    verification:
-    - Prove a shared callee, owner delegation, or inherited implementation; reject moved duplicate bodies.
-    - Pass configured project build and tests.
     guards:
     - type: code_clone_type1
       min_tokens: 30
     retry_hint_template: The labeled pair still contains exact duplicated logic.
   data_clumps:
-    instruction: Replace the recurring labeled parameter group with a cohesive language-appropriate abstraction.
-    constraints:
-    - Update all production call sites and obey the controller-frozen test-change policy; when test migration is allowed, update only callers affected by the API change and preserve their assertions.
-    verification:
-    - Reduce occurrences of the labeled group and pass configured project tests.
     guards:
     - type: data_clumps
     retry_hint_template: The labeled parameter group still recurs across too many functions.
   god_class:
-    instruction: Move one cohesive responsibility out of the labeled class or C module into a focused collaborator.
-    constraints:
-    - Preserve behavior and keep the extraction focused on one responsibility cluster.
-    verification:
-    - Make the frozen source-derived God Class profile false and pass configured project tests.
     guards:
     - type: god_class
       # Continuation progress only; never a finding or PASS condition.
       min_improved_relative_reduction: 0.05
     retry_hint_template: Move a measurable responsibility out of the labeled class or module.
   dead_code:
-    instruction: Remove the exact labeled unused declaration while preserving behavior.
-    constraints:
-    - Do not remove public APIs, framework hooks, or referenced declarations.
-    verification:
-    - Remove the labeled declaration and pass configured project tests.
     guards:
     - type: dead_code
     retry_hint_template: Remove the exact labeled dead declaration or report its concrete reference.
   feature_envy:
-    instruction: Move behavior toward the envied receiver — add a method to the receiver's type (or module) that owns the receiver-data-heavy logic, or extract that cohesive logic into a helper taking the receiver as its parameter — while preserving behavior.
-    constraints:
-    - Keep changes focused on the labeled function and its dominant foreign receiver.
-    - Caching receiver fields into local variables, rewriting access syntax, or otherwise reducing the measured access count without moving behavior does not count as refactoring.
-    verification:
-    - Reduce member accesses on the envied receiver and pass configured project tests.
     guards:
     - type: feature_envy
     retry_hint_template: Reduce accesses to the envied receiver in the labeled function further.
   mysterious_name:
-    instruction: Rename the unclear identifier at the target location to a descriptive name while preserving behavior.
-    constraints:
-    - Update all references consistently and keep the rename focused on the reported identifier.
-    verification:
-    - The reported identifier no longer appears at the target and configured tests pass.
     guards:
     - type: mysterious_name
     retry_hint_template: Rename the unclear identifier frozen in the target Guard contract before retrying.
@@ -112,157 +59,54 @@ languages:
       command: mvn -q -Drat.skip=true test
     smells:
       long_method:
-        instruction: Refactor the target method into smaller cohesive helpers or guard
-          clauses while preserving behavior.
-        constraints:
-        - Keep the changes narrow and focused on the target method.
-        - Preserve public behavior and existing interfaces.
-        verification:
-        - Confirm the target method is shorter and easier to read.
         guards:
         - type: long_method
         retry_hint_template: Address the reported long-method issue before submitting
           again.
       long_parameter_list:
-        instruction: Reduce the parameter burden of the target API while preserving
-          behavior.
-        constraints:
-        - Prefer introducing a cohesive parameter object or helper abstraction.
-        verification:
-        - Ensure callers still behave the same after the refactor.
         guards:
         - type: long_parameter_list
         retry_hint_template: Reduce the effective parameter count of the target method
           before retrying.
       nested_complexity:
-        instruction: Reduce branching and nesting in the target logic while preserving
-          behavior.
-        constraints:
-        - Prefer guard clauses, decomposition, and clearer control flow.
-        verification:
-        - Ensure the method remains behaviorally equivalent.
         guards:
         - type: nested_complexity
         retry_hint_template: Flatten the control flow further before retrying.
       switch_statements:
-        instruction: Refactor switch-heavy branching into clearer control flow while
-          preserving behavior.
-        constraints:
-        - Prefer dispatch helpers, lookup tables, or focused helper functions when
-          they improve readability.
-        verification:
-        - Ensure branch behavior remains equivalent after the refactor.
         guards:
         - type: switch_statements
         retry_hint_template: Reduce the switch-heavy branching further before retrying.
       code_clone_type1:
-        instruction: Remove the duplicated logic across the clone locations while
-          preserving behavior.
-        constraints:
-        - Use extraction or a shared helper only when it keeps the code clearer.
-        verification:
-        - Ensure the duplicate implementation is no longer present in both target
-          locations.
         guards:
         - type: code_clone_type1
         retry_hint_template: The two target blocks still look like a type-1 clone.
           Remove or centralize the duplication.
       feature_envy:
-        instruction: Move the target method to the class it is most enamored with,
-          or extract the foreign-data-heavy logic into a method on the appropriate
-          receiver class.
-        constraints:
-        - Keep the changes narrow and focused on the target method.
-        - Preserve public behavior and existing interfaces.
-        - Ensure the moved or extracted method has a clear single responsibility.
-        verification:
-        - Confirm the foreign member accesses have been eliminated or significantly
-          reduced.
-        - Ensure existing callers still work correctly.
         guards:
         - type: feature_envy
         retry_hint_template: Reduce foreign data accesses in the target method by
           moving or extracting logic to the appropriate receiver.
       data_clumps:
-        instruction: Identify the recurring group of parameters that always appear
-          together across multiple methods and extract them into a cohesive data class
-          or helper abstraction while preserving behavior.
-        constraints:
-        - Keep the changes narrow and focused on the target clump sites.
-        - Prefer introducing a parameter object or data class for the clumped parameters.
-        - Preserve existing caller behavior and public interfaces.
-        verification:
-        - Confirm the clumped parameter group is no longer repeated across the affected
-          methods.
-        - Ensure existing callers still work correctly.
         guards:
         - type: data_clumps
         retry_hint_template: Extract the repeated parameter group into a cohesive
           object before retrying.
       god_class:
-        instruction: Split the target class by moving cohesive responsibilities into
-          focused collaborators while preserving behavior.
-        constraints:
-        - Keep the change focused on the reported class and one coherent responsibility
-          cluster.
-        - Migrate a cohesive field/state cluster together with the methods that maintain
-          it; delete private wrappers that merely preserve the original class size.
-        - Preserve public behavior, callers, and existing serialization or framework
-          contracts.
-        verification:
-        - Confirm the target class no longer exceeds the god_class detector thresholds.
-        - Ensure moved or delegated behavior still has tests and build passing.
         guards:
         - type: god_class
         retry_hint_template: Move or delegate a cohesive responsibility cluster out
           of the target class before retrying.
       dead_code:
-        instruction: Remove the reported unused private Java member while preserving
-          behavior.
-        constraints:
-        - Keep the change focused on the reported private method or member.
-        - Do not delete public APIs, framework entrypoints, annotated methods, lifecycle
-          hooks, serialization hooks, or reflection/config-driven members.
-        - If product-source analysis reports real references, stop and report the blocker
-          instead of forcing deletion.
-        verification:
-        - Confirm the unused private member is no longer reported by the dead_code
-          detector.
-        - Ensure the project still compiles and configured tests pass.
         guards:
         - type: dead_code
         retry_hint_template: Remove the reported unused private member or explain the
           concrete reference that prevents safe deletion.
       mysterious_name:
-        instruction: Rename the unclear Java identifier at the target location to
-          a descriptive name while preserving behavior.
-        constraints:
-        - Keep the rename focused on the suspicious parameter, local variable, method,
-          or class name.
-        verification:
-        - Confirm the frozen target smell no longer appears at the target
-          declaration or body.
-        - Ensure existing callers still compile and tests pass.
         guards:
         - type: mysterious_name
         retry_hint_template: Rename the unclear identifier frozen in the checkpoint finding
           before retrying.
       refused_bequest:
-        instruction: Refactor the refused bequest hierarchy by removing useless overrides,
-          implementing or delegating required behavior, splitting capabilities, pulling
-          shared behavior up, pushing specialized behavior down, or replacing inheritance
-          with delegation when appropriate.
-        constraints:
-        - Keep the hierarchy change narrow and focused on the reported class.
-        - Preserve public behavior and existing subtype contracts.
-        - Inspect the source-derived parent contract, sibling implementers, and production
-          callers before choosing implementation, delegation, or a capability split.
-        - A log statement, comment, swallowed exception, or placeholder constant is not an
-          implementation of an inherited contract.
-        verification:
-        - Confirm suspicious no-op or rejecting overrides have been reduced or removed.
-        - Confirm the refused_bequest guard no longer reports the target.
-        - Ensure the controller-selected build/test contract passes.
         guards:
         - type: refused_bequest
         retry_hint_template: The rejecting or empty inheritance pattern remains. Change

@@ -15,7 +15,6 @@ from typing import Any, Mapping
 from .analysis import (
     extract_snippet,
     extract_snippet_candidates,
-    method_basename,
     signature_parameter_fingerprints,
 )
 from .feature_envy import (

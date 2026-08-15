@@ -56,7 +56,6 @@ def _config(root: Path) -> ResolvedRunConfig:
     return ResolvedRunConfig(
         project_root=root,
         dataset_root=root,
-        idea_project_root=root,
         build_root=root,
         smell="nested_complexity",
         language="c",
@@ -93,7 +92,7 @@ def _config(root: Path) -> ResolvedRunConfig:
         sample_test=CommandConfig(),
         env={},
         cwd=root,
-        profile=SmellProfile(instruction="", guards=[]),
+        profile=SmellProfile(guards=[]),
         verification_mode="project_full",
         build_source="fixture",
         test_source="fixture",

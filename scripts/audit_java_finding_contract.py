@@ -265,7 +265,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "docs" / "java-finding-contract-audit-current",
+        default=ROOT / "runs" / "java-finding-contract-audit",
     )
     parser.add_argument(
         "--smell",

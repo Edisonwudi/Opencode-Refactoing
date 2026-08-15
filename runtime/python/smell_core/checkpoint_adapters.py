@@ -18,7 +18,6 @@ from .analysis import (
     estimate_switch_branches,
     explicit_target_files_parseability,
     extract_class_definition_candidate_records,
-    extract_class_definition_candidates,
     extract_snippet,
     extract_snippet_candidates,
     function_signatures_in_file,
@@ -26,7 +25,6 @@ from .analysis import (
     method_basename,
     nonjava_finding_threshold,
     python_switch_metrics,
-    source_file_parseable,
     source_syntax_issue_witnesses,
     syntax_issue_witness_additions,
 )

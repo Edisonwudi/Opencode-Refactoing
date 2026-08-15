@@ -54,18 +54,12 @@ class DefaultsConfig:
 
 @dataclass
 class SmellProfile:
-    instruction: str
-    constraints: List[str] = field(default_factory=list)
-    verification: List[str] = field(default_factory=list)
     guards: List[Dict[str, Any]] = field(default_factory=list)
     retry_hint_template: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SmellProfile":
         return cls(
-            instruction=str(data.get("instruction", "")).strip(),
-            constraints=[str(item) for item in data.get("constraints", [])],
-            verification=[str(item) for item in data.get("verification", [])],
             guards=[dict(item) for item in data.get("guards", [])],
             retry_hint_template=_clean_optional_string(data.get("retry_hint_template")),
         )
@@ -105,7 +99,6 @@ class LanguageConfig:
 @dataclass
 class ProjectRootsConfig:
     dataset: str = "."
-    idea: str = "."
     build: str = "."
 
     @classmethod
@@ -113,7 +106,6 @@ class ProjectRootsConfig:
         data = data or {}
         return cls(
             dataset=str(data.get("dataset") or ".").strip() or ".",
-            idea=str(data.get("idea") or ".").strip() or ".",
             build=str(data.get("build") or ".").strip() or ".",
         )
 
@@ -168,7 +160,6 @@ class RefactorConfig:
 class ResolvedRunConfig:
     project_root: Path
     dataset_root: Path
-    idea_project_root: Path
     build_root: Path
     smell: str
     language: str
@@ -182,8 +173,6 @@ class ResolvedRunConfig:
     profile: SmellProfile
     focused_preflight: CommandConfig = field(default_factory=CommandConfig)
     project_override: Optional[ProjectOverride] = None
-    idea_refactor_cli: Optional[str] = None
-    idea_refactor_ready: bool = False
     verification_mode: str = "project_full"
     build_source: str = "projects.yaml"
     test_source: str = "projects.yaml"
@@ -200,7 +189,6 @@ class ResolvedRunConfig:
         return {
             "project_root": str(self.project_root),
             "dataset_root": str(self.dataset_root),
-            "idea_project_root": str(self.idea_project_root),
             "build_root": str(self.build_root),
             "smell": self.smell,
             "language": self.language,
@@ -228,8 +216,6 @@ class ResolvedRunConfig:
             "profile": asdict(self.profile),
             "focused_preflight": self.focused_preflight.to_dict(),
             "project_override_root": str(self.project_override.root) if self.project_override else None,
-            "idea_refactor_cli": self.idea_refactor_cli,
-            "idea_refactor_ready": self.idea_refactor_ready,
             "verification_mode": self.verification_mode,
             "build_source": self.build_source,
             "test_source": self.test_source,
@@ -379,7 +365,6 @@ def resolve_run_config(
     override = select_project_override(project_overrides, override_lookup_root)
     roots = override.roots if override else ProjectRootsConfig()
     dataset_root = _resolve_project_subroot(project_root_path, roots.dataset)
-    idea_project_root = _resolve_project_subroot(project_root_path, roots.idea)
     build_root = _resolve_project_subroot(project_root_path, roots.build)
     locations = parse_locations(location, dataset_root)
     language = resolve_language(
@@ -457,7 +442,6 @@ def resolve_run_config(
     return ResolvedRunConfig(
         project_root=project_root_path,
         dataset_root=dataset_root,
-        idea_project_root=idea_project_root,
         build_root=build_root,
         smell=smell,
         language=language,

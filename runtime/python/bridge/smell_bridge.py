@@ -1503,11 +1503,6 @@ def _rebase_build_test_config(
             source_root,
             fresh_root,
         ),
-        idea_project_root=_rebase_path_to_fresh_root(
-            resolved.idea_project_root,
-            source_root,
-            fresh_root,
-        ),
         build_root=_rebase_path_to_fresh_root(
             resolved.build_root,
             source_root,

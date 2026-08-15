@@ -19,8 +19,10 @@ from smell_core.config import (  # noqa: E402
     CommandConfig,
     DefaultsConfig,
     ProjectOverride,
+    ProjectRootsConfig,
     RefactorConfig,
     ResolvedRunConfig,
+    SmellProfile,
     load_refactor_config,
     load_project_overrides,
     resolve_run_config,
@@ -43,7 +45,15 @@ def main() -> int:
         "run_tests",
     ]
     assert [item.name for item in fields(RefactorConfig)] == ["defaults", "languages"]
-    assert "llm" not in {item.name for item in fields(ResolvedRunConfig)}
+    assert [item.name for item in fields(SmellProfile)] == ["guards", "retry_hint_template"]
+    assert [item.name for item in fields(ProjectRootsConfig)] == ["dataset", "build"]
+    resolved_fields = {item.name for item in fields(ResolvedRunConfig)}
+    assert not {
+        "llm",
+        "idea_project_root",
+        "idea_refactor_cli",
+        "idea_refactor_ready",
+    }.intersection(resolved_fields)
 
     with tempfile.TemporaryDirectory(prefix="config-self-check-") as raw_temp:
         temp = Path(raw_temp)
@@ -69,7 +79,13 @@ def main() -> int:
             verification_mode="project_full",
         )
         payload = resolved.to_dict()
-        assert "llm" not in payload
+        assert not {
+            "llm",
+            "idea_project_root",
+            "idea_refactor_cli",
+            "idea_refactor_ready",
+        }.intersection(payload)
+        assert set(payload["profile"]) == {"guards", "retry_hint_template"}
         assert payload["defaults"] == {
             "shell_timeout": 321,
             "run_build": True,

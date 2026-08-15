@@ -1890,24 +1890,18 @@ async function runIdleContinueSelfCheck(pluginModule) {
     "enabled",
   )
 
-  // Interactive OpenCode surfaces keep plugin-owned idle prompts. Dataset
-  // batch runs expose the same loop decision but leave prompt transport to the
-  // synchronous runner, so session.idle must remain silent.
+  // Interactive mode keeps plugin-owned idle prompts. Dataset batch runs expose
+  // the same loop decision but leave prompt transport to the synchronous runner.
   for (const modeCase of [
-    { name: "tui", argv: ["opencode"], enabled: true },
-    { name: "run", argv: ["opencode", "run"], enabled: true },
-    { name: "serve", argv: ["opencode", "serve"], enabled: true },
-    { name: "web", argv: ["opencode", "web"], enabled: true },
-    { name: "attach", argv: ["opencode", "attach"], enabled: true },
+    { name: "interactive", enabled: true },
     {
       name: "batch",
-      argv: ["opencode", "run"],
       env: { SMELL_BATCH_RUN: "1", SMELL_PROJECT_ROOT: "/tmp/project" },
       enabled: false,
     },
   ]) {
     const { client, calls } = makeFakeClient()
-    const rt = hooks.createIdleContinueRuntime({ client, argv: modeCase.argv, env: modeCase.env || {} })
+    const rt = hooks.createIdleContinueRuntime({ client, env: modeCase.env || {} })
     const metadata = record(rt)
     assertEqual(`idle_owner_${modeCase.name}_enabled`, metadata.enabled, modeCase.enabled, "enabled")
     assertEqual(`unified_${modeCase.name}_continuation`, metadata.continuation, 1, "continuation")
@@ -2049,7 +2043,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
   }
 
   return {
-    interactiveModes: ["tui", "run", "serve", "web", "attach"],
+    ownershipCases: ["interactive", "batch"],
     batchIdleController: "runner",
     sharedBudget: true,
     verifyClosure: true,

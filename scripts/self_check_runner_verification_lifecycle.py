@@ -276,8 +276,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "continue",
         1,
         3,
-        "repair",
-        failure_category="BUILD_COMPILE_ERROR",
     )
     check(
         "continuation_reads_build_test_priority_from_latest_tool_result",

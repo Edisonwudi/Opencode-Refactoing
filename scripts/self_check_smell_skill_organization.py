@@ -3,49 +3,28 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
-import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ROOT / ".opencode" / "skills"
-LEGACY = SKILLS / "java-smell-edit-patterns" / "references" / "edit-patterns"
 IDEA = SKILLS / "idea-refactor-cli" / "references" / "refactor-paths"
 
-JAVA_HASHES = {
-    "code_clone_type1": "ef201bd590b7c27888cfb7d374d5262a8aaddffe3334b54c6dce8857b022deae",
-    "data_clumps": "a748b7bdabd80b8209fa33cf8ce1e7e309c3f0e6e8d6584f6a968da7981ec7d2",
-    "dead_code": "d0c956de7c392e0768456c2112d4824f290562e0209111daf1d99c5a3208a83d",
-    "feature_envy": "20cec88e6cba007832b6390b568216722c986170f686de25420eb6738adb4ff9",
-    "god_class": "0a29c6bb8e3fd73a461cc0cdfdf932172788e8c6c868c9b859f429b5ef82ada3",
-    "long_method": "1f5e661efc47df8ba37625dd7914fb09648e0736f855c7ddccaed633b9f7a4bc",
-    "long_parameter_list": "5a7010e922f56395ca08848de035ef041cce3c79110738afdd6933e71748c9b9",
-    "mysterious_name": "26f909f2972ec1ea75b31bdee5fe196041d4d9ec7fdc472fd20a0af9eb1fc20e",
-    "nested_complexity": "09f1df2f7ecda60799147dcf14166c0f48e2a2bf6d58eea6a63843b6bb509634",
-    "refused_bequest": "c579dfa1ffc382d26d33d230481d41592fbb5663083108f6327a7035ca193e5b",
-    "switch_statements": "7e478364f08bd9d12469649d7f92ed47bfc7cb00e3fc82c151da2fdca3a6d36b",
-}
-IDEA_HASHES = {
-    "code_clone_type1": "20dd244091377696ee0e11f6b1ea914c461af970980d03b170bcca6c81bb53f6",
-    "data_clumps": "37123d14e78002a0de9670da50e6f44daf6e88898a72ac72927ce0acf2c2595e",
-    "dead_code": "c0b04c2639b3db13187b33d13391738c9389d93059966936e0c1ddf76a10e092",
-    "feature_envy": "00cc74a781c1b8987779585f8bbeb6c004c3166266ced4c1f7d535ffcce2d073",
-    "god_class": "8807ab7192f6c8831775061d674e920d631b4ca4001fe216741bd1bd36ed1685",
-    "long_method": "5184d014874bb875fb6f441c28fe9eba9c168ae26b760ed85ba9f427d87aa2a9",
-    "long_parameter_list": "24cf4efccc90d4806df43d93e681df59d5716637917549b5a6f6856f61a3ae09",
-    "mysterious_name": "752324a061056b8a9667071d7a8b7624e4c08887eec100c8af917efd871061b3",
-    "nested_complexity": "ce5a0754d109dce1077eafc0d561773ae197ef263a021ff7991a1c9f642dfaf4",
-    "refused_bequest": "bbed6fa985436585906682d22ecbec16c768e4b9b192d4e20c2aef15ab258a24",
-    "switch_statements": "9650e71c4caf7071c11839b2f216af3220cfdd19de2f43ae3410b44f868cff9c",
-}
-OPERATION_HASH = "b6140fdd5efb18221cc23d80461c726591ab12235b2ab373557c11899be599ea"
-GENERIC_SMELLS = tuple(smell for smell in JAVA_HASHES if smell != "refused_bequest")
-
-
-def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+JAVA_SMELLS = (
+    "code_clone_type1",
+    "data_clumps",
+    "dead_code",
+    "feature_envy",
+    "god_class",
+    "long_method",
+    "long_parameter_list",
+    "mysterious_name",
+    "nested_complexity",
+    "refused_bequest",
+    "switch_statements",
+)
+GENERIC_SMELLS = tuple(smell for smell in JAVA_SMELLS if smell != "refused_bequest")
 
 
 failures: list[str] = []
@@ -56,13 +35,10 @@ def require(condition: bool, message: str) -> None:
         failures.append(message)
 
 
-operation_source = LEGACY / "operation-translations.md"
-require(digest(operation_source) == OPERATION_HASH, "legacy operation translations drifted")
-
 java_dataset_smells = {
     path.stem for path in (ROOT / "dataset" / "java" / "delivery_schema").glob("*.csv")
 }
-require(java_dataset_smells == set(JAVA_HASHES), "per-smell skills do not cover the Java delivery schema")
+require(java_dataset_smells == set(JAVA_SMELLS), "per-smell skills do not cover the Java delivery schema")
 for language in ("python", "c", "cpp"):
     dataset_root = ROOT / "dataset" / "nonjava" / language
     dataset_smells = {
@@ -74,20 +50,19 @@ for language in ("python", "c", "cpp"):
     require(dataset_smells == set(GENERIC_SMELLS), f"per-smell skills do not cover {language} datasets")
 
 route_total = 0
-for smell, expected_hash in JAVA_HASHES.items():
+for smell in JAVA_SMELLS:
     skill_name = f"smell-repair-{smell.replace('_', '-')}"
     skill_root = SKILLS / skill_name
     skill_file = skill_root / "SKILL.md"
     java_reference = skill_root / "references" / "java.md"
-    legacy_reference = LEGACY / f"{smell}.md"
     operation_reference = skill_root / "references" / "operation-translations.md"
     idea_reference = IDEA / f"{smell}.yaml"
 
     require(skill_file.is_file(), f"missing primary skill: {skill_name}")
     require(java_reference.is_file(), f"missing Java reference: {skill_name}")
-    require(legacy_reference.is_file(), f"missing legacy Java reference: {smell}")
+    require(operation_reference.is_file(), f"missing operation reference: {smell}")
     require(idea_reference.is_file(), f"missing IDEA route: {smell}")
-    if not all(path.is_file() for path in (skill_file, java_reference, legacy_reference, idea_reference)):
+    if not all(path.is_file() for path in (skill_file, java_reference, operation_reference, idea_reference)):
         continue
 
     main_text = skill_file.read_text(encoding="utf-8")
@@ -98,6 +73,10 @@ for smell, expected_hash in JAVA_HASHES.items():
     require("TODO" not in main_text, f"unfinished primary skill: {skill_name}")
     require("Read exactly one language route" in main_text or smell == "refused_bequest", f"missing one-route contract: {skill_name}")
     require("references/java.md" in main_text, f"Java route not linked: {skill_name}")
+    require(
+        "references/operation-translations.md" in main_text,
+        f"operation mechanics not linked: {skill_name}",
+    )
     if smell != "refused_bequest":
         require("does not replace the Java semantic route" in main_text, f"IDEA route replaces Java semantics: {skill_name}")
 
@@ -113,10 +92,6 @@ for smell, expected_hash in JAVA_HASHES.items():
     require(actual_references == expected_references, f"unexpected references for {skill_name}: {sorted(actual_references)}")
     require(not list((skill_root / "references").rglob("SKILL.md")), f"nested skill found in {skill_name}")
 
-    require(digest(legacy_reference) == expected_hash, f"legacy Java route drifted: {smell}")
-    require(digest(java_reference) == expected_hash, f"copied Java route is not byte-identical: {smell}")
-    require(digest(operation_reference) == OPERATION_HASH, f"operation reference drifted: {smell}")
-    require(digest(idea_reference) == IDEA_HASHES[smell], f"IDEA route drifted: {smell}")
     route_total += len(re.findall(r"^### `[^`]+`$", java_reference.read_text(encoding="utf-8"), re.MULTILINE))
 
 require(route_total == 47, f"expected 47 preserved Java direct routes, found {route_total}")
@@ -127,11 +102,10 @@ generic_agent_flat = " ".join(generic_agent.split())
 for smell in GENERIC_SMELLS:
     skill_name = f"smell-repair-{smell.replace('_', '-')}"
     require(f'"{skill_name}": allow' in generic_agent, f"generic agent cannot load {skill_name}")
-for smell in JAVA_HASHES:
+for smell in JAVA_SMELLS:
     skill_name = f"smell-repair-{smell.replace('_', '-')}"
     require(f'"{skill_name}": allow' in java_agent, f"Java agent cannot load {skill_name}")
 require('"smell-repair-refused-bequest": allow' not in generic_agent, "generic agent exposes Java-only refused_bequest")
-require('"java-smell-edit-patterns": allow' not in java_agent, "Java agent still routes through the legacy umbrella")
 require("load exactly the\n   matching `smell-repair-<smell>` skill" in generic_agent, "generic agent lacks exact-smell loading")
 require(
     "Only migrate test references when the controller explicitly allows test changes" in generic_agent_flat,

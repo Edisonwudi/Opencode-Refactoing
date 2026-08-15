@@ -56,8 +56,9 @@ docker load -i images/smell-refactor-env-java.tar.gz
 
 ## 说明
 
-- Java 镜像提供工具链、语言项目、离线依赖缓存和 dataset；agent 源码以本仓库为准，
-  更新只需 `git pull`,无需重建镜像。
+- Java 镜像提供工具链、语言项目、离线依赖缓存和验收时冻结的 dataset；agent
+  源码及权威 dataset 以本仓库为准。更新后应从 `/agent-src` 使用当前 CSV，
+  `/opt/dataset` 只用于与该镜像验收快照严格匹配的复现。
 - 当前 Java 交付目录（实验服务器）：
   `D:\smell-refactor-delivery-20260730\images\`。
 
@@ -87,7 +88,8 @@ docker run --rm \
 - c/cpp 换镜像名与 CSV 路径即可;mysterious_name 换 CSV 文件名。
 - 原有 8 种异味不受影：`/opt/dataset/...`（镜像内）与
   `/agent-src/dataset/nonjava/...`（仓库内）内容一致,均可使用。
-- Java 侧无变化（镜像 dataset 本已覆盖全部 11 种异味)。
+- Java 当前运行同样优先使用 `/agent-src/dataset/java/delivery_schema/`；镜像内
+  `/opt/dataset/java/` 不会随挂载源码更新。
 - 下次镜像交付批次会把 10 种异味 dataset 烤回镜像,届时两种路径完全
   等价,该说明可移除。
 

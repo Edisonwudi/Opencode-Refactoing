@@ -840,21 +840,16 @@ for name, mutation in (
         R._runner_closure_action(trace, reminder_used=False, continuations_dispatched=0, max_continuations=2),
         "stop",
     )
-verify_resume_prompt = R._runner_continuation_prompt("verify_required", 0, 2, "repair")
+verify_resume_prompt = R._runner_continuation_prompt("verify_required", 0, 2)
 guard_progress_resume_prompt = R._runner_continuation_prompt(
     "guard_progress",
     0,
     2,
-    "repair SECRET mutable instruction",
-    failure_category="GUARD_PROGRESS_REQUIRED",
 )
 continue_resume_prompt = R._runner_continuation_prompt(
     "continue",
     1,
     2,
-    "repair SECRET mutable instruction",
-    allow_test_changes=True,
-    failure_category="BUILD_FAILED",
 )
 check_true("verify_prompt_marker", "[runner-resume verify-required]" in verify_resume_prompt)
 check_true(
@@ -1388,7 +1383,7 @@ print(json.dumps(event))
     check("fake_initial_action", first_action, "continue")
     second = subprocess.run(
         R._opencode_run_command(fake_args, "java-refactor-agent", first_sid),
-        input=R._runner_continuation_prompt("continue", 1, 2, "repair"),
+        input=R._runner_continuation_prompt("continue", 1, 2),
         text=True,
         capture_output=True,
         check=False,
@@ -1474,7 +1469,7 @@ print(json.dumps(event))
     )
     second = subprocess.run(
         second_command,
-        input=R._runner_continuation_prompt("guard_progress", 0, 2, "repair"),
+        input=R._runner_continuation_prompt("guard_progress", 0, 2),
         text=True,
         capture_output=True,
         check=False,
@@ -1506,7 +1501,7 @@ args = argparse.Namespace(
     allow_test_changes=False,
     refactoring_backend="direct",
 )
-prompt_plain = R._task_prompt(sample, args, "project_full")
+prompt_plain = R._task_prompt(sample)
 check_true("prompt_has_base", "Repair this one java smell" in prompt_plain)
 check("prompt_excludes_raw_dataset_evidence", "oracle_score=99" in prompt_plain, False)
 roundtrip = parse_command_policy(R._command_arguments(prompt_plain, args, "project_full"))
@@ -1519,9 +1514,6 @@ check_true(
         for marker in ("Refactoring backend:", "Verification mode:", "Test changes:")
     ),
 )
-idea_args = argparse.Namespace(**{**vars(args), "refactoring_backend": "idea"})
-idea_prompt = R._task_prompt(sample, idea_args, "project_full")
-check("task_prompt_backend_neutral", idea_prompt, prompt_plain)
 grouped_sample = Sample(
     sample_id="grouped",
     language="c",
@@ -1532,7 +1524,7 @@ grouped_sample = Sample(
     evidence="",
     raw={},
 )
-grouped_prompt = R._task_prompt(grouped_sample, args, "project_full")
+grouped_prompt = R._task_prompt(grouped_sample)
 check_true("grouped_prompt_uses_target_locations", "listed target locations" in grouped_prompt)
 check("grouped_prompt_avoids_java_method_wording", "target methods" in grouped_prompt, False)
 initial_controller_state = R._initial_command_loop_state(
@@ -1664,7 +1656,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         "project_full",
         session_id=first_session,
         continuation_prompt=R._runner_continuation_prompt(
-            "verify_required", 0, 2, "repair narrowly"
+            "verify_required", 0, 2
         ),
         command_loop_state=handoff_state,
         attempt_suffix=".continue-1",
@@ -1814,9 +1806,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_active_tool"}), flush=Tru
     check("active_tool_process_is_not_terminated", tool_reason, "")
 
 allowed_args = argparse.Namespace(**{**vars(args), "allow_test_changes": True})
-allowed_prompt = R._task_prompt(sample, allowed_args, "project_full")
-allowed_roundtrip = parse_command_policy(R._command_arguments(allowed_prompt, allowed_args, "project_full"))
-check("task_prompt_test_policy_neutral", allowed_prompt, prompt_plain)
+allowed_roundtrip = parse_command_policy(R._command_arguments(prompt_plain, allowed_args, "project_full"))
 check("command_roundtrip_allows_test_changes", allowed_roundtrip.allow_test_changes, True)
 
 refused = Sample(
@@ -1832,7 +1822,7 @@ refused = Sample(
     ),
     raw={},
 )
-refused_prompt = R._task_prompt(refused, args, "project_full")
+refused_prompt = R._task_prompt(refused)
 check("runner_prompt_has_no_smell_protocol", "Refused Bequest structural protocol:" in refused_prompt, False)
 
 
@@ -1935,14 +1925,6 @@ check_true(
     and "cross-domain bag" in data_clumps_skill,
 )
 
-legacy_edit_patterns = (
-    ROOT
-    / ".opencode"
-    / "skills"
-    / "java-smell-edit-patterns"
-    / "references"
-    / "edit-patterns"
-)
 lpl_skill = primary_java_skill_reference("long_parameter_list").read_text(encoding="utf-8")
 check_true(
     "lpl_skill_covers_complete_signature_shapes",
@@ -2000,13 +1982,6 @@ for smell_name, required_texts in residual_contracts.items():
         all(required_text in skill_text for required_text in required_texts),
     )
 
-index_text = (legacy_edit_patterns / "index.md").read_text(encoding="utf-8")
-check_true(
-    "edit_pattern_index_matches_expanded_routes",
-    "[`code_clone_type1.md`](code_clone_type1.md) | 7" in index_text
-    and "[`feature_envy.md`](feature_envy.md) | 5" in index_text
-    and "[`long_parameter_list.md`](long_parameter_list.md) | 4" in index_text,
-)
 java_smells = (
     "code_clone_type1",
     "data_clumps",
@@ -2020,12 +1995,6 @@ java_smells = (
     "refused_bequest",
     "switch_statements",
 )
-for smell_name in java_smells:
-    check(
-        f"{smell_name}_legacy_java_route_preserved",
-        primary_java_skill_reference(smell_name).read_bytes(),
-        (legacy_edit_patterns / f"{smell_name}.md").read_bytes(),
-    )
 
 noidea_skill_text = "\n".join(
     primary_java_skill_reference(smell_name).read_text(encoding="utf-8")

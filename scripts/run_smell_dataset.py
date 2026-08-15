@@ -1549,14 +1549,9 @@ def _append_synthetic_message_event(sample_dir: Path, event: dict[str, Any]) -> 
         handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
 
 
-def _task_prompt(
-    sample: Sample,
-    args: argparse.Namespace,
-    verification_mode: str,
-) -> str:
+def _task_prompt(sample: Sample) -> str:
     # Backend, verification, and test-change policy travel through command flags
     # and controller system context; the user task remains backend-neutral.
-    _ = args, verification_mode
     target_count = len(split_location_descriptors(sample.location))
     lines = [
         f"Project root: {sample.project_root}",
@@ -1611,7 +1606,7 @@ def _initial_command_loop_state(
     Python policy/identity authority used by the command hook.
     """
 
-    task = _task_prompt(sample, args, verification_mode)
+    task = _task_prompt(sample)
     payload = resolve_command_payload(
         _command_arguments(task, args, verification_mode),
         defaults={
@@ -2719,14 +2714,9 @@ def _runner_continuation_prompt(
     action: str,
     continuation: int,
     max_continuations: int,
-    instruction: str,
-    *,
-    allow_test_changes: bool = False,
-    failure_category: str = "",
 ) -> str:
     # Policy and failure details already live in the stable controller context
     # and latest smell_verify result. This message only resumes transport.
-    _ = instruction, allow_test_changes, failure_category
     if action == "verify_required":
         return "\n".join(
             [
@@ -2798,7 +2788,7 @@ def _run_opencode(
 ) -> tuple[int, str, str]:
     """Run one initial or same-session OpenCode turn."""
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
-    task = _task_prompt(sample, args, verification_mode)
+    task = _task_prompt(sample)
     command_arguments = _command_arguments(task, args, verification_mode)
     stdin_payload = continuation_prompt if session_id else command_arguments
     task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
@@ -3604,9 +3594,6 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             action,
             continuations_dispatched,
             args.loop_max,
-            args.loop_instruction,
-            allow_test_changes=bool(getattr(args, "allow_test_changes", False)),
-            failure_category=str(trace.get("last_failure_category") or ""),
         )
         _append_synthetic_message_event(
             sample_dir,

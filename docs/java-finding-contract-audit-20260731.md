@@ -1,5 +1,7 @@
 # Java finding-contract baseline audit
 
+> Historical snapshot generated at commit `022ed70` on 2026-07-31; it does not describe the current detector contract.
+
 - rows: 751
 - baseline detector hit: 751/751
 - baseline metric unavailable: 0

@@ -222,28 +222,22 @@ def _detect_mysterious_name(
     methods: Sequence[JavaMethodInfo],
     min_len: int,
     low_info_names: Iterable[str],
-    *,
-    profile: str = "legacy",
-    exclude_tests: bool = False,
-    exclude_generated: bool = True,
 ) -> List[JavaSyntacticFinding]:
     low_info = {name.lower() for name in low_info_names}
-    strict_mode = profile == "strict"
     rows = []
     for method in methods:
-        if _should_exclude_mysterious_path(method.rel_path, profile, exclude_tests, exclude_generated):
+        if _should_exclude_mysterious_path(method.rel_path):
             continue
         if not method.is_constructor and _is_valid_java_identifier(method.method_name):
             reason = _suspicious_name_reason(method.method_name, min_len, low_info, allow_too_short=True)
             if reason:
-                evidence = _mysterious_evidence("method", method.method_name, reason) if strict_mode else f"name={method.method_name}; reason={reason}"
                 rows.append(
                     _finding(
                         "mysterious_name",
                         method,
                         1.0,
                         "custom:mysterious_method_name",
-                        evidence,
+                        _mysterious_evidence("method", method.method_name, reason),
                         begin_line=method.begin_line,
                         end_line=method.begin_line,
                         symbol_kind="method",
@@ -253,16 +247,15 @@ def _detect_mysterious_name(
         for pname in method.parameter_names:
             if not _is_valid_java_identifier(pname):
                 continue
-            reason = _suspicious_name_reason(pname, min_len, low_info, allow_too_short=not strict_mode)
+            reason = _suspicious_name_reason(pname, min_len, low_info, allow_too_short=False)
             if reason:
-                evidence = _mysterious_evidence("param", pname, reason) if strict_mode else f"param={pname}; reason={reason}"
                 rows.append(
                     _finding(
                         "mysterious_name",
                         method,
                         1.0,
                         "custom:mysterious_parameter_name",
-                        evidence,
+                        _mysterious_evidence("param", pname, reason),
                         begin_line=method.begin_line,
                         end_line=method.begin_line,
                         symbol_kind="param",
@@ -277,14 +270,9 @@ def _detect_mysterious_name(
                 continue
             if var in seen_local_names:
                 continue
-            reason = _suspicious_name_reason(var, min_len, low_info, allow_too_short=not strict_mode)
+            reason = _suspicious_name_reason(var, min_len, low_info, allow_too_short=False)
             if reason:
                 seen_local_names.add(var)
-                evidence = (
-                    _mysterious_evidence("local", var, reason)
-                    if strict_mode
-                    else f"local={var}; reason={reason}"
-                )
                 declaration_line = method.body_begin_line + masked_body.count(
                     "\n", 0, declaration.start(1)
                 )
@@ -294,7 +282,7 @@ def _detect_mysterious_name(
                         method,
                         1.0,
                         "custom:mysterious_local_name",
-                        evidence,
+                        _mysterious_evidence("local", var, reason),
                         begin_line=declaration_line,
                         end_line=declaration_line,
                         symbol_kind="local",
@@ -311,12 +299,9 @@ def _detect_mysterious_names_outside_methods(
     methods: Sequence[JavaMethodInfo],
     min_len: int,
     low_info_names: Iterable[str],
-    *,
-    profile: str,
 ) -> List[JavaSyntacticFinding]:
     """Detect locals in static, instance, lambda, and anonymous initializer scopes."""
     low_info = {name.lower() for name in low_info_names}
-    strict_mode = profile == "strict"
     rows: List[JavaSyntacticFinding] = []
     methods_by_file: Dict[str, List[JavaMethodInfo]] = defaultdict(list)
     classes_by_file: Dict[str, List[JavaClassInfo]] = defaultdict(list)
@@ -327,7 +312,7 @@ def _detect_mysterious_names_outside_methods(
 
     for file_path in java_files:
         rel_path = str(file_path.resolve().relative_to(project_root.resolve())).replace("\\", "/")
-        if _should_exclude_mysterious_path(rel_path, profile, True, True):
+        if _should_exclude_mysterious_path(rel_path):
             continue
         text = file_path.read_text(encoding="utf-8", errors="ignore")
         masked = mask_comments_and_strings(text)
@@ -341,7 +326,7 @@ def _detect_mysterious_names_outside_methods(
             line = _idx_to_line(line_starts, declaration.start(1))
             if any(method.begin_line <= line <= method.end_line for method in methods_by_file[rel_path]):
                 continue
-            reason = _suspicious_name_reason(name, min_len, low_info, allow_too_short=not strict_mode)
+            reason = _suspicious_name_reason(name, min_len, low_info, allow_too_short=False)
             if not reason:
                 continue
             cls = _find_enclosing_class(classes_by_file[rel_path], line)
@@ -366,25 +351,19 @@ def _detect_mysterious_names_outside_methods(
             if (scope_id, name) in seen:
                 continue
             seen.add((scope_id, name))
-            evidence = (
-                _mysterious_evidence(kind, name, reason)
-                if strict_mode
-                else f"local={name}; reason={reason}"
+            structural_scopes = sorted(
+                containing,
+                key=lambda item: item[1] - item[0],
+            )[:3]
+            structural_starts = sorted({
+                _idx_to_line(line_starts, item[0])
+                for item in containing
+            })
+            evidence = _mysterious_evidence(kind, name, reason) + (
+                f"; scope_begin={min(_idx_to_line(line_starts, item[0]) for item in structural_scopes)}"
+                f"; scope_end={max(_idx_to_line(line_starts, item[1]) for item in structural_scopes)}"
+                f"; scope_starts={'|'.join(str(item) for item in structural_starts)}"
             )
-            if strict_mode:
-                structural_scopes = sorted(
-                    containing,
-                    key=lambda item: item[1] - item[0],
-                )[:3]
-                structural_starts = sorted({
-                    _idx_to_line(line_starts, item[0])
-                    for item in containing
-                })
-                evidence += (
-                    f"; scope_begin={min(_idx_to_line(line_starts, item[0]) for item in structural_scopes)}"
-                    f"; scope_end={max(_idx_to_line(line_starts, item[1]) for item in structural_scopes)}"
-                    f"; scope_starts={'|'.join(str(item) for item in structural_starts)}"
-                )
             rows.append(
                 JavaSyntacticFinding(
                     smell_type="mysterious_name",
@@ -398,7 +377,7 @@ def _detect_mysterious_names_outside_methods(
                     evidence=evidence,
                     symbol_kind=kind,
                     symbol_name=name,
-                    scope_starts=tuple(structural_starts) if strict_mode else (),
+                    scope_starts=tuple(structural_starts),
                 )
             )
     return rows
@@ -1085,15 +1064,13 @@ def _is_valid_java_identifier(name: str) -> bool:
     return bool(IDENT_RE.match(name)) and (name not in JAVA_KEYWORDS or name == "var")
 
 
-def _should_exclude_mysterious_path(rel_path: str, profile: str, exclude_tests: bool, exclude_generated: bool) -> bool:
-    if profile != "strict":
-        return False
+def _should_exclude_mysterious_path(rel_path: str) -> bool:
     normalized = "/" + rel_path.replace("\\", "/").lower().strip("/") + "/"
     if "/refactor_runs/" in normalized or "/refactors run/" in normalized:
         return True
-    if exclude_tests and _is_test_like_path(rel_path):
+    if _is_test_like_path(rel_path):
         return True
-    if exclude_generated and _is_generated_like_path(rel_path):
+    if _is_generated_like_path(rel_path):
         return True
     return False
 

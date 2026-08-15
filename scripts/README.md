@@ -1,15 +1,17 @@
 # 维护与审计脚本
 
-本目录中的 `self_check_*` 由 `npm run check` 执行；下面三份脚本不属于日常
-自检，而是数据集或交付物维护入口。它们保留生成与审计溯源，统一通过根目录
-`package.json` 调用，避免依赖个人工作目录或隐含调用者。
+日常的 `self_check_*` 由 `npm run check` 聚合执行；
+`self_check_java_baselines.py` 是例外，只由 Java 交付入口的
+`baseline-check` 单独调用。下面三份脚本不属于日常自检，而是数据集或
+交付物维护入口。它们保留生成与审计溯源，统一通过根目录 `package.json`
+调用，避免依赖个人工作目录或隐含调用者。
 
 ## Java finding-contract 审计
 
 归属：Java dataset 与产品 detector contract 维护。默认读取仓库内
-`dataset/java/delivery_schema`，并生成
-`docs/java-finding-contract-audit-current.{json,md}`。项目 checkout 根和产品项目
-配置必须显式提供：
+`dataset/java/delivery_schema`，并把含本机绝对路径的运行结果写入 ignored 的
+`runs/java-finding-contract-audit.{json,md}`。项目 checkout 根和产品项目配置必须
+显式提供：
 
 ```bash
 npm run audit:java-finding-contract -- \
@@ -18,7 +20,8 @@ npm run audit:java-finding-contract -- \
 ```
 
 `--projects-root` 下应按 dataset 的 `project_name` 放置已固定版本的 checkout；
-`--projects-config` 必须描述同一批 checkout 及其只读 build symbol roots。
+`--projects-config` 必须描述同一批 checkout 及其只读 build symbol roots。需要提交
+长期证据时，另生成去除机器路径并带日期的 snapshot；不要覆盖历史报告。
 
 ## 非 Java feature-envy / mysterious-name dataset 构建
 

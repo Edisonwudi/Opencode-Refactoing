@@ -676,72 +676,6 @@ function asStringArray(value: unknown): string[] {
     .filter((item) => item.length > 0)
 }
 
-// Redact secrets and credential-like values from text before it can appear in a
-// visible synthetic message. Match by structure (key/header scheme + value),
-// not by guessing credential length, so short or quoted values are covered too.
-//
-// Covered forms:
-//   api_key="value"   api_key='value'   api_key=value   api-key: value
-//   TOKEN="value"     ACCESS_TOKEN='value'   secret=value
-//   Authorization: Basic <anything-to-end-of-line>
-//   Authorization: Bearer <anything-to-end-of-line>
-//   bearer <token>   token <token>   {env:NAME} stays, but NAME=value leaks
-//
-// Conservative: when a key/header is recognized, the WHOLE value is redacted,
-// including quoted values and scheme-prefixed credentials.
-
-const REDACT_VALUE_CHARS = String.raw`[^'"\\]`
-
-// KEY = value, KEY: value, KEY="value", KEY='value' for known credential key
-// names. Captures the key prefix up to and including the separator so we can
-// keep the key name and redact the value only.
-const REDACT_KEY_RE = new RegExp(
-  String.raw`\b(authorization|api[_-]?key|apikey|secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|passwd|passwd64|private[_-]?key|client[_-]?secret)` +
-    String.raw`\b(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|` +
-    REDACT_VALUE_CHARS +
-    String.raw`+)`,
-  "gi",
-)
-
-// Authorization: <scheme> <credentials>  — redact the credentials after the scheme.
-// Handles "Authorization: Basic abc...", "Authorization: Bearer xyz ...".
-const REDACT_AUTH_SCHEME_RE = new RegExp(
-  String.raw`\b(authorization)\b(\s*:\s*)([A-Za-z][A-Za-z0-9._-]*)(\s+)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
-  "gi",
-)
-
-// Standalone scheme tokens that carry a trailing credential: "Bearer xxx".
-const REDACT_SCHEME_TOKEN_RE = new RegExp(
-  String.raw`\b(bearer|token|basic)\b(\s+)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
-  "gi",
-)
-
-// UPPERCASE_ENV_NAME=<value> assignments leaked into logs. Covers quoted and
-// unquoted values; "NAME" is preserved, the value is redacted.
-const REDACT_ENV_ASSIGN_RE = new RegExp(
-  String.raw`\b([A-Z][A-Z0-9_]*)(\s*=\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)`,
-  "g",
-)
-
-function redactValue(value: string): string {
-  // For quoted values, redact the inner content but keep quote boundaries so
-  // log formatting stays readable.
-  if (value.length >= 2 && (value[0] === '"' || value[0] === "'")) {
-    return `${value[0]}[REDACTED]${value[0]}`
-  }
-  return "[REDACTED]"
-}
-
-function redactSecrets(input: string): string {
-  if (typeof input !== "string" || input.length === 0) return ""
-  let out = input
-  out = out.replace(REDACT_KEY_RE, (_m, key: string, sep: string, value: string) => `${key}${sep}${redactValue(value)}`)
-  out = out.replace(REDACT_AUTH_SCHEME_RE, (_m, key: string, sep: string, scheme: string, _ws: string, _cred: string) => `${key}${sep}${scheme} [REDACTED]`)
-  out = out.replace(REDACT_SCHEME_TOKEN_RE, (_m, scheme: string, ws: string, _value: string) => `${scheme}${ws}[REDACTED]`)
-  out = out.replace(REDACT_ENV_ASSIGN_RE, (_m, name: string, sep: string, _value: string) => `${name}${sep}[REDACTED]`)
-  return out
-}
-
 function classifyFailureForContinue(failurePack: unknown): FailureClassification {
   const empty: FailureClassification = {
     category: "",
@@ -2581,6 +2515,34 @@ function hasActionableProgressAtCap(payload: Record<string, unknown>, failureGro
     && delta?.has_production_diff === true
 }
 
+function buildLoopDecision(
+  state: CommandLoopState,
+  input: {
+    decision: "continue" | "stop"
+    terminationReason: string
+    elapsedSeconds: number
+    failureCategory: string
+    failureGroup: string
+    instruction: string
+  },
+) {
+  return {
+    decision: input.decision,
+    termination_reason: input.terminationReason,
+    continuation: state.continuationCount,
+    max_continuations: state.policy.loop.max_continuations,
+    cap_recovery_used: state.capRecoveryUsed,
+    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
+    no_progress_count: state.noProgressCount,
+    no_progress_limit: state.policy.loop.no_progress_limit,
+    elapsed_seconds: input.elapsedSeconds,
+    sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
+    failure_category: input.failureCategory,
+    failure_group: input.failureGroup,
+    instruction: input.instruction,
+  }
+}
+
 function failureFingerprint(payload: Record<string, unknown>): string {
   const bridgeFingerprint = typeof payload.failure_fingerprint === "string"
     ? payload.failure_fingerprint.trim()
@@ -2709,19 +2671,12 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
     }
   }
 
-  const loop = {
+  const loop = buildLoopDecision(state, {
     decision,
-    termination_reason: terminationReason,
-    continuation: state.continuationCount,
-    max_continuations: state.policy.loop.max_continuations,
-    cap_recovery_used: state.capRecoveryUsed,
-    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
-    no_progress_count: state.noProgressCount,
-    no_progress_limit: state.policy.loop.no_progress_limit,
-    elapsed_seconds: elapsedSeconds,
-    sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
-    failure_category: category,
-    failure_group: group,
+    terminationReason,
+    elapsedSeconds,
+    failureCategory: category,
+    failureGroup: group,
     instruction: decision === "continue"
       ? (nextAction
           ? nextAction
@@ -2729,7 +2684,7 @@ function applyCommandLoopDecision(normalized: { output: string; metadata: Record
           ? payload.continue_hint
           : state.policy.loop.instruction)
       : "",
-  }
+  })
   payload.loop = loop
   normalized.output = safeJsonStringify(payload)
   normalized.metadata.loop = toJsonSafe(loop)
@@ -2781,23 +2736,16 @@ function applyGuardProgressDecision(
     decision = "stop"
     terminationReason = "GUARD_PROGRESS_NO_PROGRESS"
   }
-  const loop = {
+  const loop = buildLoopDecision(state, {
     decision,
-    termination_reason: terminationReason,
-    continuation: state.continuationCount,
-    max_continuations: state.policy.loop.max_continuations,
-    cap_recovery_used: state.capRecoveryUsed,
-    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
-    no_progress_count: state.noProgressCount,
-    no_progress_limit: state.policy.loop.no_progress_limit,
-    elapsed_seconds: elapsedSeconds,
-    sample_deadline_seconds: state.policy.loop.sample_deadline_seconds,
-    failure_category: "GUARD_PROGRESS_REQUIRED",
-    failure_group: "smell",
+    terminationReason,
+    elapsedSeconds,
+    failureCategory: "GUARD_PROGRESS_REQUIRED",
+    failureGroup: "smell",
     instruction: decision === "continue" && typeof payload.next_action === "string"
       ? payload.next_action
       : "",
-  }
+  })
   payload.loop = loop
   normalized.output = safeJsonStringify(payload)
   normalized.metadata.loop = toJsonSafe(loop)
@@ -2930,9 +2878,6 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
           resolved.checkpointRequired = controllerIdentity.checkpointRequired
         }
         const javaCheckpoint = isJavaCheckpointIdentity(resolved)
-        if (commandState) {
-          resolved.verificationMode = commandState.policy.verification_mode
-        }
         const baselineSeal = commandBaselineSeals.get(sessionID) || envDefault("SMELL_BASELINE_SEAL")
         if (javaCheckpoint && !baselineSeal) {
           throw new Error("CHECKPOINT_CONTROLLER_SEAL_MISSING: Java checkpoint verification requires the external baseline seal")
@@ -2946,24 +2891,14 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             0,
             Math.floor((Date.now() - commandState.startedAt) / 1000),
           )
-          const loop = {
+          const loop = buildLoopDecision(commandState, {
             decision: "stop",
-            termination_reason: "GUARD_PROGRESS_NO_PROGRESS",
-            continuation: commandState.continuationCount,
-            max_continuations: commandState.policy.loop.max_continuations,
-            cap_recovery_used: commandState.capRecoveryUsed,
-            remaining: Math.max(
-              0,
-              commandState.policy.loop.max_continuations - commandState.continuationCount,
-            ),
-            no_progress_count: commandState.noProgressCount,
-            no_progress_limit: commandState.policy.loop.no_progress_limit,
-            elapsed_seconds: elapsedSeconds,
-            sample_deadline_seconds: commandState.policy.loop.sample_deadline_seconds,
-            failure_category: "GUARD_PROGRESS_REQUIRED",
-            failure_group: "smell",
+            terminationReason: "GUARD_PROGRESS_NO_PROGRESS",
+            elapsedSeconds,
+            failureCategory: "GUARD_PROGRESS_REQUIRED",
+            failureGroup: "smell",
             instruction: "",
-          }
+          })
           const payload = {
             schema_version: "smell.guard-progress/v1",
             success: false,
@@ -3517,41 +3452,26 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
   normalizeToolResult,
   buildBridgeOutputPayload,
   normalizeBridgeContractPayload,
-  normalizeMetadata,
-  normalizeStdioFields,
-  safeStringOutput,
-  truncateText,
-  safeJsonStringify,
-  toJsonSafe,
   renderIdeaResult,
-  renderIdeaPreviewProtocolResult,
   renderIdeaApplyProtocolResult,
   runIdeaPreviewProtocol,
-  selectionCandidates,
   ideaDecisionsShape,
-  parseCommandPolicyResult,
   checkpointTargetIdentityPrompt,
   commandControllerSystemContext,
-  checkpointTargetIdentityContextFromFile,
-  newCommandLoopState,
   commandLoopStateSnapshot,
   restoreCommandLoopState,
-  failureFingerprint,
   isJavaCheckpointIdentity,
   usesCheapGuardProgressGate,
   applyCommandLoopDecision,
   MAX_STDOUT_STDERR_LEN,
-  // Idle continuation pure helpers + constants (no production control surface):
+  // Idle continuation helpers exercised by the harness:
   classifyFailureForContinue,
   makeTaskKey,
   buildContinuationMessage,
   buildVerifyRequiredMessage,
-  redactSecrets,
-  artifactPathsFrom,
   createIdleContinueRuntime,
   shouldPluginHandleSessionIdle,
   SMELL_IDLE_CONTINUE_PREFIX,
-  IDLE_CONTINUE_STATE_TTL_MS,
 }
 
 export default SmellPlugin

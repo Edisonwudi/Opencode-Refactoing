@@ -35,7 +35,6 @@ from smell_core.config import (  # noqa: E402
 )
 from smell_core.guards import run_build_test_guard  # noqa: E402
 from smell_core.project_revision import (  # noqa: E402
-    DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
     audit_test_commit,
     assert_commit_present,
