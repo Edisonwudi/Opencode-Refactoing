@@ -4008,14 +4008,13 @@ function applyCommandLoopDecision(
       terminationReason = "NON_REPAIRABLE_FAILURE"
     } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
       terminationReason = improvedOnly ? "IMPROVED_SAMPLE_DEADLINE" : "SAMPLE_DEADLINE_REACHED"
-    } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
-      terminationReason = improvedOnly ? "IMPROVED_NO_PROGRESS" : "NO_PROGRESS"
     } else if (state.continuationCount >= state.policy.loop.max_continuations) {
       if (
         !improvedOnly
         && !freshConfirmationRequired
         && retryable
         && !state.capRecoveryUsed
+        && state.noProgressCount < state.policy.loop.no_progress_limit
         && hasActionableProgressAtCap(payload, group)
       ) {
         // One final, bounded repair is part of the shared command policy so
@@ -4146,9 +4145,6 @@ function applyGuardProgressDecision(
   } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
     decision = "stop"
     terminationReason = "SAMPLE_DEADLINE_REACHED"
-  } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
-    decision = "stop"
-    terminationReason = "NO_PROGRESS"
   } else if (state.continuationCount >= state.policy.loop.max_continuations) {
     decision = "stop"
     terminationReason = "MAX_CONTINUATIONS_REACHED"

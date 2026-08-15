@@ -3069,7 +3069,13 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const guardRepeated = { output: guardRequired.output.replace('"loop":', '"prior_loop":'), metadata: {} }
   hooks.applyGuardProgressDecision(guardRepeated, guardState)
   const repeatedPayload = JSON.parse(guardRepeated.output)
-  assertEqual("guard_progress_no_progress_terminal", repeatedPayload.loop.decision, "stop", "decision")
+  assertEqual("guard_progress_no_progress_uses_loop_budget", repeatedPayload.loop.decision, "continue", "decision")
+  assertEqual("guard_progress_no_progress_not_terminal", Boolean(guardState.terminalReceipt), false, "terminalReceipt")
+  const guardExhausted = { output: guardRepeated.output.replace('"loop":', '"prior_loop":'), metadata: {} }
+  hooks.applyGuardProgressDecision(guardExhausted, guardState)
+  const guardExhaustedPayload = JSON.parse(guardExhausted.output)
+  assertEqual("guard_progress_shared_budget_terminal", guardExhaustedPayload.loop.decision, "stop", "decision")
+  assertEqual("guard_progress_shared_budget_reason", guardExhaustedPayload.loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
   assertEqual("guard_progress_terminal_latched", Boolean(guardState.terminalReceipt), true, "terminalReceipt")
   const phaseState = {
     ...state,
@@ -3326,13 +3332,13 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   assertEqual(
     "command_state_no_progress_survives_restart",
     JSON.parse(restartedSecond.output).loop.termination_reason,
-    "NO_PROGRESS",
+    "",
     "termination",
   )
   const second = { output: JSON.stringify(failure), metadata: {} }
   hooks.applyCommandLoopDecision(second, state)
   const secondPayload = JSON.parse(second.output)
-  assertEqual("command_decision_no_progress", secondPayload.loop.termination_reason, "NO_PROGRESS", "termination")
+  assertEqual("command_decision_no_progress_uses_loop_budget", secondPayload.loop.decision, "continue", "decision")
 
   // An IMPROVED result keeps the loop running toward
   // resolved (with the bridge continue_hint), and only identical best-partial
@@ -3370,12 +3376,12 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   hooks.applyCommandLoopDecision(improvedSecond, improvedState)
   const improvedSecondPayload = JSON.parse(improvedSecond.output)
   assertEqual(
-    "improved_no_progress_stop",
+    "improved_no_progress_uses_loop_budget",
     improvedSecondPayload.loop.termination_reason,
-    "IMPROVED_NO_PROGRESS",
+    "",
     "termination",
   )
-  assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "stop", "decision")
+  assertEqual("improved_no_progress_decision", improvedSecondPayload.loop.decision, "continue", "decision")
 
   const resolved = formalPass()
   const resolvedResult = { output: JSON.stringify(resolved), metadata: {} }
@@ -5016,7 +5022,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     )
     assertEqual("focused_diagnostic_progress_first_count", focusedProgressFirst.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
     assertEqual("focused_diagnostic_progress_second_count", focusedProgressSecond.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
-    assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "continue", "loop.decision")
     assertEqual("focused_diagnostic_progress_not_exposed_first", focusedProgressFirstPayload.focused_preflight, undefined, "focused_preflight")
     assertEqual("focused_diagnostic_progress_not_exposed_second", focusedProgressSecondPayload.focused_preflight, undefined, "focused_preflight")
     const focusedProgressCommands = (await readFile(logFile, "utf8"))
@@ -5077,10 +5083,20 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     const secondNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(noProgressToolArgs, noProgressContext)
     const secondNoProgressPayload = parseJson("guard_progress_no_progress_second", secondNoProgress.output)
     assertEqual("guard_progress_no_progress_second_status", secondNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
-    assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "NO_PROGRESS", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "continue", "loop.decision")
+    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
-    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.continuation_count, 1, "continuation_count")
+    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.continuation_count, 2, "continuation_count")
+    const exhaustedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
+      noProgressToolArgs,
+      noProgressContext,
+    )
+    const exhaustedNoProgressPayload = parseJson(
+      "guard_progress_no_progress_exhausted",
+      exhaustedNoProgress.output,
+    )
+    assertEqual("guard_progress_no_progress_exhausted_decision", exhaustedNoProgressPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("guard_progress_no_progress_exhausted_reason", exhaustedNoProgressPayload.loop?.termination_reason, "MAX_CONTINUATIONS_REACHED", "loop.termination_reason")
     const latchedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
       noProgressToolArgs,
       noProgressContext,
@@ -5092,11 +5108,11 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     assertEqual("guard_progress_no_progress_latched_schema", latchedNoProgressPayload.schema_version, "smell.loop-terminal/v1", "schema_version")
     assertEqual("guard_progress_no_progress_latched_status", latchedNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
     assertEqual("guard_progress_no_progress_latched_decision", latchedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "NO_PROGRESS", "loop.termination_reason")
-    assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
+    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "MAX_CONTINUATIONS_REACHED", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 2, "no_progress_count")
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
-    assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")
+    assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
     assertEqual("guard_progress_no_progress_focused_count", noProgressCommands.filter((item) => item.command === "focused-preflight").length, 0, "focused-preflight count")
     assertEqual("guard_progress_no_progress_full_count", noProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
 
