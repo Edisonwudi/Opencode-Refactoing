@@ -14,7 +14,7 @@ from .verification_receipt import validate_formal_verification_receipt
 
 LOOP_MODES = {"off", "verify-failure"}
 FAILURE_GROUPS = {"smell", "compile", "test"}
-COMMAND_LOOP_STATE_VERSION = 6
+COMMAND_LOOP_STATE_VERSION = 7
 INITIAL_VERIFY_INSTRUCTION = "Call smell_verify now using the frozen command identity."
 CHECKPOINT_SMELLS = frozenset({
     "long_method",
@@ -42,7 +42,7 @@ REPAIRABLE_CATEGORY_GROUPS = {
 @dataclass(frozen=True)
 class LoopPolicy:
     mode: str = "verify-failure"
-    max_continuations: int = 2
+    max_smell_verify_cycles: int = 10
     no_progress_limit: int = 1
     allowed_failure_groups: tuple[str, ...] = ("smell", "compile", "test")
     instruction: str = (
@@ -57,7 +57,7 @@ class LoopPolicy:
         return payload
 
     def allows(self, failure_category: str) -> bool:
-        if self.mode == "off" or self.max_continuations <= 0:
+        if self.mode == "off" or self.max_smell_verify_cycles <= 0:
             return False
         group = REPAIRABLE_CATEGORY_GROUPS.get(str(failure_category or "").strip())
         return bool(group and group in self.allowed_failure_groups)
@@ -316,8 +316,7 @@ def initial_command_loop_state(
             "instruction": INITIAL_VERIFY_INSTRUCTION,
             "termination_reason": "",
         },
-        "continuation_count": 0,
-        "cap_recovery_used": False,
+        "smell_verify_cycle_count": 0,
         "no_progress_count": 0,
         "last_failure_fingerprint": "",
         "best_metric_deficit": None,
@@ -412,8 +411,8 @@ def _valid_transfer_policy(value: Any) -> Mapping[str, Any] | None:
     groups = loop.get("allowed_failure_groups")
     if (
         loop.get("mode") not in LOOP_MODES
-        or not _state_integer(loop.get("max_continuations"))
-        or int(loop.get("max_continuations")) > 5
+        or not _state_integer(loop.get("max_smell_verify_cycles"))
+        or int(loop.get("max_smell_verify_cycles")) > 10
         or not _state_integer(loop.get("no_progress_limit"), minimum=1)
         or int(loop.get("no_progress_limit")) > 5
         or not isinstance(groups, list)
@@ -421,7 +420,7 @@ def _valid_transfer_policy(value: Any) -> Mapping[str, Any] | None:
         or len(set(groups)) != len(groups)
         or (
             loop.get("mode") != "off"
-            and int(loop.get("max_continuations")) > 0
+            and int(loop.get("max_smell_verify_cycles")) > 0
             and not groups
         )
         or not isinstance(loop.get("instruction"), str)
@@ -503,7 +502,7 @@ def _valid_idea_protocol_state(value: Any) -> Mapping[str, Any] | None:
 def validate_transferable_command_loop_state(
     value: Any,
 ) -> Mapping[str, Any] | None:
-    """Validate the complete v6 cross-process state without smell decisions."""
+    """Validate the complete v7 cross-process state without smell decisions."""
 
     state = _state_record(value)
     policy = _valid_transfer_policy(state.get("policy")) if state else None
@@ -536,10 +535,9 @@ def validate_transferable_command_loop_state(
         )
         or (decision == "continue" and (not instruction or termination_reason))
         or (decision == "stop" and (instruction or not termination_reason))
-        or not _state_integer(state.get("continuation_count"))
-        or int(state.get("continuation_count"))
-        > int(loop_policy.get("max_continuations"))
-        or not isinstance(state.get("cap_recovery_used"), bool)
+        or not _state_integer(state.get("smell_verify_cycle_count"))
+        or int(state.get("smell_verify_cycle_count"))
+        > int(loop_policy.get("max_smell_verify_cycles"))
         or not _state_integer(state.get("no_progress_count"))
         or not isinstance(state.get("last_failure_fingerprint"), str)
     ):
@@ -765,14 +763,14 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
         help="controller-owned opt-in; frozen into c000 before the repair starts",
     )
     parser.add_argument("--loop-mode", choices=sorted(LOOP_MODES), default="verify-failure")
-    parser.add_argument("--loop-max", type=int, default=3)
+    parser.add_argument("--max-smell-verify-cycles", type=int, default=10)
     parser.add_argument("--loop-no-progress-limit", type=int, default=2)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--sample-deadline", type=int, default=1800)
     parsed = parser.parse_args(tokens)
 
-    if not 0 <= parsed.loop_max <= 5:
-        raise ValueError("INVALID_LOOP_POLICY: --loop-max must be between 0 and 5")
+    if not 0 <= parsed.max_smell_verify_cycles <= 10:
+        raise ValueError("INVALID_LOOP_POLICY: --max-smell-verify-cycles must be between 0 and 10")
     if not 1 <= parsed.loop_no_progress_limit <= 5:
         raise ValueError("INVALID_LOOP_POLICY: --loop-no-progress-limit must be between 1 and 5")
     if not 60 <= parsed.sample_deadline <= 7200:
@@ -781,14 +779,14 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
     unknown = sorted(set(groups).difference(FAILURE_GROUPS))
     if unknown:
         raise ValueError(f"INVALID_LOOP_POLICY: unsupported --loop-on groups: {', '.join(unknown)}")
-    if not groups and parsed.loop_mode != "off" and parsed.loop_max > 0:
+    if not groups and parsed.loop_mode != "off" and parsed.max_smell_verify_cycles > 0:
         raise ValueError("INVALID_LOOP_POLICY: --loop-on must contain at least one failure group")
     if parsed.allow_test_changes and parsed.verification_mode != "project_full":
         raise ValueError(
             "TEST_CHANGE_REQUIRES_PROJECT_FULL: --allow-test-changes requires "
             "--verification-mode=project_full"
         )
-    mode = "off" if parsed.loop_max == 0 else parsed.loop_mode
+    mode = "off" if parsed.max_smell_verify_cycles == 0 else parsed.loop_mode
 
     return ResolvedCommandPolicy(
         task=task,
@@ -797,7 +795,7 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
         allow_test_changes=bool(parsed.allow_test_changes),
         loop=LoopPolicy(
             mode=mode,
-            max_continuations=parsed.loop_max,
+            max_smell_verify_cycles=parsed.max_smell_verify_cycles,
             no_progress_limit=parsed.loop_no_progress_limit,
             allowed_failure_groups=groups,
             instruction=instruction,

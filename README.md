@@ -119,7 +119,7 @@ docker run --rm \
 ### 1.8 看结果
 
 ```text
-runs/<run-name>/results.csv          # 汇总:status / 耗时 / continuation 次数
+runs/<run-name>/results.csv          # 汇总:status / 耗时 / smell_verify 修复周期数
 runs/<run-name>/samples/<sample>/
   verify.json        # 有界 decision:status、resolution、指标差值、build/test 摘要和 artifact 路径
   artifacts/.../
@@ -440,8 +440,10 @@ checkpoint 只保留作诊断证据，`restorable=false`。
   （包括 bridge/build/test）时，runner 会终止该进程树，并以
   `OPENCODE_TIMEOUT`、`termination_reason=MODEL_EVENT_INACTIVITY_TIMEOUT`
   fail closed；工具执行时间不计入模型静默时间。
-- 续跑预算：`--loop-max`（默认 3，范围 0–5）、
+- 共享 smell-verify 修复周期：`--max-smell-verify-cycles`（默认 10，范围 0–10）、
   `--loop-no-progress-limit`（默认 2)、`--loop-mode=verify-failure`。
+- 每个周期表示模型根据最新反馈完成一次窄修复后再次调用 `smell_verify`；
+  初始验证和终态回执重放不消耗周期，也不存在越过上限的隐藏恢复周期。
 - 预算内 checkpoint 失败会把"基线/当前/差值/真实剩余总数/优先 worklist/唯一下一步动作"
   反馈回同一 session 继续修复；不再用只覆盖部分异味的特判提示。
 
@@ -453,7 +455,7 @@ checkpoint 只保留作诊断证据，`restorable=false`。
 由 command 前缀显式声明（与批量 runner 同一入口）：
 
 ```text
-/java-refactor-run --verification-mode=project_full --loop-max=2 -- Project root: /abs/java-project
+/java-refactor-run --verification-mode=project_full --max-smell-verify-cycles=10 -- Project root: /abs/java-project
 Smell type: long_method
 Target location: src/main/java/Foo.java:42
 Build command: ./gradlew --offline classes
@@ -464,12 +466,12 @@ Verification cwd: .
 选择 IDEA 后端时，仍使用同一个手动 command，只增加显式 policy 参数：
 
 ```text
-/java-refactor-run --refactoring-backend=idea --verification-mode=project_full --loop-max=2 -- Project root: /abs/java-project
+/java-refactor-run --refactoring-backend=idea --verification-mode=project_full --max-smell-verify-cycles=10 -- Project root: /abs/java-project
 Smell type: long_method
 Target location: src/main/java/Foo.java:42
 ```
 
-该 flag 会冻结进 v6 会话状态。plugin 会在模型开始前、同一个 sample deadline
+该 flag 会冻结进 v7 会话状态。plugin 会在模型开始前、同一个 sample deadline
 内执行 `ensure-service --open`；失败直接形成 protocol terminal。IDEA 路径禁止 bash
 和普通 edit/write，项目根目录也不能被工具参数改写。合法变更链只有
 `preview -> matching apply -> smell_verify`，或明确 `unsupported_target` 后的
@@ -494,7 +496,7 @@ Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_ful
 `--refactoring-backend=direct|idea`（默认 `direct`）、
 `--allow-test-changes`（默认关闭并冻结到 c000；启用时必须使用
 `project_full`）、
-`--loop-mode=off|verify-failure`、`--loop-max=0..5`、
+`--loop-mode=off|verify-failure`、`--max-smell-verify-cycles=0..10`、
 `--loop-no-progress-limit=1..5`、`--loop-on=smell,compile,test`、
 `--sample-deadline=60..7200`。参数非法直接报 `INVALID_LOOP_POLICY`。
 

@@ -1728,13 +1728,13 @@ def _controller_context_manifest(
             "refactoring_backend": refactoring_backend,
             "checkpoint_required": policy.get("checkpoint_required"),
             "loop_mode": loop.get("mode"),
-            "max_continuations": loop.get("max_continuations"),
+            "max_smell_verify_cycles": loop.get("max_smell_verify_cycles"),
             "no_progress_limit": loop.get("no_progress_limit"),
             "allowed_failure_groups": loop.get("allowed_failure_groups"),
             "sample_deadline_seconds": loop.get("sample_deadline_seconds"),
         },
         "excluded_mutable_fields": [
-            "continuation_count",
+            "smell_verify_cycle_count",
             "failure_category",
             "failure_pack",
             "loop_instruction",
@@ -1779,7 +1779,7 @@ def _command_arguments(task: str, args: argparse.Namespace, verification_mode: s
         f"--verification-mode={verification_mode}",
         f"--refactoring-backend={getattr(args, 'refactoring_backend', 'direct')}",
         f"--loop-mode={args.loop_mode}",
-        f"--loop-max={args.loop_max}",
+        f"--max-smell-verify-cycles={args.max_smell_verify_cycles}",
         f"--loop-no-progress-limit={args.loop_no_progress_limit}",
         f"--loop-on={args.loop_on}",
         f"--sample-deadline={args.sample_deadline}",
@@ -1799,7 +1799,7 @@ def _initial_command_loop_state(
     *,
     started_at_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Freeze trusted v6 state before the first OpenCode process starts.
+    """Freeze trusted v7 state before the first OpenCode process starts.
 
     A verify-required reminder runs in a new OpenCode process.  The first
     model turn may have made no ``smell_verify`` call, so there may be no tool
@@ -2941,7 +2941,7 @@ def _idea_protocol_contract(controller_attempts: list[dict[str, Any]]) -> dict[s
 
 
 def _typed_command_control(state: Any) -> dict[str, Any] | None:
-    """Read the v6 transport projection without interpreting smell policy."""
+    """Read the v7 transport projection without interpreting smell policy."""
     validated = validate_transferable_command_loop_state(state)
     if validated is None:
         return None
@@ -4043,7 +4043,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
 
     # Batch `opencode run` exits as the session becomes idle, so a fire-and-forget
     # plugin promptAsync cannot reliably create another turn. The plugin still
-    # owns every decision; the runner only transports each validated v6 control
+    # owns every decision; the runner only transports each validated v7 control
     # generation into the same OpenCode session once.
     controller_attempts: list[dict[str, Any]] = []
     agent_verification_history: list[dict[str, Any]] = []
@@ -4320,7 +4320,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         last["raw_reported_status"] = final_verify_raw_status
     attempts = _verification_attempt_history(agent_verification_history, last)
     note = (
-        f"loop_policy={args.loop_mode}:{args.loop_max};"
+        f"loop_policy={args.loop_mode}:{args.max_smell_verify_cycles};"
         f"runner_transports={continuations_dispatched};"
         f"opencode_timed_out={str(opencode_returncode == 124).lower()};"
         f"final_verify_source={final_verify_source};"
@@ -4420,7 +4420,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--loop-mode", choices=["off", "verify-failure"], default="verify-failure")
-    parser.add_argument("--loop-max", type=int, choices=range(0, 6), default=3)
+    parser.add_argument("--max-smell-verify-cycles", type=int, choices=range(0, 11), default=10)
     parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=2)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--loop-instruction", default=LoopPolicy().instruction)

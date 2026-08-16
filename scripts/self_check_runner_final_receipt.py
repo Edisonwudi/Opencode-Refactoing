@@ -299,7 +299,7 @@ def _state(
         else None
     )
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "policy": {
             "task": "Continue the current smell refactoring task.",
             "verification_mode": "project_full",
@@ -324,7 +324,7 @@ def _state(
             },
             "loop": {
                 "mode": "verify-failure",
-                "max_continuations": 5,
+                "max_smell_verify_cycles": 5,
                 "no_progress_limit": 1,
                 "allowed_failure_groups": ["smell", "compile", "test"],
                 "instruction": "repair narrowly",
@@ -334,8 +334,7 @@ def _state(
         "target_identity_context": "",
         "started_at": 1,
         "control": control,
-        "continuation_count": 0,
-        "cap_recovery_used": False,
+        "smell_verify_cycle_count": 0,
         "no_progress_count": 0,
         "last_failure_fingerprint": "",
         "best_metric_deficit": None,

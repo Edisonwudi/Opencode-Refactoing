@@ -1001,7 +1001,7 @@ if command == "resolve-command":
         "identity": identity,
         "loop": {
             "mode": "verify-failure",
-            "max_continuations": 2,
+            "max_smell_verify_cycles": 2,
             "no_progress_limit": 1,
             "allowed_failure_groups": ["smell", "compile", "test"],
             "instruction": "repair narrowly",
@@ -2316,7 +2316,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
   const confirmationInstruction = "Do not edit the candidate; call smell_verify again for one fresh confirmation."
   const confirmationMessage = hooks.buildContinuationMessage({
     continuation: 2,
-    maxContinuations: 2,
+    maxSmellVerifyCycles: 2,
     instruction: confirmationInstruction,
   })
   assertCond(
@@ -2333,7 +2333,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
       generation,
       decision,
       continuation,
-      max_continuations: max,
+      max_smell_verify_cycles: max,
       instruction: decision === "continue" ? "repair from the latest evidence" : "",
     }
     return JSON.stringify(payload)
@@ -2398,7 +2398,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
     const metadata = record(rt)
     assertEqual(`idle_owner_${modeCase.name}_enabled`, metadata.enabled, modeCase.enabled, "enabled")
     assertEqual(`unified_${modeCase.name}_continuation`, metadata.continuation, 1, "continuation")
-    assertEqual(`unified_${modeCase.name}_max`, metadata.maxContinuations, 2, "maxContinuations")
+    assertEqual(`unified_${modeCase.name}_max`, metadata.maxSmellVerifyCycles, 2, "maxSmellVerifyCycles")
     assertEqual(`idle_owner_${modeCase.name}_dispatch`, rt.handleIdle("s1"), modeCase.enabled, "dispatch")
     await flush()
     assertEqual(`idle_owner_${modeCase.name}_calls`, calls.length, modeCase.enabled ? 1 : 0, "calls")
@@ -2414,7 +2414,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
       sessionID: "batch-initial",
       agent: "java-refactor-agent",
       directory: IDLE_DIR,
-      maxContinuations: 2,
+      maxSmellVerifyCycles: 2,
       instruction: "repair narrowly",
       allowTestChanges: false,
     })
@@ -2497,7 +2497,7 @@ async function runIdleContinueSelfCheck(pluginModule) {
       sessionID: "initial",
       agent: "java-refactor-agent",
       directory: IDLE_DIR,
-      maxContinuations: 2,
+      maxSmellVerifyCycles: 2,
       instruction: "repair narrowly",
     })
     assertEqual("verify_required_initial_dispatch", rt.handleIdle("initial"), true, "dispatch")
@@ -2626,7 +2626,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       },
       loop: {
         mode: "verify-failure",
-        max_continuations: 2,
+        max_smell_verify_cycles: 2,
         no_progress_limit: 1,
         allowed_failure_groups: ["smell"],
         instruction: "repair narrowly",
@@ -2641,8 +2641,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       instruction: "Call smell_verify now using the frozen command identity.",
       terminationReason: "",
     },
-    continuationCount: 0,
-    capRecoveryUsed: false,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     bestMetricDeficit: null,
@@ -2659,9 +2658,9 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     terminalReceipt: null,
   }
   const serializedState = hooks.commandLoopStateSnapshot(state)
-  assertEqual("command_state_schema_v6", serializedState.schema_version, 6, "schema_version")
+  assertEqual("command_state_schema_v7", serializedState.schema_version, 7, "schema_version")
   assertEqual(
-    "command_state_v6_formal_candidate_initial",
+    "command_state_v7_formal_candidate_initial",
     serializedState.formal_candidate_state.confirmation_required,
     false,
     "formal_candidate_state.confirmation_required",
@@ -2675,7 +2674,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const missingV6Field = { ...serializedState }
   delete missingV6Field.control
   assertEqual(
-    "command_state_v6_missing_field_rejected",
+    "command_state_v7_missing_field_rejected",
     hooks.restoreCommandLoopState(JSON.stringify(missingV6Field)),
     undefined,
     "restored state",
@@ -2683,7 +2682,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   const missingFormalCandidateState = { ...serializedState }
   delete missingFormalCandidateState.formal_candidate_state
   assertEqual(
-    "command_state_v6_missing_formal_candidate_rejected",
+    "command_state_v7_missing_formal_candidate_rejected",
     hooks.restoreCommandLoopState(JSON.stringify(missingFormalCandidateState)),
     undefined,
     "restored state",
@@ -2693,12 +2692,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     Boolean(hooks.restoreCommandLoopState(JSON.stringify(serializedState))),
     "valid state did not restore",
   )
-  assertEqual(
-    "command_state_invalid_cap_flag_rejected",
-    hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, cap_recovery_used: "false" })),
-    undefined,
-    "cap_recovery_used",
-  )
+  assertEqual("command_state_has_no_hidden_cap_recovery", "cap_recovery_used" in serializedState, false, "cap_recovery_used")
   assertEqual(
     "command_state_invalid_fingerprint_rejected",
     hooks.restoreCommandLoopState(JSON.stringify({ ...serializedState, last_failure_fingerprint: 7 })),
@@ -2815,15 +2809,14 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       ...state.policy,
       loop: {
         ...state.policy.loop,
-        max_continuations: 2,
+        max_smell_verify_cycles: 2,
         no_progress_limit: 3,
         allowed_failure_groups: ["smell", "compile", "test"],
       },
     },
     startedAt: Date.now(),
     control: { ...state.control },
-    continuationCount: 0,
-    capRecoveryUsed: false,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     formalCandidateState: {
@@ -2863,7 +2856,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     "confirmationRequired",
   )
   const exhaustedConfirmationState = newFormalState()
-  exhaustedConfirmationState.continuationCount = 2
+  exhaustedConfirmationState.smellVerifyCycleCount = 2
   exhaustedConfirmationState.formalCandidateState = {
     candidateIdentity: {
       baselineRevision: "baseline-revision",
@@ -3039,7 +3032,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   )
   const guardState = {
     ...state,
-    continuationCount: 0,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     bestMetricDeficit: null,
@@ -3075,7 +3068,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   hooks.applyGuardProgressDecision(guardExhausted, guardState)
   const guardExhaustedPayload = JSON.parse(guardExhausted.output)
   assertEqual("guard_progress_shared_budget_terminal", guardExhaustedPayload.loop.decision, "stop", "decision")
-  assertEqual("guard_progress_shared_budget_reason", guardExhaustedPayload.loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
+  assertEqual("guard_progress_shared_budget_reason", guardExhaustedPayload.loop.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "termination")
   assertEqual("guard_progress_terminal_latched", Boolean(guardState.terminalReceipt), true, "terminalReceipt")
   const phaseState = {
     ...state,
@@ -3083,12 +3076,12 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       ...state.policy,
       loop: {
         ...state.policy.loop,
-        max_continuations: 5,
+        max_smell_verify_cycles: 5,
         no_progress_limit: 5,
       },
     },
     control: { ...state.control },
-    continuationCount: 0,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     bestMetricDeficit: null,
@@ -3320,7 +3313,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     JSON.stringify(hooks.commandLoopStateSnapshot(state)),
   )
   assertCond("command_state_restored", Boolean(restoredAfterRestart), "state did not restore")
-  assertEqual("command_state_count_survives_restart", restoredAfterRestart.continuationCount, 1, "continuationCount")
+  assertEqual("command_state_count_survives_restart", restoredAfterRestart.smellVerifyCycleCount, 1, "smellVerifyCycleCount")
   assertEqual(
     "command_state_fingerprint_survives_restart",
     restoredAfterRestart.lastFailureFingerprint,
@@ -3347,8 +3340,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     ...state,
     startedAt: Date.now(),
     control: { ...state.control },
-    continuationCount: 0,
-    capRecoveryUsed: false,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     terminalReceipt: null,
@@ -3397,7 +3389,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   ]) {
     const inconsistentState = {
       ...improvedState,
-      continuationCount: 0,
+      smellVerifyCycleCount: 0,
       noProgressCount: 0,
       lastFailureFingerprint: "",
     }
@@ -3420,8 +3412,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     policy: capPolicy,
     startedAt: Date.now(),
     control: { ...state.control },
-    continuationCount: 2,
-    capRecoveryUsed: false,
+    smellVerifyCycleCount: 2,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     terminalReceipt: null,
@@ -3430,32 +3421,27 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
     ...failure,
     checkpoint: { delta: { metric_progress: true } },
   }
-  const capRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
-  hooks.applyCommandLoopDecision(capRecovery, capState)
-  const capRecoveryPayload = JSON.parse(capRecovery.output)
-  assertEqual("cap_progress_recovers_once", capRecoveryPayload.loop.decision, "continue", "decision")
-  assertEqual("cap_recovery_count_bounded", capRecoveryPayload.loop.continuation, 2, "continuation")
-  assertEqual("cap_recovery_marked", capRecoveryPayload.loop.cap_recovery_used, true, "cap_recovery_used")
+  const exactCap = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(exactCap, capState)
+  const exactCapPayload = JSON.parse(exactCap.output)
+  assertEqual("cycle_cap_is_exact", exactCapPayload.loop.decision, "stop", "decision")
+  assertEqual("cycle_cap_count", exactCapPayload.loop.continuation, 2, "continuation")
+  assertEqual("cycle_cap_reason", exactCapPayload.loop.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "termination")
+  assertEqual("cycle_cap_has_no_hidden_recovery", "cap_recovery_used" in exactCapPayload.loop, false, "cap_recovery_used")
   const restoredCapState = hooks.restoreCommandLoopState(
     JSON.stringify(hooks.commandLoopStateSnapshot(capState)),
   )
-  const restartedCapRecovery = { output: JSON.stringify(progressingAtCap), metadata: {} }
-  hooks.applyCommandLoopDecision(restartedCapRecovery, restoredCapState)
+  const restartedAtCap = { output: JSON.stringify(progressingAtCap), metadata: {} }
+  hooks.applyCommandLoopDecision(restartedAtCap, restoredCapState)
   assertEqual(
-    "cap_recovery_survives_restart",
-    JSON.parse(restartedCapRecovery.output).loop.termination_reason,
-    "MAX_CONTINUATIONS_REACHED",
+    "cycle_cap_survives_restart",
+    JSON.parse(restartedAtCap.output).loop.termination_reason,
+    "MAX_SMELL_VERIFY_CYCLES_REACHED",
     "termination",
   )
-  const capRecoveryAgain = { output: JSON.stringify(progressingAtCap), metadata: {} }
-  hooks.applyCommandLoopDecision(capRecoveryAgain, capState)
-  const capRecoveryAgainPayload = JSON.parse(capRecoveryAgain.output)
-  assertEqual("cap_recovery_only_once", capRecoveryAgainPayload.loop.decision, "stop", "decision")
-  assertEqual("cap_recovery_then_max", capRecoveryAgainPayload.loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
 
   const compileCapState = {
     ...capState,
-    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -3473,11 +3459,10 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   }
   const compileRecovery = { output: JSON.stringify(compileAtCap), metadata: {} }
   hooks.applyCommandLoopDecision(compileRecovery, compileCapState)
-  assertEqual("compile_checkpoint_diff_recovers_at_cap", JSON.parse(compileRecovery.output).loop.decision, "continue", "decision")
+  assertEqual("compile_checkpoint_diff_stops_at_exact_cap", JSON.parse(compileRecovery.output).loop.decision, "stop", "decision")
 
   const noProgressCapState = {
     ...capState,
-    capRecoveryUsed: false,
     noProgressCount: 0,
     lastFailureFingerprint: "",
   }
@@ -3487,7 +3472,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   }
   const noCapRecovery = { output: JSON.stringify(noProgressAtCap), metadata: {} }
   hooks.applyCommandLoopDecision(noCapRecovery, noProgressCapState)
-  assertEqual("cap_without_progress_stops", JSON.parse(noCapRecovery.output).loop.termination_reason, "MAX_CONTINUATIONS_REACHED", "termination")
+  assertEqual("cap_without_progress_stops", JSON.parse(noCapRecovery.output).loop.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "termination")
   return { passed: true }
 }
 
@@ -3554,7 +3539,7 @@ async function runPluginSelfCheck(fixtureRoot, artifactRoot) {
         {
           command: "java-refactor-run",
           sessionID: "command-policy-self-check",
-          arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2\nSample test command: ${sampleTestCommand}`,
+          arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${fixtureRoot}\nSmell type: long_method\nTarget location: src/main/java/SelfCheckSample.java:2\nSample test command: ${sampleTestCommand}`,
         },
         commandOutput,
       )
@@ -3954,7 +3939,7 @@ if command == "resolve-command":
         },
         "loop": {
             "mode": "verify-failure",
-            "max_continuations": 2,
+            "max_smell_verify_cycles": 2,
             "no_progress_limit": 1,
             "allowed_failure_groups": ["smell", "compile", "test"],
             "instruction": "continue one narrow edit",
@@ -4826,7 +4811,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
         {
           command: "smell-refactor-run",
           sessionID,
-          arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${replayRoot}; Language: ${replay.language}; Smell type: ${replay.smell}; Target location: ${replay.location}`,
+          arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 -- Project root: ${replayRoot}; Language: ${replay.language}; Smell type: ${replay.smell}; Target location: ${replay.location}`,
         },
         { parts: [] },
       )
@@ -4854,9 +4839,9 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
         assertEqual(`guard_progress_${replay.name}_${call}_loop`, earlyPayload.loop?.decision, "continue", "loop.decision")
         assertEqual(
           `guard_progress_${replay.name}_${call}_continuation`,
-          early.metadata?.command_loop_state?.continuation_count,
+          early.metadata?.command_loop_state?.smell_verify_cycle_count,
           call + 1,
-          "continuation_count",
+          "smell_verify_cycle_count",
         )
         assertEqual(
           `guard_progress_${replay.name}_${call}_no_progress`,
@@ -4869,12 +4854,6 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
           Boolean(early.metadata?.command_loop_state?.last_failure_fingerprint),
           true,
           "last_failure_fingerprint present",
-        )
-        assertEqual(
-          `guard_progress_${replay.name}_${call}_cap`,
-          early.metadata?.command_loop_state?.cap_recovery_used,
-          false,
-          "cap_recovery_used",
         )
         assertEqual(
           `guard_progress_${replay.name}_${call}_auto_enabled`,
@@ -4909,9 +4888,9 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       assertEqual(`guard_progress_${replay.name}_crossed_loop`, crossedPayload.loop?.decision, "stop", "loop.decision")
       assertEqual(
         `guard_progress_${replay.name}_crossed_continuation`,
-        crossed.metadata?.command_loop_state?.continuation_count,
+        crossed.metadata?.command_loop_state?.smell_verify_cycle_count,
         2,
-        "continuation_count",
+        "smell_verify_cycle_count",
       )
       const commands = (await readFile(logFile, "utf8"))
         .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
@@ -4989,7 +4968,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: focusedProgressSession,
-        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${focusedProgressRoot}; Language: cpp; Smell type: code_clone_type1; Target location: sample.cc:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${focusedProgressRoot}; Language: cpp; Smell type: code_clone_type1; Target location: sample.cc:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5053,7 +5032,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: noProgressSession,
-        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5086,7 +5065,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "continue", "loop.decision")
     assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
-    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.continuation_count, 2, "continuation_count")
+    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.smell_verify_cycle_count, 2, "smell_verify_cycle_count")
     const exhaustedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
       noProgressToolArgs,
       noProgressContext,
@@ -5096,7 +5075,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       exhaustedNoProgress.output,
     )
     assertEqual("guard_progress_no_progress_exhausted_decision", exhaustedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_exhausted_reason", exhaustedNoProgressPayload.loop?.termination_reason, "MAX_CONTINUATIONS_REACHED", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_exhausted_reason", exhaustedNoProgressPayload.loop?.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "loop.termination_reason")
     const latchedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
       noProgressToolArgs,
       noProgressContext,
@@ -5108,7 +5087,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     assertEqual("guard_progress_no_progress_latched_schema", latchedNoProgressPayload.schema_version, "smell.loop-terminal/v1", "schema_version")
     assertEqual("guard_progress_no_progress_latched_status", latchedNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
     assertEqual("guard_progress_no_progress_latched_decision", latchedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "MAX_CONTINUATIONS_REACHED", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 2, "no_progress_count")
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
@@ -5181,7 +5160,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: noProgressSession,
-        arguments: `--verification-mode=project_full --loop-max=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5212,7 +5191,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: malformedSession,
-        arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${malformedRoot}; Language: python; Smell type: long_method; Target location: malformed.py:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 -- Project root: ${malformedRoot}; Language: python; Smell type: long_method; Target location: malformed.py:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5230,7 +5209,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     assertEqual("guard_progress_malformed_loop_terminal", malformedPayload.loop?.decision, "stop", "loop.decision")
     assertEqual("guard_progress_malformed_terminal_stage", malformed.metadata?.command_loop_state?.terminal_receipt?.stage, "protocol", "terminal stage")
     assertEqual("guard_progress_malformed_control", malformed.metadata?.command_loop_state?.control?.decision, "stop", "control decision")
-    assertEqual("guard_progress_malformed_continuation", malformed.metadata?.command_loop_state?.continuation_count, 0, "continuation_count")
+    assertEqual("guard_progress_malformed_continuation", malformed.metadata?.command_loop_state?.smell_verify_cycle_count, 0, "smell_verify_cycle_count")
     const malformedCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
     assertEqual("guard_progress_malformed_preflight_count", malformedCommands.filter((item) => item.command === "guard-progress").length, 1, "guard-progress count")
@@ -5257,7 +5236,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: nonzeroProgressSession,
-        arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${nonzeroProgressRoot}; Language: python; Smell type: long_method; Target location: nonzero.py:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 -- Project root: ${nonzeroProgressRoot}; Language: python; Smell type: long_method; Target location: nonzero.py:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5299,7 +5278,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
         {
           command: "smell-refactor-run",
           sessionID,
-          arguments: `--verification-mode=project_full --loop-max=2 -- Project root: ${bypassRoot}; Language: ${bypass.language}; Smell type: ${bypass.smell}; Target location: ${bypass.location}`,
+          arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 -- Project root: ${bypassRoot}; Language: ${bypass.language}; Smell type: ${bypass.smell}; Target location: ${bypass.location}`,
         },
         { parts: [] },
       )
@@ -5410,7 +5389,7 @@ if command == "resolve-command":
         "identity": identity,
         "loop": {
             "mode": "verify-failure",
-            "max_continuations": 2,
+            "max_smell_verify_cycles": 2,
             "no_progress_limit": 1,
             "allowed_failure_groups": ["smell", "compile", "test"],
             "instruction": "repair narrowly",
@@ -5504,7 +5483,7 @@ print(json.dumps(payload))
         },
       },
     }
-    const commandArguments = `--verification-mode=project_full --loop-max=2 -- Project root: ${projectRoot}; Language: python; Smell type: long_method; Target location: sample.py:method=target|line=1`
+    const commandArguments = `--verification-mode=project_full --max-smell-verify-cycles=2 -- Project root: ${projectRoot}; Language: python; Smell type: long_method; Target location: sample.py:method=target|line=1`
     const sessionID = "manual-cross-process"
     const plugin = await pluginModule.SmellPlugin({ worktree: projectRoot, client })
     await plugin["command.execute.before"](
@@ -5521,7 +5500,7 @@ print(json.dumps(payload))
     const readyInitialEnvelope = JSON.parse(JSON.stringify(envelope))
     assertEqual("manual_state_session_binding", envelope.session_id, sessionID, "session_id")
     assertEqual("manual_state_worktree_binding", envelope.worktree, path.resolve(projectRoot), "worktree")
-    assertEqual("manual_state_schema_v6", envelope.command_loop_state.schema_version, 6, "schema_version")
+    assertEqual("manual_state_schema_v7", envelope.command_loop_state.schema_version, 7, "schema_version")
     assertEqual("manual_state_initial_control", envelope.command_loop_state.control.decision, "verify_required", "control.decision")
     assertEqual("manual_state_command_persisted", envelope.command, "smell-refactor-run", "command")
     assertEqual("manual_state_agent_persisted", envelope.agent, "smell-refactor-agent", "agent")
@@ -5624,7 +5603,7 @@ print(json.dumps(payload))
       instruction: "Do not edit the candidate; call smell_verify again for one fresh confirmation.",
       terminationReason: "",
     }
-    confirmationState.continuationCount = 1
+    confirmationState.smellVerifyCycleCount = 1
     confirmationState.formalCandidateState = {
       candidateIdentity: {
         baselineRevision: "manual-seal",

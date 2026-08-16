@@ -63,7 +63,7 @@ type IdeaCliRunner = (worktree: string, cli: string, args: string[]) => Promise<
 
 type LoopPolicy = {
   mode: "off" | "verify-failure"
-  max_continuations: number
+  max_smell_verify_cycles: number
   no_progress_limit: number
   allowed_failure_groups: string[]
   instruction: string
@@ -134,8 +134,7 @@ type CommandLoopState = {
   targetIdentityContext: string
   startedAt: number
   control: CommandControlState
-  continuationCount: number
-  capRecoveryUsed: boolean
+  smellVerifyCycleCount: number
   noProgressCount: number
   lastFailureFingerprint: string
   bestMetricDeficit: number | null
@@ -212,7 +211,7 @@ type CommandTerminalReceipt = {
   loop: Record<string, unknown>
 }
 
-const COMMAND_LOOP_STATE_VERSION = 6
+const COMMAND_LOOP_STATE_VERSION = 7
 const COMMAND_LOOP_STATE_ENV = "SMELL_COMMAND_LOOP_STATE_JSON"
 const BASELINE_CONTEXT_FILE_ENV = "SMELL_BASELINE_CONTEXT_FILE"
 const CONTROLLER_CONTEXT_AUDIT_FILE_ENV = "SMELL_CONTROLLER_CONTEXT_AUDIT_FILE"
@@ -710,7 +709,7 @@ type ContinuationState = {
   generation: number
   dispatchedGeneration: number
   continuation: number
-  maxContinuations: number
+  maxSmellVerifyCycles: number
   pending: boolean
   dispatching: boolean
   awaitingVerify: boolean
@@ -741,7 +740,7 @@ function makeTaskKey(projectRoot: string, smell: string, location: string): stri
 
 function buildContinuationMessage(state: ContinuationState): string {
   return [
-    `${SMELL_IDLE_CONTINUE_PREFIX} ${state.continuation}/${state.maxContinuations}]`,
+    `${SMELL_IDLE_CONTINUE_PREFIX} ${state.continuation}/${state.maxSmellVerifyCycles}]`,
     "Resume the existing task in this session.",
     state.instruction,
   ].join("\n")
@@ -2313,7 +2312,7 @@ function createIdleContinueRuntime(options: {
     sessionID: string
     agent: string
     directory: string
-    maxContinuations: number
+    maxSmellVerifyCycles: number
     generation?: number
     instruction?: string
   }) {
@@ -2324,7 +2323,7 @@ function createIdleContinueRuntime(options: {
       generation: input.generation ?? 0,
       dispatchedGeneration: -1,
       continuation: 0,
-      maxContinuations: input.maxContinuations,
+      maxSmellVerifyCycles: input.maxSmellVerifyCycles,
       pending: false,
       dispatching: false,
       awaitingVerify: true,
@@ -2347,7 +2346,7 @@ function createIdleContinueRuntime(options: {
     decision: CommandControlState["decision"]
     instruction: string
     continuation: number
-    maxContinuations: number
+    maxSmellVerifyCycles: number
   }): void {
     if (!sessionIdleEnabled || !input.sessionID) return
     if (input.decision === "stop") {
@@ -2361,7 +2360,7 @@ function createIdleContinueRuntime(options: {
         sessionID: input.sessionID,
         agent: input.agent,
         directory: input.directory,
-        maxContinuations: input.maxContinuations,
+        maxSmellVerifyCycles: input.maxSmellVerifyCycles,
         generation: input.generation,
         instruction: input.instruction,
       })
@@ -2372,7 +2371,7 @@ function createIdleContinueRuntime(options: {
       generation: input.generation,
       dispatchedGeneration: -1,
       continuation: input.continuation,
-      maxContinuations: input.maxContinuations,
+      maxSmellVerifyCycles: input.maxSmellVerifyCycles,
       pending: true,
       dispatching: false,
       awaitingVerify: false,
@@ -2398,7 +2397,7 @@ function createIdleContinueRuntime(options: {
   }): {
     enabled: boolean
     continuation: number
-    maxContinuations: number
+    maxSmellVerifyCycles: number
     generation: number
     status: string
     category: string
@@ -2435,7 +2434,7 @@ function createIdleContinueRuntime(options: {
       existing.updatedAt = Date.now()
     }
     const continuation = typeof loop?.continuation === "number" ? loop.continuation : 0
-    const maxContinuations = typeof loop?.max_continuations === "number" ? loop.max_continuations : 0
+    const maxSmellVerifyCycles = typeof loop?.max_smell_verify_cycles === "number" ? loop.max_smell_verify_cycles : 0
     const decision = typeof loop?.decision === "string" ? loop.decision : "stop"
     const controlGeneration = Number(loop?.generation)
     const instruction = typeof loop?.instruction === "string" ? loop.instruction.trim() : ""
@@ -2443,7 +2442,7 @@ function createIdleContinueRuntime(options: {
     const base = {
       enabled: sessionIdleEnabled,
       continuation,
-      maxContinuations,
+      maxSmellVerifyCycles,
       generation: Number.isInteger(controlGeneration)
         ? controlGeneration
         : existing ? existing.generation : 0,
@@ -2474,7 +2473,7 @@ function createIdleContinueRuntime(options: {
       !preparedOutput
       || decision !== "continue"
       || continuation <= 0
-      || continuation > maxContinuations
+      || continuation > maxSmellVerifyCycles
       || !Number.isInteger(controlGeneration)
       || controlGeneration !== (existing?.generation ?? 0) + 1
       || !instruction
@@ -2505,7 +2504,7 @@ function createIdleContinueRuntime(options: {
           generation: nextGeneration,
           dispatchedGeneration: existing ? existing.dispatchedGeneration : -1,
           continuation,
-          maxContinuations,
+          maxSmellVerifyCycles,
           pending: true,
           dispatching: false,
           awaitingVerify: false,
@@ -2522,7 +2521,7 @@ function createIdleContinueRuntime(options: {
       nextState.taskKey = input.taskKey
       nextState.generation = nextGeneration
       nextState.continuation = continuation
-      nextState.maxContinuations = maxContinuations
+      nextState.maxSmellVerifyCycles = maxSmellVerifyCycles
       nextState.pending = true
       nextState.awaitingVerify = false
       nextState.awaitingVerifyReason = "continuation"
@@ -2540,12 +2539,12 @@ function createIdleContinueRuntime(options: {
       taskKey: nextState.taskKey,
       category: nextState.failureCategory,
       continuation: nextState.continuation,
-      maxContinuations: nextState.maxContinuations,
+      maxSmellVerifyCycles: nextState.maxSmellVerifyCycles,
     })
     return {
       ...base,
       continuation: nextState.continuation,
-      maxContinuations: nextState.maxContinuations,
+      maxSmellVerifyCycles: nextState.maxSmellVerifyCycles,
       generation: nextState.generation,
       category: nextState.failureCategory,
       dispatched: nextState.dispatchedGeneration === nextState.generation,
@@ -2601,7 +2600,7 @@ function createIdleContinueRuntime(options: {
       return true
     }
 
-    if (state.continuation <= 0 || state.continuation > state.maxContinuations) return false
+    if (state.continuation <= 0 || state.continuation > state.maxSmellVerifyCycles) return false
     if (state.dispatchedGeneration === state.generation) return false
 
     // Atomically mark dispatching for this generation before the async call.
@@ -2637,7 +2636,7 @@ function createIdleContinueRuntime(options: {
         log("smell-idle-continue dispatched", {
           sessionID,
           continuation: state.continuation,
-          maxContinuations: state.maxContinuations,
+          maxSmellVerifyCycles: state.maxSmellVerifyCycles,
           generation: state.generation,
         })
       })
@@ -2795,8 +2794,8 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
   if (!loop || !["off", "verify-failure"].includes(String(loop.mode || ""))) {
     throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid loop mode")
   }
-  if (!Number.isInteger(loop.max_continuations) || Number(loop.max_continuations) < 0 || Number(loop.max_continuations) > 5) {
-    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid continuation limit")
+  if (!Number.isInteger(loop.max_smell_verify_cycles) || Number(loop.max_smell_verify_cycles) < 0 || Number(loop.max_smell_verify_cycles) > 10) {
+    throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid smell-verify cycle limit")
   }
   if (!Number.isInteger(loop.no_progress_limit) || Number(loop.no_progress_limit) < 1 || Number(loop.no_progress_limit) > 5) {
     throw new Error("INVALID_LOOP_POLICY: resolver returned an invalid no-progress limit")
@@ -2804,12 +2803,12 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
   if (
     !Array.isArray(loop.allowed_failure_groups)
     || !loop.allowed_failure_groups.every((item) => typeof item === "string" && allowedFailureGroups.has(item))
-    || (loop.mode !== "off" && Number(loop.max_continuations) > 0 && loop.allowed_failure_groups.length === 0)
+    || (loop.mode !== "off" && Number(loop.max_smell_verify_cycles) > 0 && loop.allowed_failure_groups.length === 0)
   ) {
     throw new Error("INVALID_LOOP_POLICY: resolver returned invalid failure groups")
   }
   if (typeof loop.instruction !== "string" || !loop.instruction.trim()) {
-    throw new Error("INVALID_LOOP_POLICY: resolver returned no continuation instruction")
+    throw new Error("INVALID_LOOP_POLICY: resolver returned no smell-verify repair instruction")
   }
   if (
     !Number.isFinite(loop.sample_deadline_seconds)
@@ -2829,7 +2828,7 @@ function parseCommandPolicyPayload(value: unknown): CommandPolicy {
     ) as CommandTaskIdentity,
     loop: {
       mode: loop.mode as LoopPolicy["mode"],
-      max_continuations: Number(loop.max_continuations),
+      max_smell_verify_cycles: Number(loop.max_smell_verify_cycles),
       no_progress_limit: Number(loop.no_progress_limit),
       allowed_failure_groups: [...loop.allowed_failure_groups] as string[],
       instruction: loop.instruction,
@@ -2903,7 +2902,7 @@ function commandControllerSystemContext(
     `- allow_test_changes: ${policy.allow_test_changes}`,
     `- refactoring_backend: ${backend}`,
     `- loop_mode: ${policy.loop.mode}`,
-    `- max_continuations: ${policy.loop.max_continuations}`,
+    `- max_smell_verify_cycles: ${policy.loop.max_smell_verify_cycles}`,
     `- no_progress_limit: ${policy.loop.no_progress_limit}`,
     `- allowed_failure_groups: ${allowed}`,
     `- sample_deadline_seconds: ${policy.loop.sample_deadline_seconds}`,
@@ -2966,8 +2965,7 @@ function newCommandLoopState(
       instruction: INITIAL_VERIFY_INSTRUCTION,
       terminationReason: "",
     },
-    continuationCount: 0,
-    capRecoveryUsed: false,
+    smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
     bestMetricDeficit: null,
@@ -3003,8 +3001,7 @@ function commandLoopStateSnapshot(state: CommandLoopState): Record<string, unkno
       instruction: state.control.instruction,
       termination_reason: state.control.terminationReason,
     },
-    continuation_count: state.continuationCount,
-    cap_recovery_used: state.capRecoveryUsed,
+    smell_verify_cycle_count: state.smellVerifyCycleCount,
     no_progress_count: state.noProgressCount,
     last_failure_fingerprint: state.lastFailureFingerprint,
     best_metric_deficit: state.bestMetricDeficit ?? null,
@@ -3038,7 +3035,7 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
     const policy = parseCommandPolicyPayload(parsed.policy)
     const loop = policy.loop
     const startedAt = Number(parsed.started_at)
-    const continuationCount = Number(parsed.continuation_count)
+    const smellVerifyCycleCount = Number(parsed.smell_verify_cycle_count)
     const noProgressCount = Number(parsed.no_progress_count)
     const bestMetricDeficit = parsed.best_metric_deficit === null
       ? null
@@ -3086,12 +3083,11 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
       || (control.decision === "verify_required" && control.termination_reason !== "")
       || (control.decision === "continue" && (!control.instruction || control.termination_reason !== ""))
       || (control.decision === "stop" && control.instruction !== "")
-      || !Number.isInteger(continuationCount)
-      || continuationCount < 0
-      || continuationCount > loop.max_continuations
+      || !Number.isInteger(smellVerifyCycleCount)
+      || smellVerifyCycleCount < 0
+      || smellVerifyCycleCount > loop.max_smell_verify_cycles
       || !Number.isInteger(noProgressCount)
       || noProgressCount < 0
-      || typeof parsed.cap_recovery_used !== "boolean"
       || typeof parsed.last_failure_fingerprint !== "string"
       || (bestMetricDeficit !== null && (!Number.isFinite(bestMetricDeficit) || bestMetricDeficit < 0))
       || (bestStructuralFailureCount !== null && (!Number.isInteger(bestStructuralFailureCount) || bestStructuralFailureCount < 0))
@@ -3191,8 +3187,7 @@ function restoreCommandLoopState(raw: string | undefined): CommandLoopState | un
         instruction: control.instruction,
         terminationReason: control.termination_reason,
       },
-      continuationCount,
-      capRecoveryUsed: parsed.cap_recovery_used,
+      smellVerifyCycleCount,
       noProgressCount,
       lastFailureFingerprint: parsed.last_failure_fingerprint,
       bestMetricDeficit,
@@ -3451,18 +3446,6 @@ function writeControllerContextAudit(context: string, file: string | undefined):
   }
 }
 
-function hasActionableProgressAtCap(payload: Record<string, unknown>, failureGroup: string): boolean {
-  const checkpoint = payload.checkpoint && typeof payload.checkpoint === "object" && !Array.isArray(payload.checkpoint)
-    ? payload.checkpoint as Record<string, unknown>
-    : undefined
-  const delta = checkpoint?.delta && typeof checkpoint.delta === "object" && !Array.isArray(checkpoint.delta)
-    ? checkpoint.delta as Record<string, unknown>
-    : undefined
-  if (delta?.metric_progress === true) return true
-  return (failureGroup === "compile" || failureGroup === "test")
-    && delta?.has_production_diff === true
-}
-
 function buildLoopDecision(
   state: CommandLoopState,
   input: {
@@ -3478,10 +3461,9 @@ function buildLoopDecision(
     generation: state.control.generation + 1,
     decision: input.decision,
     termination_reason: input.terminationReason,
-    continuation: state.continuationCount,
-    max_continuations: state.policy.loop.max_continuations,
-    cap_recovery_used: state.capRecoveryUsed,
-    remaining: Math.max(0, state.policy.loop.max_continuations - state.continuationCount),
+    continuation: state.smellVerifyCycleCount,
+    max_smell_verify_cycles: state.policy.loop.max_smell_verify_cycles,
+    remaining: Math.max(0, state.policy.loop.max_smell_verify_cycles - state.smellVerifyCycleCount),
     no_progress_count: state.noProgressCount,
     no_progress_limit: state.policy.loop.no_progress_limit,
     elapsed_seconds: input.elapsedSeconds,
@@ -4002,35 +3984,18 @@ function applyCommandLoopDecision(
     }
     state.lastFailureFingerprint = fingerprint
 
-    if (state.policy.loop.mode === "off" || state.policy.loop.max_continuations <= 0) {
+    if (state.policy.loop.mode === "off" || state.policy.loop.max_smell_verify_cycles <= 0) {
       terminationReason = improvedOnly ? "IMPROVED_LOOP_DISABLED" : "LOOP_DISABLED"
     } else if (!improvedOnly && !retryable) {
       terminationReason = "NON_REPAIRABLE_FAILURE"
     } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
       terminationReason = improvedOnly ? "IMPROVED_SAMPLE_DEADLINE" : "SAMPLE_DEADLINE_REACHED"
-    } else if (state.continuationCount >= state.policy.loop.max_continuations) {
-      if (
-        !improvedOnly
-        && !freshConfirmationRequired
-        && retryable
-        && !state.capRecoveryUsed
-        && state.noProgressCount < state.policy.loop.no_progress_limit
-        && hasActionableProgressAtCap(payload, group)
-      ) {
-        // One final, bounded repair is part of the shared command policy so
-        // TUI/Web/serve/attach and batch runs receive identical behavior.
-        // Keep the public continuation count at the configured maximum; the
-        // separate flag prevents a second recovery.
-        state.capRecoveryUsed = true
-        decision = "continue"
-        terminationReason = ""
-      } else {
-        terminationReason = freshConfirmationRequired
-          ? "FLAKY_TEST_INCONCLUSIVE"
-          : improvedOnly ? "IMPROVED_MAX_CONTINUATIONS" : "MAX_CONTINUATIONS_REACHED"
-      }
+    } else if (state.smellVerifyCycleCount >= state.policy.loop.max_smell_verify_cycles) {
+      terminationReason = freshConfirmationRequired
+        ? "FLAKY_TEST_INCONCLUSIVE"
+        : improvedOnly ? "IMPROVED_MAX_SMELL_VERIFY_CYCLES" : "MAX_SMELL_VERIFY_CYCLES_REACHED"
     } else {
-      state.continuationCount += 1
+      state.smellVerifyCycleCount += 1
       decision = "continue"
       terminationReason = ""
     }
@@ -4139,17 +4104,17 @@ function applyGuardProgressDecision(
   const elapsedSeconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000))
   let decision: "continue" | "stop" = "continue"
   let terminationReason = ""
-  if (state.policy.loop.mode === "off" || state.policy.loop.max_continuations <= 0) {
+  if (state.policy.loop.mode === "off" || state.policy.loop.max_smell_verify_cycles <= 0) {
     decision = "stop"
     terminationReason = "LOOP_DISABLED"
   } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
     decision = "stop"
     terminationReason = "SAMPLE_DEADLINE_REACHED"
-  } else if (state.continuationCount >= state.policy.loop.max_continuations) {
+  } else if (state.smellVerifyCycleCount >= state.policy.loop.max_smell_verify_cycles) {
     decision = "stop"
-    terminationReason = "MAX_CONTINUATIONS_REACHED"
+    terminationReason = "MAX_SMELL_VERIFY_CYCLES_REACHED"
   } else {
-    state.continuationCount += 1
+    state.smellVerifyCycleCount += 1
   }
   const feedback = recordValue(payload.source_guard_feedback)
   const nextAction = typeof feedback?.next_action === "string" && feedback.next_action.trim()
@@ -4305,8 +4270,8 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
       generation: state.control.generation,
       decision: state.control.decision,
       instruction: state.control.instruction,
-      continuation: state.continuationCount,
-      maxContinuations: state.policy.loop.max_continuations,
+      continuation: state.smellVerifyCycleCount,
+      maxSmellVerifyCycles: state.policy.loop.max_smell_verify_cycles,
     })
   }
   const restoreCommandLineage = (sessionID: string): void => {
@@ -4603,7 +4568,7 @@ export const SmellPlugin: Plugin = async ({ worktree, client }) => {
             normalized.metadata.auto_continuation = toJsonSafe({
               enabled: cont.enabled,
               continuation: cont.continuation,
-              maxContinuations: cont.maxContinuations,
+              maxSmellVerifyCycles: cont.maxSmellVerifyCycles,
               generation: cont.generation,
               status: cont.status,
               category: cont.category,

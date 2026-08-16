@@ -421,13 +421,19 @@ for removed_mode in ("local", "auto"):
         raise AssertionError(f"removed verification mode still accepted: {removed_mode}")
 
 print("== command policy parser ==")
-resolved = parse_command_policy('--verification-mode=sample_optimized --loop-max=2 --loop-on=smell,test --loop-instruction="Use the pack" -- Project root: /tmp/p')
+resolved = parse_command_policy('--verification-mode=sample_optimized --max-smell-verify-cycles=10 --loop-on=smell,test --loop-instruction="Use the pack" -- Project root: /tmp/p')
 check("policy_mode", resolved.verification_mode, "sample_optimized")
-check("policy_max", resolved.loop.max_continuations, 2)
+check("policy_max_smell_verify_cycles", resolved.loop.max_smell_verify_cycles, 10)
 check("policy_groups", resolved.loop.allowed_failure_groups, ("smell", "test"))
 check("policy_instruction", resolved.loop.instruction, "Use the pack")
-quoted_argv = parse_command_policy("--loop-max=2 '--loop-instruction=修复最新 failure pack 并保持行为不变' -- task")
+quoted_argv = parse_command_policy("--max-smell-verify-cycles=10 '--loop-instruction=修复最新 failure pack 并保持行为不变' -- task")
 check("policy_instruction_quoted_argv", quoted_argv.loop.instruction, "修复最新 failure pack 并保持行为不变")
+try:
+    parse_command_policy("--loop-max=10 -- task")
+except ValueError as exc:
+    check_true("legacy_loop_max_rejected", "unrecognized arguments" in str(exc))
+else:
+    raise AssertionError("legacy --loop-max unexpectedly remained accepted")
 check_true("policy_allows_guard", resolved.loop.allows("SMELL_GUARD_FAILED"))
 check("policy_removes_dataset_route_category", resolved.loop.allows("STRUCTURAL_ROUTE_MISMATCH"), False)
 check("policy_blocks_compile", resolved.loop.allows("BUILD_COMPILE_ERROR"), False)
@@ -453,7 +459,7 @@ readme_bridge = subprocess.run(
         "resolve-command",
         "--arguments",
         (
-            "--verification-mode=sample_optimized --loop-max=2 -- "
+            "--verification-mode=sample_optimized --max-smell-verify-cycles=2 -- "
             "Project root: /abs/java-project; Smell type: long_method; "
             "Target location: src/main/java/Foo.java:42; "
             "Build command: ./mvnw -q package; "
@@ -490,13 +496,13 @@ if readme_bridge.returncode == 0:
         "command",
     )
     initial_state = readme_bridge_payload["command_loop_state"]
-    check("readme_bridge_state_schema", initial_state["schema_version"], 6)
+    check("readme_bridge_state_schema", initial_state["schema_version"], 7)
     check(
         "readme_bridge_state_identity",
         initial_state["policy"]["identity"]["project_root"],
         "/abs/java-project",
     )
-    check("readme_bridge_state_continuations", initial_state["continuation_count"], 0)
+    check("readme_bridge_state_continuations", initial_state["smell_verify_cycle_count"], 0)
     check("readme_bridge_state_target_context", initial_state["target_identity_context"], "")
     check("readme_bridge_state_best_metric", initial_state["best_metric_deficit"], None)
     check("readme_bridge_state_best_structural", initial_state["best_structural_failure_count"], None)
@@ -713,11 +719,11 @@ for name, defaults, expected_prefix in [
         failures.append(f"{name}: expected ValueError")
     except ValueError as exc:
         check_true(name, str(exc).startswith(expected_prefix))
-disabled = parse_command_policy('--loop-max=0 -- Project root: /tmp/p')
+disabled = parse_command_policy('--max-smell-verify-cycles=0 -- Project root: /tmp/p')
 check("zero_disables", disabled.loop.mode, "off")
 for name, raw in [
-    ("missing_delimiter", "--loop-max=2 task"),
-    ("bad_max", "--loop-max=9 -- task"),
+    ("missing_delimiter", "--max-smell-verify-cycles=2 task"),
+    ("bad_max", "--max-smell-verify-cycles=11 -- task"),
     ("bad_group", "--loop-on=unknown -- task"),
 ]:
     try:
@@ -834,7 +840,7 @@ def command_state(
         else None
     )
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "policy": {
             "task": "Continue the current smell refactoring task.",
             "verification_mode": "project_full",
@@ -859,7 +865,7 @@ def command_state(
             },
             "loop": {
                 "mode": "verify-failure",
-                "max_continuations": 5,
+                "max_smell_verify_cycles": 5,
                 "no_progress_limit": 1,
                 "allowed_failure_groups": ["smell", "compile", "test"],
                 "instruction": "repair narrowly",
@@ -874,8 +880,7 @@ def command_state(
             "instruction": instruction,
             "termination_reason": termination_reason,
         },
-        "continuation_count": 0,
-        "cap_recovery_used": False,
+        "smell_verify_cycle_count": 0,
         "no_progress_count": 0,
         "last_failure_fingerprint": "",
         "best_metric_deficit": None,
@@ -953,15 +958,15 @@ initial_control_state = command_state(
     "verify_required",
     "Call smell_verify now using the frozen command identity.",
 )
-truncated_v6_state = {
-    "schema_version": 6,
+truncated_v7_state = {
+    "schema_version": 7,
     "control": dict(initial_control_state["control"]),
 }
 check(
-    "truncated_v6_state_is_not_transportable",
+    "truncated_v7_state_is_not_transportable",
     R._runner_transport_plan(
         R._verification_trace('{"type":"text","part":{"text":"done"}}'),
-        previous_state=truncated_v6_state,
+        previous_state=truncated_v7_state,
         transported_generations=set(),
     )["action"],
     "stop",
@@ -1332,10 +1337,9 @@ guard_progress_trace = R._verification_trace(verify_event(
     metadata={
         "command_loop_state": {
             "schema_version": 1,
-            "continuation_count": 0,
+            "smell_verify_cycle_count": 0,
             "no_progress_count": 0,
             "last_failure_fingerprint": "",
-            "cap_recovery_used": False,
         },
     },
 ))
@@ -1396,13 +1400,12 @@ check(
 )
 persisted_state = {
     "schema_version": 1,
-    "continuation_count": 2,
-    "cap_recovery_used": False,
+    "smell_verify_cycle_count": 2,
 }
 state_trace = R._verification_trace(verify_event(
     {"status": "SMELL_GUARD_FAILED", "loop": {"decision": "continue"}},
     metadata={
-        "loop": {"decision": "continue", "cap_recovery_used": False},
+        "loop": {"decision": "continue"},
         "command_loop_state": persisted_state,
     },
 ))
@@ -1561,7 +1564,7 @@ cap_payload = {
     "status": "SMELL_GUARD_FAILED",
     "failure_pack": {"retryable": True},
     "checkpoint": {"delta": {"metric_progress": True}},
-    "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
+    "loop": {"decision": "stop", "termination_reason": "MAX_SMELL_VERIFY_CYCLES_REACHED"},
 }
 cap_trace = R._verification_trace(verify_event(cap_payload))
 check(
@@ -1578,7 +1581,7 @@ compile_cap_payload = {
     "failure_pack": {"retryable": True},
     "checkpoint": {"delta": {"metric_progress": False}},
     "snapshot": {"diff_stat": {"stdout": " Foo.java | 2 +-\n 1 file changed"}},
-    "loop": {"decision": "stop", "termination_reason": "MAX_CONTINUATIONS_REACHED"},
+    "loop": {"decision": "stop", "termination_reason": "MAX_SMELL_VERIFY_CYCLES_REACHED"},
 }
 compile_cap_trace = R._verification_trace(verify_event(compile_cap_payload))
 check(
@@ -1941,7 +1944,7 @@ with tempfile.TemporaryDirectory() as tmp:
         model_event_inactivity_timeout=1,
         projects="",
         loop_mode="verify-failure",
-        loop_max=2,
+        max_smell_verify_cycles=2,
         loop_no_progress_limit=1,
         loop_on="smell,compile,test",
         loop_instruction="repair narrowly",
@@ -2082,7 +2085,7 @@ check_true(
     "_runner_transport_plan(" in run_sample_source
     and "transported_control_generations.add(generation)" in run_sample_source
     and 'action == "guard_progress"' not in run_sample_source
-    and "max_continuations" not in inspect.getsource(R._runner_transport_plan),
+    and "max_smell_verify_cycles" not in inspect.getsource(R._runner_transport_plan),
 )
 check_true(
     "one_absolute_deadline_precedes_baseline",
@@ -2231,7 +2234,7 @@ if continued:
         "loop": loop,
     }
 state = {
-    "schema_version": 6,
+    "schema_version": 7,
     "policy": {
         "task": "Continue the current smell refactoring task.",
         "verification_mode": "project_full",
@@ -2248,7 +2251,7 @@ state = {
             "verification_command_source": "", "sample_test_source": "",
         },
         "loop": {
-            "mode": "verify-failure", "max_continuations": 5,
+            "mode": "verify-failure", "max_smell_verify_cycles": 5,
             "no_progress_limit": 1,
             "allowed_failure_groups": ["smell", "compile", "test"],
             "instruction": "repair narrowly", "sample_deadline_seconds": 1800,
@@ -2257,8 +2260,7 @@ state = {
     "target_identity_context": "",
     "started_at": 1,
     "control": loop,
-    "continuation_count": 0,
-    "cap_recovery_used": False,
+    "smell_verify_cycle_count": 0,
     "no_progress_count": 0,
     "last_failure_fingerprint": "",
     "best_metric_deficit": None,
@@ -2366,10 +2368,9 @@ event = {
             "metadata": {
                 "command_loop_state": {
                     "schema_version": 1,
-                    "continuation_count": 0,
+                    "smell_verify_cycle_count": 0,
                     "no_progress_count": 0,
                     "last_failure_fingerprint": "",
-                    "cap_recovery_used": False,
                 },
             },
         },
@@ -2407,7 +2408,7 @@ sample = Sample(
 )
 args = argparse.Namespace(
     loop_mode="verify-failure",
-    loop_max=2,
+    max_smell_verify_cycles=2,
     loop_no_progress_limit=1,
     loop_on="smell,compile,test",
     loop_instruction="Repair from the latest failure pack",
@@ -2453,7 +2454,7 @@ initial_controller_state = R._initial_command_loop_state(
     "project_full",
     started_at_ms=123456,
 )
-check("initial_controller_state_schema", initial_controller_state["schema_version"], 6)
+check("initial_controller_state_schema", initial_controller_state["schema_version"], 7)
 check("initial_controller_state_started_at", initial_controller_state["started_at"], 123456)
 check("initial_controller_state_target_context", initial_controller_state["target_identity_context"], "")
 check(
@@ -2510,7 +2511,7 @@ if continued:
         raise SystemExit(21)
     state = json.loads(raw)
     identity = state.get("policy", {}).get("identity", {})
-    if state.get("schema_version") != 6 or identity.get("location") != "Foo.java:1":
+    if state.get("schema_version") != 7 or identity.get("location") != "Foo.java:1":
         raise SystemExit(22)
 print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
 """,
@@ -2544,7 +2545,7 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
         allow_test_changes=False,
         refactoring_backend="idea",
         loop_mode="verify-failure",
-        loop_max=2,
+        max_smell_verify_cycles=2,
         loop_no_progress_limit=1,
         loop_on="smell,compile,test",
         loop_instruction="repair narrowly",

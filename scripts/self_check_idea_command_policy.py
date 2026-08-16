@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared command-policy checks for the IDEA backend.
 
-This check intentionally exercises the command parser and transferable v6
+This check intentionally exercises the command parser and transferable v7
 state directly.  It does not invoke the dataset runner.
 """
 
@@ -21,7 +21,7 @@ def command(backend: str, language: str = "java") -> str:
     return (
         "--verification-mode=project_full "
         f"--refactoring-backend={backend} "
-        "--loop-max=2 --sample-deadline=600 -- "
+        "--max-smell-verify-cycles=10 --sample-deadline=600 -- "
         f"Project root: /tmp/project; Language: {language}; "
         "Smell type: long_method; Target location: src/Foo.java:method=run|line=1"
     )
@@ -30,6 +30,11 @@ def command(backend: str, language: str = "java") -> str:
 idea = resolve_command_payload(command("idea"), started_at_ms=1234)
 assert idea["refactoring_backend"] == "idea", idea
 assert idea["command_loop_state"]["policy"]["refactoring_backend"] == "idea", idea
+assert idea["command_loop_state"]["schema_version"] == 7, idea
+assert idea["command_loop_state"]["policy"]["loop"]["max_smell_verify_cycles"] == 10, idea
+assert idea["command_loop_state"]["smell_verify_cycle_count"] == 0, idea
+assert "max_continuations" not in idea["command_loop_state"]["policy"]["loop"], idea
+assert "continuation_count" not in idea["command_loop_state"], idea
 assert idea["command_loop_state"]["idea_protocol_state"] == {
     "active_proposal": None,
     "proposal_blocker": None,
