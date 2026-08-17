@@ -786,6 +786,54 @@ def _check_empty_cpp_body_has_explicit_no_copy_witness() -> None:
         ), snapshot
 
 
+def _check_python_declaration_only_body_has_no_copy_witness() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="nonjava-data-clumps-python-declaration-only-"
+    ) as raw:
+        project = Path(raw)
+        target = project / "targets.py"
+        target.write_text(
+            "from abc import abstractmethod\n\n"
+            "class Base:\n"
+            "    @abstractmethod\n"
+            "    def alpha(self, start: int, end: int, retry: int): ...\n\n"
+            "class One(Base):\n"
+            "    def alpha(self, start: int, end: int, retry: int):\n"
+            "        value = start * 17 + end * 19\n"
+            "        return value + retry\n\n"
+            "class Two(Base):\n"
+            "    def alpha(self, start: int, end: int, retry: int):\n"
+            "        value = start * 23 + end * 29\n"
+            "        return value + retry\n\n"
+            "class Three(Base):\n"
+            "    def alpha(self, start: int, end: int, retry: int):\n"
+            "        value = start * 31 + end * 37\n"
+            "        return value + retry\n",
+            encoding="utf-8",
+        )
+        locations = ";".join(
+            f"{target}:method=alpha|line={line}"
+            for line in (5, 8, 13, 18)
+        )
+        config = resolve_run_config(
+            refactor_config=load_refactor_config(None),
+            project_overrides=[],
+            project_root=str(project),
+            smell="data_clumps",
+            location=locations,
+            cli_language="python",
+            target_context={"group": GROUP},
+        )
+        snapshot = capture_metric_snapshot(config, "")
+        assert snapshot["ok"] is True, snapshot
+        assert snapshot["finding_present"] is True, snapshot
+        abstract = snapshot["occurrence_contract"][0]
+        assert abstract["body_windows"] == [], abstract
+        assert abstract["body_copy_not_applicable"] == (
+            "declaration_only_body"
+        ), abstract
+
+
 def _config_for_target(project: Path, target: Path):
     locations = ";".join(
         f"{target}:method={name}|line=1"
@@ -1688,6 +1736,7 @@ def main() -> int:
     _check_shared_non_unique_windows()
     _check_short_body_baseline_rejected()
     _check_empty_cpp_body_has_explicit_no_copy_witness()
+    _check_python_declaration_only_body_has_no_copy_witness()
     _check_old_contract_without_witness_fails_closed()
     _check_type_only_mutation_continuity()
     _check_one_for_one_helper_relocation()

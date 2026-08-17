@@ -28,6 +28,7 @@ def _run_case(
     semantic_regressions: list[str] | None = None,
     plan_next_action: str | None = None,
     plan_overrides: dict[str, object] | None = None,
+    candidate_revision: str = "",
 ) -> dict[str, object]:
     resolved = SimpleNamespace(
         language=language,
@@ -55,6 +56,8 @@ def _run_case(
             **dict(plan_overrides or {}),
         },
     }
+    if candidate_revision:
+        checkpoint["production_diff_hash"] = candidate_revision
     guard_results = [{
         "type": smell,
         "success": True,
@@ -124,11 +127,14 @@ def _run_case(
     assert feedback["passed"] is source_guard_passed, feedback
     assert payload["next_action"] == feedback["next_action"], payload
     observation = feedback["progress_observation"]
-    assert set(observation) == {
+    expected_observation_keys = {
         "metric_deficit",
         "structural_failure_count",
         "blocker_codes",
-    }, observation
+    }
+    if candidate_revision:
+        expected_observation_keys.add("candidate_revision")
+    assert set(observation) == expected_observation_keys, observation
     rendered = json.dumps(payload, sort_keys=True)
     for forbidden in (
         "worklist",
@@ -144,6 +150,31 @@ def _run_case(
 
 
 def main() -> None:
+    revisioned = _run_case(
+        language="python",
+        smell="long_method",
+        budget={
+            "metric": "meaningful_line_count",
+            "current": 90,
+            "passing_max": 80,
+            "required_reduction": 10,
+            "unit": "meaningful_line_count",
+        },
+        source_guard_passed=False,
+        candidate_revision="existing-production-diff-revision",
+    )
+    revision_observation = revisioned["source_guard_feedback"][
+        "progress_observation"
+    ]
+    assert revision_observation["candidate_revision"] == (
+        "existing-production-diff-revision"
+    ), revisioned
+    assert smell_bridge._compact_source_guard_feedback(
+        revisioned["source_guard_feedback"]
+    )["progress_observation"]["candidate_revision"] == (
+        "existing-production-diff-revision"
+    ), revisioned
+
     replay_cases = (
         (
             "55",
@@ -372,6 +403,11 @@ def main() -> None:
     ), (multiple_observation, second_observation)
 
     typed_contract_actions = (
+        (
+            "TARGET_SYNTAX_RECOVERY_REGRESSION",
+            ("syntax", "parseability", "before further metric work"),
+            {},
+        ),
         (
             "CLONE_TARGET_DECLARATION_IDENTITY_FAILED",
             ("original owner", "thin wrapper", "shared implementation"),

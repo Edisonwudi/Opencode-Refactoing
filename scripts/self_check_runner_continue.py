@@ -293,6 +293,46 @@ check(
 parser = R.build_parser()
 parsed = parser.parse_args(["--dataset", "/tmp/input.csv", "--sample-deadline", "2400"])
 check("sample_deadline_public_entry", parsed.sample_deadline, 2400)
+original_monotonic = R.time.monotonic
+R.time.monotonic = lambda: 17.0
+try:
+    check(
+        "sample_timing_separates_setup_from_budget",
+        R._sample_timing_evidence(10.0, 12.0),
+        {
+            "duration_seconds": "7.0",
+            "setup_duration_seconds": "2.0",
+            "sample_budget_elapsed_seconds": "5.0",
+        },
+    )
+    check(
+        "sample_timing_before_budget_is_setup_only",
+        R._sample_timing_evidence(10.0),
+        {
+            "duration_seconds": "7.0",
+            "setup_duration_seconds": "7.0",
+            "sample_budget_elapsed_seconds": "",
+        },
+    )
+finally:
+    R.time.monotonic = original_monotonic
+check("runner_default_max_smell_verify_cycles", parsed.max_smell_verify_cycles, 10)
+check(
+    "runner_accepts_max_smell_verify_cycles",
+    parser.parse_args([
+        "--dataset", "/tmp/input.csv", "--max-smell-verify-cycles", "10"
+    ]).max_smell_verify_cycles,
+    10,
+)
+try:
+    with contextlib.redirect_stderr(io.StringIO()):
+        parser.parse_args([
+            "--dataset", "/tmp/input.csv", "--max-smell-verify-cycles", "11"
+        ])
+except SystemExit:
+    pass
+else:
+    raise AssertionError("runner unexpectedly accepted max_smell_verify_cycles=11")
 check(
     "model_event_inactivity_timeout_default",
     getattr(parsed, "model_event_inactivity_timeout", None),
@@ -421,6 +461,10 @@ for removed_mode in ("local", "auto"):
         raise AssertionError(f"removed verification mode still accepted: {removed_mode}")
 
 print("== command policy parser ==")
+default_policy = parse_command_policy("--verification-mode=project_full -- task")
+check("policy_default_max_smell_verify_cycles", default_policy.loop.max_smell_verify_cycles, 10)
+max_policy = parse_command_policy("--max-smell-verify-cycles=10 -- task")
+check("policy_accepts_max_smell_verify_cycles", max_policy.loop.max_smell_verify_cycles, 10)
 resolved = parse_command_policy('--verification-mode=sample_optimized --max-smell-verify-cycles=10 --loop-on=smell,test --loop-instruction="Use the pack" -- Project root: /tmp/p')
 check("policy_mode", resolved.verification_mode, "sample_optimized")
 check("policy_max_smell_verify_cycles", resolved.loop.max_smell_verify_cycles, 10)

@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +114,52 @@ def _verify_args(artifact_root: Path) -> SimpleNamespace:
 
 
 def main() -> None:
+    assert hasattr(smell_bridge, "_run_git_cleanup"), (
+        "project_full cleanup must use an independent bounded cleanup deadline"
+    )
+    original_run_git = smell_bridge._run_git
+    cleanup_deadlines: list[float | None] = []
+
+    def _capture_cleanup_deadline(
+        args: list[str],
+        cwd: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, object]:
+        cleanup_deadlines.append(deadline_monotonic)
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    smell_bridge._run_git = _capture_cleanup_deadline
+    try:
+        cleanup_probe = smell_bridge._run_git_cleanup(
+            ["worktree", "prune"],
+            ROOT,
+        )
+    finally:
+        smell_bridge._run_git = original_run_git
+    assert cleanup_probe["returncode"] == 0, cleanup_probe
+    assert len(cleanup_deadlines) == 1, cleanup_deadlines
+    cleanup_remaining = float(cleanup_deadlines[0] or 0) - time.monotonic()
+    assert 0 < cleanup_remaining <= 30.0, cleanup_remaining
+
+    def _timeout_cleanup(
+        args: list[str],
+        cwd: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, object]:
+        raise subprocess.TimeoutExpired(["git", *args], 30.0)
+
+    smell_bridge._run_git = _timeout_cleanup
+    try:
+        timed_out_cleanup = smell_bridge._run_git_cleanup(
+            ["worktree", "prune"],
+            ROOT,
+        )
+    finally:
+        smell_bridge._run_git = original_run_git
+    assert timed_out_cleanup["returncode"] == 124, timed_out_cleanup
+    assert "cleanup deadline" in str(timed_out_cleanup["stderr"]), timed_out_cleanup
     with tempfile.TemporaryDirectory(prefix="fresh-project-full-check-") as raw:
         fixture = Path(raw)
         root = fixture / "agent-worktree"
@@ -507,14 +554,23 @@ def main() -> None:
 
         original_run_git = smell_bridge._run_git
 
-        def _report_cleanup_failure(args: list[str], cwd: Path):
+        def _report_cleanup_failure(
+            args: list[str],
+            cwd: Path,
+            *,
+            deadline_monotonic: float | None = None,
+        ):
             if args[:3] == ["worktree", "remove", "--force"]:
                 return {
                     "returncode": 1,
                     "stdout": "",
                     "stderr": "fixture cleanup report failure",
                 }
-            return original_run_git(args, cwd)
+            return original_run_git(
+                args,
+                cwd,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         try:
             smell_bridge._run_git = _report_cleanup_failure
@@ -537,14 +593,23 @@ def main() -> None:
 
         original_run_git = smell_bridge._run_git
 
-        def _fail_worktree_add(args: list[str], cwd: Path):
+        def _fail_worktree_add(
+            args: list[str],
+            cwd: Path,
+            *,
+            deadline_monotonic: float | None = None,
+        ):
             if args[:3] == ["worktree", "add", "--detach"]:
                 return {
                     "returncode": 128,
                     "stdout": "",
                     "stderr": "fixture worktree creation failure",
                 }
-            return original_run_git(args, cwd)
+            return original_run_git(
+                args,
+                cwd,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         try:
             smell_bridge._run_git = _fail_worktree_add
@@ -565,8 +630,17 @@ def main() -> None:
 
         original_run_git = smell_bridge._run_git
 
-        def _partially_register_then_fail(args: list[str], cwd: Path):
-            result = original_run_git(args, cwd)
+        def _partially_register_then_fail(
+            args: list[str],
+            cwd: Path,
+            *,
+            deadline_monotonic: float | None = None,
+        ):
+            result = original_run_git(
+                args,
+                cwd,
+                deadline_monotonic=deadline_monotonic,
+            )
             if args[:3] == ["worktree", "add", "--detach"]:
                 assert result["returncode"] == 0, result
                 return {

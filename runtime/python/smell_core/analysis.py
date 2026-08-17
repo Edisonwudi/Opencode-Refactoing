@@ -122,6 +122,7 @@ class SourceSnippet:
     # behind and silently reassigned when the selected function is deleted.
     declaration_start_line: int = 0
     declaration_text: str = ""
+    declaration_boundary_complete: bool = False
 
 
 @dataclass
@@ -517,34 +518,73 @@ def extract_snippet_candidates(
     """
     source_bytes = target.file_path.read_bytes()
     root = _parse_tree(target.file_path, language, source_bytes)
-    function_nodes = [
-        node
-        for node in _iter_nodes(root)
-        if node.type in FUNCTION_NODE_TYPES.get(language, set())
-    ]
     method_name = method_basename(target.method)
-    if method_name:
+
+    def selected_nodes(parsed_root: Node) -> list[Node]:
         function_nodes = [
             node
-            for node in function_nodes
-            if _extract_declared_name(node, language, source_bytes)
-            == method_name
+            for node in _iter_nodes(parsed_root)
+            if node.type in FUNCTION_NODE_TYPES.get(language, set())
         ]
-    elif target.line is not None:
-        containing = [
-            node
-            for node in function_nodes
-            if _node_contains_line(node, target.line)
-        ]
-        if containing:
-            function_nodes = containing
+        if method_name:
+            return [
+                node
+                for node in function_nodes
+                if _extract_declared_name(node, language, source_bytes)
+                == method_name
+            ]
+        if target.line is not None:
+            containing = [
+                node
+                for node in function_nodes
+                if _node_contains_line(node, target.line)
+            ]
+            if containing:
+                return containing
+        return function_nodes
 
     candidates: List[Tuple[SourceSnippet, bool]] = []
-    for node in function_nodes:
+    for node in selected_nodes(root):
         snippet = _build_source_snippet(node, source_bytes, language)
         if snippet is None:
             continue
         candidates.append((snippet, node_subtree_parseable(node)))
+
+    # Tree-sitter cannot represent a valid C/C++ pattern where alternative
+    # preprocessor branches open the same statement and share its body after
+    # ``#endif``.  Recover only declarations that the original parse already
+    # anchored by exact name and start line.  A deterministic first-branch
+    # projection supplies the declaration boundary; it never discovers a new
+    # target, while the original file-level recovery witnesses remain frozen
+    # by the caller and reject newly introduced syntax damage.
+    if language in {"c", "cpp"} and any(
+        not item.declaration_boundary_complete for item, _ in candidates
+    ):
+        projected_bytes = _first_preprocessor_branch_projection(source_bytes)
+        projected_root = _parse_tree(
+            target.file_path,
+            language,
+            projected_bytes,
+        )
+        projected: dict[tuple[int, str], list[tuple[SourceSnippet, bool]]] = {}
+        for node in selected_nodes(projected_root):
+            snippet = _build_source_snippet(node, source_bytes, language)
+            if snippet is None:
+                continue
+            key = (int(snippet.start_line), str(snippet.declared_name))
+            projected.setdefault(key, []).append(
+                (snippet, node_subtree_parseable(node))
+            )
+        recovered: list[tuple[SourceSnippet, bool]] = []
+        for snippet, parseable in candidates:
+            key = (int(snippet.start_line), str(snippet.declared_name))
+            matches = [
+                item
+                for item in projected.get(key, [])
+                if item[0].declaration_boundary_complete
+            ]
+            recovered.append(matches[0] if len(matches) == 1 else (snippet, parseable))
+        candidates = recovered
     candidates.sort(key=lambda item: (
         abs(item[0].start_line - int(target.line or item[0].start_line)),
         item[0].end_line - item[0].start_line,
@@ -553,11 +593,98 @@ def extract_snippet_candidates(
     return candidates
 
 
+def _first_preprocessor_branch_projection(source_bytes: bytes) -> bytes:
+    """Preserve offsets while selecting the first branch of C conditionals.
+
+    The projection exists only to let tree-sitter recover declaration
+    boundaries.  Metrics and identities are still read from the original
+    source bytes, and callers freeze the original parser-recovery witnesses.
+    """
+
+    projected: list[bytes] = []
+    active = True
+    parent_activity: list[bool] = []
+    directive_continuation = False
+
+    for line in source_bytes.splitlines(keepends=True):
+        content = line.rstrip(b"\r\n")
+        ending = line[len(content):]
+        stripped = content.lstrip()
+        if directive_continuation:
+            projected.append(b" " * len(content) + ending)
+            directive_continuation = content.rstrip().endswith(b"\\")
+            continue
+
+        directive = b""
+        if stripped.startswith(b"#"):
+            payload = stripped[1:].lstrip()
+            directive = payload.split(None, 1)[0] if payload else b""
+
+        if directive in {b"if", b"ifdef", b"ifndef"}:
+            parent_activity.append(active)
+        elif directive in {b"elif", b"else"}:
+            active = False
+        elif directive == b"endif":
+            if parent_activity:
+                active = parent_activity.pop()
+
+        if directive:
+            projected.append(b" " * len(content) + ending)
+            directive_continuation = content.rstrip().endswith(b"\\")
+        elif active:
+            projected.append(line)
+        else:
+            projected.append(b" " * len(content) + ending)
+    return b"".join(projected)
+
+
 def node_subtree_parseable(node: Node) -> bool:
     """Whether one selected AST subtree contains no recovery nodes."""
     return not bool(node.has_error) and not any(
         child.type == "ERROR" or child.is_missing
         for child in _iter_nodes(node)
+    )
+
+
+def function_declaration_boundary_complete(
+    node: Node,
+    source_bytes: bytes,
+    language: str,
+) -> bool:
+    """Whether tree-sitter recovered a complete, named function boundary.
+
+    C/C++ macro tokens can produce recovery nodes in an otherwise complete
+    declaration or body.  Callers that freeze the file-level recovery witness
+    may still use that declaration, but an actually truncated function must
+    remain unavailable.  This predicate deliberately checks only structure
+    already present in the selected AST node; it does not guess a declaration
+    from text or search another source location.
+    """
+
+    body = node.child_by_field_name("body")
+    if body is None or not (_extract_declared_name(node, language, source_bytes) or ""):
+        return False
+    if language == "python":
+        return node_subtree_parseable(node)
+    if language not in {"c", "cpp"}:
+        return node_subtree_parseable(node)
+    if any(
+        child.is_missing and child.type == "}"
+        for child in _iter_nodes(node)
+    ):
+        return False
+    body_text = _node_text(source_bytes, body).strip()
+    return body_text.startswith("{") and body_text.endswith("}")
+
+
+def source_snippet_boundary_complete(snippet: SourceSnippet, language: str) -> bool:
+    """Public projection of :func:`function_declaration_boundary_complete`."""
+
+    return bool(
+        snippet.declaration_boundary_complete
+        and str(snippet.declared_name or "")
+        and str(snippet.signature_text or "")
+        and language in {"python", "c", "cpp"}
     )
 
 
@@ -1532,6 +1659,11 @@ def _build_source_snippet(node: Node, source_bytes: bytes, language: str) -> Opt
         owner_qualified_name=_actual_function_owner(node, language, source_bytes),
         declaration_start_line=_node_start_line(declaration_node),
         declaration_text=_node_text(source_bytes, declaration_node),
+        declaration_boundary_complete=function_declaration_boundary_complete(
+            node,
+            source_bytes,
+            language,
+        ),
     )
 
 

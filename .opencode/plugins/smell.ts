@@ -3612,6 +3612,7 @@ function guardProgressObservation(payload: Record<string, unknown>): {
   metricDeficit: number
   structuralFailureCount: number
   blockerCodes: string[]
+  candidateRevision: string
 } {
   const feedback = recordValue(payload.source_guard_feedback)
   const observation = recordValue(feedback?.progress_observation)
@@ -3638,7 +3639,10 @@ function guardProgressObservation(payload: Record<string, unknown>): {
     ...asStringArray(observation?.blocker_codes),
     typeof blocker?.code === "string" ? blocker.code : "",
   ].map((code) => code.trim()).filter(Boolean))).sort().slice(0, MAX_SEEN_STRUCTURAL_STATES)
-  return { metricDeficit, structuralFailureCount, blockerCodes }
+  const candidateRevision = typeof observation?.candidate_revision === "string"
+    ? observation.candidate_revision.trim().slice(0, 128)
+    : ""
+  return { metricDeficit, structuralFailureCount, blockerCodes, candidateRevision }
 }
 
 function failureFingerprint(payload: Record<string, unknown>): string {
@@ -3990,6 +3994,10 @@ function applyCommandLoopDecision(
       terminationReason = "NON_REPAIRABLE_FAILURE"
     } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
       terminationReason = improvedOnly ? "IMPROVED_SAMPLE_DEADLINE" : "SAMPLE_DEADLINE_REACHED"
+    } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
+      terminationReason = improvedOnly
+        ? "IMPROVED_NO_PROGRESS_LIMIT_REACHED"
+        : "NO_PROGRESS_LIMIT_REACHED"
     } else if (state.smellVerifyCycleCount >= state.policy.loop.max_smell_verify_cycles) {
       terminationReason = freshConfirmationRequired
         ? "FLAKY_TEST_INCONCLUSIVE"
@@ -4083,6 +4091,18 @@ function applyGuardProgressDecision(
   ) {
     state.seenStructuralStates.push(structuralState)
   }
+  const progressFingerprint = [
+    "guard-progress",
+    observation.metricDeficit,
+    observation.structuralFailureCount,
+    observation.blockerCodes.join("|"),
+    observation.candidateRevision,
+  ].join(":")
+  if (state.lastFailureFingerprint === progressFingerprint) {
+    state.noProgressCount += 1
+  } else {
+    state.noProgressCount = 0
+  }
   if (strictlyImproved) {
     if (!hasBest || observation.structuralFailureCount < priorStructuralFailureCount!) {
       state.bestStructuralFailureCount = observation.structuralFailureCount
@@ -4090,17 +4110,9 @@ function applyGuardProgressDecision(
     if (!hasBest || observation.structuralFailureCount === 0) {
       state.bestMetricDeficit = observation.metricDeficit
     }
-    state.noProgressCount = 0
-  } else {
-    state.noProgressCount += 1
   }
   state.lastBlockerCodes = observation.blockerCodes
-  state.lastFailureFingerprint = [
-    "guard-progress",
-    observation.metricDeficit,
-    observation.structuralFailureCount,
-    observation.blockerCodes.join("|"),
-  ].join(":")
+  state.lastFailureFingerprint = progressFingerprint
   const elapsedSeconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000))
   let decision: "continue" | "stop" = "continue"
   let terminationReason = ""
@@ -4110,6 +4122,9 @@ function applyGuardProgressDecision(
   } else if (elapsedSeconds >= state.policy.loop.sample_deadline_seconds) {
     decision = "stop"
     terminationReason = "SAMPLE_DEADLINE_REACHED"
+  } else if (state.noProgressCount >= state.policy.loop.no_progress_limit) {
+    decision = "stop"
+    terminationReason = "NO_PROGRESS_LIMIT_REACHED"
   } else if (state.smellVerifyCycleCount >= state.policy.loop.max_smell_verify_cycles) {
     decision = "stop"
     terminationReason = "MAX_SMELL_VERIFY_CYCLES_REACHED"
@@ -4136,6 +4151,7 @@ function applyGuardProgressDecision(
     metric_deficit: observation.metricDeficit,
     structural_failure_count: observation.structuralFailureCount,
     blocker_codes: observation.blockerCodes,
+    candidate_revision: observation.candidateRevision,
     strictly_improved: strictlyImproved,
   }
   payload.loop = loop

@@ -59,6 +59,9 @@ from smell_core.loop_policy import (  # noqa: E402
     resolve_command_payload,
 )
 from smell_core.target_context import parse_target_context_json  # noqa: E402
+from smell_core.test_diagnostics import (  # noqa: E402
+    compact_test_diagnostic_signature,
+)
 from smell_core.verification_slots import (  # noqa: E402
     VerificationSlotError,
     acquire_verification_slot,
@@ -617,6 +620,11 @@ def _failure_fingerprint(payload: dict[str, Any], failure_pack: Any) -> str:
             if isinstance(item, dict)
         ],
         "delta": _compact_delta(delta),
+        "candidate_revision": (
+            checkpoint.get("production_diff_hash")
+            if isinstance(checkpoint, dict)
+            else ""
+        ),
     }
     rendered = json.dumps(source, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
@@ -685,6 +693,11 @@ def _compact_source_guard_feedback(value: Any) -> Optional[dict[str, Any]]:
                 observation.get("blocker_codes"), count=8, limit=128
             ),
         }
+        candidate_revision = _bounded_text(
+            observation.get("candidate_revision"), limit=128
+        )
+        if candidate_revision:
+            compact_observation["candidate_revision"] = candidate_revision
     return {
         "schema_version": _bounded_text(value.get("schema_version"), limit=128),
         "passed": passed if isinstance(passed, bool) or passed is None else False,
@@ -861,6 +874,12 @@ def cmd_guard_progress(args: argparse.Namespace) -> dict[str, Any]:
         resolution_plan=resolution_plan,
         source_guard_passed=source_guard_passed,
     )
+    candidate_revision = _bounded_text(
+        checkpoint_payload.get("production_diff_hash"), limit=128
+    )
+    progress_observation = source_guard_feedback.get("progress_observation")
+    if candidate_revision and isinstance(progress_observation, dict):
+        progress_observation["candidate_revision"] = candidate_revision
     metric_budget = source_guard_feedback["metric_budget"]
     return _assert_decision_size({
         "schema_version": GUARD_PROGRESS_SCHEMA,
@@ -1953,11 +1972,11 @@ def _run_project_full_in_fresh_worktree_impl(
             )
             worktree_created = created.get("returncode") == 0
             if not worktree_created:
-                removed = _run_git(
+                removed = _run_git_cleanup(
                     ["worktree", "remove", "--force", str(fresh_root)],
                     source_root,
                 )
-                pruned = _run_git(["worktree", "prune"], source_root)
+                pruned = _run_git_cleanup(["worktree", "prune"], source_root)
                 cleanup_success = bool(
                     removed.get("returncode") == 0
                     or (
@@ -2066,7 +2085,7 @@ def _run_project_full_in_fresh_worktree_impl(
                                             snapshot_change_count=change_count,
                                         )
                 finally:
-                    removed = _run_git(
+                    removed = _run_git_cleanup(
                         ["worktree", "remove", "--force", str(fresh_root)],
                         source_root,
                     )
@@ -2095,7 +2114,7 @@ def _run_project_full_in_fresh_worktree_impl(
         cleanup_success = False
 
     if cleanup_success is False:
-        _run_git(["worktree", "prune"], source_root)
+        _run_git_cleanup(["worktree", "prune"], source_root)
     if failure is not None:
         isolation = failure.get("verification_isolation")
         if isinstance(isolation, dict) and isolation.get("cleanup_success") is None:
@@ -2452,6 +2471,7 @@ def _verify_decision_payload(
         if failure_pack is not None
         else ""
     )
+    test_diagnostic_signature = compact_test_diagnostic_signature(full_payload)
     payload: dict[str, Any] = {
         "schema_version": VERIFY_DECISION_SCHEMA,
         "success": bool(full_payload.get("success")),
@@ -2473,7 +2493,8 @@ def _verify_decision_payload(
             full_payload,
             artifacts,
             diagnostic_signature=(
-                failure_fingerprint
+                test_diagnostic_signature
+                or failure_fingerprint
                 or (
                     "PASS"
                     if full_payload.get("status") == "PASS"
@@ -2788,6 +2809,26 @@ def _run_git(
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+_PROJECT_FULL_CLEANUP_TIMEOUT_SECONDS = 30.0
+
+
+def _run_git_cleanup(args: list[str], cwd: Path) -> dict[str, Any]:
+    """Run mandatory worktree cleanup on its own bounded deadline."""
+    deadline = time.monotonic() + _PROJECT_FULL_CLEANUP_TIMEOUT_SECONDS
+    try:
+        return _run_git(args, cwd, deadline_monotonic=deadline)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": 124,
+            "stdout": "",
+            "stderr": (
+                "git cleanup exceeded the bounded "
+                f"{_PROJECT_FULL_CLEANUP_TIMEOUT_SECONDS:.0f}s cleanup deadline"
+            ),
+            "timeout_seconds": exc.timeout,
+        }
 
 
 def _git_untracked_files(

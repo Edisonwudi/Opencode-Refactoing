@@ -325,9 +325,89 @@ def main() -> int:
     )
     failed_receipt = failed_decision["formal_verification_receipt"]
     assert failed_receipt["outcome"] == "test_failed", failed_receipt
-    assert failed_receipt["diagnostic_signature"] == (
-        failed_decision["failure_fingerprint"]
-    ), failed_decision
+    assert failed_receipt["diagnostic_signature"].startswith("tests=1:test@1:"), (
+        failed_decision
+    )
+
+    def failed_test_decision(
+        test_name: str,
+        *,
+        named_case: bool = True,
+    ) -> dict[str, object]:
+        diagnostic = (
+            f"FAIL {test_name}: exit 1\n[FAIL] assertion mismatch\n"
+            if named_case
+            else f"pytest failed: {test_name}\n"
+        )
+        payload = {
+            "success": False,
+            "accepted": False,
+            "progress": False,
+            "status": "TEST_FAILED",
+            "resolution": "unresolved",
+            "project_full_executed": True,
+            "smell_guard": {
+                "success": True,
+                "failure_count": 0,
+                "results": [],
+            },
+            "build_test_guard": {
+                "success": False,
+                "project_full_executed": True,
+                "details": {
+                    "build": {"success": True, "status": "passed"},
+                    "test": {
+                        "success": False,
+                        "status": "failed",
+                        "returncode": 1,
+                        "stdout": diagnostic,
+                    },
+                    "sample_test": None,
+                },
+            },
+            "checkpoint": {
+                "baseline_project_commit": "base-revision",
+                "production_diff_hash": "same-production-diff-id",
+                "test_changes": {
+                    "current_tree_sha256": "same-test-tree-id",
+                    "current_verification_config_tree_sha256": (
+                        "same-verification-config-tree-id"
+                    ),
+                },
+                "delta": {"reason": "NO_STRUCTURAL_PROGRESS"},
+            },
+            "failure_pack": {
+                "failure_category": "TEST_BEHAVIOR_REGRESSION",
+                "failure_group": "test",
+                "retryable": True,
+                "verify_status": "TEST_FAILED",
+                "next_action": "repair the behavior regression",
+            },
+        }
+        return smell_bridge._verify_decision_payload(payload, receipt_artifacts)
+
+    first_failed_test = failed_test_decision("first-case.sh")
+    second_failed_test = failed_test_decision("second-case.sh")
+    assert (
+        first_failed_test["formal_verification_receipt"]["candidate_identity"]
+        == second_failed_test["formal_verification_receipt"]["candidate_identity"]
+    )
+    assert (
+        first_failed_test["formal_verification_receipt"]["diagnostic_signature"]
+        != second_failed_test["formal_verification_receipt"]["diagnostic_signature"]
+    ), (first_failed_test, second_failed_test)
+    first_generic_failure = failed_test_decision(
+        "first_generic_case",
+        named_case=False,
+    )
+    second_generic_failure = failed_test_decision(
+        "second_generic_case",
+        named_case=False,
+    )
+    assert (
+        first_generic_failure["formal_verification_receipt"]["diagnostic_signature"]
+        != second_generic_failure["formal_verification_receipt"]["diagnostic_signature"]
+    ), (first_generic_failure, second_generic_failure)
     changed_test_tree_payload = smell_bridge._verify_decision_payload(
         {
             "success": True,

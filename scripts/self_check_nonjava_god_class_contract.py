@@ -104,6 +104,36 @@ def _cpp_out_of_class_candidate(methods: int) -> str:
     )
 
 
+def _cpp_macro_suffixed_overloads() -> str:
+    """Mirror valid declarations that tree-sitter may recover through ERROR."""
+    return """\
+#define API_LIFETIME
+class Candidate {
+public:
+    int first;
+    int second;
+    int value() API_LIFETIME;
+    int value() const API_LIFETIME;
+};
+int Candidate::value() { return 1; }
+int Candidate::value() const { return 2; }
+"""
+
+
+def _cpp_macro_wrapped_inline_candidate() -> str:
+    return """\
+PROJECT_NAMESPACE_BEGIN
+namespace detail {
+class Candidate {
+public:
+    int first;
+    int second;
+    int value() { if (first) return second; return first; }
+};
+}
+"""
+
+
 def main() -> int:
     sources = {
         "python": _python_candidate(10),
@@ -163,6 +193,38 @@ def main() -> int:
     assert nonjava_god_class_product_profile(out_of_class_cpp)[
         "finding_present"
     ] is True, out_of_class_cpp
+
+    macro_overloads = nonjava_god_class_metrics(
+        _cpp_macro_suffixed_overloads(),
+        "cpp",
+    )
+    assert macro_overloads["nom"] == 2, macro_overloads
+    assert macro_overloads["wmc"] == 2, macro_overloads
+
+    wrapped_inline = nonjava_god_class_metrics(
+        _cpp_macro_wrapped_inline_candidate(),
+        "cpp",
+        class_name="Candidate",
+    )
+    assert wrapped_inline["nom"] == 1, wrapped_inline
+    assert wrapped_inline["wmc"] == 1, wrapped_inline
+
+    namespace_qualified = (
+        "namespace project { namespace detail {\n"
+        + _cpp_out_of_class_candidate(3)
+        + "} }\n"
+    )
+    suffix_selected = nonjava_god_class_metrics(
+        namespace_qualified,
+        "cpp",
+        class_name="detail::Candidate",
+    )
+    fully_selected = nonjava_god_class_metrics(
+        namespace_qualified,
+        "cpp",
+        class_name="project::detail::Candidate",
+    )
+    assert suffix_selected == fully_selected, (suffix_selected, fully_selected)
 
     left_only = (
         "namespace left {\n"

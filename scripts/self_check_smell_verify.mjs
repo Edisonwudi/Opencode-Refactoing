@@ -2627,7 +2627,7 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       loop: {
         mode: "verify-failure",
         max_smell_verify_cycles: 2,
-        no_progress_limit: 1,
+        no_progress_limit: 3,
         allowed_failure_groups: ["smell"],
         instruction: "repair narrowly",
         sample_deadline_seconds: 1800,
@@ -3032,6 +3032,13 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
   )
   const guardState = {
     ...state,
+    policy: {
+      ...state.policy,
+      loop: {
+        ...state.policy.loop,
+        no_progress_limit: 5,
+      },
+    },
     smellVerifyCycleCount: 0,
     noProgressCount: 0,
     lastFailureFingerprint: "",
@@ -3127,6 +3134,51 @@ function runCommandPolicyDecisionSelfCheck(pluginModule) {
       && restoredPhaseState.seenStructuralStates.includes("1:C"),
     "seen structural states did not persist",
   )
+  const revisionState = {
+    ...phaseState,
+    policy: {
+      ...phaseState.policy,
+      loop: {
+        ...phaseState.policy.loop,
+        no_progress_limit: 1,
+      },
+    },
+    control: { ...state.control },
+    smellVerifyCycleCount: 0,
+    noProgressCount: 0,
+    lastFailureFingerprint: "",
+    bestMetricDeficit: null,
+    bestStructuralFailureCount: null,
+    lastBlockerCodes: [],
+    seenStructuralStates: [],
+    terminalReceipt: null,
+  }
+  const observeRevision = (candidateRevision) => {
+    const result = {
+      output: JSON.stringify({
+        schema_version: "smell.guard-progress/v1",
+        success: false,
+        status: "GUARD_PROGRESS_REQUIRED",
+        source_guard_feedback: {
+          next_action: "repair the current blocker",
+          progress_observation: {
+            metric_deficit: 3,
+            structural_failure_count: 1,
+            blocker_codes: ["A"],
+            candidate_revision: candidateRevision,
+          },
+        },
+      }),
+      metadata: {},
+    }
+    hooks.applyGuardProgressDecision(result, revisionState)
+    return JSON.parse(result.output)
+  }
+  assertEqual("guard_revision_first_continues", observeRevision("revision-1").loop.decision, "continue", "decision")
+  assertEqual("guard_revision_change_resets_stall", observeRevision("revision-2").loop.decision, "continue", "decision")
+  const unchangedRevision = observeRevision("revision-2")
+  assertEqual("guard_revision_unchanged_stops", unchangedRevision.loop.decision, "stop", "decision")
+  assertEqual("guard_revision_unchanged_reason", unchangedRevision.loop.termination_reason, "NO_PROGRESS_LIMIT_REACHED", "termination")
   const fallbackObservation = hooks.guardProgressObservation({
     guard_failure_count: 2,
     source_guard_feedback: {
@@ -3939,8 +3991,8 @@ if command == "resolve-command":
         },
         "loop": {
             "mode": "verify-failure",
-            "max_smell_verify_cycles": 2,
-            "no_progress_limit": 1,
+            "max_smell_verify_cycles": int(case.get("max_smell_verify_cycles", 2)),
+            "no_progress_limit": int(case.get("no_progress_limit", 1)),
             "allowed_failure_groups": ["smell", "compile", "test"],
             "instruction": "continue one narrow edit",
             "sample_deadline_seconds": 1800,
@@ -3984,6 +4036,11 @@ elif guard_progress_only:
             "progress_observation": {
                 "metric_deficit": budget.get("required_reduction", 0),
                 "structural_failure_count": 0 if ready else int(case.get("structural_failure_count", 0)),
+                "candidate_revision": (
+                    f"revision-{count}"
+                    if case.get("candidate_revision_each_call")
+                    else case.get("candidate_revision", "")
+                ),
             },
         },
     }
@@ -4960,6 +5017,8 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       early_calls: 99,
       focused_status: "FAILED",
       focused_progress_each_call: true,
+      max_smell_verify_cycles: 5,
+      no_progress_limit: 3,
       budget: { metric: "clone_token_count", current: 9, passing_max: 24, required_reduction: 0, unit: "clone_token_count" },
     })
     const focusedProgressPlugin = await pluginModule.SmellPlugin({ worktree: focusedProgressRoot })
@@ -4968,7 +5027,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: focusedProgressSession,
-        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${focusedProgressRoot}; Language: cpp; Smell type: code_clone_type1; Target location: sample.cc:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=5 --loop-no-progress-limit=3 -- Project root: ${focusedProgressRoot}; Language: cpp; Smell type: code_clone_type1; Target location: sample.cc:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5001,6 +5060,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     )
     assertEqual("focused_diagnostic_progress_first_count", focusedProgressFirst.metadata?.command_loop_state?.no_progress_count, 0, "no_progress_count")
     assertEqual("focused_diagnostic_progress_second_count", focusedProgressSecond.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
+    assertEqual("focused_diagnostic_progress_second_reason", focusedProgressSecondPayload.loop?.termination_reason, "", "loop.termination_reason")
     assertEqual("focused_diagnostic_progress_second_decision", focusedProgressSecondPayload.loop?.decision, "continue", "loop.decision")
     assertEqual("focused_diagnostic_progress_not_exposed_first", focusedProgressFirstPayload.focused_preflight, undefined, "focused_preflight")
     assertEqual("focused_diagnostic_progress_not_exposed_second", focusedProgressSecondPayload.focused_preflight, undefined, "focused_preflight")
@@ -5024,6 +5084,8 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       early_calls: 99,
       focused_status: "READY",
       focused_progress_each_call: true,
+      max_smell_verify_cycles: 5,
+      no_progress_limit: 1,
       budget: { metric: "max_nesting_depth", current: 6, passing_max: 4, required_reduction: 2, unit: "max_nesting_depth" },
     })
     const noProgressPlugin = await pluginModule.SmellPlugin({ worktree: noProgressRoot })
@@ -5032,7 +5094,7 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
       {
         command: "smell-refactor-run",
         sessionID: noProgressSession,
-        arguments: `--verification-mode=project_full --max-smell-verify-cycles=2 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
+        arguments: `--verification-mode=project_full --max-smell-verify-cycles=5 --loop-no-progress-limit=1 -- Project root: ${noProgressRoot}; Language: c; Smell type: nested_complexity; Target location: sample185.c:method=target|line=1`,
       },
       { parts: [] },
     )
@@ -5062,20 +5124,10 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     const secondNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(noProgressToolArgs, noProgressContext)
     const secondNoProgressPayload = parseJson("guard_progress_no_progress_second", secondNoProgress.output)
     assertEqual("guard_progress_no_progress_second_status", secondNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
-    assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "continue", "loop.decision")
-    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_second_decision", secondNoProgressPayload.loop?.decision, "stop", "loop.decision")
+    assertEqual("guard_progress_no_progress_second_reason", secondNoProgressPayload.loop?.termination_reason, "NO_PROGRESS_LIMIT_REACHED", "loop.termination_reason")
     assertEqual("guard_progress_no_progress_second_count", secondNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
-    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.smell_verify_cycle_count, 2, "smell_verify_cycle_count")
-    const exhaustedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
-      noProgressToolArgs,
-      noProgressContext,
-    )
-    const exhaustedNoProgressPayload = parseJson(
-      "guard_progress_no_progress_exhausted",
-      exhaustedNoProgress.output,
-    )
-    assertEqual("guard_progress_no_progress_exhausted_decision", exhaustedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_exhausted_reason", exhaustedNoProgressPayload.loop?.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_continuation_shared", secondNoProgress.metadata?.command_loop_state?.smell_verify_cycle_count, 1, "smell_verify_cycle_count")
     const latchedNoProgress = await resumedNoProgressPlugin.tool.smell_verify.execute(
       noProgressToolArgs,
       noProgressContext,
@@ -5087,11 +5139,11 @@ if guard_progress_only and case.get("guard_progress_exit_code"):
     assertEqual("guard_progress_no_progress_latched_schema", latchedNoProgressPayload.schema_version, "smell.loop-terminal/v1", "schema_version")
     assertEqual("guard_progress_no_progress_latched_status", latchedNoProgressPayload.status, "GUARD_PROGRESS_REQUIRED", "status")
     assertEqual("guard_progress_no_progress_latched_decision", latchedNoProgressPayload.loop?.decision, "stop", "loop.decision")
-    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "MAX_SMELL_VERIFY_CYCLES_REACHED", "loop.termination_reason")
-    assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 2, "no_progress_count")
+    assertEqual("guard_progress_no_progress_latched_reason", latchedNoProgressPayload.loop?.termination_reason, "NO_PROGRESS_LIMIT_REACHED", "loop.termination_reason")
+    assertEqual("guard_progress_no_progress_latched_count", latchedNoProgress.metadata?.command_loop_state?.no_progress_count, 1, "no_progress_count")
     const noProgressCommands = (await readFile(logFile, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
-    assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 3, "guard-progress count")
+    assertEqual("guard_progress_no_progress_preflight_count", noProgressCommands.filter((item) => item.command === "guard-progress").length, 2, "guard-progress count")
     assertEqual("guard_progress_no_progress_focused_count", noProgressCommands.filter((item) => item.command === "focused-preflight").length, 0, "focused-preflight count")
     assertEqual("guard_progress_no_progress_full_count", noProgressCommands.filter((item) => item.command === "verify").length, 0, "verify count")
 

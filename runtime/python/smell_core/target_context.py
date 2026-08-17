@@ -12,6 +12,7 @@ from typing import Any, Mapping
 TARGET_CONTEXT_KEYS = frozenset({
     "symbol_kind",
     "symbol_name",
+    "declaration_lines",
     "container_method",
     "receiver_type",
     "group",
@@ -50,6 +51,23 @@ def validate_target_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
         raise ValueError("unsupported target context fields: " + ", ".join(unknown))
     result: dict[str, Any] = {}
     for key, item in normalized.items():
+        if key == "declaration_lines":
+            if (
+                not isinstance(item, list)
+                or not item
+                or any(
+                    isinstance(line, bool)
+                    or not isinstance(line, int)
+                    or line < 1
+                    for line in item
+                )
+                or len(set(item)) != len(item)
+            ):
+                raise ValueError(
+                    "declaration_lines must be unique positive integers"
+                )
+            result[key] = sorted(item)
+            continue
         if key == "target_parameter_count":
             if isinstance(item, bool) or not str(item).isdigit():
                 raise ValueError("target_parameter_count must be a non-negative integer")

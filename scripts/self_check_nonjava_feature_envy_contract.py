@@ -334,7 +334,7 @@ def _positive_case(
         ), profile
         assert (
             profile["source_parseability_contract"]
-            == "explicit-target-declaration-subtree-no-errors-v1"
+            == "complete-target-boundary-with-frozen-recovery-no-additions-v2"
         ), profile
         assert (
             profile["declaration_uniqueness_contract"]
@@ -683,6 +683,79 @@ def _explicit_receiver_must_own_baseline_finding() -> None:
         assert "BASELINE_FINDING_NOT_FOUND" in rendered, baseline
 
 
+def _selected_target_parser_recovery_is_frozen() -> None:
+    """A macro-shaped recovery remains bounded baseline evidence."""
+
+    before = """\
+#define API_EXPORT
+struct Order { int unit_price, quantity, tax_rate, shipping_fee, discount; };
+
+API_EXPORT int total_price(struct Order *order) {
+    int subtotal = order->unit_price * order->quantity;
+    int tax = subtotal * order->tax_rate;
+    int shipping = order->shipping_fee;
+    int discount = order->discount;
+    return subtotal + tax + shipping - discount;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="feature-envy-parser-recovery-") as raw:
+        project = Path(raw)
+        _commit(project, "demo.c", before)
+        baseline = _bridge(
+            project,
+            "capture-baseline",
+            language="c",
+            location="demo.c:method=total_price|line=4",
+            receiver="order",
+        )
+        assert baseline["success"] is True, baseline
+        metrics = baseline["metrics"]
+        assert metrics["parser_recovery_required"] is True, metrics
+        assert metrics["target_file_parseable"] is False, metrics
+        assert metrics["target_declaration_boundary_complete"] is True, metrics
+        assert list(metrics["target_syntax_issue_witnesses"]), metrics
+
+
+def _conditional_declarator_recovery_keeps_exact_boundary() -> None:
+    """Conditional alternatives may share one body without widening the target."""
+
+    before = """\
+struct Order { int unit_price, quantity, tax_rate, shipping_fee, discount; };
+int total_price(struct Order *order) {
+    int value = 0;
+    for (int i = 0; i < 2; i++) {
+        if (i) {
+#ifdef USE_UNIT_PRICE
+            if (order->unit_price) {
+#else
+            if (order->quantity) {
+                value += order->unit_price;
+#endif
+                if (order->tax_rate) { value += order->shipping_fee; }
+            } else { value += order->discount; }
+        }
+    }
+    return value + order->quantity;
+}
+int unrelated(void) { return 0; }
+"""
+    with tempfile.TemporaryDirectory(prefix="feature-envy-conditional-recovery-") as raw:
+        project = Path(raw)
+        _commit(project, "demo.c", before)
+        baseline = _bridge(
+            project,
+            "capture-baseline",
+            language="c",
+            location="demo.c:method=total_price|line=2",
+            receiver="order",
+        )
+        assert baseline["success"] is True, baseline
+        metrics = baseline["metrics"]
+        assert metrics["target_declaration_boundary_complete"] is True, metrics
+        identity = metrics["finding_identity"]
+        assert identity["begin_line"] == 2, identity
+
+
 def main() -> int:
     positives = {
         "python": _positive_case(
@@ -817,6 +890,8 @@ struct OtherCheckout {
     _ordinary_guard_fail_closed()
     _exact_budget_and_denominator_contract()
     _explicit_receiver_must_own_baseline_finding()
+    _selected_target_parser_recovery_is_frozen()
+    _conditional_declarator_recovery_keeps_exact_boundary()
     alias_gaming = _alias_folding_anti_gaming_cases()
     rendered = " ".join(
         f"{language}={before}->{after}/reanchor{reanchors}"

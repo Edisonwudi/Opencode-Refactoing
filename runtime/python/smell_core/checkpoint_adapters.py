@@ -450,7 +450,7 @@ def detector_profile_for(config: Any) -> dict[str, Any]:
                 ),
                 "candidate_evaluation": "one-explicit-target-declaration-only",
                 "source_parseability_contract": (
-                    "explicit-target-declaration-subtree-no-errors-v1"
+                    "complete-target-boundary-with-frozen-recovery-no-additions-v2"
                 ),
                 "declaration_uniqueness_contract": (
                     "same-file-owner-name-full-parameter-fingerprint-exactly-one-v1"
@@ -931,6 +931,11 @@ def _mysterious_name(
             contract_identity.get("symbol_name")
             or selector.get("symbol_name")
             or ""
+        ),
+        "declaration_lines": (
+            contract_identity.get("declaration_lines")
+            or selector.get("declaration_lines")
+            or []
         ),
     }
     return evaluate_mysterious_name_target(

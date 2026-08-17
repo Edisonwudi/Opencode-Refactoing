@@ -18,6 +18,11 @@ _SOURCE_GUARD_BLOCKER_CODE_LIMIT = 8
 
 
 _SOURCE_GUARD_CONTRACT_ACTIONS: dict[str, str] = {
+    "TARGET_SYNTAX_RECOVERY_REGRESSION": (
+        "restore valid syntax and target parseability at the reported source "
+        "locations before further metric work; do not continue structural "
+        "extraction while the frozen target is syntactically invalid"
+    ),
     "CLONE_TARGET_DECLARATION_IDENTITY_FAILED": (
         "restore every frozen clone target declaration at its original owner "
         "and signature as a thin wrapper over one shared implementation; do "

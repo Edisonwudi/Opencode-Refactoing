@@ -23,10 +23,16 @@ def _bridge(
     smell: str,
     location: str,
     evidence: str,
+    selector_extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
     kind = re.search(r"(?:^|;\s*)kind=([^;]+)", evidence)
     name = re.search(r"(?:^|;\s*)name=([^;]+)", evidence)
     assert smell == "mysterious_name" and kind and name, evidence
+    selector = {
+        "symbol_kind": kind.group(1).strip(),
+        "symbol_name": name.group(1).strip(),
+        **dict(selector_extra or {}),
+    }
     args = [
         sys.executable,
         str(BRIDGE),
@@ -46,10 +52,7 @@ def _bridge(
         "--smell-evidence",
         evidence,
         "--target-context-json",
-        json.dumps({
-            "symbol_kind": kind.group(1).strip(),
-            "symbol_name": name.group(1).strip(),
-        }, separators=(",", ":"), sort_keys=True),
+        json.dumps(selector, separators=(",", ":"), sort_keys=True),
     ]
     if command == "verify":
         args.append("--skip-build-test")
@@ -158,7 +161,10 @@ def _assert_parser_recovery_pass(
     checkpoint = dict(result.get("checkpoint") or {})
     current = dict(checkpoint.get("current_metrics") or {})
     assert current.get("target_file_parseable") is False, (label, current)
-    assert current.get("target_container_parseable") is True, (label, current)
+    assert current.get("target_container_boundary_complete") is True, (
+        label,
+        current,
+    )
     assert current.get("parser_recovery_required") is True, (label, current)
     assert list(current.get("target_syntax_issue_witnesses") or []), (
         label,
@@ -282,6 +288,121 @@ def _assert_duplicate_container_identity_baseline() -> None:
         assert "MN_BASELINE_CONTAINER_IDENTITY_AMBIGUOUS" in str(
             result.get("error") or ""
         ), result
+
+
+def _assert_macro_recovery_container_baseline() -> None:
+    source_text = (
+        "#define API_EXPORT\n"
+        "API_EXPORT int proc(int n) {\n"
+        "    return n + 1;\n"
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="mn-macro-recovery-") as temp_dir:
+        project = Path(temp_dir)
+        _init_project(project, "demo.c", source_text)
+        result = _bridge(
+            project,
+            "capture-baseline",
+            "c",
+            "mysterious_name",
+            "demo.c:method=proc|line=2",
+            "kind=param; name=n; reason=too_short; len=1",
+        )
+        assert result.get("success") is True, result
+        metrics = dict(result.get("metrics") or {})
+        assert metrics.get("parser_recovery_required") is True, metrics
+        assert metrics.get("target_container_boundary_complete") is True, metrics
+
+
+def _assert_python_rebinding_is_one_symbol() -> None:
+    result = _exercise(
+        "python",
+        "demo.py",
+        (
+            "def proc(value):\n"
+            "    m = value + 1\n"
+            "    if value > 0:\n"
+            "        m = value + 2\n"
+            "    return m\n"
+        ),
+        (
+            "def proc(value):\n"
+            "    mode = value + 1\n"
+            "    if value > 0:\n"
+            "        mode = value + 2\n"
+            "    return mode\n"
+        ),
+        kind="local",
+        name="m",
+    )
+    _assert_pass(result, "python/rebinding-local")
+
+
+def _assert_explicit_multi_declaration_cohort() -> None:
+    before = (
+        "int proc(int value) {\n"
+        "#if USE_FIRST\n"
+        "    int n = value + 1;\n"
+        "#else\n"
+        "    int n = value + 2;\n"
+        "#endif\n"
+        "    return n;\n"
+        "}\n"
+    )
+    after = before.replace("int n =", "int count =").replace(
+        "return n;", "return count;"
+    )
+    with tempfile.TemporaryDirectory(prefix="mn-declaration-cohort-") as temp_dir:
+        project = Path(temp_dir)
+        source = _init_project(project, "demo.c", before)
+        selector = {"declaration_lines": [3, 5]}
+        baseline = _bridge(
+            project,
+            "capture-baseline",
+            "c",
+            "mysterious_name",
+            "demo.c:method=proc|line=1",
+            "kind=local; name=n; reason=too_short; len=1",
+            selector,
+        )
+        assert baseline.get("success") is True, baseline
+        source.write_text(after, encoding="utf-8")
+        verified = _bridge(
+            project,
+            "verify",
+            "c",
+            "mysterious_name",
+            "demo.c:method=proc|line=1",
+            "kind=local; name=n; reason=too_short; len=1",
+            selector,
+        )
+        _assert_pass(verified, "c/conditional-declaration-cohort")
+
+
+def _assert_preprocessor_container_cohort_is_line_anchored() -> None:
+    source_text = (
+        "#if FIRST_CHECK\n"
+        "int proc(int n) { return n; }\n"
+        "#endif\n"
+        "#if SECOND_CHECK\n"
+        "int proc(int n) { return n + 1; }\n"
+        "#endif\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="mn-preprocessor-container-") as temp_dir:
+        project = Path(temp_dir)
+        _init_project(project, "demo.c", source_text)
+        result = _bridge(
+            project,
+            "capture-baseline",
+            "c",
+            "mysterious_name",
+            "demo.c:method=proc|line=2",
+            "kind=param; name=n; reason=too_short; len=1",
+        )
+        assert result.get("success") is True, result
+        metrics = dict(result.get("metrics") or {})
+        identity = dict(metrics.get("finding_identity") or {})
+        assert len(identity.get("container_cohort") or []) == 2, identity
 
 
 def main() -> int:
@@ -632,11 +753,6 @@ def main() -> int:
     failed += 1
 
     _assert_ambiguous_baseline(
-        "python",
-        "demo.py",
-        "def proc():\n    n = 1\n    n = 2\n    return n\n",
-    )
-    _assert_ambiguous_baseline(
         "c",
         "demo.c",
         "int proc(void) { int n = 1; { int n = 2; } return n; }\n",
@@ -646,10 +762,16 @@ def main() -> int:
         "demo.cpp",
         "int proc() { int n = 1; { int n = 2; } return n; }\n",
     )
-    failed += 3
+    failed += 2
 
     _assert_duplicate_container_identity_baseline()
     failed += 1
+
+    _assert_macro_recovery_container_baseline()
+    _assert_python_rebinding_is_one_symbol()
+    _assert_explicit_multi_declaration_cohort()
+    _assert_preprocessor_container_cohort_is_line_anchored()
+    passed += 4
 
     print(
         "nonjava-mysterious-name-successor PASS "

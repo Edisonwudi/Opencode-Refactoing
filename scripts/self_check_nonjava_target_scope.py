@@ -234,13 +234,13 @@ def _check_other_local_guards(language: str) -> None:
             f"nonjava-target-guard/{language}/mysterious_name/v6"
         ), snapshot
         assert snapshot["detector_profile"]["source_parseability_contract"] == (
-            "selected-container-no-errors-with-frozen-target-file-recovery-v2"
+            "selected-container-complete-boundary-with-frozen-file-recovery-v3"
         ), snapshot
         assert snapshot["detector_profile"]["same_hunk_witness_contract"] == (
             "target-old-new-lines-identifiers-same-unique-hunk-v1"
         ), snapshot
         assert snapshot["detector_profile"]["container_identity_contract"] == (
-            "complete-parser-declaration-boundaries-and-sha256-v1"
+            "complete-parser-declaration-boundaries-conditional-anchor-and-sha256-v2"
         ), snapshot
         assert snapshot["detector_profile"]["container_continuity_contract"] == (
             "complete-container-cohort-old-current-target-patch-bijection-v1"
@@ -313,14 +313,21 @@ def _check_other_local_guards(language: str) -> None:
             cli_language=language,
             target_context={"symbol_kind": "local", "symbol_name": "m"},
         )
-        try:
-            capture_baseline_finding_snapshot(repeated)
-        except ValueError as exc:
-            assert "TARGET_AMBIGUOUS" in str(exc), exc
-        else:
-            raise AssertionError(
-                "same kind/name at multiple declaration lines was aggregated"
+        if language == "python":
+            repeated_snapshot = capture_baseline_finding_snapshot(repeated)
+            assert repeated_snapshot["finding_present"] is True, repeated_snapshot
+            assert repeated_snapshot["finding_identity"]["symbol_slots"] == [0], (
+                repeated_snapshot
             )
+        else:
+            try:
+                capture_baseline_finding_snapshot(repeated)
+            except ValueError as exc:
+                assert "TARGET_AMBIGUOUS" in str(exc), exc
+            else:
+                raise AssertionError(
+                    "same kind/name at multiple declaration lines was aggregated"
+                )
 
 
 def main() -> int:

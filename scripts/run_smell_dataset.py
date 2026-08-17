@@ -40,6 +40,14 @@ from smell_core.feature_envy_target_contract import (  # noqa: E402
     explicit_receiver_name,
 )
 from smell_core.target_context import parse_target_context_json  # noqa: E402
+from smell_core.test_diagnostics import (  # noqa: E402
+    build_test_details as _build_test_details,
+    failed_build_test_steps as _failed_build_test_steps,
+    failed_test_diagnostic_signature as _failed_test_diagnostic_signature,
+    failed_test_diagnostics as _failed_test_diagnostics,
+    step_diagnostic_text as _step_diagnostic_text,
+    step_failed as _step_failed,
+)
 from smell_core.project_revision import (  # noqa: E402
     DEFAULT_REVISIONS_PATH,
     ProjectRevisionError,
@@ -81,6 +89,7 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
 
 FINAL_VERIFICATION_MODES = {"sample_optimized", "project_full"}
 RUNNER_FINAL_RECEIPT_SCHEMA = "smell.runner-final-receipt/v1"
+RUNNER_FINAL_VERIFY_MIN_REMAINING_SECONDS = 60.0
 PROCESS_TERM_TIMEOUT_SECONDS = 2.0
 PROCESS_KILL_TIMEOUT_SECONDS = 2.0
 PROCESS_DRAIN_TIMEOUT_SECONDS = 2.0
@@ -1032,7 +1041,6 @@ def _prepare_opencode_home(sample_dir: Path) -> dict[str, str]:
     }
 
 
-_VERIFY_STEP_NAMES = ("build", "test", "sample_test")
 _NATIVE_DIAGNOSTIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("NATIVE_SEGMENTATION_FAULT", re.compile(r"\bsegmentation fault\b", re.IGNORECASE)),
     ("NATIVE_CORE_DUMP", re.compile(r"\bcore dumped\b", re.IGNORECASE)),
@@ -1049,54 +1057,6 @@ _NATIVE_DIAGNOSTIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"\bninja:\s+build stopped\b", re.IGNORECASE),
     ),
 )
-
-
-def _build_test_details(payload: dict[str, Any]) -> dict[str, Any]:
-    guard = payload.get("build_test_guard") if isinstance(payload, dict) else None
-    details = guard.get("details") if isinstance(guard, dict) else None
-    return details if isinstance(details, dict) else {}
-
-
-def _diagnostic_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (list, tuple)):
-        return "\n".join(_diagnostic_text(item) for item in value)
-    if isinstance(value, dict):
-        return "\n".join(_diagnostic_text(item) for item in value.values())
-    return str(value)
-
-
-def _step_diagnostic_text(step: dict[str, Any]) -> str:
-    # Do not inspect command/script fields: target names and package names may
-    # legitimately contain words such as "timeout" or "failed".
-    return "\n".join(
-        _diagnostic_text(step.get(key))
-        for key in (
-            "summary_text",
-            "summary",
-            "failure_highlights",
-            "tail",
-            "message",
-            "error",
-            "stderr",
-            "stdout",
-        )
-        if step.get(key) is not None
-    )
-
-
-def _step_failed(step: Any) -> bool:
-    if not isinstance(step, dict):
-        return False
-    status = str(step.get("status") or "").strip().casefold()
-    return (
-        step.get("success") is False
-        or status in {"fail", "failed", "error", "timeout", "timed_out"}
-        or (isinstance(step.get("returncode"), int) and step["returncode"] != 0)
-    )
 
 
 def _step_infra_kind(step: Any) -> str:
@@ -1124,15 +1084,6 @@ def _step_infra_kind(step: Any) -> str:
     return ""
 
 
-def _failed_build_test_steps(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    details = _build_test_details(payload)
-    return [
-        (name, details[name])
-        for name in _VERIFY_STEP_NAMES
-        if isinstance(details.get(name), dict) and _step_failed(details[name])
-    ]
-
-
 def _native_failure_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]:
     """Extract generic native build/test signals without copying raw log text."""
     diagnostics: list[dict[str, str]] = []
@@ -1146,99 +1097,6 @@ def _native_failure_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]
             seen.add(key)
             diagnostics.append({"step": step_name, "category": category})
     return diagnostics
-
-
-_TMUX_FAILURE_HEADER = re.compile(
-    r"\bFAIL ([A-Za-z0-9_.+/-]+): exit (-?[0-9]+)\b"
-)
-_TMUX_FAILURE_CASE_MARKER = "TMUX_FAIL_CASE "
-
-
-def _normalized_test_failure_fingerprint(exit_code: int, diagnostic: str) -> str:
-    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(diagnostic or ""))
-    text = re.sub(r"/(?:tmp|var/tmp)/[^\s'\"]+", "<tmp>", text)
-    text = re.sub(r"['\"],\s*['\"]", "\n", text)
-    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-    notable = [
-        line
-        for line in lines
-        if line == "TIMEOUT"
-        or line.startswith("[FAIL]")
-        or re.search(r"(?:failed|error|unexpected|no such file)", line, re.IGNORECASE)
-    ]
-    selected = notable[:3] if notable else lines[:3]
-    if "TIMEOUT" in notable and "TIMEOUT" not in selected:
-        selected = ["TIMEOUT", *selected[:2]]
-    detail = " | ".join(selected)
-    return f"exit={exit_code}" + (f" | {detail}" if detail else "")
-
-
-def _failed_test_diagnostics(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract compact named test failures without retaining full test logs."""
-    marked: set[tuple[str, int, str]] = set()
-    legacy: set[tuple[str, int, str]] = set()
-    decoder = json.JSONDecoder()
-    for step_name, step in _failed_build_test_steps(payload):
-        if step_name not in {"test", "sample_test"}:
-            continue
-        text = _step_diagnostic_text(step)
-        marker_offset = 0
-        while True:
-            marker_offset = text.find(_TMUX_FAILURE_CASE_MARKER, marker_offset)
-            if marker_offset < 0:
-                break
-            payload_offset = marker_offset + len(_TMUX_FAILURE_CASE_MARKER)
-            try:
-                item, consumed = decoder.raw_decode(text[payload_offset:])
-            except json.JSONDecodeError:
-                marker_offset = payload_offset
-                continue
-            marker_offset = payload_offset + consumed
-            if not isinstance(item, dict):
-                continue
-            test_name = str(item.get("test") or "")
-            exit_code = item.get("exit_code")
-            fingerprint = str(item.get("diagnostic_fingerprint") or "")
-            if (
-                re.fullmatch(r"[A-Za-z0-9_.+/-]+", test_name)
-                and isinstance(exit_code, int)
-                and fingerprint
-            ):
-                marked.add((test_name, exit_code, fingerprint[:600]))
-        matches = list(_TMUX_FAILURE_HEADER.finditer(text))
-        for index, match in enumerate(matches):
-            block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            exit_code = int(match.group(2))
-            legacy.add(
-                (
-                    match.group(1),
-                    exit_code,
-                    _normalized_test_failure_fingerprint(
-                        exit_code, text[match.end() : block_end]
-                    )[:600],
-                )
-            )
-    selected = marked or legacy
-    by_case: dict[tuple[str, int], str] = {}
-    for test_name, exit_code, fingerprint in selected:
-        key = (test_name, exit_code)
-        if len(fingerprint) > len(by_case.get(key, "")):
-            by_case[key] = fingerprint
-    return [
-        {
-            "test": test_name,
-            "exit_code": exit_code,
-            "diagnostic_fingerprint": fingerprint,
-        }
-        for (test_name, exit_code), fingerprint in sorted(by_case.items())
-    ]
-
-
-def _failed_test_diagnostic_signature(payload: dict[str, Any]) -> tuple[str, ...]:
-    return tuple(
-        f'{item["test"]}|{item["exit_code"]}|{item["diagnostic_fingerprint"]}'
-        for item in _failed_test_diagnostics(payload)
-    )
 
 
 def _structured_failure_category(payload: dict[str, Any]) -> str:
@@ -2546,11 +2404,14 @@ def _agent_project_full_receipt(
             str(terminal_authorization.get("reason") or "FORMAL_PASS_TERMINAL_MISSING")
         )
     completed_count = int(last_trace.get("tools_after_last_verify") or 0)
-    attempted_count = int(last_trace.get("tool_attempts_after_last_verify") or 0)
-    if completed_count:
-        return reject("TOOLS_AFTER_LAST_VERIFY")
-    if attempted_count:
-        return reject("TOOL_ATTEMPT_AFTER_LAST_VERIFY")
+    completed_tools = last_trace.get("completed_tools_after_last_verify")
+    if not isinstance(completed_tools, list):
+        completed_tools = []
+    if completed_count != len(completed_tools):
+        return reject("TOOLS_AFTER_LAST_VERIFY_UNCLASSIFIED")
+    read_only_tools = {"read", "grep", "glob", "list", "todowrite"}
+    if any(str(tool) not in read_only_tools for tool in completed_tools):
+        return reject("MUTATION_AFTER_LAST_VERIFY")
     if (
         last_trace.get("last_output_parsed") is not True
         or last_trace.get("last_loop_decision") != "stop"
@@ -2675,6 +2536,44 @@ def _runner_final_verify(
         _persist_verify_payload(sample_dir, receipt_payload)
         _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
         return 0, receipt_payload, receipt_audit
+    remaining = (
+        None
+        if deadline_monotonic is None
+        else deadline_monotonic - time.monotonic()
+    )
+    if (
+        authorization.get("formal_terminal_valid") is True
+        and authorization.get("authorized") is not True
+        and remaining is not None
+        and remaining < RUNNER_FINAL_VERIFY_MIN_REMAINING_SECONDS
+    ):
+        terminal_payload = last_trace.get("last_payload")
+        if isinstance(terminal_payload, dict):
+            last_attempt = (
+                agent_verification_history[-1]
+                if agent_verification_history
+                else {}
+            )
+            terminal_returncode = int(last_attempt.get("verify_returncode") or 0)
+            receipt_audit = {
+                **_runner_final_receipt_audit(
+                    "FRESH_VERIFY_SKIPPED_INSUFFICIENT_BUDGET"
+                ),
+                "source": "agent_formal_terminal",
+                "promotion_authorized": False,
+                "raw_observation": _runner_observation_summary(
+                    terminal_returncode,
+                    terminal_payload,
+                ),
+                "terminal_evidence": authorization,
+                "canonical_status": str(terminal_payload.get("status") or ""),
+                "canonical_accepted": False,
+                "reuse_rejected_reason": str(reuse_audit.get("reason") or ""),
+                "remaining_seconds": max(0.0, remaining),
+            }
+            _persist_verify_payload(sample_dir, terminal_payload)
+            _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
+            return terminal_returncode, terminal_payload, receipt_audit
     verify_returncode, raw_verify_payload = _run_verify(
         sample,
         sample_dir,
@@ -3082,6 +2981,7 @@ def _runner_terminal_authorization(
     """Authorize only confirmation of one typed plugin formal PASS terminal."""
     evidence: dict[str, Any] = {
         "authorized": False,
+        "formal_terminal_valid": False,
         "reason": "FORMAL_PASS_TERMINAL_MISSING",
         "control": None,
         "terminal_receipt": None,
@@ -3159,7 +3059,8 @@ def _runner_terminal_authorization(
     )
     return {
         "authorized": authorized,
-        "reason": "FORMAL_PASS_TERMINAL" if authorized else "FORMAL_PASS_TERMINAL_MISSING",
+        "formal_terminal_valid": typed_receipt["stage"] == "formal_verify",
+        "reason": "FORMAL_PASS_TERMINAL" if authorized else "FORMAL_NONACCEPT_TERMINAL",
         "control": control,
         "terminal_receipt": typed_receipt,
     }
@@ -3677,6 +3578,8 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         "opencode_failure_category",
         "verify_returncode",
         "duration_seconds",
+        "setup_duration_seconds",
+        "sample_budget_elapsed_seconds",
         "sample_dir",
         "note",
     ]
@@ -3686,6 +3589,31 @@ def _append_result(results_path: Path, row: dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _sample_timing_evidence(
+    run_started_monotonic: float,
+    sample_budget_started_monotonic: float | None = None,
+) -> dict[str, str]:
+    """Separate checkout/setup time from the command-owned sample budget."""
+
+    now = time.monotonic()
+    total = max(0.0, now - run_started_monotonic)
+    if sample_budget_started_monotonic is None:
+        return {
+            "duration_seconds": f"{total:.1f}",
+            "setup_duration_seconds": f"{total:.1f}",
+            "sample_budget_elapsed_seconds": "",
+        }
+    return {
+        "duration_seconds": f"{total:.1f}",
+        "setup_duration_seconds": (
+            f"{max(0.0, sample_budget_started_monotonic - run_started_monotonic):.1f}"
+        ),
+        "sample_budget_elapsed_seconds": (
+            f"{max(0.0, now - sample_budget_started_monotonic):.1f}"
+        ),
+    }
 
 
 def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -3763,7 +3691,7 @@ def _checkout_only_sample(sample: Sample, run_dir: Path, args: argparse.Namespac
 
 
 def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
-    started = time.time()
+    run_started_monotonic = time.monotonic()
     dataset_audit = {
         "evidence": sample.evidence,
         "target_context": sample.target_context,
@@ -3846,7 +3774,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             "status": exc.status,
             "opencode_returncode": -1,
             "verify_returncode": -1,
-            "duration_seconds": f"{time.time() - started:.1f}",
+            **_sample_timing_evidence(run_started_monotonic),
             "sample_dir": str(sample_dir),
             "note": f"project_revision_error: {exc.status}: {exc.message}",
         }
@@ -3882,8 +3810,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         encoding="utf-8",
     )
     sample_deadline_started_at_ms = int(time.time() * 1000)
-    sample_deadline_monotonic = time.monotonic() + _opencode_timeout_seconds(
-        args.sample_deadline
+    sample_budget_started_monotonic = time.monotonic()
+    sample_deadline_monotonic = (
+        sample_budget_started_monotonic
+        + _opencode_timeout_seconds(args.sample_deadline)
     )
 
     baseline_capture: dict[str, Any] | None = None
@@ -3951,7 +3881,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "opencode_timed_out": True,
                 "opencode_failure_category": "OPENCODE_TIMEOUT",
                 "verify_returncode": 124,
-                "duration_seconds": f"{time.time() - started:.1f}",
+                **_sample_timing_evidence(
+                    run_started_monotonic,
+                    sample_budget_started_monotonic,
+                ),
                 "sample_dir": str(sample_dir),
                 "note": "sample_deadline_reached_during_baseline_capture",
             }
@@ -3991,7 +3924,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "status": baseline_status,
                 "opencode_returncode": -1,
                 "verify_returncode": -1,
-                "duration_seconds": f"{time.time() - started:.1f}",
+                **_sample_timing_evidence(
+                    run_started_monotonic,
+                    sample_budget_started_monotonic,
+                ),
                 "sample_dir": str(sample_dir),
                 "note": f"baseline_capture_failed: {baseline_error}",
             }
@@ -4027,7 +3963,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 "status": "BASELINE_SEAL_MISSING",
                 "opencode_returncode": -1,
                 "verify_returncode": -1,
-                "duration_seconds": f"{time.time() - started:.1f}",
+                **_sample_timing_evidence(
+                    run_started_monotonic,
+                    sample_budget_started_monotonic,
+                ),
                 "sample_dir": str(sample_dir),
                 "note": "baseline_capture_failed: controller baseline seal missing",
             }
@@ -4367,7 +4306,10 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             "last_agent_same_diff_test_failure"
         )
         is True,
-        "duration_seconds": f"{time.time() - started:.1f}",
+        **_sample_timing_evidence(
+            run_started_monotonic,
+            sample_budget_started_monotonic,
+        ),
         "sample_dir": str(sample_dir),
         "note": note,
     }
@@ -4421,7 +4363,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--loop-mode", choices=["off", "verify-failure"], default="verify-failure")
     parser.add_argument("--max-smell-verify-cycles", type=int, choices=range(0, 11), default=10)
-    parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=2)
+    parser.add_argument("--loop-no-progress-limit", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--loop-instruction", default=LoopPolicy().instruction)
     parser.add_argument(

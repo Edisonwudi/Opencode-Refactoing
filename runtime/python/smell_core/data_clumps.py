@@ -801,7 +801,7 @@ def data_clump_body_window_contract_available(records: Any) -> bool:
         and (
             bool(_valid_body_windows(record))
             or record.get("body_copy_not_applicable")
-            == "empty_function_body"
+            in {"empty_function_body", "declaration_only_body"}
         )
         for record in records
     )
@@ -833,6 +833,26 @@ def _valid_body_windows(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         and not isinstance(window.get("baseline_source_occurrences"), bool)
         and int(window.get("baseline_source_occurrences")) > 0
     ]
+
+
+def _body_copy_not_applicable_reason(
+    body_text: str,
+    tokens: list[str],
+    language: str,
+) -> str:
+    if not tokens:
+        return "empty_function_body"
+    if language != "python":
+        return ""
+    compact = tuple(tokens)
+    if compact in {
+        (".", ".", "."),
+        ("pass",),
+        ("raise", "NotImplementedError"),
+        ("raise", "NotImplementedError", "(", ")"),
+    }:
+        return "declaration_only_body"
+    return ""
 
 
 def signature_contains_group(signature: FunctionSignature, group: str) -> bool:
@@ -947,10 +967,10 @@ def _build_occurrence_contract(
                 }
                 for window in selected
             ],
-            "body_copy_not_applicable": (
-                "empty_function_body"
-                if not token_lists.get(target_index)
-                else ""
+            "body_copy_not_applicable": _body_copy_not_applicable_reason(
+                str(item.get("body_text") or ""),
+                token_lists.get(target_index, []),
+                language,
             ),
             "occurrence": occurrence,
         })

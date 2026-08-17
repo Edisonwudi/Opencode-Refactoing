@@ -131,7 +131,10 @@ runs/<run-name>/samples/<sample>/
 ```
 
 `results.csv` 会独立记录 `status`、`resolution`、`accepted`、`progress`
-和 `termination_reason`，`note` 另记录 `final_verify_source`。runner 只做一次
+和 `termination_reason`；`duration_seconds` 是含 checkout/修订审计的总耗时，
+`setup_duration_seconds` 与 `sample_budget_elapsed_seconds` 分别记录预算开始前的
+准备时间和真正消耗 `--sample-deadline` 的时间。`note` 另记录
+`final_verify_source`。runner 只做一次
 最终验收选择：若最后一次 agent `project_full` PASS 的候选 diff、fresh-worktree
 隔离、build/test、Guard、测试未修改证据和 artifact 均与当前候选一致，runner
 复用该次完整验证并写入独立 receipt；否则执行一次新的 `runner_final` 完整验证。
@@ -208,12 +211,16 @@ Mysterious Name 使用 v6，Code Clone 使用 v5。Code Clone 的局部编辑闭
 Mysterious Name 的 v6 profile 中，c000 冻结 parser 声明的
 container name/owner、symbol kind/name、声明 slot 和声明行；参数只能在同一声明
 slot 一对一改名，局部变量只能在目标文件 patch 的同一 hunk 唯一一对一改名。
+同一 container 内确实需要一起迁移的条件编译声明或同名局部声明，必须由数据在
+`target_context_json.declaration_lines` 中列出完整声明行集合；运行时不会按同名
+自动扩张集合，未显式列出的遮蔽变量仍按歧义拒绝。
 同 owner/name/参数形状的完整 container cohort 也会冻结声明边界与摘要；验证时必须
 在同一目标文件 patch 中建立数量一致、唯一且全局一对一的旧锚到当前锚映射。
 新名称仍命中 too-short/low-info（例如 `n -> q`、`tmp -> data`）、改动其他声明、
 遗留旧引用、删除或改变 container owner、跨 hunk 或多候选都会 fail-closed。C/C++
-允许目标函数之外已经存在的 parser recovery，但目标函数本身必须完整可解析；c000
-会冻结文件级 recovery witness，验证时新增 recovery 仍会拒绝。
+允许已经存在的 parser recovery，但目标函数必须有唯一、完整且具名的声明边界；
+C/C++ 条件编译分支共享语句体时，只用保持字节偏移的单分支投影恢复该边界，不发现
+新目标。c000 会冻结原文件的 recovery witness，验证时新增 recovery 仍会拒绝。
 
 Dead Code 正例另走 fail-closed 的离线语料审计：全项目引用、宏拼接、注册/回调、
 动态协议和公共 API 风险只在整理数据时检查，不进入运行时 Guard。2026-08-09
@@ -441,9 +448,11 @@ checkpoint 只保留作诊断证据，`restorable=false`。
   `OPENCODE_TIMEOUT`、`termination_reason=MODEL_EVENT_INACTIVITY_TIMEOUT`
   fail closed；工具执行时间不计入模型静默时间。
 - 共享 smell-verify 修复周期：`--max-smell-verify-cycles`（默认 10，范围 0–10）、
-  `--loop-no-progress-limit`（默认 2)、`--loop-mode=verify-failure`。
+  `--loop-no-progress-limit`（默认 3)、`--loop-mode=verify-failure`。
 - 每个周期表示模型根据最新反馈完成一次窄修复后再次调用 `smell_verify`；
   初始验证和终态回执重放不消耗周期，也不存在越过上限的隐藏恢复周期。
+- 只有候选 production diff、当前 blocker、指标缺口与结构失败数量都未变化时，
+  才累计一次 no-progress；任一项发生变化便清零。基础设施等待不计入停滞周期。
 - 预算内 checkpoint 失败会把"基线/当前/差值/真实剩余总数/优先 worklist/唯一下一步动作"
   反馈回同一 session 继续修复；不再用只覆盖部分异味的特判提示。
 

@@ -43,7 +43,7 @@ REPAIRABLE_CATEGORY_GROUPS = {
 class LoopPolicy:
     mode: str = "verify-failure"
     max_smell_verify_cycles: int = 10
-    no_progress_limit: int = 1
+    no_progress_limit: int = 3
     allowed_failure_groups: tuple[str, ...] = ("smell", "compile", "test")
     instruction: str = (
         "Read the latest failure_pack, make one narrow corrective edit, and call "
@@ -764,7 +764,7 @@ def parse_command_policy(arguments: str) -> ResolvedCommandPolicy:
     )
     parser.add_argument("--loop-mode", choices=sorted(LOOP_MODES), default="verify-failure")
     parser.add_argument("--max-smell-verify-cycles", type=int, default=10)
-    parser.add_argument("--loop-no-progress-limit", type=int, default=2)
+    parser.add_argument("--loop-no-progress-limit", type=int, default=3)
     parser.add_argument("--loop-on", default="smell,compile,test")
     parser.add_argument("--sample-deadline", type=int, default=1800)
     parsed = parser.parse_args(tokens)

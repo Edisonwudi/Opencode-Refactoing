@@ -750,11 +750,34 @@ def _check_receipt_reuse(root: Path) -> None:
         "completed_tools_after_last_verify": ["todowrite"],
         "attempted_tools_after_last_verify": ["todowrite"],
     }
-    assert_fresh("TOOLS_AFTER_LAST_VERIFY", changed_trace=read_only_after)
-    assert_fresh(
-        "TOOL_ATTEMPT_AFTER_LAST_VERIFY",
-        changed_trace={**trace, "tool_attempts_after_last_verify": 1},
-    )
+    calls.clear()
+    R._run_verify = unexpected_verify
+    try:
+        read_only_rc, read_only_payload, read_only_audit = R._runner_final_verify(
+            sample,
+            sample_dir,
+            args,
+            "project_full",
+            baseline_seal="c000-seal",
+            deadline_monotonic=None,
+            opencode_returncode=0,
+            last_trace=read_only_after,
+            agent_verification_history=history,
+        )
+    finally:
+        R._run_verify = original_run_verify
+    assert read_only_rc == 0 and read_only_payload["accepted"] is True, read_only_payload
+    assert read_only_audit["reused"] is True, read_only_audit
+    assert calls == [], calls
+
+    mutating_after = {
+        **trace,
+        "tools_after_last_verify": 1,
+        "tool_attempts_after_last_verify": 1,
+        "completed_tools_after_last_verify": ["edit"],
+        "attempted_tools_after_last_verify": ["edit"],
+    }
+    assert_fresh("MUTATION_AFTER_LAST_VERIFY", changed_trace=mutating_after)
 
     changed_tests = copy.deepcopy(payload)
     changed_tests["test_changes"]["status"] = "TEST_SOURCE_CHANGE_ALLOWED"
@@ -1063,6 +1086,72 @@ def main() -> int:
             _pass_payload(),
         )
         assert formal_reject["accepted"] is False, formal_reject
+
+        typed_nonaccept = copy.deepcopy(formal_payload)
+        typed_nonaccept.update({
+            "status": "TEST_FAILED",
+            "success": False,
+            "accepted": False,
+            "resolution": "unresolved",
+            "loop": {
+                **formal_loop,
+                "termination_reason": "TEST_FAILED",
+            },
+        })
+        typed_nonaccept_receipt = typed_nonaccept["formal_verification_receipt"]
+        typed_nonaccept_receipt.update({
+            "status": "TEST_FAILED",
+            "success": False,
+            "accepted": False,
+            "resolution": "unresolved",
+            "outcome": "test_failed",
+            "diagnostic_signature": "TEST_FAILED",
+        })
+        typed_nonaccept_receipt["build_test"].update({
+            "success": False,
+            "reason": "TEST_FAILED",
+            "test_status": "failed",
+        })
+        typed_nonaccept_state = _state(
+            generation=1,
+            decision="stop",
+            instruction="",
+            termination_reason="TEST_FAILED",
+            stage="formal_verify",
+            status="TEST_FAILED",
+            success=False,
+            accepted=False,
+            resolution="unresolved",
+            formal_receipt=typed_nonaccept_receipt,
+        )
+        typed_nonaccept_trace = _trace(typed_nonaccept_state, typed_nonaccept)
+        calls.clear()
+
+        def unexpected_fresh(*_args, **_kwargs):
+            calls.append("fresh")
+            raise AssertionError("a typed nonaccept terminal must not start a fresh verify with no budget")
+
+        R._run_verify = unexpected_fresh
+        try:
+            nonaccept_rc, nonaccept_decision, nonaccept_audit = R._runner_final_verify(
+                sample,
+                sample_dir,
+                args,
+                "project_full",
+                baseline_seal="c000-seal",
+                deadline_monotonic=time.monotonic() + 1,
+                opencode_returncode=0,
+                last_trace=typed_nonaccept_trace,
+                agent_verification_history=[],
+            )
+        finally:
+            R._run_verify = original_run_verify
+        assert calls == [], calls
+        assert nonaccept_rc == 0, nonaccept_rc
+        assert nonaccept_decision["status"] == "TEST_FAILED", nonaccept_decision
+        assert nonaccept_decision["accepted"] is False, nonaccept_decision
+        assert nonaccept_audit["reason"] == "FRESH_VERIFY_SKIPPED_INSUFFICIENT_BUDGET", nonaccept_audit
+        assert nonaccept_audit["source"] == "agent_formal_terminal", nonaccept_audit
 
         stale_state = _state(
             generation=2,

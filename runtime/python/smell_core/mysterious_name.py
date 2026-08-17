@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from .analysis import (
+    function_declaration_boundary_complete,
     function_signatures_in_file,
     iter_local_variable_names,
     method_basename,
-    node_subtree_parseable,
     parse_function_nodes,
     source_syntax_issue_witnesses,
 )
@@ -60,16 +60,16 @@ class MysteriousNameFinding:
 
 
 MYSTERIOUS_NAME_SUCCESSOR_CONTRACT = (
-    "frozen-container-param-slot-or-local-same-hunk-successor-v2"
+    "frozen-container-symbol-slot-cohort-same-hunk-successor-v3"
 )
 MYSTERIOUS_NAME_SOURCE_PARSEABILITY_CONTRACT = (
-    "selected-container-no-errors-with-frozen-target-file-recovery-v2"
+    "selected-container-complete-boundary-with-frozen-file-recovery-v3"
 )
 MYSTERIOUS_NAME_CONTAINER_CONTINUITY_CONTRACT = (
     "complete-container-cohort-old-current-target-patch-bijection-v1"
 )
 MYSTERIOUS_NAME_CONTAINER_IDENTITY_CONTRACT = (
-    "complete-parser-declaration-boundaries-and-sha256-v1"
+    "complete-parser-declaration-boundaries-conditional-anchor-and-sha256-v2"
 )
 
 
@@ -93,7 +93,8 @@ class _Container:
     locals: tuple[_LocalDeclaration, ...]
     identifier_counts: Mapping[str, int]
     declaration_sha256: str
-    syntax_parseable: bool
+    boundary_complete: bool
+    preprocessor_guard_start_line: int
 
 
 def suspicious_name_reason(
@@ -203,7 +204,8 @@ def evaluate_mysterious_name_target(
     source_path = Path(target.file_path).expanduser().resolve()
     kind = str(selector.get("symbol_kind") or "").strip().lower()
     name = str(selector.get("symbol_name") or "").strip()
-    if kind not in {"param", "local"} or not name:
+    declaration_lines = _selector_declaration_lines(selector)
+    if kind not in {"param", "local"} or not name or declaration_lines is None:
         return _snapshot_error(
             "MYSTERIOUS_NAME_SELECTOR_INVALID",
             target=target,
@@ -239,6 +241,7 @@ def evaluate_mysterious_name_target(
             containers=containers,
             kind=kind,
             name=name,
+            declaration_lines=declaration_lines,
         )
     else:
         snapshot = _evaluate_target_symbol(
@@ -247,6 +250,7 @@ def evaluate_mysterious_name_target(
             containers=containers,
             kind=kind,
             name=name,
+            declaration_lines=declaration_lines,
             frozen=frozen,
             changed_patch=changed_patch,
         )
@@ -260,6 +264,7 @@ def _capture_target_symbol(
     containers: list[_Container],
     kind: str,
     name: str,
+    declaration_lines: tuple[int, ...],
 ) -> dict[str, Any]:
     candidates = _baseline_container_candidates(target, containers)
     if len(candidates) != 1:
@@ -272,7 +277,7 @@ def _capture_target_symbol(
             target_missing=not candidates,
         )
     container = candidates[0]
-    if not container.syntax_parseable:
+    if not container.boundary_complete:
         return _snapshot_error(
             "MN_TARGET_CONTAINER_SYNTAX_INVALID",
             target=target,
@@ -300,8 +305,20 @@ def _capture_target_symbol(
             name=name,
         )
     declarations = _symbol_declarations(container, kind, name)
+    if declaration_lines:
+        declarations = [
+            item for item in declarations if item[1] in declaration_lines
+        ]
+        if tuple(sorted(item[1] for item in declarations)) != declaration_lines:
+            return _snapshot_error(
+                "MN_DECLARATION_SELECTOR_NOT_FOUND",
+                target=target,
+                kind=kind,
+                name=name,
+                candidate_count=len(declarations),
+            )
     reason = suspicious_name_reason(name)
-    if len(declarations) != 1:
+    if not declarations or (len(declarations) != 1 and not declaration_lines):
         return {
             "ok": True,
             "detector": "tree_sitter_generic",
@@ -328,8 +345,9 @@ def _capture_target_symbol(
             "error": "MN_SELECTED_NAME_NOT_SUSPICIOUS",
         }
 
-    slot, declaration_line = declarations[0]
-    if declaration_line < 1:
+    symbol_slots = [slot for slot, _line in declarations]
+    selected_declaration_lines = [line for _slot, line in declarations]
+    if any(line < 1 for line in selected_declaration_lines):
         return _snapshot_error(
             "MN_DECLARATION_LINE_UNAVAILABLE",
             target=target,
@@ -353,8 +371,8 @@ def _capture_target_symbol(
         ),
         "container_cohort": [_container_identity(item) for item in cohort],
         "target_container_cohort_index": target_cohort_indexes[0],
-        "symbol_slot": slot,
-        "declaration_line": declaration_line,
+        "symbol_slots": symbol_slots,
+        "declaration_lines": selected_declaration_lines,
         "baseline_reference_count": occurrence_count,
     }
     return {
@@ -370,8 +388,8 @@ def _capture_target_symbol(
         "successor_contract": {
             "contract": MYSTERIOUS_NAME_SUCCESSOR_CONTRACT,
             "status": "frozen",
-            "symbol_slot": slot,
-            "declaration_line": declaration_line,
+            "symbol_slots": symbol_slots,
+            "declaration_lines": selected_declaration_lines,
             "baseline_reference_count": occurrence_count,
             "container_cohort_size": len(cohort),
         },
@@ -385,6 +403,7 @@ def _evaluate_target_symbol(
     containers: list[_Container],
     kind: str,
     name: str,
+    declaration_lines: tuple[int, ...],
     frozen: Mapping[str, Any],
     changed_patch: str | None,
 ) -> dict[str, Any]:
@@ -399,6 +418,7 @@ def _evaluate_target_symbol(
     if (
         str(frozen.get("symbol_kind") or "") != kind
         or str(frozen.get("symbol_name") or "") != name
+        or tuple(frozen.get("declaration_lines") or ()) != declaration_lines
         or str(frozen.get("file") or "").replace("\\", "/")
         != str(target.project_path).replace("\\", "/")
     ):
@@ -480,7 +500,7 @@ def _evaluate_target_symbol(
             continuity_result
         )
         return snapshot
-    if not container.syntax_parseable:
+    if not container.boundary_complete:
         return _snapshot_error(
             "MN_TARGET_CONTAINER_SYNTAX_INVALID",
             target=target,
@@ -525,16 +545,23 @@ def _evaluate_target_symbol(
             },
         }
 
-    symbol_slot = frozen.get("symbol_slot")
-    declaration_line = frozen.get("declaration_line")
+    raw_symbol_slots = frozen.get("symbol_slots")
+    raw_declaration_lines = frozen.get("declaration_lines")
     reference_count = frozen.get("baseline_reference_count")
     if (
-        isinstance(symbol_slot, bool)
-        or not isinstance(symbol_slot, int)
-        or symbol_slot < 0
-        or isinstance(declaration_line, bool)
-        or not isinstance(declaration_line, int)
-        or declaration_line < 1
+        not isinstance(raw_symbol_slots, list)
+        or not raw_symbol_slots
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 0
+            for item in raw_symbol_slots
+        )
+        or len(set(raw_symbol_slots)) != len(raw_symbol_slots)
+        or not isinstance(raw_declaration_lines, list)
+        or len(raw_declaration_lines) != len(raw_symbol_slots)
+        or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item >= 1
+            for item in raw_declaration_lines
+        )
         or isinstance(reference_count, bool)
         or not isinstance(reference_count, int)
         or reference_count < 1
@@ -545,6 +572,8 @@ def _evaluate_target_symbol(
             kind=kind,
             name=name,
         )
+    symbol_slots = [int(item) for item in raw_symbol_slots]
+    declaration_lines = [int(item) for item in raw_declaration_lines]
 
     baseline_parameters = _string_tuple(frozen_container.get("parameter_names"))
     baseline_locals = _string_tuple(frozen_container.get("local_names"))
@@ -556,21 +585,35 @@ def _evaluate_target_symbol(
     )
     baseline_symbols = baseline_parameters if kind == "param" else baseline_locals
     current_symbols = current_parameters if kind == "param" else current_locals
-    if symbol_slot >= len(baseline_symbols) or symbol_slot >= len(current_symbols):
-        violations.append(_violation("MN_SYMBOL_SLOT_MISSING", symbol_slot=symbol_slot))
+    if any(
+        slot >= len(baseline_symbols) or slot >= len(current_symbols)
+        for slot in symbol_slots
+    ):
+        violations.append(_violation("MN_SYMBOL_SLOT_MISSING", symbol_slots=symbol_slots))
         successor = ""
-        successor_line = 0
+        successor_lines: list[int] = []
     else:
-        successor = current_symbols[symbol_slot]
-        successor_line = current_lines[symbol_slot] if symbol_slot < len(current_lines) else 0
+        successor_names = {current_symbols[slot] for slot in symbol_slots}
+        successor = next(iter(successor_names)) if len(successor_names) == 1 else ""
+        successor_lines = [
+            current_lines[slot] if slot < len(current_lines) else 0
+            for slot in symbol_slots
+        ]
+        if len(successor_names) != 1:
+            violations.append(
+                _violation(
+                    "MN_SUCCESSOR_COHORT_NOT_UNIFORM",
+                    successor_names=sorted(successor_names),
+                )
+            )
 
     if kind == "param":
         changed_slots = _changed_slots(baseline_parameters, current_parameters)
-        if changed_slots != [symbol_slot]:
+        if changed_slots != symbol_slots:
             violations.append(
                 _violation(
                     "MN_PARAMETER_SLOT_MAPPING_NOT_UNIQUE",
-                    expected_slot=symbol_slot,
+                    expected_slots=symbol_slots,
                     changed_slots=changed_slots,
                 )
             )
@@ -578,11 +621,11 @@ def _evaluate_target_symbol(
             violations.append(_violation("MN_UNRELATED_LOCAL_DECLARATION_CHANGED"))
     else:
         changed_slots = _changed_slots(baseline_locals, current_locals)
-        if changed_slots != [symbol_slot]:
+        if changed_slots != symbol_slots:
             violations.append(
                 _violation(
                     "MN_LOCAL_MAPPING_NOT_UNIQUE",
-                    expected_slot=symbol_slot,
+                    expected_slots=symbol_slots,
                     changed_slots=changed_slots,
                 )
             )
@@ -604,16 +647,10 @@ def _evaluate_target_symbol(
         baseline_other_declarations = [
             item
             for index, item in enumerate((*baseline_parameters, *baseline_locals))
-            if not (
-                item == name
-                and (
-                    (kind == "param" and index == symbol_slot)
-                    or (
-                        kind == "local"
-                        and index == len(baseline_parameters) + symbol_slot
-                    )
-                )
-            )
+            if index not in {
+                slot if kind == "param" else len(baseline_parameters) + slot
+                for slot in symbol_slots
+            }
         ]
         if successor in baseline_other_declarations:
             violations.append(
@@ -638,20 +675,35 @@ def _evaluate_target_symbol(
             )
         )
 
-    patch_result = _same_hunk_declaration_successor(
-        changed_patch,
-        old_line=declaration_line,
-        current_line=successor_line,
-        old_name=name,
-        successor_name=successor,
+    patch_witnesses = [
+        _same_hunk_declaration_successor(
+            changed_patch,
+            old_line=old_line,
+            current_line=current_line,
+            old_name=name,
+            successor_name=successor,
+        )
+        for old_line, current_line in zip(declaration_lines, successor_lines)
+    ]
+    patch_result = (
+        patch_witnesses[0]
+        if len(patch_witnesses) == 1
+        else {
+            "ok": bool(patch_witnesses)
+            and all(item.get("ok") is True for item in patch_witnesses),
+            "contract": "all-selected-declarations-same-hunk-successor-v1",
+            "witnesses": patch_witnesses,
+        }
     )
-    if patch_result.get("ok") is not True:
+    for witness in patch_witnesses:
+        if witness.get("ok") is True:
+            continue
         violations.append(
             _violation(
-                str(patch_result.get("code") or "MN_TARGET_PATCH_INVALID"),
+                str(witness.get("code") or "MN_TARGET_PATCH_INVALID"),
                 **{
                     key: value
-                    for key, value in patch_result.items()
+                    for key, value in witness.items()
                     if key not in {"ok", "code"}
                 },
             )
@@ -671,9 +723,9 @@ def _evaluate_target_symbol(
         "successor_contract": {
             "contract": MYSTERIOUS_NAME_SUCCESSOR_CONTRACT,
             "status": "accepted" if not violations else "rejected",
-            "symbol_slot": symbol_slot,
-            "old_declaration_line": declaration_line,
-            "current_declaration_line": successor_line,
+            "symbol_slots": symbol_slots,
+            "old_declaration_lines": declaration_lines,
+            "current_declaration_lines": successor_lines,
             "successor_name": successor,
             "baseline_reference_count": reference_count,
             "successor_reference_count": successor_references,
@@ -724,10 +776,26 @@ def _containers_in_file(file_path: Path, language: str) -> list[_Container]:
                         "utf-8", errors="surrogateescape"
                     )
                 ).hexdigest(),
-                syntax_parseable=node_subtree_parseable(node),
+                boundary_complete=function_declaration_boundary_complete(
+                    node,
+                    source_bytes,
+                    language,
+                ),
+                preprocessor_guard_start_line=(
+                    _preprocessor_guard_start_line(node)
+                ),
             )
         )
     return containers
+
+
+def _preprocessor_guard_start_line(node: Any) -> int:
+    parent = node.parent
+    while parent is not None:
+        if str(parent.type).startswith("preproc_"):
+            return int(parent.start_point[0]) + 1
+        parent = parent.parent
+    return 0
 
 
 def _baseline_container_candidates(target: Any, containers: list[_Container]) -> list[_Container]:
@@ -781,7 +849,12 @@ def _complete_container_identity_key(
         if isinstance(value, _Container)
         else str(value.get("declaration_sha256") or "")
     )
-    return (*_container_family_key(value), digest)
+    guard_start = (
+        value.preprocessor_guard_start_line
+        if isinstance(value, _Container)
+        else int(value.get("preprocessor_guard_start_line") or 0)
+    )
+    return (*_container_family_key(value), digest, guard_start)
 
 
 def _duplicate_complete_container_identities(
@@ -870,6 +943,13 @@ def _validate_container_identity(
         if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
             return None, f"container_{field}_invalid"
         line_fields[field] = raw
+    guard_start = value.get("preprocessor_guard_start_line")
+    if (
+        isinstance(guard_start, bool)
+        or not isinstance(guard_start, int)
+        or guard_start < 0
+    ):
+        return None, "container_preprocessor_guard_start_line_invalid"
     if not (
         line_fields["capture_declaration_start_line"]
         <= line_fields["capture_start_line"]
@@ -888,6 +968,7 @@ def _validate_container_identity(
         "owner_kind": owner_kind,
         **sequence_fields,
         **line_fields,
+        "preprocessor_guard_start_line": guard_start,
         "declaration_sha256": digest,
     }, ""
 
@@ -1080,6 +1161,9 @@ def _container_identity(container: _Container) -> dict[str, Any]:
         "capture_end_line": container.end_line,
         "capture_declaration_start_line": container.declaration_start_line,
         "capture_declaration_end_line": container.end_line,
+        "preprocessor_guard_start_line": (
+            container.preprocessor_guard_start_line
+        ),
         "declaration_sha256": container.declaration_sha256,
     }
 
@@ -1112,6 +1196,7 @@ def _local_declarations(
         return ()
     declarations: list[_LocalDeclaration] = []
     if language == "python":
+        first_binding: dict[str, _LocalDeclaration] = {}
         for node in _walk_container_scope(body, language):
             if node.type != "assignment":
                 continue
@@ -1119,9 +1204,12 @@ def _local_declarations(
             if left is None or left.type != "identifier":
                 continue
             name = _node_text(source_bytes, left).strip()
-            if name:
-                declarations.append(_LocalDeclaration(name, node.start_point[0] + 1))
-        return tuple(declarations)
+            if name and name not in first_binding:
+                first_binding[name] = _LocalDeclaration(
+                    name,
+                    node.start_point[0] + 1,
+                )
+        return tuple(first_binding.values())
     if language in {"c", "cpp"}:
         for node in _walk_container_scope(body, language):
             if node.type != "declaration":
@@ -1291,6 +1379,23 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def _selector_declaration_lines(
+    selector: Mapping[str, Any],
+) -> tuple[int, ...] | None:
+    raw = selector.get("declaration_lines", [])
+    if raw in (None, ""):
+        return ()
+    if not isinstance(raw, list):
+        return None
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 1
+        for item in raw
+    ):
+        return None
+    lines = tuple(sorted(int(item) for item in raw))
+    return lines if len(set(lines)) == len(lines) else None
+
+
 def _name_pattern(name: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
 
@@ -1356,9 +1461,9 @@ def _with_source_parseability(
     result["target_syntax_issue_witnesses"] = list(syntax_witnesses)
     error = str(result.get("error") or "")
     if error == "MN_TARGET_CONTAINER_SYNTAX_INVALID":
-        result["target_container_parseable"] = False
+        result["target_container_boundary_complete"] = False
     elif result.get("ok") is True and result.get("target_missing") is not True:
-        result["target_container_parseable"] = True
+        result["target_container_boundary_complete"] = True
     return result
 
 

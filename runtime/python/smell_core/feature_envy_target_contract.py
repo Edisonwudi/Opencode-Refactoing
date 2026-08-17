@@ -15,6 +15,8 @@ from typing import Any, Mapping
 from .analysis import (
     extract_snippet,
     extract_snippet_candidates,
+    source_snippet_boundary_complete,
+    source_syntax_issue_witnesses,
     signature_parameter_fingerprints,
 )
 from .feature_envy import (
@@ -147,7 +149,12 @@ def _capture_baseline_target(
         return _identity_collision(
             relative_file, receiver, identity, len(anchor_matches)
         )
-    if anchor_matches[0][1] is not True:
+    selected, selected_parseable = anchor_matches[0]
+    boundary_complete = source_snippet_boundary_complete(
+        selected,
+        str(config.language),
+    )
+    if selected_parseable is not True and not boundary_complete:
         return _failure(
             "target_declaration_parse_failed",
             file=relative_file,
@@ -168,16 +175,21 @@ def _capture_baseline_target(
         return _identity_collision(
             relative_file, receiver, identity, len(identity_matches)
         )
-    return _profile_snapshot(
-        config,
-        target=replace(
-            target,
-            method=selected.declared_name,
-            line=selected.start_line,
+    return _with_source_parseability(
+        _profile_snapshot(
+            config,
+            target=replace(
+                target,
+                method=selected.declared_name,
+                line=selected.start_line,
+            ),
+            relative_file=relative_file,
+            receiver=receiver,
+            identity=identity,
         ),
-        relative_file=relative_file,
-        receiver=receiver,
-        identity=identity,
+        target.file_path,
+        str(config.language),
+        boundary_complete=boundary_complete,
     )
 
 
@@ -233,13 +245,18 @@ def _evaluate_frozen_target(
             {"reason": "feature_envy_current_identity_not_unique"}
         ]
         return result
-    if identity_matches[0][1] is not True:
+    selected, selected_parseable = identity_matches[0]
+    boundary_complete = source_snippet_boundary_complete(
+        selected,
+        str(config.language),
+    )
+    if selected_parseable is not True and not boundary_complete:
         return _failure(
             "target_declaration_parse_failed",
             file=relative_file,
             finding_identity=frozen_identity,
         )
-    identity_candidates = [identity_matches[0][0]]
+    identity_candidates = [selected]
     if changed_patch is None:
         return _failure(
             "changed_target_patch_unavailable",
@@ -299,16 +316,21 @@ def _evaluate_frozen_target(
         ]
         return result
     selected = selected_matches[0]
-    snapshot = _profile_snapshot(
-        config,
-        target=replace(
-            target,
-            method=selected.declared_name,
-            line=selected.start_line,
+    snapshot = _with_source_parseability(
+        _profile_snapshot(
+            config,
+            target=replace(
+                target,
+                method=selected.declared_name,
+                line=selected.start_line,
+            ),
+            relative_file=relative_file,
+            receiver=receiver,
+            identity=frozen_identity,
         ),
-        relative_file=relative_file,
-        receiver=receiver,
-        identity=frozen_identity,
+        target.file_path,
+        str(config.language),
+        boundary_complete=boundary_complete,
     )
     snapshot.update({
         "target_patch_identity_ok": True,
@@ -433,6 +455,23 @@ def _profile_snapshot(
         "target_missing": False,
         "target_identity_collision": False,
         "finding_identity": finding_identity,
+    }
+
+
+def _with_source_parseability(
+    snapshot: Mapping[str, Any],
+    file_path: Path,
+    language: str,
+    *,
+    boundary_complete: bool,
+) -> dict[str, Any]:
+    syntax_witnesses = source_syntax_issue_witnesses(file_path, language)
+    return {
+        **dict(snapshot),
+        "target_file_parseable": not syntax_witnesses,
+        "parser_recovery_required": bool(syntax_witnesses),
+        "target_syntax_issue_witnesses": syntax_witnesses,
+        "target_declaration_boundary_complete": bool(boundary_complete),
     }
 
 

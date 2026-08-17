@@ -197,7 +197,10 @@ def _selected_class(
             declared = qualified.rsplit("::", 1)[-1]
             if (
                 requested_qualified
-                and qualified == requested
+                and (
+                    qualified == requested
+                    or qualified.endswith(f"::{requested}")
+                )
             ) or (
                 not requested_qualified
                 and declared == requested
@@ -278,10 +281,24 @@ def _cpp_bodyless_method_declarations(root: Any, owner: Any) -> list[Any]:
             continue
         if not _is_direct_class_member(node, owner, "cpp"):
             continue
-        for declarator in _declarators(node):
+        for declarator in _cpp_member_declarators(node):
             if _is_callable_declarator(declarator):
                 declarations.append(declarator)
     return declarations
+
+
+def _cpp_member_declarators(node: Any) -> list[Any]:
+    """Recover a method declarator hidden by a trailing attribute macro."""
+    declarators = _declarators(node)
+    if any(_is_callable_declarator(item) for item in declarators):
+        return declarators
+    return [
+        candidate
+        for candidate in _iter_nodes(node)
+        if candidate.type == "function_declarator"
+        and _nearest_ancestor(candidate, {"function_declarator"}) is None
+        and _nearest_ancestor(candidate, {"parameter_declaration"}) is None
+    ]
 
 
 def _cpp_out_of_class_method_definitions(
@@ -318,7 +335,13 @@ def _cpp_out_of_class_method_definitions(
     for node in _iter_nodes(root):
         if node.type not in FUNCTION_NODE_TYPES.get("cpp", set()):
             continue
-        if _is_direct_class_member(node, owner, "cpp"):
+        # A definition lexically inside any class is inline, never an
+        # out-of-class definition of the selected owner.  This also excludes
+        # same-named class templates emitted in preprocessor alternatives.
+        if _nearest_ancestor(
+            node,
+            {"class_specifier", "struct_specifier"},
+        ) is not None:
             continue
         actual_owner = _canonical_cpp_owner(
             _actual_function_owner(node, "cpp", source_bytes)
@@ -473,7 +496,16 @@ def _is_direct_class_member(node: Any, owner: Any, language: str) -> bool:
     )
     if _nearest_ancestor(node, class_types) != owner:
         return False
-    return _nearest_ancestor(node, FUNCTION_NODE_TYPES.get(language, set())) is None
+    # Only a callable between the node and its class makes it nested.  A macro
+    # before a namespace can make tree-sitter wrap the whole remaining file in
+    # a recovered function_definition; that outer recovery node must not hide
+    # otherwise direct class members.
+    current = node.parent
+    while current is not None and current != owner:
+        if current.type in FUNCTION_NODE_TYPES.get(language, set()):
+            return False
+        current = current.parent
+    return current == owner
 
 
 def _nearest_ancestor(node: Any, node_types: set[str]) -> Any:
