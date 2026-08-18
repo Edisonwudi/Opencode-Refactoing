@@ -28,6 +28,48 @@ check_maven_offline_repository() {
     --repository-id "$MAVEN_OFFLINE_REPOSITORY_ID"
 }
 
+prepare_mounted_source_maven_settings() {
+  # The mounted-source image executes this entrypoint from the current source
+  # tree, so its source contract may be newer than the immutable environment
+  # layer.  The canonical offline settings remain environment-owned; only
+  # materialize their two required copies in this container's write layer.
+  [[ -n "${OPENCODE_AGENT_SOURCE:-}" ]] || return 0
+  [[ -d "$OPENCODE_AGENT_SOURCE" ]] || {
+    echo "Mounted agent source directory not found: $OPENCODE_AGENT_SOURCE" >&2
+    return 66
+  }
+  if [[ ! -e "$MAVEN_OFFLINE_SETTINGS" && ! -e "$MAVEN_OFFLINE_REPOSITORY" ]]; then
+    return 0
+  fi
+  [[ -f "$MAVEN_OFFLINE_SETTINGS" ]] || {
+    echo "Maven offline settings are incomplete: $MAVEN_OFFLINE_SETTINGS" >&2
+    return 70
+  }
+  [[ -d "$MAVEN_OFFLINE_REPOSITORY" ]] || {
+    echo "Maven offline repository is incomplete: $MAVEN_OFFLINE_REPOSITORY" >&2
+    return 70
+  }
+
+  mkdir -p "$(dirname "$MAVEN_GLOBAL_SETTINGS")" "$(dirname "$MAVEN_USER_SETTINGS")" || {
+    echo "Cannot prepare Maven settings directories" >&2
+    return 70
+  }
+  if [[ ! -f "$MAVEN_GLOBAL_SETTINGS" ]] \
+      || ! cmp -s "$MAVEN_OFFLINE_SETTINGS" "$MAVEN_GLOBAL_SETTINGS"; then
+    install -m 0644 "$MAVEN_OFFLINE_SETTINGS" "$MAVEN_GLOBAL_SETTINGS" || {
+      echo "Cannot prepare Maven global settings: $MAVEN_GLOBAL_SETTINGS" >&2
+      return 70
+    }
+  fi
+  if [[ ! -f "$MAVEN_USER_SETTINGS" ]] \
+      || ! cmp -s "$MAVEN_OFFLINE_SETTINGS" "$MAVEN_USER_SETTINGS"; then
+    install -m 0644 "$MAVEN_OFFLINE_SETTINGS" "$MAVEN_USER_SETTINGS" || {
+      echo "Cannot prepare Maven user settings: $MAVEN_USER_SETTINGS" >&2
+      return 70
+    }
+  fi
+}
+
 ensure_local_hostname() {
   local current_hostname
   current_hostname="$(hostname)"
@@ -41,6 +83,12 @@ ensure_local_hostname() {
   printf '127.0.0.1\t%s\n' "$current_hostname" >> /etc/hosts
   getent hosts "$current_hostname" >/dev/null 2>&1
 }
+
+prepare_mounted_source_maven_settings
+if [[ "${MOUNTED_SOURCE_PREPARE_MAVEN_SETTINGS_ONLY:-0}" == "1" ]]; then
+  echo "Mounted source Maven settings prepared"
+  exit 0
+fi
 
 ensure_local_hostname
 if [[ -e "$MAVEN_OFFLINE_SETTINGS" || -e "$MAVEN_OFFLINE_REPOSITORY" ]]; then

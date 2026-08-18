@@ -72,6 +72,68 @@ set -e
 [[ "$status" == "78" ]] || { echo "Expected dependency mismatch exit 78, got $status" >&2; exit 1; }
 grep -q 'AGENT_DEPENDENCY_MISMATCH: package-lock.json' "$tmp/mismatch.stderr"
 
+# Mounted-source images intentionally execute the delivery entrypoint from the
+# current source tree.  Older certified Java environments may contain the
+# canonical offline Maven settings without the two byte-identical installed
+# copies required by the current strict delivery check.  The mounted-source
+# adapter must materialize only those copies in the container write layer; the
+# delivery entrypoint remains responsible for validating them and the offline
+# repository contract.
+grep -Fq 'prepare_mounted_source_maven_settings()' "$delivery_entrypoint" || {
+  echo 'Delivery entrypoint must prepare mounted-source Maven settings compatibility copies' >&2
+  exit 1
+}
+grep -Fq 'MOUNTED_SOURCE_PREPARE_MAVEN_SETTINGS_ONLY' "$delivery_entrypoint" || {
+  echo 'Mounted-source Maven settings preparation must be independently testable' >&2
+  exit 1
+}
+
+maven_root="$tmp/maven-buildenv"
+mkdir -p "$maven_root/offline-home/.m2/repository"
+printf '%s\n' '<settings><mirrors/></settings>' >"$maven_root/maven-offline-settings.xml"
+printf '%s\n' '<settings>stale-global</settings>' >"$maven_root/maven-global-settings.xml"
+printf '%s\n' '<settings>stale-user</settings>' >"$maven_root/offline-home/.m2/settings.xml"
+
+MOUNTED_SOURCE_PREPARE_MAVEN_SETTINGS_ONLY=1 \
+OPENCODE_AGENT_SOURCE="$repo_root" \
+MAVEN_OFFLINE_SETTINGS="$maven_root/maven-offline-settings.xml" \
+MAVEN_GLOBAL_SETTINGS="$maven_root/maven-global-settings.xml" \
+MAVEN_USER_SETTINGS="$maven_root/offline-home/.m2/settings.xml" \
+MAVEN_OFFLINE_REPOSITORY="$maven_root/offline-home/.m2/repository" \
+bash "$delivery_entrypoint" >"$tmp/maven-prepare.log"
+grep -q 'Mounted source Maven settings prepared' "$tmp/maven-prepare.log"
+cmp -s "$maven_root/maven-offline-settings.xml" "$maven_root/maven-global-settings.xml"
+cmp -s "$maven_root/maven-offline-settings.xml" "$maven_root/offline-home/.m2/settings.xml"
+
+# The ordinary delivery path keeps the strict immutable-image contract; only
+# an active mounted-source contract may materialize compatibility copies.
+printf '%s\n' '<settings>ordinary-delivery-drift</settings>' >"$maven_root/maven-global-settings.xml"
+OPENCODE_AGENT_SOURCE= \
+MOUNTED_SOURCE_PREPARE_MAVEN_SETTINGS_ONLY=1 \
+MAVEN_OFFLINE_SETTINGS="$maven_root/maven-offline-settings.xml" \
+MAVEN_GLOBAL_SETTINGS="$maven_root/maven-global-settings.xml" \
+MAVEN_USER_SETTINGS="$maven_root/offline-home/.m2/settings.xml" \
+MAVEN_OFFLINE_REPOSITORY="$maven_root/offline-home/.m2/repository" \
+bash "$delivery_entrypoint" >"$tmp/maven-ordinary.log"
+if cmp -s "$maven_root/maven-offline-settings.xml" "$maven_root/maven-global-settings.xml"; then
+  echo 'Ordinary delivery must not repair Maven settings at runtime' >&2
+  exit 1
+fi
+
+rm -f "$maven_root/maven-offline-settings.xml"
+set +e
+MOUNTED_SOURCE_PREPARE_MAVEN_SETTINGS_ONLY=1 \
+OPENCODE_AGENT_SOURCE="$repo_root" \
+MAVEN_OFFLINE_SETTINGS="$maven_root/maven-offline-settings.xml" \
+MAVEN_GLOBAL_SETTINGS="$maven_root/maven-global-settings.xml" \
+MAVEN_USER_SETTINGS="$maven_root/offline-home/.m2/settings.xml" \
+MAVEN_OFFLINE_REPOSITORY="$maven_root/offline-home/.m2/repository" \
+bash "$delivery_entrypoint" >"$tmp/maven-missing.stdout" 2>"$tmp/maven-missing.stderr"
+status=$?
+set -e
+[[ "$status" == "70" ]] || { echo "Expected incomplete Maven environment exit 70, got $status" >&2; exit 1; }
+grep -q 'Maven offline settings are incomplete' "$tmp/maven-missing.stderr"
+
 grep -q '^FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source$' "$dockerfile"
 grep -q '^FROM ${DEPENDENCY_CLOSURE_IMAGE} AS dependency_closure$' "$dockerfile"
 grep -q '^FROM ${BASE_ENV_IMAGE}$' "$dockerfile"
