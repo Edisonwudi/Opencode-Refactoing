@@ -5,6 +5,10 @@ OpenCode 会话、原生 OpenCode 对照，以及外部批量控制器。验收�
 [`verification-contract.md`](verification-contract.md)，语言与数据集约束见
 [`language-and-dataset-contracts.md`](language-and-dataset-contracts.md)。
 
+根 `README.md` 的正式交付流程统一使用 Docker。下文的
+`python3 scripts/run_smell_dataset.py` 是宿主机开发调试入口，要求宿主机自行准备
+OpenCode、语言工具链、项目快照和构建依赖，不用于镜像交付验收。
+
 ## 1. 模型配置
 
 API key 只允许来自环境变量或 secret 文件，不要写进仓库、CSV、日志或命令参数。
@@ -35,7 +39,7 @@ python3 scripts/run_smell_dataset.py \
 key 来源优先级为：`--opencode-api-key`（不推荐）>
 `--opencode-api-key-env`（推荐）> `OPENCODE_AUTH_JSON` 或镜像内置 auth。
 
-## 2. runner 的两种 Agent 模式
+## 2. 开发调试：宿主机 runner 的两种 Agent 模式
 
 ### 2.1 交付 Agent
 
@@ -44,7 +48,7 @@ Java 使用 `java-refactor-agent`；Python、C、C++ 默认根据 CSV 的 `langu
 
 ```bash
 python3 scripts/run_smell_dataset.py \
-  --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
+  --dataset "$PWD/dataset/java/delivery_schema/<smell>.csv" \
   --sample-id <id> \
   --model minimax/MiniMax-M2.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \
@@ -62,7 +66,7 @@ python3 scripts/run_smell_dataset.py \
 
 ```bash
 python3 scripts/run_smell_dataset.py \
-  --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
+  --dataset "$PWD/dataset/java/delivery_schema/<smell>.csv" \
   --sample-id <id> \
   --model minimax/MiniMax-M2.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \

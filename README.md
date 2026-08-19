@@ -29,7 +29,7 @@ IDEA service 的开发环境。
 git clone https://github.com/Edisonwudi/Opencode-Refactoing.git
 cd Opencode-Refactoing
 
-mkdir -p images
+mkdir -p images runs
 cp /path/to/smell-refactor-env-java.tar.gz images/
 cp /path/to/SHA256SUMS images/
 (cd images && sha256sum -c SHA256SUMS)
@@ -71,6 +71,9 @@ docker run --rm \
   opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
   self-check
 ```
+
+`/agent-src` 是容器内挂载点，不是仓库中的目录；上面的 `--mount` 会把当前仓库
+`$PWD` 映射到该路径。直接在宿主机运行脚本时应使用仓库本地路径。
 
 该命令不调用模型，会检查只读源码挂载、运行时依赖、项目 revision、离线构建环境和
 项目级验证配置。非 Java 镜像需要显式指定本语言的 smoke dataset，命令见
@@ -142,28 +145,17 @@ docker run --rm \
 Feature Envy、Mysterious Name、Dead Code 清洗集以及非 Java selector/Guard 约束见
 [`docs/language-and-dataset-contracts.md`](docs/language-and-dataset-contracts.md)。
 
-### 直接调用 runner
-
-```bash
-python3 scripts/run_smell_dataset.py \
-  --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
-  --sample-id <id> \
-  --model minimax/MiniMax-M2.7 \
-  --opencode-api-key-env SMELL_OPENCODE_API_KEY \
-  --opencode-base-url "$SMELL_OPENCODE_BASE_URL" \
-  --verification-mode sample_optimized \
-  --agent java-refactor-agent
-```
-
-真实项目也可通过 `--build-command`、`--project-test-command` 和
-`--verification-cwd` 显式声明验证命令。参数优先级、测试迁移、手动 command 和外部
-`benchmark-worker` 见 [`docs/advanced-usage.md`](docs/advanced-usage.md)。完整参数以
-`python3 scripts/run_smell_dataset.py --help` 为准。
-
 ### 原生 OpenCode 能力对照
 
 ```bash
-python3 scripts/run_smell_dataset.py \
+: "${SMELL_OPENCODE_API_KEY:?请先设置并 export SMELL_OPENCODE_API_KEY}"
+
+docker run --rm \
+  --pull=never \
+  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
+  --mount type=bind,src="$PWD/runs",dst=/runs \
+  -e SMELL_OPENCODE_API_KEY \
+  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
   --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
   --sample-id <id> \
   --model minimax/MiniMax-M2.7 \
@@ -177,6 +169,10 @@ python3 scripts/run_smell_dataset.py \
 `smell_verify`。模型单轮退出后，runner 基于预先冻结的 c000 做一次独立最终验证。
 它只支持 `direct` backend，且不会降低正式 PASS 合同。实验边界和审计方法见
 [`docs/advanced-usage.md`](docs/advanced-usage.md#22-原生-opencode-对照)。
+
+宿主机直接调用 runner、真实项目验证命令、手动 command 和外部
+`benchmark-worker` 属于开发调试方式，见
+[`docs/advanced-usage.md`](docs/advanced-usage.md)。
 
 ## 结果语义速查
 
