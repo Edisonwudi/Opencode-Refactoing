@@ -1,75 +1,67 @@
 # OpenCode 异味自动重构交付包
 
-单 Agent Java 异味自动重构系统：OpenCode 插件 `smell_verify` + Python
-checkpoint 契约（通用 contract + 每种异味的指标适配器）。Agent 负责定位并
-重构，checkpoint 负责用"前后指标对比 + build/test"做真实验收。
+面向 Java、Python、C、C++ 的单 Agent 自动重构系统。模型负责定位和修改代码，
+`smell_verify`、checkpoint 与 Target Guard 负责用冻结目标、生产源码 diff 和
+build/test 做独立验收。
 
-- 本仓库（GitHub）：agent 源码、checkpoint 契约与适配器、批量 runner、自检、文档。
-- 四个环境镜像（java / python / c / cpp，压缩包单独交付，不进 Git）：
-  语言工具链、项目、离线依赖缓存、dataset、OpenCode/Node 运行时。当前 Java
-  环境镜像不包含 IDEA/IDEA-Refactoring。
+仓库包含 Agent、Skill、插件、checkpoint、数据集 runner、自检和文档；四种语言的
+环境镜像单独交付，包含固定工具链、项目快照、离线依赖和 OpenCode 运行时。
 
-> 拿到仓库和镜像后，照第 1 节的编号顺序执行即可跑通第一个样本。
+## 支持范围
 
----
+| 语言 | 异味范围 | 默认 Agent |
+|---|---|---|
+| Java | 10 种通用异味 + `refused_bequest` | `java-refactor-agent` |
+| Python / C / C++ | 10 种通用异味 | `smell-refactor-agent` |
 
-## 1. 拿到仓库 + 镜像后的完整流程
+10 种通用异味：Long Method、Long Parameter List、Nested Complexity、Switch
+Statements、Data Clumps、Type-1 Code Clone、God Class、Dead Code、Feature Envy、
+Mysterious Name。
 
-### 1.1 克隆仓库
+当前 Java 交付镜像不包含 IDEA/IDEA-Refactoring。IDEA backend 仅用于另行配置了
+IDEA service 的开发环境。
+
+## 快速上手
+
+### 1. 获取仓库和镜像
 
 ```bash
 git clone https://github.com/Edisonwudi/Opencode-Refactoing.git
 cd Opencode-Refactoing
-```
 
-### 1.2 把镜像压缩包放进 `images/` 并校验
-
-```bash
 mkdir -p images
 cp /path/to/smell-refactor-env-java.tar.gz images/
 cp /path/to/SHA256SUMS images/
 (cd images && sha256sum -c SHA256SUMS)
-```
 
-`images/` 已在 `.gitignore` 中，不会被提交。压缩包与镜像 tag、hash 的
-对照见 `delivery/README.md`。四个镜像均为 **linux/amd64**，在 amd64
-Linux 主机上开箱即用；ARM 主机（如 Apple Silicon）需
-`--platform linux/amd64` 仿真运行（慢）或按 Dockerfile 重建 ARM 版。
-这里只运行 Java 时只需 Java 归档；同时交付其他语言时，再把对应归档加入
-`images/`，并使用覆盖实际归档集合的 `SHA256SUMS`。
-
-### 1.3 载入镜像
-
-```bash
 docker load -i images/smell-refactor-env-java.tar.gz
-docker image inspect \
-  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
-  --format '{{.Id}}'
 ```
 
-如交付了其他语言，再分别 `docker load` 对应归档。
+镜像 tag、归档文件和验收记录见 [`delivery/README.md`](delivery/README.md)。镜像均为
+`linux/amd64`；ARM 主机需要仿真运行或按对应 Dockerfile 重建。
 
-### 1.4 安装本地依赖并验证源码契约
+### 2. 安装本地依赖并自检源码
 
 ```bash
 npm ci && (cd .opencode && npm ci && cd ..)
 python3 -m pip install pyyaml tree_sitter tree_sitter_language_pack
-# Ubuntu 24.04(PEP 668)请改用 venv,或加 --break-system-packages
 npm run check
 ```
 
-要求：Node.js ≥ 18（推荐 22)、Python ≥ 3.10、Docker 24+。
+要求：Node.js ≥ 18（推荐 22）、Python ≥ 3.10、Docker 24+。Ubuntu 24.04 的系统
+Python 建议使用 venv。
 
-### 1.5 配置模型（环境变量，见第 2 节）
+### 3. 配置模型
 
 ```bash
 export SMELL_OPENCODE_API_KEY="<api-key>"
-export SMELL_OPENCODE_BASE_URL="https://api.minimaxi.com/v1"   # 按 provider 选择,见下表
+export SMELL_OPENCODE_BASE_URL="https://api.minimaxi.com/v1"
 ```
 
-### 1.6 容器自检（不调用模型）
+key 只放在环境变量或 secret 文件中，不要写进仓库、CSV、日志或命令参数。其他
+provider 的配置见 [`docs/advanced-usage.md`](docs/advanced-usage.md)。
 
-以 Java 镜像为例（其余语言换镜像名即可）：
+### 4. 自检环境镜像
 
 ```bash
 docker run --rm \
@@ -80,20 +72,11 @@ docker run --rm \
   self-check
 ```
 
-`self-check` 会校验：只读挂载、lockfile hash、运行时依赖、项目版本清单、
-项目级验证配置，全部就位才放行。
+该命令不调用模型，会检查只读源码挂载、运行时依赖、项目 revision、离线构建环境和
+项目级验证配置。非 Java 镜像需要显式指定本语言的 smoke dataset，命令见
+[`docs/language-and-dataset-contracts.md`](docs/language-and-dataset-contracts.md)。
 
-**非 Java 镜像注意**：`self-check` 默认走 Java dataset 路径，非 Java 镜像
-必须显式指定本语言的 dataset:
-
-```bash
-docker run --rm \
-  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
-  opencode-smell-python-refactor-env:0.1.1-amd64-delivery-20260720 \
-  self-check --dataset-smoke-dataset /opt/dataset/smells/python/long_method_30.csv
-```
-
-### 1.7 跑一个真实样本
+### 5. 跑一个 Java 样本
 
 ```bash
 : "${SMELL_OPENCODE_API_KEY:?请先设置并 export SMELL_OPENCODE_API_KEY}"
@@ -113,138 +96,34 @@ docker run --rm \
   --agent java-refactor-agent
 ```
 
-当前 Java 产品只有 `java-refactor-agent` 这一条执行路径，不再注册或解析
-旧 IDEA agent/command/runner 参数。
+Java 产品只注册 `java-refactor-agent`；不再解析旧 IDEA agent/runner 参数。
 
-### 1.8 看结果
+### 6. 查看结果
 
 ```text
-runs/<run-name>/results.csv          # 汇总:status / 耗时 / smell_verify 修复周期数
+runs/<run-name>/results.csv
 runs/<run-name>/samples/<sample>/
-  verify.json        # 有界 decision:status、resolution、指标差值、build/test 摘要和 artifact 路径
-  artifacts/.../
-    guard-evidence.json # 有界 Guard/checkpoint 证据（按需读取，<2 MiB）
-    build.log / test.log / diff.patch # 独立的完整过程证据
-  diff.patch         # 生产源码 diff(有效 PASS 的必要条件)
-  run.log            # opencode 过程日志
-  failure_pack       # 失败时的结构化原因(在 verify.json 内)
+  result.json
+  verify.json
+  runner-final-receipt.json
+  diff.patch
+  run.log
+  artifacts/
+    guard-evidence.json
+    build.log
+    test.log
 ```
 
-`results.csv` 会独立记录 `status`、`resolution`、`accepted`、`progress`
-和 `termination_reason`；`duration_seconds` 是含 checkout/修订审计的总耗时，
-`setup_duration_seconds` 与 `sample_budget_elapsed_seconds` 分别记录预算开始前的
-准备时间和真正消耗 `--sample-deadline` 的时间。`note` 另记录
-`final_verify_source`。runner 只做一次
-最终验收选择：若最后一次 agent `project_full` PASS 的候选 diff、fresh-worktree
-隔离、build/test、Guard、测试未修改证据和 artifact 均与当前候选一致，runner
-复用该次完整验证并写入独立 receipt；否则执行一次新的 `runner_final` 完整验证。
-两条路径都只产生一个权威终态。OpenCode 超时和 Provider 错误仅作为
-执行元数据记录，不能被已通过的验证覆盖。每样本容器内 Maven `install` 产生的临时
-本地仓库元数据不会覆盖 smell/build/test 的最终状态。
+最先看 `results.csv` 的 `status`、`resolution`、`accepted`、
+`termination_reason` 和 `duration_seconds`。正式接受必须是 `PASS / resolved`，且
+`accepted=true`；`IMPROVED` 只表示指标改善，仍不接受。完整判定方法见
+[`docs/verification-contract.md`](docs/verification-contract.md)。
 
-`smell_verify` 和数据集 runner 默认只传递固定投影的
-`smell.verify.decision/v1`（硬上限 64 KiB）；不会把 clone catalog、完整
-worklist、测试清单或源码 diff 复制进模型上下文。模型需要进一步诊断时，按
-`artifacts` 中的路径读取对应文件。`smell_bridge.py` 的 `--output-detail audit`
-仅供自检和人工审计使用。
+## 常用运行方式
 
-### 1.9 日常更新
+### Python、C、C++
 
-```bash
-git pull    # 更新 agent 源码及仓库内权威 dataset
-```
-
-Java 环境镜像的唯一构建入口是
-`docker/java-refactor-delivery/Dockerfile.mounted-source`。该 Dockerfile
-只允许固化 Java 工具链、项目快照、dataset、离线仓库、Node/OpenCode 依赖及版本清单；
-Agent prompt、skill、plugin、checkpoint、Python runtime 和 runner 必须在运行时
-从 `/agent-src` 只读装配。`npm run check:mounted-source` 会阻断重新复制这些源码
-或绕过挂载入口的 Dockerfile 改动。
-
-Java 工具链、项目快照、离线依赖或两个 lockfile 变化时必须重建镜像。仓库
-dataset 更新后，运行时应使用 `/agent-src/dataset/...` 的权威 CSV；只有需要同步
-更新镜像内 `/opt/dataset/...` 快照时才重建镜像。实验结果同时记录 Git commit、
-dataset 路径与环境镜像 ID，避免把三种版本混为一谈。
-
-### 1.10 非 Java 语言（python / c / cpp）
-
-非 Java 与 Java 共用同一套 checkpoint 契约、runner 和容器入口，差异只在
-镜像、dataset 路径和 agent 选择。
-
-**dataset 与异味范围**：镜像内路径为
-`/opt/dataset/smells/<lang>/<smell>_30.csv`，权威源 CSV 在本仓库
-`dataset/nonjava/<lang>/<smell>_30.csv`（除 Dead Code 外，每语言每种异味
-30 样本；**已是容器路径格式**——`/opt/projects/<lang>/<name>`，与快照 payload
-逐字节一致，容器内可直接通过 `/agent-src` 挂载使用）。
-Java 数据集的权威源同样在本仓库 `dataset/java/delivery_schema/<smell>.csv`
-（容器内使用 `/agent-src/dataset/java/delivery_schema/`；镜像内 `/opt/dataset/`
-只代表该镜像验收时冻结的历史快照）。
-8 种基础异味：long_method、long_parameter_list、nested_complexity、
-switch_statements、data_clumps、code_clone_type1、god_class、dead_code。
-检测层面非 Java 现已
-支持全部 10 种通用异味：feature_envy 与 mysterious_name 走 tree-sitter 通用
-检测。非 Java Feature Envy 的接收者按根标识符统计，无类型解析；CSV 必须在
-`target_context_json.receiver_type` 显式冻结别名折算后的 canonical receiver root，
-运行时不从 evidence、类型名或当前 dominant receiver 回退选择。feature_envy 计数
-带别名折算：把接收者字段缓存进局部变量（`x = r->f`，含元组解包与 walrus)
-不会降低访问计数——别名后续的每次读取使用（裸名或后接属性）都折算为对
-原接收者的一次访问，重赋非别名值才解除；refused_bequest 仍
-仅 Java 支持，非 Java 暂无对应 dataset。
-
-非 Java Data Clumps 的每一行同时冻结完整关系 witness：`location` 用分号列出
-本组所有函数位置，`target_context_json.group` 保存规范化参数组。runner 对缺少
-group、少于 3 个位置或缺少方法 selector 的样本直接拒绝。运行时 Guard 只解析这些
-显式位置，不遍历项目源码。Mysterious Name 只解析显式目标文件；
-非 Java Dead Code 只判断显式目标声明是否仍存在，不在 Guard 内搜索全项目引用。
-Feature Envy c000 还冻结目标文件、parser owner/declared name、完整参数 fingerprint
-和声明起始行。验证只解析该显式目标文件，并用该文件的 production patch 做旧锚到
-当前声明的一对一映射；保留 wrapper 仅允许同一 hunk、相同 owner/name/完整参数身份
-且唯一候选的窄重锚。目标删除、跨 hunk、同 hunk 多候选、owner/name/参数身份改变
-全部 fail-closed。Mysterious Name 的 `symbol_kind` 与 `symbol_name` 同样在 CSV 的
-`target_context_json` 中冻结，不从审计 evidence 反推。三种语言默认记录
-`nonjava-target-guard/<language>/<smell>/v2` profile；Feature Envy 使用 v3，
-Mysterious Name 使用 v6，Code Clone 使用 v5。Code Clone 的局部编辑闭包只检查
-传入 production patch 中完整删除的 exact declaration，不遍历项目源码；只有模型
-确实改写了保留端点时，才允许同文件、同一固定 hunk、相同 owner/name/完整签名、
-唯一一对一的窄重锚，跨 hunk、owner 改变和多候选继续 fail-closed。
-
-Mysterious Name 的 v6 profile 中，c000 冻结 parser 声明的
-container name/owner、symbol kind/name、声明 slot 和声明行；参数只能在同一声明
-slot 一对一改名，局部变量只能在目标文件 patch 的同一 hunk 唯一一对一改名。
-同一 container 内确实需要一起迁移的条件编译声明或同名局部声明，必须由数据在
-`target_context_json.declaration_lines` 中列出完整声明行集合；运行时不会按同名
-自动扩张集合，未显式列出的遮蔽变量仍按歧义拒绝。
-同 owner/name/参数形状的完整 container cohort 也会冻结声明边界与摘要；验证时必须
-在同一目标文件 patch 中建立数量一致、唯一且全局一对一的旧锚到当前锚映射。
-新名称仍命中 too-short/low-info（例如 `n -> q`、`tmp -> data`）、改动其他声明、
-遗留旧引用、删除或改变 container owner、跨 hunk 或多候选都会 fail-closed。C/C++
-允许已经存在的 parser recovery，但目标函数必须有唯一、完整且具名的声明边界；
-C/C++ 条件编译分支共享语句体时，只用保持字节偏移的单分支投影恢复该边界，不发现
-新目标。c000 会冻结原文件的 recovery witness，验证时新增 recovery 仍会拒绝。
-
-Dead Code 正例另走 fail-closed 的离线语料审计：全项目引用、宏拼接、注册/回调、
-动态协议和公共 API 风险只在整理数据时检查，不进入运行时 Guard。2026-08-09
-清洗后的权威文件为各语言目录下的 `dead_code_curated.csv`，样本数分别为
-Python 30、C 16、C++ 10；旧 `dead_code_30.csv` 已移除，避免继续把宏调用、
-协议钩子、vendored/public header 方法当作正例。在非 Java 环境镜像重建前，
-Dead Code 运行必须使用 `/agent-src/dataset/nonjava/<lang>/dead_code_curated.csv`，
-不能使用旧镜像内置的 `/opt/dataset/smells/<lang>/dead_code_30.csv`。
-
-`dataset/nonjava` 只保留每种语言、每种异味的一份最终 CSV，不提交候选池、审计
-JSON、构建日志或固定 10 条子集。需要子集实验时由调用方从最终 CSV 显式选择样本，
-不再维护第二套数据文件。
-
-非 Java dataset-aligned 指标口径为：Nested Complexity 使用显式目标函数内的纯
-AST 控制流嵌套深度（3 种语言阈值均为 5）；Long Method 阈值为 Python 50、C/C++
-60；Long Parameter List 阈值为 Python 6、C 5、C++ 6；Type-1 Clone 的最小规范化
-token 数分别为 Python 17、C 18、C++ 25。上述值是冻结正例语料兼容边界，不代表已经
-完成负例误报率校准。
-
-**agent 选择**：非 Java 样本**省略 `--agent`**(runner 按 CSV 的 `language`
-列自动选用 `smell-refactor-agent`)，或显式 `--agent smell-refactor-agent`;
-Java 样本自动选用 `java-refactor-agent`。runner 不再提供 IDEA 选择参数。
-
-**跑一个 python 样本**（c/cpp 只换镜像名和 CSV 路径）：
+三种语言共用 runner 和验证合同，只替换镜像与 dataset。以 Python 为例：
 
 ```bash
 docker run --rm \
@@ -252,7 +131,7 @@ docker run --rm \
   --mount type=bind,src="$PWD/runs",dst=/runs \
   -e SMELL_OPENCODE_API_KEY \
   opencode-smell-python-refactor-env:0.1.1-amd64-delivery-20260720 \
-  --dataset /opt/dataset/smells/python/long_method_30.csv \
+  --dataset /agent-src/dataset/nonjava/python/long_method_30.csv \
   --sample-id 1 \
   --model minimax/MiniMax-M2.7 \
   --opencode-api-key-env SMELL_OPENCODE_API_KEY \
@@ -260,274 +139,10 @@ docker run --rm \
   --verification-mode project_full
 ```
 
-`--dataset` 也可指向仓库内 CSV(如
-`/agent-src/dataset/nonjava/python/feature_envy_30.csv`),与镜像内内容
-一致;feature_envy 与 mysterious_name 目前**只有**仓库内路径可用(旧
-镜像 dataset 未含这两种)。
+Feature Envy、Mysterious Name、Dead Code 清洗集以及非 Java selector/Guard 约束见
+[`docs/language-and-dataset-contracts.md`](docs/language-and-dataset-contracts.md)。
 
-注意：
-
-- 非 Java 的 build/test 配置来自镜像内 `/opt/buildenv/projects.docker.yaml`
-  （仓库内的 `defaults/projects.yaml` 是空的）；运行时仅用
-  `projects.runtime-overrides.yaml` 对已存在的精确项目 root 做窄覆盖，不复制整份
-  镜像配置。Lua 的旧 `./lua -e "print('ok')"` 已被覆盖为上游
-  `testes/all.lua` portable user suite；DuckDB 的 `duckdb --version` 已被覆盖为上游
-  `test/smoke_tests.list`（清单 253 项；固定 revision 实际调度 252 项）经原生 Catch2
-  `unittest` 执行；
-  RocksDB 的 `test -f librocksdb.a` 已被覆盖为原生 GTest `db_basic_test` suite。
-  三者都会生成 fresh JUnit 执行证据。DuckDB 使用上游 Debug/O0、关闭 sanitizer 的
-  build 内两阶段冷构建（core 后增量构建 `unittest`），两步都成功才写 ready stamp
-  并进入 test 阶段。默认 1 job、项目级 shell timeout 最低为 1500 秒，以覆盖三容器共享
-  两核时的资源放大；这只是 exact-root 预算，不会吞掉失败或重试。独占 CPU 时可用
-  `SMELL_BUILD_JOBS` 显式提高。RocksDB 同样在 build 阶段依次完成上游 Debug/O0
-  `static_lib` 与增量 `db_basic_test`，默认 1 job、exact-root timeout 1500 秒；test 阶段
-  只执行固定 GTest suite。suite 始终固定为项目级入口，不按样本选择测试。
-  C 项目的弱 smoke 也由相同的 exact-root overlay 覆盖：Curl 使用 Autotools 冷构建后
-  运行上游 `tests/runtests.pl` 非易波动套件；Redis 以 `REDIS_TEST` 编译并执行内建
-  `redis-server test all`；libssh2 运行关闭外部 Docker/sshd 依赖的原生 CTest；tmux
-  逐项执行仓库 `regress/*.sh`（不再把 GNU Make 对 BSD Makefile 的空跑当成功）。固定
-  delivery image 下仅 `utf8-test.sh` 因固定的 display-width 期望与该环境输出不一致而
-  被显式记为 skipped，
-  其余 34 项必须全部真实通过；nginx
-  使用官方 `nginx/nginx-tests` commit
-  `1502b87f5fa712ff485a1bb6baeab50153719d03` 的八文件固定行为套件。nginx fixture
-  测试以非 root 身份在可写临时目录执行；缺文件、
-  runner 不可用或真实测试失败都会直接失败，不退回 `-v`/`--version`/文件存在性检查。
-  Git 的 `git --version` 已替换为八个上游 `t/` 行为脚本，覆盖 basic、path、cat-file、
-  config、fsck、rev-parse、log 与 line-log；RRDtool 的 `rrdtool --version` 已替换为官方
-  Automake `make check`：从配置后 Makefile 的官方 `TESTS` 读取该 revision 的 28 项，
-  固定镜像内 27 项实际执行，唯一依赖镜像未提供的外部 `dc` 计算器的
-  `create-with-source-4` 被显式记为 skipped；构建生成的测试程序不会被误判为缺失源码脚本。
-  libuv 保留十二个稳定原生测试；root 容器会在启动原生测试进程前固定降权为 `nobody`，
-  而不是屏蔽项目的 root 检查，并用 JUnit 封装提供可核验的
-  非零执行证据。OpenTTD 的 `openttd -h` 已替换为 `openttd_test` 的 94 项 CTest 单元
-  套件；两项依赖外部 OpenGFX 的 gameplay regression 不在这个离线入口中，不会被冒充
-  为已执行。探索性数据额外涉及的 CMake 与 aria2 也不再使用 `--version`：CMake
-  运行八项固定且无外部能力依赖的项目原生 CTest 行为测试，aria2 运行上游 Automake/CppUnit
-  `make check`；aria2 在离线容器中通过项目配置关闭 BitTorrent/LPD 外部组播路径，不按
-  测试名事后忽略失败。aria2 所需 CppUnit 由
-  `docker/cpp-refactor-delivery/Dockerfile.project-test-dependencies` 以固定包版本构建进
-  C++ 交付镜像；正式运行仍为 `--network none`，没有运行时安装或备用测试路径。
-  fmt、nlohmann/json 与 yt-dlp 继续使用其原生 CTest/pytest。
-  当前最终 CSV 涉及的项目测试入口由三份 delivery `projects.docker.yaml` 与
-  `projects.runtime-overrides.yaml` 共同提供；交付镜像验收会直接检查解析后的命令，
-  不接受版本、帮助、文件存在或 print-only 验证。
-  **在容器外直接跑 runner** 时仍需显式 `--projects <yaml>`。
-- `project_full` 必须得到 fresh、非零且非全 skipped 的测试执行证据；原生 JUnit XML
-  或严格的 pytest、Python `unittest`、CTest、Curl `TESTDONE` 与 Redis native-test
-  终态可作为证据；后两者必须与对应真实 runner invocation 同时出现。`--version`、`-v`、
-  帮助输出、文件存在性和 collection-only 均不能把返回码 0 变成测试 PASS。
-- 正式验证按三段执行：source Guard 先判断目标异味是否越线；配置了重项目预检时，
-  未越线的 `smell_verify` 会把当前候选重放到一次性 fresh worktree 做聚焦编译，并仅对
-  已声明的项目运行固定目标测试或行为探针；越线后才在正式 fresh worktree 执行一次
-  `project_full`。模型应在一次连贯生产编辑后调用这个受控入口，不应在候选源码树手工运行
-  重项目构建。前两段只提供修复反馈，`acceptance=false`，不能缓存或复用 PASS、
-  测试结果和 JUnit。C/C++ replay matrix 只通过按镜像、语言、项目隔离的 named volume
-  共享 ccache 对象；build 目录、测试输出与验收结论始终按样本隔离。
-- 最终交付快照在 build/test 前以 c000 冻结 commit 为基线采集完整 Git diff/status，
-  包含已提交、已暂存、未暂存、未跟踪生产源码及构建元数据；候选自行 commit 不能
-  隐藏改动。禁止的测试源码改动会先于构建测试 fail-closed。
-- runner 在 `result.json.attempts` 中保留每次 agent 验证与最终验收选择。同一 diff
-  若最后一次 agent 测试失败而 final 单次转绿，标记 `FLAKY_TEST_INCONCLUSIVE`；
-  若 agent 已通过而 final 仅因超时/OOM 翻红，标记 `FINAL_VERIFY_INFRA_FAILED`。
-  两者都不自动计为接受，也不会伪装成确定的代码回归。
-- 镜像内项目：python 17 个（django、requests、airflow 等）、c 11 个
-  (redis、nginx、curl 等）、cpp 12 个（rocksdb、protobuf、fmt 等）。
-- 验收语义（resolved / improved、loop 预算、有效 PASS 硬规则）与 Java 完全一致。
-
----
-
-## 2. 模型配置（环境变量）
-
-key 只允许来自环境变量或 secret 文件，**不要**写进仓库、日志、命令行、
-CSV。runner 生成的 `opencode.runtime.json` 里 key 永远只是 `{env:...}` 引用。
-
-| 环境变量 | 作用 | 示例 |
-|---|---|---|
-| `SMELL_OPENCODE_API_KEY` | 模型 API key | （保密，轮换暴露过的 key） |
-| `SMELL_OPENCODE_BASE_URL` | provider 的 OpenAI 兼容端点 | `https://api.minimaxi.com/v1` |
-| `OPENCODE_AUTH_JSON` | 可选：已有 opencode auth 文件路径 | `/abs/path/auth.json` |
-
-`--model` 的形式是 `provider/model-id`，配合 runner 参数
-`--opencode-api-key-env <环境变量名>` 与 `--opencode-base-url <端点>`：
-
-| provider | `--model` 示例 | baseURL |
-|---|---|---|
-| minimax | `minimax/MiniMax-M2.7` | `https://api.minimaxi.com/v1` |
-| zai | `zai/glm-4.7` | `https://api.z.ai/api/coding/paas/v4`（默认可省略） |
-
-key 来源优先级：`--opencode-api-key`（不推荐）>
-`--opencode-api-key-env`（推荐）> `OPENCODE_AUTH_JSON` / 镜像内置 auth。
-
----
-
-## 3. 机制与结果语义（最新版）
-
-### 3.1 两层验收：checkpoint contract + target Guard
-
-- **通用 contract**(`runtime/python/smell_core/checkpoint_contract.py`):
-  统一处理 baseline、生产 diff、指标差值、build/test、失败原因与续跑条件。
-- **目标 Guard**（11 种异味全覆盖）：调用方必须提供异味类别和目标位置/身份；
-  Guard 只确认该目标是否具有该异味，不提供“扫描项目并发现所有异味”的 Detect
-  能力。Long Method 等局部异味只解析目标文件；Feature Envy、Clone 等结构异味
-  在 verify 时额外解析本次 diff 中的生产 Java 文件，以拒绝搬运或复制。
-- **c000 Guard contract**（schema v5 / contract v5）：冻结 guard rule/profile hash、唯一
-  target identity、baseline objectives、selector、项目 revision、目标源码 hash、测试修改策略、
-  解析后的 build/test 命令与 verification 配置；controller 另持有外部
-  baseline seal。会话身份、验证合同或 seal
-  丢失时直接拒绝，不能退回模型参数或由 c000 自签名代替。
-- dataset 与产品调用统一使用 `target_context_json` 传递需要的 selector 身份
-  （如 symbol kind/name/container、receiver、参数组、父类）；字段经过同一白名单
-  校验，只能选择目标，不能提供 score、threshold 或预期 verdict。CSV `evidence`
-  仅保留审计展示，runner、checkpoint 和 PASS 判定均不会从中反向构造异味。
-- verify 的基本解析边界只有 `冻结目标文件`；Git diff 的生产 Java 路径只是候选元数据，
-  不会自动进入 AST。局部异味、God Class 和 Dead Code 始终只读目标；LPL 只追加包含
-  冻结方法名的 changed successor 候选；Data Clumps 只追加精确三参数组的真实 occurrence；
-  Refused Bequest 只追加目标的精确祖先合同链。Feature Envy 与 Clone 为防止把异味搬到
-  本次重构代码中，会读取 diff 文件，但只对实际变更行相交的方法执行 anti-relocation/
-  anti-copy。Guard 不 `rglob/os.walk` Java 源码、不建立全项目 finding catalog，也不执行
-  所有异味规则。一次异味 Guard 最多解析 32 个生产 Java 文件、8 MiB 源码，超限返回
-  `GUARD_SCOPE_TOO_LARGE`，不会退回全仓扫描。
-- checkpoint 只保存 bounded witness，不保存全项目 AST、finding catalog、clone
-  body token catalog 或调用图。stdout decision 小于 64 KiB，详细 Guard 结果写入
-  `guard-evidence.json`（硬上限 2 MiB）；build/test 日志和 diff 分开保存，避免重复
-  大对象造成 OOM。
-
-### 3.2 PASS 与 IMPROVED（`resolution`）
-
-- `PASS / resolved`：同版本 Target Guard 确认冻结目标异味消失，diff scope 内没有
-  搬运/复制违规，并且存在生产源码改动且 build/test 均通过。这是唯一验收通过状态；dataset
-  evidence 不参与异味或 PASS 判定。Guard 必须成功并唯一定位目标；不可用、结果无效或歧义都会 fail closed，resolution plan 也不会
-  把这类快照标成 resolved。
-- `IMPROVED / improved`：checkpoint 确认"真实生产 diff + 任一目标指标相对基线下降"
-  （此时 build/test 也会强制执行）。`improved` 不终止 loop：插件按同一
-  预算让 agent 继续冲 `resolved`，并把同一 Guard 计算的剩余目标指标、优先
-  worklist 与精确 `next_action` 直接注入续跑提示；预算耗尽后仍有异味就保留 `IMPROVED`，
-  不得转换为 `PASS`。
-
-checkpoint 会保存每次指标、production patch 和 build/test 结果，但只有
-`build_test_success=true` 的 checkpoint 才能成为可恢复的 `best` 或
-`best_partial`。
-合法候选先按 `resolved > improved` 排序，再比较指标改善；编译或测试失败的
-checkpoint 只保留作诊断证据，`restorable=false`。
-
-### 3.3 有效 PASS 的硬规则
-
-- 必须有真实、非空、命中目标异味的生产源码 diff；无 diff PASS 恒为 0。
-- 只改注释/格式/测试/生成文件不算（`EDIT_REQUIRED`)。
-- selector 无法唯一定位 baseline 目标异味时直接拒绝；capture 后只跟踪冻结目标
-  身份，并由同一 Guard rule/profile 复检。
-- Feature Envy 以 `file/class/方法名+解析后参数类型` 冻结方法级目标（不把参数名
-  或等价的类型限定写法当作身份）；dominant field/type 变化只更新指标，不能伪装成异味
-  消失。verify 会在显式 diff scope 中复检每个改变/新增方法，拒绝跨方法、跨类和跨文件
-  搬运；与目标和本次 diff 无关的源码不进入 Guard。Guard 不自行实现
-  全项目 Java 调用图或重载分派来扩大目标身份。Data Clumps 只冻结精确组和有界
-  occurrence scope，不保存全项目 occurrence catalog。
-- build/test 回归按 `BUILD_FAILED` / `TEST_FAILED` / `SAMPLE_TEST_FAILED`
-  如实归因，不会被 smell 判定吞掉。
-- 最终接受是原子合同：bridge 返回码为 0，且 `status=PASS`、
-  `resolution=resolved`、`success=true`、`accepted=true`、build/test 成功必须
-  同时成立；旧字段缺失或彼此矛盾一律 fail closed。
-- Java Guard 只读取目标/变更生产文件；标准 test source 会从 Guard/production diff
-  排除，完整测试修改策略仍由 c000 test-change contract 冻结；build/test 描述符或本地验证脚本被修改时返回
-  `VERIFICATION_CONFIG_MODIFIED`。
-- Maven `build-helper:add-test-source` 的非测试命名目录被标为
-  `auxiliary_test_compile`：工具/benchmark 源码仍是可重构产品输入；路径中明确
-  带 test/spec 的行为测试源码仍归入冻结测试树。target admission、production
-  diff 与测试冻结共用这一 source-role 解析，不再把所有 test-compile 输入一律
-  当作不可改测试。自定义 source-role 的完整判定属于 test/build contract，不会触发
-  Java 异味 AST 的全仓扫描。
-
-### 3.4 loop 与预算
-
-- 唯一时间预算：`--sample-deadline`（默认 1800s，范围 60–7200)，没有
-  step 数上限。
-- 模型事件静默看门狗：`--model-event-inactivity-timeout`（默认 300s）。
-  OpenCode 在该窗口内没有产生新的 JSON 事件且没有正在运行的工具子进程
-  （包括 bridge/build/test）时，runner 会终止该进程树，并以
-  `OPENCODE_TIMEOUT`、`termination_reason=MODEL_EVENT_INACTIVITY_TIMEOUT`
-  fail closed；工具执行时间不计入模型静默时间。
-- 共享 smell-verify 修复周期：`--max-smell-verify-cycles`（默认 10，范围 0–10）、
-  `--loop-no-progress-limit`（默认 3)、`--loop-mode=verify-failure`。
-- 每个周期表示模型根据最新反馈完成一次窄修复后再次调用 `smell_verify`；
-  初始验证和终态回执重放不消耗周期，也不存在越过上限的隐藏恢复周期。
-- 只有候选 production diff、当前 blocker、指标缺口与结构失败数量都未变化时，
-  才累计一次 no-progress；任一项发生变化便清零。基础设施等待不计入停滞周期。
-- 预算内 checkpoint 失败会把"基线/当前/差值/真实剩余总数/优先 worklist/唯一下一步动作"
-  反馈回同一 session 继续修复；不再用只覆盖部分异味的特判提示。
-
----
-
-## 4. 手动使用（不经 runner)
-
-交互式 OpenCode 会话或 `opencode run` 中直接给完整任务输入；loop 策略
-由 command 前缀显式声明（与批量 runner 同一入口）：
-
-```text
-/java-refactor-run --verification-mode=project_full --max-smell-verify-cycles=10 -- Project root: /abs/java-project
-Smell type: long_method
-Target location: src/main/java/Foo.java:42
-Build command: ./gradlew --offline classes
-Project test command: ./gradlew --offline test
-Verification cwd: .
-```
-
-选择 IDEA 后端时，仍使用同一个手动 command，只增加显式 policy 参数：
-
-```text
-/java-refactor-run --refactoring-backend=idea --verification-mode=project_full --max-smell-verify-cycles=10 -- Project root: /abs/java-project
-Smell type: long_method
-Target location: src/main/java/Foo.java:42
-```
-
-该 flag 会冻结进 v7 会话状态。plugin 会在模型开始前、同一个 sample deadline
-内执行 `ensure-service --open`；失败直接形成 protocol terminal。IDEA 路径禁止 bash
-和普通 edit/write，项目根目录也不能被工具参数改写。合法变更链只有
-`preview -> matching apply -> smell_verify`，或明确 `unsupported_target` 后的
-`preview -> idea_edit -> smell_verify`；正式终态会携带与 mutation generation 绑定的
-compact IDEA receipt。该合同由 command/plugin 直接提供，不依赖 dataset runner。
-
-command 展开后的用户消息会原样保留；plugin 不再重写 `output.parts`。解析出的
-验证模式、目标身份、测试修改策略、backend 与 loop 上限通过独立且稳定的
-controller system context 注入。失败类别、`failure_pack`、`next_action` 和
-`loop.instruction` 只以最新一次 `smell_verify` 工具结果为准，自动续跑消息仅恢复
-同一 session 并提示重新验证，不复制这些可变内容。
-
-批量 runner 生成的用户任务同样只包含项目、语言、异味、目标位置和修复目标；
-backend、验证模式与测试修改策略不在用户任务中重复展示。
-
-批量运行会按 attempt 保存 `raw-user-input.txt*`、`controller-context.json*`、
-`controller-system.txt*` 与 `message-manifest.json*`；`synthetic-events.jsonl`
-单独记录 runner 注入的恢复消息。由此可以分别核对原始输入、稳定控制上下文和
-合成消息 provenance。
-
-Java 支持的 policy 参数：`--verification-mode=sample_optimized|project_full`、
-`--refactoring-backend=direct|idea`（默认 `direct`）、
-`--allow-test-changes`（默认关闭并冻结到 c000；启用时必须使用
-`project_full`）、
-`--loop-mode=off|verify-failure`、`--max-smell-verify-cycles=0..10`、
-`--loop-no-progress-limit=1..5`、`--loop-on=smell,compile,test`、
-`--sample-deadline=60..7200`。参数非法直接报 `INVALID_LOOP_POLICY`。
-
-Java 与非 Java 都会在正式 build/test 前先执行 source-only Guard；未越线时只返回
-数值缺口，不启动完整项目验证。两种正式验证模式都会执行严格 build/test；
-`sample_optimized` 在 build 后只执行数据行
-中已物化的聚焦测试命令。`project_full` 必须执行解析后的项目级测试；当 controller
-还提供了样本测试（benchmark CSV 的 `test_command`）时，再追加执行该命令，并要求
-每个声明测试类都有新鲜、非零的 JUnit 执行证据。真实用户只声明 build 和项目测试
-即可，不必虚构样本测试。build、项目测试及已声明的样本测试任一失败都不通过；所有
-实际命令及其工作目录均冻结进 c000，不能互相替代。
-允许测试迁移时 runner 会无条件切到 `project_full`。
-此时 c000 将测试策略冻结为 `api_migration`（默认是 `immutable`）：只允许测试
-源码的 API 同步迁移，已有测试文件不得删除，测试方法/断言不得减少，不得新增
-disabled/ignored/assumption-skip，测试资源和验证配置仍不可改；声明的测试类必须
-在最终命令中产生新鲜、非零的执行证据。verify 会按冻结 manifest SHA 复用
-未变化测试源码的强度审计，只重读 added/changed source；判定规则不因此放宽。
-任何 PASS 和 IMPROVED 都必须通过。
-
----
-
-## 5. 批量使用（runner)
+### 直接调用 runner
 
 ```bash
 python3 scripts/run_smell_dataset.py \
@@ -540,100 +155,87 @@ python3 scripts/run_smell_dataset.py \
   --agent java-refactor-agent
 ```
 
-真实用户可直接指定该项目的构建、项目级测试及其工作目录，无需先编写项目
-manifest：
+真实项目也可通过 `--build-command`、`--project-test-command` 和
+`--verification-cwd` 显式声明验证命令。参数优先级、测试迁移、手动 command 和外部
+`benchmark-worker` 见 [`docs/advanced-usage.md`](docs/advanced-usage.md)。完整参数以
+`python3 scripts/run_smell_dataset.py --help` 为准。
+
+### 原生 OpenCode 能力对照
 
 ```bash
 python3 scripts/run_smell_dataset.py \
-  --dataset /abs/samples.csv \
-  --build-command './gradlew --offline classes' \
-  --project-test-command './gradlew --offline test' \
-  --verification-cwd .
+  --dataset /agent-src/dataset/java/delivery_schema/<smell>.csv \
+  --sample-id <id> \
+  --model minimax/MiniMax-M2.7 \
+  --opencode-api-key-env SMELL_OPENCODE_API_KEY \
+  --opencode-base-url "$SMELL_OPENCODE_BASE_URL" \
+  --verification-mode project_full \
+  --agent opencode-builtin
 ```
 
-验证命令分三层，且不会静默互相覆盖：
+该模式不加载交付 Agent、command、Skill 或插件控制环，也不向模型提供
+`smell_verify`。模型单轮退出后，runner 基于预先冻结的 c000 做一次独立最终验证。
+它只支持 `direct` backend，且不会降低正式 PASS 合同。实验边界和审计方法见
+[`docs/advanced-usage.md`](docs/advanced-usage.md#22-原生-opencode-对照)。
 
-1. runner 的 `--build-command`、`--project-test-command`、
-   `--verification-cwd` 是本次选择范围的用户显式项目合同，来源记为 `cli`；build 与
-   project-test 必须成对，未给 cwd 时按项目根目录 `.` 处理。
-2. CSV 可选列 `build_command`、`project_test_command`、`verification_cwd` 用于需要
-   单文件复现实验的项目合同，来源记为 `dataset`；同一 `project_path` 和 project
-   revision 的所有选中行必须完全一致。若 CLI 与 CSV 都声明合同，三项必须一致，否则
-   runner 在模型启动前报 conflict。
-3. 两者都未声明时，沿用 `--projects <yaml>` 中匹配项目的 manifest；复杂的环境变量、
-   多行脚本和项目子根仍推荐放在 manifest，而不是逐行复制到 CSV。
+## 结果语义速查
 
-CSV 已有的 `test_file`、`test_command` 仍只表示样本级测试，来源为 `dataset`，不等同于
-项目级完整测试。验证模式按“显式 `--verification-mode` > CSV
-`verification_mode` > `project_full`”解析；`--allow-test-changes` 仍无条件强制
-`project_full`。解析后的命令、cwd 和来源会进入 controller 环境并冻结在 c000，后续
-agent 调用不能改写。
+| 结果 | 含义 | 接受 |
+|---|---|---:|
+| `PASS / resolved` | 冻结目标消失，production diff、Guard、build/test 全部通过 | 是 |
+| `IMPROVED / improved` | 指标下降但目标仍存在 | 否 |
+| `EDIT_REQUIRED` | 没有有效生产源码改动 | 否 |
+| `BUILD_FAILED` / `TEST_FAILED` | 正式构建或测试失败 | 否 |
+| `FLAKY_TEST_INCONCLUSIVE` | 同候选测试结果不稳定 | 否 |
+| `FINAL_VERIFY_INFRA_FAILED` | 最终验证基础设施失败 | 否 |
 
-要点：
+不要只根据一个 `status` 字段判断 PASS。`results.csv`、`result.json`、
+`verify.json` 与 `runner-final-receipt.json` 必须唯一且语义一致；最终 receipt 使用
+`canonical_status`、`canonical_accepted` 记录权威结果。
 
-- 每个样本独立 git checkout、独立容器，requested commit/tree 与 actual
-  必须一致，禁止 HEAD fallback。
-- 测试默认以 `immutable` 冻结；只有 controller 显式传 `--allow-test-changes`
-  才切到 `api_migration`。启用后统一执行 `project_full`；完整 test SHA 与测试强度
-  审计、c000 冻结的 build/项目测试及已声明样本测试合同仍必须通过，基线测试文件身份不得删除，
-  测试方法/断言不得减少，不能新增跳过信号，声明测试必须实际执行；构建描述符、
-  测试资源与验证脚本始终不可改。
-- 离线约束：Maven/Gradle 全部走镜像内离线仓库；模型 API 是唯一外联。
-- 外部并发控制器使用交付镜像的 `benchmark-worker` 入口时，必须同时提供
-  `--results-root`。入口会创建可写的 `<results-root>/artifacts`，并将
-  `SMELL_ARTIFACT_ROOT` 唯一设置为该目录后再降权启动 worker；目录不可写时
-  会在调用模型前以退出码 73 失败。不要另行挂载未对齐的 `/runs` artifact
-  目录。
-- C/C++ worker 若要跨样本复用编译对象，还必须按“精确镜像 tag / 语言 / 项目”
-  挂载一个稳定 named volume 到 `/var/cache/refactoragent/ccache`，并设置
-  `CCACHE_DIR` 为该目录、`CCACHE_UMASK=000`。只允许共享这个目录；不得共享 build 目录、测试报告或
-  验收结果。Python worker 不挂该 volume。受版本控制的 non-Java replay launcher
-  会自动生成此挂载；自定义 300 条控制器必须采用同一合同，否则缓存只存在于单个
-  `--rm` 容器内，跨样本命中率为零。
-- 更多 runner 参数（`--limit`、`--offset`、`--projects`、
-  `--project-revisions`、dry-run 等）见 `python3 scripts/run_smell_dataset.py --help`。
-
-外部并发控制器的容器调用契约如下；`run_worker.py` 与 plan 由控制器提供，
-而 Agent 源码始终从当前 Git checkout 只读挂载：
+## 更新与镜像边界
 
 ```bash
-docker run --rm \
-  --pull=never \
-  --mount type=bind,src="$PWD",dst=/agent-src,readonly \
-  --mount type=bind,src="/path/to/control",dst=/control,readonly \
-  --mount type=bind,src="/path/to/results",dst=/results \
-  --mount type=bind,src="/path/to/secret",dst=/secret,readonly \
-  opencode-java-refactor-env:0.1.1-rb-certified-no-idea-mounted-source-v2 \
-  benchmark-worker \
-  --plan /control/plan.json \
-  --results-root /results \
-  --secret-file /secret/model-api-key
+git pull
+npm run check
 ```
 
----
+Agent、Skill、plugin、checkpoint、runner 和权威 dataset 从 `/agent-src` 只读装配，
+一般只需更新 Git。只有语言工具链、项目快照、离线依赖、lockfile，或需要固化新的
+`/opt/dataset` 快照时才重建镜像。
 
-## 6. 仓库结构
+Java 环境镜像的唯一构建入口是
+`docker/java-refactor-delivery/Dockerfile.mounted-source`；交付和离线依赖验收流程见
+[`delivery/README.md`](delivery/README.md)。
+
+## 文档导航
+
+| 文档 | 适合查什么 |
+|---|---|
+| [`docs/advanced-usage.md`](docs/advanced-usage.md) | provider、runner 模式、原生对照、手动 command、参数与外部控制器 |
+| [`docs/verification-contract.md`](docs/verification-contract.md) | c000、Target Guard、PASS/IMPROVED、loop、最终 receipt 与测试合同 |
+| [`docs/language-and-dataset-contracts.md`](docs/language-and-dataset-contracts.md) | 四种语言范围、dataset 路径、非 Java selector、项目原生测试入口 |
+| [`docs/legacy-java-image-maven-repair.md`](docs/legacy-java-image-maven-repair.md) | 旧 Java 镜像 Maven 仓库 ID 不匹配的原因与修复流程 |
+| [`delivery/README.md`](delivery/README.md) | 镜像 tag/hash、载入、离线依赖和发布验收 |
+| [`scripts/README.md`](scripts/README.md) | dataset 与交付物维护、审计脚本 |
+
+`docs/` 下带日期的报告是固定时点审计或实验记录，不是日常运行入口。
+
+## 仓库结构
 
 ```text
-.opencode/agents/            两个公开 agent(java-refactor-agent、smell-refactor-agent)
-.opencode/commands/          java-refactor-run、smell-refactor-run(loop policy 入口)
-.opencode/plugins/smell.ts   smell_verify 工具 + loop 状态机
-.opencode/skills/            每种异味一个主 skill；按需加载 Java/Python/C/C++ reference，IDEA 机械路线独立保留
-runtime/python/bridge/       smell_bridge(verify/capture-baseline 入口)
-runtime/python/smell_core/   checkpoint contract、adapters、检测器、guards
-scripts/                     runner、自检及维护入口（见 scripts/README.md）
-delivery/                    交付镜像清单(tag / sha256 / 使用说明)
+.opencode/agents/            Java 与多语言 Agent
+.opencode/commands/          command loop policy 入口
+.opencode/plugins/smell.ts   smell_verify 与 loop 状态机
+.opencode/skills/            异味主 Skill 与语言 reference
+runtime/python/bridge/       baseline capture / verify 入口
+runtime/python/smell_core/   checkpoint、detector 与 Guard
+dataset/                     Java 与非 Java 权威 CSV
+scripts/                     runner、自检和维护脚本
+delivery/                    交付镜像清单与验收说明
 docker/                      mounted-source 与 delivery entrypoint
+docs/                        使用合同和固定时点审计报告
 ```
 
-日常全量自检运行 `npm run check`（已包含 `check:self` 及根目录
-`package.json` 列出的 Python 自检）；仅在定位问题时单独运行
-`npm run check:self` 或对应的 `scripts/self_check_*.py`。
-
-异味 skill 采用“主流程 + 语言 reference”组织：10 个通用异味支持
-Java/Python/C/C++，Java 特有的 `refused_bequest` 只暴露 Java reference。每个
-`smell-repair-*` 是该异味语义规则的唯一来源；IDEA 后端仍按异味加载
-`idea-refactor-cli` 的单个 YAML，不与语言语义规则混写。
-
-约定：实验结果、worktree、`runs/`、`node_modules/`、`images/` 都不进 Git;
-key 不进任何文件。
+日常全量自检使用 `npm run check`。实验结果、worktree、`runs/`、`node_modules/`、
+`images/` 和任何 API key 都不提交到 Git。

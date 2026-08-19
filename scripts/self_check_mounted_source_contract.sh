@@ -134,6 +134,55 @@ set -e
 [[ "$status" == "70" ]] || { echo "Expected incomplete Maven environment exit 70, got $status" >&2; exit 1; }
 grep -q 'Maven offline settings are incomplete' "$tmp/maven-missing.stderr"
 
+# The public README invokes the delivery image's self-check before any sample
+# manifest has selected a project JDK.  That branch must therefore install one
+# deterministic image-owned Java toolchain into the self-check process rather
+# than inheriting the base image PATH (which contains no javac).
+self_check_jdk="$tmp/self-check-jdk"
+fake_bin="$tmp/fake-bin"
+mkdir -p "$self_check_jdk/bin" "$fake_bin"
+for tool in java javac; do
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$self_check_jdk/bin/$tool"
+  chmod +x "$self_check_jdk/bin/$tool"
+done
+cat >"$fake_bin/node" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$JAVA_HOME" != "$EXPECTED_SELF_CHECK_JAVA_HOME" ]]; then
+  echo 'self-check did not select the fixed Java home' >&2
+  exit 1
+fi
+case "$PATH" in
+  "$JAVA_HOME/bin:"*) ;;
+  *) echo 'self-check did not prepend the fixed Java bin directory' >&2; exit 1 ;;
+esac
+if [[ ! -x "$JAVA_HOME/bin/java" || ! -x "$JAVA_HOME/bin/javac" ]]; then
+  echo 'self-check Java toolchain is incomplete' >&2
+  exit 1
+fi
+printf '%s\n' 'Self-check Java toolchain prepared'
+EOF
+chmod +x "$fake_bin/node"
+cat >"$fake_bin/hostname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'self-check-host'
+EOF
+cat >"$fake_bin/getent" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$fake_bin/hostname" "$fake_bin/getent"
+
+JAVA_HOME= \
+PATH="$fake_bin:/usr/local/bin:/usr/bin:/bin" \
+SELF_CHECK_JAVA_HOME="$self_check_jdk" \
+EXPECTED_SELF_CHECK_JAVA_HOME="$self_check_jdk" \
+OPENCODE_AGENT_SOURCE= \
+MAVEN_OFFLINE_SETTINGS="$tmp/absent-maven-settings.xml" \
+MAVEN_OFFLINE_REPOSITORY="$tmp/absent-maven-repository" \
+bash "$delivery_entrypoint" self-check >"$tmp/self-check-java.log"
+grep -q 'Self-check Java toolchain prepared' "$tmp/self-check-java.log"
+
 grep -q '^FROM ${DEPENDENCY_SOURCE_IMAGE} AS dependency_source$' "$dockerfile"
 grep -q '^FROM ${DEPENDENCY_CLOSURE_IMAGE} AS dependency_closure$' "$dockerfile"
 grep -q '^FROM ${BASE_ENV_IMAGE}$' "$dockerfile"

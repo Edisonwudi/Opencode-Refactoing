@@ -153,11 +153,22 @@ prepare_compiler_cache_for_run_user() {
   export CCACHE_UMASK=000
 }
 
+prepare_self_check_java_toolchain() {
+  local java_home="${SELF_CHECK_JAVA_HOME:-/opt/buildenv/jdks/temurin-17}"
+  if [[ ! -x "$java_home/bin/java" || ! -x "$java_home/bin/javac" ]]; then
+    echo "Self-check Java toolchain is incomplete: $java_home" >&2
+    exit 70
+  fi
+  export JAVA_HOME="$java_home"
+  export PATH="$JAVA_HOME/bin:$PATH"
+}
+
 if [[ "${1:-}" == "bash" || "${1:-}" == "sh" ]]; then
   exec "$@"
 fi
 
 if [[ "${1:-}" == "self-check" || "${1:-}" == "smell-verify-self-check" ]]; then
+  prepare_self_check_java_toolchain
   shift
   exec node /opt/opencode-refactor/scripts/self_check_smell_verify.mjs --require-dataset "$@"
 fi

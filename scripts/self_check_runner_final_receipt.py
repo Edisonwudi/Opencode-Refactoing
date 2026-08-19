@@ -887,6 +887,61 @@ def main() -> int:
         )
         args = argparse.Namespace(projects="", sample_deadline=60, allow_test_changes=False)
 
+        original_run_verify = R._run_verify
+        builtin_calls: list[str] = []
+
+        def builtin_fresh(*_args, **_kwargs):
+            builtin_calls.append("fresh")
+            return 0, copy.deepcopy(_pass_payload())
+
+        R._run_verify = builtin_fresh
+        try:
+            builtin_rc, builtin_decision, builtin_audit = R._runner_final_verify(
+                sample,
+                sample_dir,
+                args,
+                "project_full",
+                baseline_seal="c000-seal",
+                deadline_monotonic=None,
+                opencode_returncode=0,
+                last_trace=R._verification_trace(""),
+                agent_verification_history=[],
+                builtin_mode=True,
+            )
+        finally:
+            R._run_verify = original_run_verify
+        assert builtin_calls == ["fresh"], builtin_calls
+        assert builtin_rc == 0, builtin_rc
+        assert builtin_decision["status"] == "PASS", builtin_decision
+        assert builtin_decision["accepted"] is True, builtin_decision
+        assert builtin_audit["source"] == "fresh_runner_verify_builtin", builtin_audit
+        assert builtin_audit["acceptance_authority"] == "independent_runner", builtin_audit
+        assert builtin_audit["promotion_authorized"] is False, builtin_audit
+        assert builtin_audit["terminal_evidence"]["reason"] == "BUILTIN_NO_AGENT_TERMINAL", builtin_audit
+
+        malformed_builtin = copy.deepcopy(_pass_payload())
+        malformed_builtin.pop("formal_verification_receipt", None)
+        R._run_verify = lambda *_args, **_kwargs: (0, malformed_builtin)
+        try:
+            _malformed_rc, malformed_decision, malformed_audit = R._runner_final_verify(
+                sample,
+                sample_dir,
+                args,
+                "project_full",
+                baseline_seal="c000-seal",
+                deadline_monotonic=None,
+                opencode_returncode=0,
+                last_trace=R._verification_trace(""),
+                agent_verification_history=[],
+                builtin_mode=True,
+            )
+        finally:
+            R._run_verify = original_run_verify
+        assert malformed_decision["status"] == "FRESH_VERIFY_PROTOCOL_INVALID", malformed_decision
+        assert malformed_decision["accepted"] is False, malformed_decision
+        assert malformed_audit["acceptance_authority"] == "independent_runner", malformed_audit
+        assert malformed_audit["promotion_authorized"] is False, malformed_audit
+
         formal_loop = {
             "generation": 1,
             "decision": "stop",

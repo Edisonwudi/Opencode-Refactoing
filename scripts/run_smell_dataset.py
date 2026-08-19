@@ -88,6 +88,7 @@ ZAI_PROVIDER_MODELS: dict[str, Any] = {
 }
 
 FINAL_VERIFICATION_MODES = {"sample_optimized", "project_full"}
+BUILTIN_AGENT = "opencode-builtin"
 RUNNER_FINAL_RECEIPT_SCHEMA = "smell.runner-final-receipt/v1"
 RUNNER_FINAL_VERIFY_MIN_REMAINING_SECONDS = 60.0
 PROCESS_TERM_TIMEOUT_SECONDS = 2.0
@@ -1607,7 +1608,7 @@ def _append_synthetic_message_event(sample_dir: Path, event: dict[str, Any]) -> 
         handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
 
 
-def _task_prompt(sample: Sample) -> str:
+def _task_prompt(sample: Sample, *, agent: str = "") -> str:
     # Backend, verification, and test-change policy travel through command flags
     # and controller system context; the user task remains backend-neutral.
     target_count = len(split_location_descriptors(sample.location))
@@ -1618,6 +1619,21 @@ def _task_prompt(sample: Sample) -> str:
         f"Target location: {sample.location}",
     ]
     lines.append("")
+    if agent == BUILTIN_AGENT:
+        if target_count > 1:
+            lines.append(
+                f"Repair this grouped {sample.language} smell across all {target_count} listed "
+                "target locations in one cohesive refactoring. Partial target removal is not accepted. "
+                "Preserve behavior. Make the code changes directly, then stop; the runner evaluates "
+                "the final checkout independently."
+            )
+        else:
+            lines.append(
+                f"Repair this one {sample.language} smell from the dataset row. "
+                "Preserve behavior. Make the code changes directly, then stop; the runner evaluates "
+                "the final checkout independently."
+            )
+        return "\n".join(lines)
     if target_count > 1:
         lines.append(
             f"Repair this grouped {sample.language} smell across all {target_count} listed "
@@ -1761,7 +1777,7 @@ def _run_capture_baseline(
     verification_mode: str,
     deadline_monotonic: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Freeze the Java product finding before the model can edit the checkout."""
+    """Freeze the product finding before the model can edit the checkout."""
     cmd = [
         sys.executable,
         str(ROOT / "runtime" / "python" / "bridge" / "smell_bridge.py"),
@@ -2499,7 +2515,69 @@ def _runner_final_verify(
     opencode_returncode: int,
     last_trace: dict[str, Any],
     agent_verification_history: list[dict[str, Any]],
+    builtin_mode: bool = False,
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    if builtin_mode:
+        verify_returncode, raw_verify_payload = _run_verify(
+            sample,
+            sample_dir,
+            args,
+            verification_mode,
+            baseline_seal=baseline_seal,
+            deadline_monotonic=deadline_monotonic,
+        )
+        (sample_dir / "verify.runner-observation.json").write_text(
+            json.dumps(raw_verify_payload, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        terminal_evidence = {
+            "authorized": False,
+            "formal_terminal_valid": False,
+            "reason": "BUILTIN_NO_AGENT_TERMINAL",
+            "control": None,
+            "terminal_receipt": None,
+        }
+        raw_observation = _runner_observation_summary(
+            verify_returncode,
+            raw_verify_payload,
+        )
+        raw_pass = _accepted_verify_pass(raw_verify_payload, verify_returncode)
+        formal_pass = bool(
+            raw_pass
+            and validate_formal_verification_decision(
+                raw_verify_payload,
+                require_project_full_pass=verification_mode == "project_full",
+            )
+        )
+        if raw_pass and not formal_pass:
+            verify_payload, confirmation = _apply_runner_confirmation(
+                verify_returncode,
+                raw_verify_payload,
+                terminal_evidence,
+                require_project_full_pass=verification_mode == "project_full",
+            )
+            reason = str(confirmation["reason"])
+        else:
+            verify_payload = raw_verify_payload
+            reason = (
+                "BUILTIN_INDEPENDENT_VERIFY_ACCEPTED"
+                if formal_pass
+                else "BUILTIN_INDEPENDENT_VERIFY_REJECTED"
+            )
+        receipt_audit = {
+            **_runner_final_receipt_audit(reason),
+            "source": "fresh_runner_verify_builtin",
+            "acceptance_authority": "independent_runner",
+            "promotion_authorized": False,
+            "raw_observation": raw_observation,
+            "terminal_evidence": terminal_evidence,
+            "canonical_status": str(verify_payload.get("status") or ""),
+            "canonical_accepted": verify_payload.get("accepted") is True,
+        }
+        _persist_verify_payload(sample_dir, verify_payload)
+        _persist_runner_final_receipt_audit(sample_dir, receipt_audit)
+        return verify_returncode, verify_payload, receipt_audit
+
     authorization = _runner_terminal_authorization(last_trace, opencode_returncode)
     receipt_payload: dict[str, Any] | None = None
     if getattr(args, "refactoring_backend", "direct") == "idea":
@@ -3182,6 +3260,16 @@ def _termination_reasons(
 
 def _opencode_run_command(args: argparse.Namespace, agent: str, session_id: str = "") -> list[str]:
     cmd = [args.opencode_bin, "run"]
+    if agent == BUILTIN_AGENT:
+        if session_id:
+            raise ValueError("opencode-builtin is single turn and cannot continue a session")
+        cmd.extend([
+            "--model", args.model,
+            "--dangerously-skip-permissions",
+            "--format", "json",
+            "--print-logs",
+        ])
+        return cmd
     if session_id:
         cmd.extend(["--session", session_id])
     else:
@@ -3223,10 +3311,11 @@ def _run_opencode(
     baseline_seal: str = "",
 ) -> tuple[int, str, str]:
     """Run one initial or same-session OpenCode turn."""
+    builtin_mode = agent == BUILTIN_AGENT
     config_path, runtime_env, auth_meta = _write_opencode_config(sample_dir, args)
-    task = _task_prompt(sample)
-    command_arguments = _command_arguments(task, args, verification_mode)
-    stdin_payload = continuation_prompt if session_id else command_arguments
+    task = _task_prompt(sample, agent=agent)
+    command_arguments = "" if builtin_mode else _command_arguments(task, args, verification_mode)
+    stdin_payload = task if builtin_mode else (continuation_prompt if session_id else command_arguments)
     task_path = _attempt_artifact_path(sample_dir, "task.txt", attempt_suffix)
     task_path.write_text(stdin_payload + "\n", encoding="utf-8")
     raw_input_path = _attempt_artifact_path(sample_dir, "raw-user-input.txt", attempt_suffix)
@@ -3257,6 +3346,10 @@ def _run_opencode(
     env = os.environ.copy()
     env.update(_prepare_opencode_home(sample_dir))
     env.update(runtime_env)
+    # Popen(cwd=...) changes the process directory but does not rewrite an
+    # inherited PWD. OpenCode uses PWD while discovering project-local
+    # configuration, so keep it aligned with the isolated execution checkout.
+    env["PWD"] = str(sample.project_root)
     if config_path:
         env["OPENCODE_CONFIG"] = str(config_path)
     # The custom command owns the native in-session loop. Disable the legacy
@@ -3331,6 +3424,43 @@ def _run_opencode(
     )
     env[SAMPLE_DEADLINE_EPOCH_MS_ENV] = _deadline_epoch_ms(turn_timeout_seconds)
 
+    if builtin_mode:
+        # The native arm receives no delivery command/plugin state. Keep only
+        # OpenCode runtime/auth configuration and the runner-owned hard stop.
+        for name in (
+            "SMELL_BATCH_RUN",
+            "SMELL_COMMAND_LOOP_STATE_JSON",
+            "SMELL_BRIDGE_FILE",
+            "SMELL_PROJECT_ROOT",
+            "SMELL_CANONICAL_PROJECT_ROOT",
+            "SMELL_LANGUAGE",
+            "SMELL_SMELL",
+            "SMELL_LOCATION",
+            "SMELL_EVIDENCE",
+            "SMELL_TARGET_CONTEXT_JSON",
+            "SMELL_VERIFICATION_MODE",
+            "SMELL_SAMPLE_TEST_LOCATION",
+            "SMELL_SAMPLE_TEST_COMMAND",
+            "SMELL_SAMPLE_TEST_SOURCE",
+            "SMELL_BUILD_COMMAND",
+            "SMELL_PROJECT_TEST_COMMAND",
+            "SMELL_VERIFICATION_CWD",
+            "SMELL_VERIFICATION_COMMAND_SOURCE",
+            "SMELL_ALLOW_TEST_CHANGES",
+            "SMELL_BASELINE_CONTEXT_FILE",
+            "SMELL_CONTROLLER_CONTEXT_AUDIT_FILE",
+            "SMELL_REFACTORING_BACKEND",
+            "SMELL_ENABLE_IDEA_TOOLS",
+            "SMELL_IDEA_PREPARED",
+            "SMELL_IDEA_PROJECT_ROOT",
+            "SMELL_BASELINE_SEAL",
+            "SMELL_ARTIFACT_ROOT",
+            "SMELL_PROJECTS",
+            "SMELL_REQUIRE_BUILD_TEST",
+            SAMPLE_DEADLINE_EPOCH_MS_ENV,
+        ):
+            env.pop(name, None)
+
     # --format json: raw JSON events on stdout (for session-id parsing).
     # --print-logs: human-readable logs on stderr (written to run.log).
     cmd = _opencode_run_command(args, agent, session_id)
@@ -3351,7 +3481,11 @@ def _run_opencode(
             "source": sample.verification_command_source,
             "sample_test_source": "dataset" if sample.test_command else "",
         },
-        "loop_policy": parse_command_policy(command_arguments).loop.to_dict(),
+        "loop_policy": (
+            None
+            if builtin_mode
+            else parse_command_policy(command_arguments).loop.to_dict()
+        ),
         "time_budget": {
             "source": "sample-deadline",
             "scope": "baseline-model-continuations-and-runner-final",
@@ -3707,6 +3841,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
     if stale_home.exists():
         shutil.rmtree(stale_home, ignore_errors=True)
     agent = _select_agent(sample, args)
+    builtin_mode = agent == BUILTIN_AGENT
     verification_mode = _effective_verification_mode(sample, args)
 
     # One isolated checkout is used for the complete command-owned native loop.
@@ -3818,7 +3953,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
 
     baseline_capture: dict[str, Any] | None = None
     baseline_seal = ""
-    if execution_sample.language == "java":
+    if execution_sample.language == "java" or builtin_mode:
         baseline_returncode, baseline_capture = _run_capture_baseline(
             execution_sample,
             sample_dir,
@@ -3977,23 +4112,27 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
             )
             return row
 
-    # Bootstrap .opencode once before starting the command-owned loop.
-    _bootstrap_opencode(execution_sample.project_root, sample_dir)
+    # The built-in control arm must not expose delivery agents, commands,
+    # skills, or the smell plugin to the model.
+    if not builtin_mode:
+        _bootstrap_opencode(execution_sample.project_root, sample_dir)
 
-    # Batch `opencode run` exits as the session becomes idle, so a fire-and-forget
-    # plugin promptAsync cannot reliably create another turn. The plugin still
-    # owns every decision; the runner only transports each validated v7 control
-    # generation into the same OpenCode session once.
+    # Custom-agent sessions transport validated plugin control generations.
+    # The built-in control arm exits this loop after its first model turn.
     controller_attempts: list[dict[str, Any]] = []
     agent_verification_history: list[dict[str, Any]] = []
     seen_agent_verification_ids: set[str] = set()
     session_id = ""
     continuation_prompt = ""
-    command_loop_state: dict[str, Any] | None = _initial_command_loop_state(
-        execution_sample,
-        args,
-        verification_mode,
-        started_at_ms=sample_deadline_started_at_ms,
+    command_loop_state: dict[str, Any] | None = (
+        None
+        if builtin_mode
+        else _initial_command_loop_state(
+            execution_sample,
+            args,
+            verification_mode,
+            started_at_ms=sample_deadline_started_at_ms,
+        )
     )
     continuations_dispatched = 0
     transported_control_generations: set[int] = set()
@@ -4069,6 +4208,8 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
                 **trace_summary,
             }
         )
+        if builtin_mode:
+            break
         if opencode_returncode != 0 or not session_id:
             break
         transport_plan = _runner_transport_plan(
@@ -4120,6 +4261,7 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         opencode_returncode=opencode_returncode,
         last_trace=last_trace,
         agent_verification_history=agent_verification_history,
+        builtin_mode=builtin_mode,
     )
     if (
         opencode_returncode == 0
@@ -4146,11 +4288,15 @@ def _run_sample(sample: Sample, run_dir: Path, args: argparse.Namespace) -> dict
         _persist_verify_payload(sample_dir, verify_payload)
     if getattr(args, "refactoring_backend", "direct") == "idea":
         _close_idea_project(execution_sample.project_root, sample_dir)
-    final_verify_source = "runner_final"
+    final_verify_source = "runner_builtin" if builtin_mode else "runner_final"
     final_verify_execution = (
-        "agent_project_full_receipt"
-        if runner_final_receipt.get("reused") is True
-        else "fresh_runner_verify"
+        "fresh_runner_verify_builtin"
+        if builtin_mode
+        else (
+            "agent_project_full_receipt"
+            if runner_final_receipt.get("reused") is True
+            else "fresh_runner_verify"
+        )
     )
     opencode_failure_category = (
         "PROVIDER_QUOTA_FAILED"
@@ -4400,7 +4546,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--agent",
-        choices=["smell-refactor-agent", "java-refactor-agent"],
+        choices=["smell-refactor-agent", "java-refactor-agent", BUILTIN_AGENT],
         default="",
     )
     parser.add_argument("--no-worktree", dest="worktree", action="store_false", help="Mutate project_path directly. Default is one isolated Git checkout per sample.")
@@ -4430,6 +4576,8 @@ def main(argv: list[str] | None = None) -> int:
     # contract is an independent behavior gate.
     if args.refactoring_backend == "idea" and args.agent == "smell-refactor-agent":
         parser.error("--refactoring-backend=idea requires the Java refactor agent")
+    if args.refactoring_backend == "idea" and args.agent == BUILTIN_AGENT:
+        parser.error("--agent=opencode-builtin supports the direct backend only")
     if args.model_event_inactivity_timeout <= 0:
         parser.error("--model-event-inactivity-timeout must be positive")
     # Validate the runner flags through the same parser used by the OpenCode

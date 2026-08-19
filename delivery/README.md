@@ -51,7 +51,7 @@ checkpoint 或 runner 更新只需同步 Git 工作树，不重建镜像；仅�
 docker load -i images/smell-refactor-env-java.tar.gz
 ```
 
-完整的端到端操作顺序见仓库根目录 `README.md` 第 1 节：
+完整的端到端操作顺序见仓库根目录 `README.md` 的“快速上手”：
 将本仓库只读挂载为 `/agent-src`,先跑 `self-check`,再按 dataset 样本运行。
 
 ## 说明

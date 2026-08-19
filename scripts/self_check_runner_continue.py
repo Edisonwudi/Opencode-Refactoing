@@ -2073,6 +2073,115 @@ with tempfile.TemporaryDirectory() as tmp:
         "MODEL_EVENT_INACTIVITY_TIMEOUT",
     )
 
+print("== opencode builtin single-turn runner authority ==")
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    run_dir = root / "run"
+    run_dir.mkdir()
+    builtin_sample = R.Sample(
+        sample_id="builtin-single-turn",
+        language="python",
+        smell="long_method",
+        project_name="p",
+        project_root=root,
+        location="src/a.py:method=target|line=1",
+        evidence="",
+        raw={},
+        verification_mode="project_full",
+    )
+    builtin_args = argparse.Namespace(
+        project_revisions="unused.json",
+        worktree=False,
+        agent="opencode-builtin",
+        verification_mode="project_full",
+        allow_test_changes=False,
+        refactoring_backend="direct",
+        sample_deadline=60,
+        model_event_inactivity_timeout=1,
+        projects="",
+        loop_mode="verify-failure",
+        max_smell_verify_cycles=10,
+        loop_no_progress_limit=3,
+        loop_on="smell,compile,test",
+        loop_instruction="repair narrowly",
+    )
+    builtin_calls: dict[str, list] = {
+        "baseline": [],
+        "opencode": [],
+        "final": [],
+    }
+    originals = {
+        "load_revisions": R.load_revisions,
+        "resolve_revision": R.resolve_revision,
+        "assert_commit_present": R.assert_commit_present,
+        "audit_test_commit": R.audit_test_commit,
+        "verify_test_oracle": R.verify_test_oracle,
+        "_run_capture_baseline": R._run_capture_baseline,
+        "_bootstrap_opencode": R._bootstrap_opencode,
+        "_run_opencode": R._run_opencode,
+        "_runner_final_verify": R._runner_final_verify,
+    }
+    R.load_revisions = lambda _path: {}
+    R.resolve_revision = lambda _project, _revisions, _path: argparse.Namespace(
+        project_commit="frozen-commit"
+    )
+    R.assert_commit_present = lambda _root, _commit: None
+    R.audit_test_commit = lambda *_args, **_kwargs: {}
+    R.verify_test_oracle = lambda *_args, **_kwargs: {}
+
+    def builtin_baseline(*_args, **_kwargs):
+        builtin_calls["baseline"].append(_kwargs)
+        return 0, {
+            "success": True,
+            "status": "BASELINE_CAPTURED",
+            "baseline_seal": "builtin-c000",
+        }
+
+    def reject_builtin_bootstrap(*_args, **_kwargs):
+        raise AssertionError("opencode-builtin must not bootstrap delivery .opencode")
+
+    def builtin_opencode(*_args, **_kwargs):
+        builtin_calls["opencode"].append(_kwargs)
+        return 0, "ses_builtin", ""
+
+    def builtin_final(*_args, **_kwargs):
+        builtin_calls["final"].append(_kwargs)
+        return (
+            0,
+            {
+                "schema_version": "smell.verify.decision/v1",
+                **make_payload("PASS", project_full_executed=True),
+            },
+            {
+                **R._runner_final_receipt_audit("BUILTIN_INDEPENDENT_VERIFY"),
+                "source": "fresh_runner_verify_builtin",
+                "reused": False,
+            },
+        )
+
+    R._run_capture_baseline = builtin_baseline
+    R._bootstrap_opencode = reject_builtin_bootstrap
+    R._run_opencode = builtin_opencode
+    R._runner_final_verify = builtin_final
+    try:
+        builtin_row = R._run_sample(builtin_sample, run_dir, builtin_args)
+    finally:
+        for name, value in originals.items():
+            setattr(R, name, value)
+    check("builtin_non_java_baseline_count", len(builtin_calls["baseline"]), 1)
+    check("builtin_model_turn_count", len(builtin_calls["opencode"]), 1)
+    check("builtin_final_verify_count", len(builtin_calls["final"]), 1)
+    if builtin_calls["opencode"]:
+        check("builtin_initial_session", builtin_calls["opencode"][0]["session_id"], "")
+        check("builtin_no_continuation", builtin_calls["opencode"][0]["continuation_prompt"], "")
+        check("builtin_no_command_state", builtin_calls["opencode"][0]["command_loop_state"], None)
+    if builtin_calls["final"]:
+        check("builtin_runner_authority_enabled", builtin_calls["final"][0]["builtin_mode"], True)
+    check("builtin_result_status", builtin_row["status"], "PASS")
+    check("builtin_result_agent", builtin_row["agent"], "opencode-builtin")
+    check_true("builtin_no_runner_transports", "runner_transports=0" in builtin_row["note"])
+    check_true("builtin_no_agent_verifications", "agent_verifications=0" in builtin_row["note"])
+
 check(
     "baseline_not_found_status_is_exact",
     R._baseline_failure_status(1, {"success": False, "error": "BASELINE_FINDING_NOT_FOUND"}),
@@ -2685,6 +2794,102 @@ print(json.dumps({"type": "message", "sessionID": "ses_zero_verify"}))
                 encoding="utf-8"
             )
         )["excluded_mutable_fields"],
+    )
+
+print("== native builtin OpenCode invocation ==")
+with tempfile.TemporaryDirectory() as tmp:
+    temp = Path(tmp)
+    project = temp / "project"
+    artifacts = temp / "artifacts"
+    project.mkdir()
+    artifacts.mkdir()
+    fake = temp / "fake-opencode-builtin"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+raw = sys.stdin.read()
+if "--command" in sys.argv or "--agent" in sys.argv:
+    raise SystemExit(30)
+if "smell_verify" in raw:
+    raise SystemExit(31)
+if any(
+    name in os.environ
+    for name in (
+        "SMELL_BATCH_RUN",
+        "SMELL_COMMAND_LOOP_STATE_JSON",
+        "SMELL_BRIDGE_FILE",
+        "SMELL_PROJECT_ROOT",
+        "SMELL_BASELINE_SEAL",
+        "SMELL_ARTIFACT_ROOT",
+    )
+):
+    raise SystemExit(32)
+if Path(os.environ.get("PWD", "")).resolve() != Path.cwd().resolve():
+    raise SystemExit(33)
+print(json.dumps({"type": "message", "sessionID": "ses_builtin"}))
+""",
+        encoding="utf-8",
+    )
+    os.chmod(fake, 0o755)
+    builtin_sample = Sample(
+        sample_id="native",
+        language="python",
+        smell="long_method",
+        project_name="p",
+        project_root=project,
+        location="src/a.py:method=target|line=1",
+        evidence="",
+        raw={},
+    )
+    builtin_args = argparse.Namespace(
+        opencode_bin=str(fake),
+        model="minimax/MiniMax-M2.7",
+        opencode_api_key="",
+        opencode_api_key_env="",
+        opencode_auth_json="disabled",
+        opencode_base_url="",
+        projects="",
+        sample_deadline=60,
+        allow_test_changes=False,
+        refactoring_backend="direct",
+        loop_mode="verify-failure",
+        max_smell_verify_cycles=10,
+        loop_no_progress_limit=3,
+        loop_on="smell,compile,test",
+        loop_instruction="repair narrowly",
+    )
+    stale_state = os.environ.get("SMELL_COMMAND_LOOP_STATE_JSON")
+    os.environ["SMELL_COMMAND_LOOP_STATE_JSON"] = "stale-controller-state"
+    try:
+        builtin_rc, builtin_session, builtin_reason = R._run_opencode(
+            builtin_sample,
+            artifacts,
+            builtin_args,
+            "opencode-builtin",
+            "project_full",
+            command_loop_state=None,
+            hard_timeout_seconds=5,
+            baseline_seal="builtin-c000",
+        )
+    finally:
+        if stale_state is None:
+            os.environ.pop("SMELL_COMMAND_LOOP_STATE_JSON", None)
+        else:
+            os.environ["SMELL_COMMAND_LOOP_STATE_JSON"] = stale_state
+    builtin_command = json.loads(
+        (artifacts / "command.json").read_text(encoding="utf-8")
+    )
+    check("builtin_native_process_rc", builtin_rc, 0)
+    check("builtin_native_session_audit", builtin_session, "ses_builtin")
+    check("builtin_native_termination_reason", builtin_reason, "")
+    check("builtin_native_loop_policy_absent", builtin_command["loop_policy"], None)
+    check("builtin_native_command_flag_absent", "--command" in builtin_command["cmd"], False)
+    check("builtin_native_agent_flag_absent", "--agent" in builtin_command["cmd"], False)
+    check_true(
+        "builtin_native_prompt_is_raw_task",
+        "Repair this one python smell"
+        in (artifacts / "raw-user-input.txt").read_text(encoding="utf-8"),
     )
 
 print("== model event inactivity watchdog ==")

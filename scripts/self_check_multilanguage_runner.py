@@ -344,11 +344,28 @@ def main() -> int:
         assert "Repair this one Java smell" not in prompt
         assert "IDEA preference" not in prompt
 
+        builtin_prompt = runner._task_prompt(sample, agent="opencode-builtin")
+        assert "Repair this one python smell" in builtin_prompt
+        assert "smell_verify" not in builtin_prompt
+        assert "final acceptance gate" not in builtin_prompt
+
         args = argparse.Namespace(agent="", opencode_bin="opencode", model="test/model")
         assert runner._select_agent(sample, args) == "smell-refactor-agent"
         assert runner._select_agent(focused_sample, args) == "java-refactor-agent"
         command = runner._opencode_run_command(args, "smell-refactor-agent")
         assert command[command.index("--command") + 1] == "smell-refactor-run"
+        builtin_command = runner._opencode_run_command(args, "opencode-builtin")
+        assert "--command" not in builtin_command
+        assert "--agent" not in builtin_command
+        try:
+            runner._opencode_run_command(args, "opencode-builtin", "ses_forbidden")
+        except ValueError as exc:
+            assert "single turn" in str(exc)
+        else:
+            raise AssertionError("opencode-builtin must not support session continuation")
+        assert runner.build_parser().parse_args(
+            ["--dataset", str(dataset), "--agent", "opencode-builtin"]
+        ).agent == "opencode-builtin"
         rebased = _rebase_command_config(
             CommandConfig(script=f'cd "{project}"\npython -m compileall demo.py'),
             project,
